@@ -1,7 +1,10 @@
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -258,12 +261,24 @@ fn bash(args: &Value, cancel: &Cancel) -> String {
         return "error: missing \"command\"".into();
     };
 
+    // Output goes to scratch files, not pipes: a command that leaves a
+    // background process behind must not be able to keep this call waiting on
+    // a pipe nobody will close.
+    let (mut out_file, mut err_file) = match (scratch("out"), scratch("err")) {
+        (Ok(out), Ok(err)) => (out, err),
+        (Err(e), _) | (_, Err(e)) => return format!("error: scratch file: {e}"),
+    };
+    let (out_write, err_write) = match (out_file.try_clone(), err_file.try_clone()) {
+        (Ok(out), Ok(err)) => (out, err),
+        (Err(e), _) | (_, Err(e)) => return format!("error: scratch file: {e}"),
+    };
+
     let mut child = match Command::new("sh")
         .arg("-c")
         .arg(command)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(out_write))
+        .stderr(Stdio::from(err_write))
         // Own process group, so an interrupt kills the whole pipeline.
         .process_group(0)
         .spawn()
@@ -272,11 +287,6 @@ fn bash(args: &Value, cancel: &Cancel) -> String {
         Err(e) => return format!("error: spawn: {e}"),
     };
     let pid = child.id() as i32;
-
-    let stdout = child.stdout.take().expect("stdout");
-    let stderr = child.stderr.take().expect("stderr");
-    let out_thread = thread::spawn(move || read_all(stdout));
-    let err_thread = thread::spawn(move || read_all(stderr));
 
     let start = Instant::now();
     let mut timed_out = false;
@@ -316,8 +326,8 @@ fn bash(args: &Value, cancel: &Cancel) -> String {
         }
     };
 
-    let stdout = out_thread.join().unwrap_or_default();
-    let stderr = err_thread.join().unwrap_or_default();
+    let stdout = read_all(&mut out_file);
+    let stderr = read_all(&mut err_file);
 
     let mut out = format!(
         "exit: {}\n",
@@ -359,9 +369,30 @@ fn kill(signal: &str, pid: i32) {
         .status();
 }
 
-fn read_all(mut reader: impl Read) -> String {
+/// A command's output file. Created `0600`, then unlinked at once: the handle
+/// is the only name it has, so nothing is left in the temp directory and no
+/// other local user can open it in between.
+fn scratch(kind: &str) -> std::io::Result<File> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "nano-{}-{}-{kind}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    let _ = std::fs::remove_file(&path);
+    Ok(file)
+}
+
+fn read_all(file: &mut File) -> String {
     let mut bytes = Vec::new();
-    let _ = reader.read_to_end(&mut bytes);
+    let _ = file.seek(SeekFrom::Start(0));
+    let _ = file.read_to_end(&mut bytes);
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
