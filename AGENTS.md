@@ -1,7 +1,7 @@
 # nano
 
 Minimal coding agent harness in Rust. One binary, a line REPL, OpenAI-compatible
-providers, four tools. Roughly 2.6k LOC across six files.
+providers, four tools. Roughly 4.5k LOC across seven files.
 
 ## Principles
 
@@ -13,7 +13,7 @@ providers, four tools. Roughly 2.6k LOC across six files.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
    panes, sessions, compaction, subagents, MCP, or permission layer until the REPL
    is genuinely insufficient. One feature per change.
-3. **Small surface.** Six modules. A new module needs a reason.
+3. **Small surface.** Seven modules. A new module needs a reason.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` + SSE
    only. Never add per-provider code paths; express differences as config
    (`base_url`, `models_url`, `api_key_env`, `session_header`).
@@ -55,6 +55,9 @@ providers, four tools. Roughly 2.6k LOC across six files.
   applies events and draws once per batch.
 - `ui.rs` — the screen: prompt buffer and key mapping, the six-row live region, and
   `insert` for transcript lines (wrapped here, since a clipped line would be lost).
+- `md.rs` — markdown: a port of `md.ts` (blocks, inlines, tables, entities, URL
+  checks), plus the renderer that turns its AST into transcript lines. `Stream`
+  feeds it a line at a time and lays a block out when it ends.
 - `api.rs` — model listing, chat request, SSE parsing, tool-call accumulation.
 - `http.rs` — URL parsing, HTTP/1.1 over `TcpStream`/rustls, body decoding
   (`Content-Length`, chunked, EOF).
@@ -66,8 +69,14 @@ providers, four tools. Roughly 2.6k LOC across six files.
 - Errors are `String`, user-facing, prefixed with context (`connect host:port: ...`).
   No error crates.
 - Keep functions short; comment only non-obvious behavior.
-- Transcript output is complete lines. `ui::Screen::text` splits on newlines: a
-  leading newline means a blank line, a trailing one only closes the last line.
+- Transcript output is complete lines. `ui::Screen::text` splits on newlines and
+  collects markdown; `ui::Screen::output` writes the binary's own text verbatim,
+  one line per line.
+
+Markdown is the model's and the user's, never the binary's. Blocks are laid out
+when they end — a blank line, a tool call, a thought, or the end of the turn —
+because a table needs its header and a paragraph its last line. The line still
+being streamed stays raw in the status row.
 - Style comes from `Paint` in `main.rs`, rendered either as cells or as ANSI when
   there is no screen to draw on.
 - Tool names and descriptions are part of the prompt. Change them deliberately.

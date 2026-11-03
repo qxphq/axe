@@ -21,6 +21,8 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthChar;
 
+use crate::md;
+
 /// Rows the live region always occupies: a blank gap, the queue, the prompt,
 /// an empty row, the status and selection row, and a blank row under it.
 /// Fixed, so the viewport never moves under the cursor, the transcript never
@@ -89,6 +91,9 @@ pub struct Screen {
     commands: Vec<&'static str>,
     /// The last block written, for the blank line between blocks.
     last: Option<Block>,
+    /// Markdown being collected. A block is laid out once it ends, not once
+    /// per line: a table needs its whole header, a paragraph its last line.
+    md: md::Stream,
     restored: bool,
 }
 
@@ -112,6 +117,7 @@ impl Screen {
             killed: String::new(),
             commands: Vec::new(),
             last: None,
+            md: md::Stream::new(),
             restored: false,
         })
     }
@@ -206,10 +212,28 @@ impl Screen {
 
     /// Commit the line: echo it into the transcript and return it. The marker
     /// is `█`, not the live prompt's `❯`: the line is settled, not editable.
+    /// What was typed is markdown, laid out here because it is complete.
     pub fn commit(&mut self) -> String {
         let line = self.take();
-        let text = format!("{MARK} {line}");
-        self.insert(vec![Line::styled(text, PROMPT_STYLE)], Block::User);
+        let mut lines = md::document(&line, self.cols().saturating_sub(2));
+        if lines.is_empty() {
+            lines.push(Line::default());
+        }
+        let rows: Vec<Line<'static>> = lines
+            .into_iter()
+            .enumerate()
+            .map(|(k, row)| {
+                let head = if k == 0 {
+                    format!("{MARK} ")
+                } else {
+                    "  ".to_string()
+                };
+                let mut spans = vec![Span::styled(head, PROMPT_STYLE)];
+                spans.extend(row.spans);
+                Line::from(spans)
+            })
+            .collect();
+        self.write(rows, Block::User);
         self.status.clear();
         line
     }
@@ -220,13 +244,38 @@ impl Screen {
     ///
     /// Blocks are separated by one blank line, so a message never sits against
     /// the tool call that followed it. Consecutive tool calls are one block:
-    /// they belong together. So are the fragments of a message or a thought,
-    /// which arrive split at their newlines: a separator per fragment would
-    /// put a blank line between the lines of one paragraph.
+    /// they belong together, and so are the lines of one thought.
     pub fn insert(&mut self, lines: Vec<Line<'static>>, block: Block) {
+        // Anything that is not model text ends the block being collected: a
+        // paragraph must not straddle a tool call, a thought, or a turn.
+        if block != Block::Text {
+            self.flush();
+        }
+        self.write(lines, block);
+    }
+
+    /// End the collected markdown: what it rendered to joins the transcript.
+    pub fn flush(&mut self) {
+        let mut lines = Vec::new();
+        self.md.flush(self.cols(), &mut lines);
+        if !lines.is_empty() {
+            self.write(lines, Block::Text);
+        }
+    }
+
+    /// The width inside the margins.
+    fn cols(&self) -> usize {
+        let width = self.term.size().map(|s| s.width).unwrap_or(80).max(1) as usize;
+        let margin = PAD.min(width.saturating_sub(1) as u16) as usize;
+        width.saturating_sub(2 * margin).max(1)
+    }
+
+    fn write(&mut self, lines: Vec<Line<'static>>, block: Block) {
         let mut lines = lines;
-        // A run of one kind is one block, except user lines: each is its own.
-        let continues = block != Block::User && self.last == Some(block);
+        // A run of one kind is one block, except user lines, which are each
+        // their own, and markdown, which arrives one laid-out block at a time.
+        let continues =
+            matches!(block, Block::Tool | Block::Thought) && self.last == Some(block);
         if !continues {
             lines.insert(0, Line::default());
         }
@@ -243,21 +292,32 @@ impl Screen {
         let _ = self.draw();
     }
 
-    /// Plain text, split into transcript lines. A blank line at the start is
-    /// the separator the sink wrote for its own output, and `insert` owns that
-    /// here; blank lines inside the text are paragraph breaks and stay.
+    /// Model text, a line at a time. The lines are markdown: they are
+    /// collected until the block they belong to ends, which is where they
+    /// reach the transcript.
     pub fn text(&mut self, text: &str) {
-        let mut lines: Vec<&str> = split(text);
-        if self.last != Some(Block::Text) {
-            let lead = lines.iter().take_while(|line| line.is_empty()).count();
-            lines.drain(..lead);
+        let width = self.cols();
+        for line in split(text) {
+            let mut lines = Vec::new();
+            self.md.push(line, width, &mut lines);
+            // One write per rendered block: the block separator belongs
+            // between them, not once per chunk.
+            if !lines.is_empty() {
+                self.write(lines, Block::Text);
+            }
         }
-        let lines: Vec<Line<'static>> = lines
+    }
+
+    /// Text this binary produced, not the model's: written as it is, one
+    /// transcript line per line. Markdown belongs to the model and the user.
+    pub fn output(&mut self, text: &str) {
+        self.flush();
+        let lines: Vec<Line<'static>> = split(text)
             .into_iter()
             .map(|line| Line::raw(line.to_string()))
             .collect();
         if !lines.is_empty() {
-            self.insert(lines, Block::Text);
+            self.write(lines, Block::Text);
         }
     }
 
@@ -274,14 +334,15 @@ impl Screen {
         self.insert(lines, Block::Thought);
     }
 
-    /// A warning or an error: same as `text`, in red.
+    /// A warning or an error: same as `output`, in red.
     pub fn error(&mut self, text: &str) {
+        self.flush();
         let lines: Vec<Line<'static>> = split(text)
             .into_iter()
             .map(|line| Line::styled(line.to_string(), ERROR_STYLE))
             .collect();
         if !lines.is_empty() {
-            self.insert(lines, Block::Text);
+            self.write(lines, Block::Text);
         }
     }
 
@@ -634,7 +695,7 @@ fn wrap(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
 /// Text to transcript lines. A newline ends a line, so text that starts with
 /// one starts with a blank line — which is exactly what a separator is. The
 /// last one only closes the final line, so it must not add an empty one.
-fn split(text: &str) -> Vec<&str> {
+pub(crate) fn split(text: &str) -> Vec<&str> {
     let mut lines: Vec<&str> = text.split('\n').collect();
     if text.ends_with('\n') {
         lines.pop();

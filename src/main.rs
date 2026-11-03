@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod http;
+mod md;
 mod ui;
 mod tools;
 
@@ -293,7 +294,7 @@ impl Session {
         self.set_read_only(!self.read_only);
         screen.set_explore(self.read_only);
         screen.set_info(&self.info());
-        screen.text(&format!(
+        screen.output(&format!(
             "explore: {}\n",
             if self.read_only { "on" } else { "off" }
         ));
@@ -451,6 +452,8 @@ impl Session {
                         Event::Done(Ok(())) => {
                             let tail = std::mem::take(&mut thought);
                             screen.thought(&tail);
+                            // The last block has no ending line of its own.
+                            screen.flush();
                             partial.clear();
                             done = true;
                         }
@@ -517,7 +520,7 @@ impl Session {
         match input {
             "/exit" | "/quit" => return Cmd::Exit,
             "/help" => {
-                screen.text(
+                screen.output(
                     "/model [id]    pick or switch model\n\
                      /models        list models\n\
                      /thinking [l]  show or set thinking level (off, low, medium, high)\n\
@@ -529,7 +532,7 @@ impl Session {
             }
             "/models" => {
                 let text = models(&providers);
-                screen.text(&text);
+                screen.output(&text);
                 return Cmd::Continue;
             }
             "/model" => {
@@ -538,7 +541,7 @@ impl Session {
                     self.model = id;
                     let text = self.info();
                     screen.set_info(&text);
-                    screen.text(&format!("{text}\n"));
+                    screen.output(&format!("{text}\n"));
                     save_selection(&providers[self.provider].name, &self.model);
                 }
                 return Cmd::Continue;
@@ -549,7 +552,7 @@ impl Session {
         if input == "/thinking" || input.starts_with("/thinking ") {
             let rest = input.strip_prefix("/thinking").unwrap_or("").trim();
             if rest.is_empty() {
-                screen.text(&format!(
+                screen.output(&format!(
                     "thinking: {}\n\n",
                     thinking_label(&providers[self.provider].cfg, &self.thinking)
                 ));
@@ -560,7 +563,7 @@ impl Session {
                 screen.set_info(&self.info());
                 let spec = format!("{}/{}", providers[self.provider].name, self.model);
                 config::save_thinking(&spec, level.as_str());
-                screen.text(&format!(
+                screen.output(&format!(
                     "thinking: {}\n\n",
                     thinking_label(&providers[self.provider].cfg, &self.thinking)
                 ));
@@ -584,7 +587,7 @@ impl Session {
                         .map(|(_, level)| level.clone());
                     let text = self.info();
                     screen.set_info(&text);
-                    screen.text(&format!("{text}\n"));
+                    screen.output(&format!("{text}\n"));
                     save_selection(&providers[self.provider].name, &self.model);
                 }
                 None => screen.error(&format!("unknown model: {spec}\n")),
@@ -599,7 +602,7 @@ impl Session {
 
         if input == "/thoughts" {
             self.thoughts = !self.thoughts;
-            screen.text(&format!(
+            screen.output(&format!(
                 "thoughts: {}\n\n",
                 if self.thoughts { "on" } else { "off" }
             ));
@@ -790,19 +793,64 @@ trait Sink {
 #[derive(Default)]
 struct PlainSink {
     out: TextSink,
+    md: md::Stream,
+    /// The line being written: the stream ends wherever the provider felt
+    /// like it, and a line is only a line once its newline arrives.
+    partial: String,
+    /// Whether a block has already been written: the renderer decides where
+    /// blocks end, so the blank line between them is put here.
+    wrote_block: bool,
+}
+
+impl PlainSink {
+    fn write(&mut self, lines: Vec<Line<'static>>) {
+        if lines.is_empty() {
+            return;
+        }
+        let mut buf = String::new();
+        if self.wrote_block {
+            buf.push('\n');
+        }
+        self.wrote_block = true;
+        for line in &lines {
+            buf.push_str(&md::ansi(line));
+            buf.push('\n');
+        }
+        let mut done = String::new();
+        self.out.push(&buf, &mut done);
+        print!("{done}");
+        io::stdout().flush().ok();
+    }
+
+    fn flush(&mut self) {
+        let mut lines = Vec::new();
+        let rest = std::mem::take(&mut self.partial);
+        if !rest.is_empty() {
+            self.md.push(&rest, 0, &mut lines);
+        }
+        self.md.flush(0, &mut lines);
+        self.write(lines);
+    }
 }
 
 impl Sink for PlainSink {
     fn text(&mut self, text: &str) {
-        let mut done = String::new();
-        self.out.push(text, &mut done);
-        print!("{done}");
-        io::stdout().flush().ok();
+        self.partial.push_str(text);
+        let Some(last) = self.partial.rfind('\n') else {
+            return;
+        };
+        let finished: String = self.partial.drain(..=last).collect();
+        for line in ui::split(&finished) {
+            let mut lines = Vec::new();
+            self.md.push(line, 0, &mut lines);
+            self.write(lines);
+        }
     }
 
     fn status(&mut self, _text: &str) {}
 
     fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str)) {
+        self.flush();
         let mut line = String::new();
         for (paint, text) in call {
             line.push_str(&paint.ansi(text));
@@ -814,10 +862,12 @@ impl Sink for PlainSink {
     }
 
     fn end_round(&mut self) {
+        self.flush();
         self.out.commit();
         if std::mem::take(&mut self.out.wrote) {
             println!();
         }
+        self.wrote_block = false;
     }
 
     fn reasoning(&mut self, _text: &str) {}
@@ -1128,7 +1178,7 @@ fn pick(
         }
     }
 
-    screen.text(&text);
+    screen.output(&text);
     let saved = screen.prompt().to_string();
     screen.set_prompt("model> ");
     // A mode toggle is not a model choice: keep the picker open.
