@@ -928,11 +928,9 @@ fn selection(
 /// lands in the transcript and is never repainted, so it must be narrower than
 /// the terminal's margin-to-margin width on a narrow window.
 const LOGO: &[&str] = &[
-    "██   ██   █████    ██   ██    █████ ",
-    "███  ██  ██   ██   ███  ██   ██   ██",
-    "██ █ ██  ███████   ██ █ ██   ██   ██",
-    "██  ███  ██   ██   ██  ███   ██   ██",
-    "██   ██  ██   ██   ██   ██    █████ ",
+    "████▄  ▀▀█▄ ████▄ ▄███▄",
+    "██ ██ ▄█▀██ ██ ██ ██ ██",
+    "██ ██ ▀█▄██ ██ ██ ▀███▀",
 ];
 
 fn banner(note: Option<&str>) {
