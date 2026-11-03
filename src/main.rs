@@ -1430,7 +1430,9 @@ impl TextSink {
 // A shell command, the user's (`!cmd`) or the model's, on one line: the glyph
 // says what runs, and the command follows it, since `bash` has no call syntax.
 fn shell_line(command: &str, read_only: bool) -> Vec<(Paint, String)> {
-    let paint = if read_only { Paint::Dim } else { Paint::Yellow };
+    // Cyan for a command that cannot change the tree: dim is the thought's
+    // color, and the two must not read alike.
+    let paint = if read_only { Paint::Cyan } else { Paint::Yellow };
     vec![
         (Paint::Plain, "  ".to_string()),
         (paint, "▷".to_string()),
@@ -1441,19 +1443,16 @@ fn shell_line(command: &str, read_only: bool) -> Vec<(Paint, String)> {
 
 // Echo tool calls compactly: show the arguments that identify the target, never
 // the raw JSON (heredoc scripts and long content are unreadable in a line).
-// A glyph per tool says what it does at a glance: read-only is dim, anything
-// that can change the tree is yellow.
+// A glyph per tool says what it does at a glance. The palette has one rule:
+// anything that can change the tree is yellow, anything that cannot is cyan
+// (dim is the thought's color, so a read-only call must not use it).
 fn call_line(call: &api::ToolCall, read_only: bool) -> Vec<(Paint, String)> {
     let v: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     let (glyph, paint) = match call.name.as_str() {
-        "read" => ("◇", Paint::Dim),
-        _ => ("✚", Paint::Yellow),
-    };
-    let (glyph, paint) = match call.name.as_str() {
-        "read" => (glyph, paint),
+        "read" => ("◇", Paint::Cyan),
         "write" => ("✚", Paint::Yellow),
         "edit" => ("✎", Paint::Yellow),
-        _ => (glyph, paint),
+        _ => ("✚", Paint::Yellow),
     };
 
     if call.name == "bash" {
