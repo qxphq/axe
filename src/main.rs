@@ -3,7 +3,7 @@ mod config;
 mod http;
 mod tools;
 
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 
 use serde_json::{json, Value};
 
@@ -325,9 +325,10 @@ fn run_turn(
         }));
 
         for call in &reply.calls {
-            println!("→ {}", call_line(call));
+            print!("{}", call_line(call));
+            io::stdout().flush().ok();
             let result = tools::execute(&call.name, &call.arguments);
-            println!("  {}", summarize(&result, 120));
+            println!(" {}", mark(&result));
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call.id,
@@ -345,13 +346,48 @@ fn run_turn(
 // never the raw JSON (heredoc scripts and long content are unreadable in a line).
 fn call_line(call: &api::ToolCall) -> String {
     let v: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-    let target = ["path", "command", "file", "pattern"]
-        .iter()
-        .find_map(|k| v[*k].as_str())
-        .map(|s| summarize(s, 120));
-    match target {
-        Some(t) => format!("{}({})", call.name, t),
-        None => call.name.clone(),
+    let mut parts = Vec::new();
+    for key in ["path", "command", "file", "pattern"] {
+        if let Some(s) = v[key].as_str() {
+            parts.push(summarize(s, 120));
+        }
+    }
+    // Read-only calls are dim; anything that can change the tree is yellow.
+    let (glyph, code) = if call.name == "read" {
+        ("◇", "2")
+    } else {
+        ("◆", "33")
+    };
+    let name = paint(code, &call.name);
+    if parts.is_empty() {
+        format!("{glyph} {name}")
+    } else {
+        format!("{glyph} {name}({})", parts.join(" "))
+    }
+}
+
+/// One glyph for the outcome. A failed tool result is a result, not an error:
+/// tools report failures as text, either `error: ...` or a non-zero `exit: N`.
+fn mark(result: &str) -> String {
+    let failed = if let Some(rest) = result.strip_prefix("exit: ") {
+        let code = rest.lines().next().unwrap_or("").trim();
+        code != "0"
+    } else {
+        result.starts_with("error:")
+    };
+    if failed {
+        paint("31", "✗")
+    } else {
+        paint("32", "✓")
+    }
+}
+
+/// ANSI colors only when stdout is a terminal, so redirected output stays plain.
+fn paint(code: &str, text: &str) -> String {
+    if io::stdout().is_terminal() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
     }
 }
 
