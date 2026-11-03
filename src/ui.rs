@@ -50,6 +50,8 @@ pub struct Screen {
     /// status row changes constantly, and a queued line that scrolls away
     /// silently looks like the Enter was lost.
     queued: Option<String>,
+    /// The last killed text: one slot, enough for Ctrl-U ... Ctrl-Y.
+    killed: String,
     restored: bool,
 }
 
@@ -68,6 +70,7 @@ impl Screen {
             cursor: 0,
             status: String::new(),
             queued: None,
+            killed: String::new(),
             restored: false,
         })
     }
@@ -106,18 +109,39 @@ impl Screen {
     /// to the caller, which knows whether a turn is in flight.
     pub fn apply_key(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Enter => return Action::Submit,
+            KeyCode::Backspace if alt || ctrl => self.kill_word_back(),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Delete => self.delete(),
+            KeyCode::Left if alt || ctrl => self.word_back(),
+            KeyCode::Right if alt || ctrl => self.word_forward(),
             KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.len()),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.len(),
             // A shell's Ctrl-C: drop what was typed, keep the prompt.
-            KeyCode::Char('c') if ctrl => self.buf.clear(),
+            KeyCode::Char('c') if ctrl => {
+                self.buf.clear();
+                self.cursor = 0;
+            }
             KeyCode::Char('d') if ctrl && self.buf.is_empty() => return Action::Eof,
-            KeyCode::Char(c) if !ctrl => self.insert_char(c),
+            KeyCode::Char('d') if ctrl => self.delete(),
+            KeyCode::Char('a') if ctrl => self.cursor = 0,
+            KeyCode::Char('e') if ctrl => self.cursor = self.len(),
+            KeyCode::Char('b') if ctrl => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Char('f') if ctrl => self.cursor = (self.cursor + 1).min(self.len()),
+            KeyCode::Char('b') if alt => self.word_back(),
+            KeyCode::Char('f') if alt => self.word_forward(),
+            KeyCode::Char('w') if ctrl || alt => self.kill_word_back(),
+            KeyCode::Char('d') if alt => self.kill_word_forward(),
+            KeyCode::Char('u') if ctrl => self.kill_to_start(),
+            KeyCode::Char('k') if ctrl => self.kill_to_end(),
+            KeyCode::Char('y') if ctrl => self.yank(),
+            KeyCode::Char('t') if ctrl => self.transpose_chars(),
+            KeyCode::Char('t') if alt => self.transpose_words(),
+            KeyCode::Char(c) if !ctrl && !alt => self.insert_char(c),
             _ => {}
         }
         Action::None
@@ -254,6 +278,145 @@ impl Screen {
             let at = self.offset(self.cursor);
             self.buf.remove(at);
         }
+    }
+
+    /// Replace chars `from..to` with `text`, leaving the cursor after it.
+    fn splice(&mut self, from: usize, to: usize, text: &str) {
+        let start = self.offset(from);
+        let end = self.offset(to);
+        self.buf.replace_range(start..end, text);
+        self.cursor = from + text.chars().count();
+    }
+
+    /// `nth` from the end, where 0 is the last char. Cuts on char boundaries.
+    fn at(&self, nth: usize) -> usize {
+        self.offset(self.len().saturating_sub(nth))
+    }
+
+    fn char_at(&self, i: usize) -> Option<char> {
+        self.buf.chars().nth(i)
+    }
+
+    /// Start of the word ending at or before the cursor: skip the whitespace
+    /// the cursor sits in (or just after), then the word before it.
+    fn word_start(&self) -> usize {
+        let mut i = self.cursor;
+        while i > 0 && self.char_at(i - 1).is_some_and(char::is_whitespace) {
+            i -= 1;
+        }
+        while i > 0 && self.char_at(i - 1).is_some_and(|c| !c.is_whitespace()) {
+            i -= 1;
+        }
+        i
+    }
+
+    /// End of the word starting at or after the cursor.
+    fn word_end(&self) -> usize {
+        let mut i = self.cursor;
+        while i < self.len() && self.char_at(i).is_some_and(char::is_whitespace) {
+            i += 1;
+        }
+        while i < self.len() && self.char_at(i).is_some_and(|c| !c.is_whitespace()) {
+            i += 1;
+        }
+        i
+    }
+
+    fn word_back(&mut self) {
+        self.cursor = self.word_start();
+    }
+
+    fn word_forward(&mut self) {
+        self.cursor = self.word_end();
+    }
+
+    fn kill_word_back(&mut self) {
+        let start = self.word_start();
+        if start < self.cursor {
+            self.killed = self.buf[self.offset(start)..self.offset(self.cursor)].to_string();
+            self.splice(start, self.cursor, "");
+        }
+    }
+
+    fn kill_word_forward(&mut self) {
+        let end = self.word_end();
+        if end > self.cursor {
+            self.killed = self.buf[self.offset(self.cursor)..self.offset(end)].to_string();
+            self.splice(self.cursor, end, "");
+        }
+    }
+
+    fn kill_to_start(&mut self) {
+        if self.cursor > 0 {
+            self.killed = self.buf[..self.offset(self.cursor)].to_string();
+            self.splice(0, self.cursor, "");
+        }
+    }
+
+    fn kill_to_end(&mut self) {
+        if self.cursor < self.len() {
+            self.killed = self.buf[self.offset(self.cursor)..].to_string();
+            self.splice(self.cursor, self.len(), "");
+        }
+    }
+
+    fn yank(&mut self) {
+        // Copied out first: `splice` takes `&mut self`.
+        let text = self.killed.clone();
+        if text.is_empty() {
+            return;
+        }
+        let at = self.cursor;
+        self.splice(at, at, &text);
+    }
+
+    /// Swap the two chars before the cursor, as readline does: at the end of
+    /// the line the cursor steps back one first.
+    fn transpose_chars(&mut self) {
+        let end = if self.cursor == self.len() {
+            self.at(0)
+        } else {
+            self.cursor
+        };
+        if end < 2 {
+            return;
+        }
+        let (a, b) = (end - 2, end - 1);
+        let (x, y) = (self.char_at(a).unwrap(), self.char_at(b).unwrap());
+        self.splice(a, b + 1, &format!("{y}{x}"));
+        // The cursor is a char index, so a multi-cell char is one step.
+        self.cursor = a + 2;
+    }
+
+    /// Swap the two words before the cursor.
+    fn transpose_words(&mut self) {
+        // Step back over trailing whitespace, then find the word before it.
+        let mut second_end = self.cursor;
+        while second_end > 0 && self.char_at(second_end - 1).is_some_and(char::is_whitespace) {
+            second_end -= 1;
+        }
+        let mut second_start = second_end;
+        while second_start > 0 && self.char_at(second_start - 1).is_some_and(|c| !c.is_whitespace()) {
+            second_start -= 1;
+        }
+        if second_start == second_end {
+            return;
+        }
+        let mut first_end = second_start;
+        while first_end > 0 && self.char_at(first_end - 1).is_some_and(char::is_whitespace) {
+            first_end -= 1;
+        }
+        let mut first_start = first_end;
+        while first_start > 0 && self.char_at(first_start - 1).is_some_and(|c| !c.is_whitespace()) {
+            first_start -= 1;
+        }
+        if first_start == first_end {
+            return;
+        }
+        let first = self.buf[self.offset(first_start)..self.offset(first_end)].to_string();
+        let between = self.buf[self.offset(first_end)..self.offset(second_start)].to_string();
+        let second = self.buf[self.offset(second_start)..self.offset(second_end)].to_string();
+        self.splice(first_start, second_end, &format!("{second}{between}{first}"));
     }
 }
 
