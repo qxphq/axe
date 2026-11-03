@@ -181,6 +181,19 @@ impl Screen {
         }
     }
 
+    /// Reasoning, dim: the model's notes, not its answer. Blank text is a
+    /// no-op, so a round without reasoning adds no gap.
+    pub fn thought(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let lines: Vec<Line<'static>> = split(text)
+            .into_iter()
+            .map(|line| Line::styled(line.to_string(), DIM))
+            .collect();
+        self.insert(lines);
+    }
+
     /// A warning or an error: same as `text`, in red.
     pub fn error(&mut self, text: &str) {
         let lines: Vec<Line<'static>> = split(text)

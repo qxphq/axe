@@ -75,7 +75,7 @@ pub fn chat(
     http::request(ep, "POST", "/chat/completions", api_key, headers, Some(&body))
 }
 
-pub fn stream_chat<F: FnMut(&str), G: FnMut()>(
+pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
     ep: &Endpoint,
     api_key: Option<&str>,
     headers: &[(String, String)],
@@ -122,8 +122,8 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut()>(
         let reasoning = delta["reasoning_content"]
             .as_str()
             .or_else(|| delta["reasoning"].as_str());
-        if reasoning.is_some_and(|r| !r.is_empty()) {
-            on_reasoning();
+        if let Some(reasoning) = reasoning.filter(|r| !r.is_empty()) {
+            on_reasoning(reasoning);
         }
         if let Some(part) = delta["content"].as_str() {
             text.push_str(part);

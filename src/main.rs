@@ -126,6 +126,7 @@ fn run() -> Result<(), String> {
         provider,
         model,
         thinking,
+        thoughts: false,
         messages,
     };
 
@@ -143,6 +144,9 @@ struct Session {
     provider: usize,
     model: String,
     thinking: Option<String>,
+    /// Show reasoning in the transcript (`/thoughts`). Off by default: the
+    /// status row's "thinking…" is enough unless the user asks for more.
+    thoughts: bool,
     messages: Vec<Value>,
 }
 
@@ -229,6 +233,9 @@ impl Session {
         // Streamed text up to the last newline is permanent; the rest is the
         // line still being written and lives in the status row.
         let mut partial = String::new();
+        // Reasoning before the answer. Its last line is unfinished until the
+        // answer starts or the round ends, so it is held until then.
+        let mut thought = String::new();
 
         screen.set_status("thinking…");
         let _ = screen.draw();
@@ -237,6 +244,7 @@ impl Session {
         let provider = &self.providers[self.provider];
         let model = self.model.clone();
         let thinking = self.thinking.clone();
+        let thoughts = self.thoughts;
         let turn_tx = tx.clone();
         let turn_cancel = cancel.clone();
 
@@ -245,6 +253,7 @@ impl Session {
                 let mut sink = ChannelSink {
                     tx: turn_tx.clone(),
                     out: TextSink::default(),
+                    thoughts,
                 };
                 let result = run_turn(
                     provider,
@@ -300,6 +309,10 @@ impl Session {
                         // to the last newline is a finished line.
                         Event::Printed(text) => {
                             dirty = true;
+                            // The answer starting is the end of the thought: its
+                            // unfinished last line goes out first.
+                            let tail = std::mem::take(&mut thought);
+                            screen.thought(&tail);
                             partial.push_str(&text);
                             let finished = match partial.rfind('\n') {
                                 Some(at) => partial.drain(..=at).collect::<String>(),
@@ -313,10 +326,25 @@ impl Session {
                         // A tool call and its outcome, on one line.
                         Event::Echo(spans) => {
                             dirty = true;
+                            // A round that only reasoned and called a tool: its
+                            // thought ends here, before the call it produced.
+                            let tail = std::mem::take(&mut thought);
+                            screen.thought(&tail);
                             // The command that was running is in the transcript
                             // now; the status row goes back to being empty.
                             screen.set_status("");
                             screen.insert(vec![line_of(&spans)]);
+                        }
+                        // Reasoning, dim: it precedes the answer and is not the
+                        // answer, and it must not disturb the status row.
+                        Event::Thought(text) => {
+                            dirty = true;
+                            thought.push_str(&text);
+                            let finished = match thought.rfind('\n') {
+                                Some(at) => thought.drain(..=at).collect::<String>(),
+                                None => String::new(),
+                            };
+                            screen.thought(&finished);
                         }
                         Event::Status(text) => {
                             if screen.status() != text {
@@ -329,6 +357,8 @@ impl Session {
                             done = true;
                         }
                         Event::Done(Ok(())) => {
+                            let tail = std::mem::take(&mut thought);
+                            screen.thought(&tail);
                             partial.clear();
                             done = true;
                         }
@@ -395,6 +425,7 @@ impl Session {
                     "/model [id]    pick or switch model\n\
                      /models        list models\n\
                      /thinking [l]  show or set thinking level (off, low, medium, high)\n\
+                     /thoughts      show or hide the model's reasoning\n\
                      /exit          quit\n",
                 );
                 return Cmd::Continue;
@@ -461,6 +492,15 @@ impl Session {
             return Cmd::Continue;
         }
 
+        if input == "/thoughts" {
+            self.thoughts = !self.thoughts;
+            screen.text(&format!(
+                "thoughts: {}\n\n",
+                if self.thoughts { "on" } else { "off" }
+            ));
+            return Cmd::Continue;
+        }
+
         if input.starts_with('/') {
             screen.error(&format!("unknown command: {input}\n"));
             return Cmd::Continue;
@@ -482,6 +522,7 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
                 "/model [id]    pick or switch model\n\
                  /models        list models\n\
                  /thinking [l]  show or set thinking level (off, low, medium, high)\n\
+                 /thoughts      show or hide the model's reasoning\n\
                  /exit          quit"
             );
             return Cmd::Continue;
@@ -492,6 +533,12 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
         }
         "/model" => {
             eprintln!("nano: /model needs a terminal");
+            return Cmd::Continue;
+        }
+        // Reasoning goes to stdout in a piped run; only the live region can
+        // hide it, so the toggle means nothing here.
+        "/thoughts" => {
+            eprintln!("nano: /thoughts needs a terminal");
             return Cmd::Continue;
         }
         _ => {}
@@ -556,6 +603,8 @@ enum Event {
     Echo(Vec<(Paint, String)>),
     /// A transient label for the status row.
     Status(String),
+    /// Streamed reasoning, before any answer text.
+    Thought(String),
     Done(Result<(), String>),
     Eof,
 }
@@ -615,13 +664,15 @@ trait Sink {
     /// Streamed model text. `TextSink` owns the spacing: finished lines go out
     /// permanently, the unfinished one is exposed as a tail.
     fn text(&mut self, text: &str);
+    /// Streamed reasoning. Shown or not is the sink's business; the label is
+    /// what appears when it is hidden.
+    fn reasoning(&mut self, text: &str);
     /// A transient label for the live region: "thinking…", a running command.
     fn status(&mut self, text: &str);
     /// One tool call, finished: the call and its outcome on one line.
     fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str));
     /// A round's text is over; close its last line if it wrote one.
     fn end_round(&mut self);
-    fn reasoning(&mut self);
 }
 
 #[derive(Default)]
@@ -657,12 +708,14 @@ impl Sink for PlainSink {
         }
     }
 
-    fn reasoning(&mut self) {}
+    fn reasoning(&mut self, _text: &str) {}
 }
 
 struct ChannelSink {
     tx: Sender<Event>,
     out: TextSink,
+    /// Reasoning is shown in the transcript unless `/thoughts` turned it off.
+    thoughts: bool,
 }
 
 impl ChannelSink {
@@ -700,8 +753,12 @@ impl Sink for ChannelSink {
         }
     }
 
-    fn reasoning(&mut self) {
-        self.send(Event::Status("thinking…".to_string()));
+    fn reasoning(&mut self, text: &str) {
+        if self.thoughts {
+            self.send(Event::Thought(text.to_string()));
+        } else {
+            self.send(Event::Status("thinking…".to_string()));
+        }
     }
 }
 
@@ -970,7 +1027,7 @@ fn run_turn(
                 tools,
                 extra.as_ref(),
                 |text| sink.borrow_mut().text(text),
-                || sink.borrow_mut().reasoning(),
+                |text| sink.borrow_mut().reasoning(text),
             )?
         };
         sink.end_round();
