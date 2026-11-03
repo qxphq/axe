@@ -17,9 +17,11 @@ providers, four tools. Roughly 4.5k LOC across seven files.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` + SSE
    only. Never add per-provider code paths; express differences as config
    (`base_url`, `models_url`, `api_key_env`, `session_header`).
-5. **The prompt is structure.** The built-in system prompt describes only the
-   available tools and the working directory, and is generated from the same tool
-   registry used for the `tools` array. No behavioral advice, no workflow rules.
+5. **The prompt is structure.** The built-in system prompt is the working
+   directory, a short numbered list of behavioral rules that hold for every user,
+   and the available tools — rules and tools generated in `tools::system_prompt`,
+   tools from the same registry used for the `tools` array. Rules are policy, not
+   advice: one line each, no workflow, nothing project- or provider-specific.
    `system` from config is appended after it, never replaces it. The same rule
    covers instructions: `agents` (config) then the nearest `AGENTS.md` at or above
    cwd, each capped at 48 KB, then `system`. All read once at startup; never

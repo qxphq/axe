@@ -111,11 +111,22 @@ pub fn definitions(read_only: bool) -> &'static Value {
     })
 }
 
+/// Rules that hold for every user: one line each, no workflow. Rendered as a
+/// numbered list so a later rule can refer back to an earlier one.
+const BEHAVIOR: &[&str] = &[
+    "When asking the user a multiple-choice question, put the recommended option \
+     first and mark it with \"(recommended)\".",
+];
+
 pub fn system_prompt(read_only: bool) -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
-    let mut out = format!("Working directory: {cwd}\n\nTools:\n");
+    let mut out = format!("Working directory: {cwd}\n\nBehavior:\n");
+    for (i, rule) in BEHAVIOR.iter().enumerate() {
+        out.push_str(&format!("{}. {rule}\n", i + 1));
+    }
+    out.push_str("\nTools:\n");
     for spec in specs(read_only) {
         out.push_str(&format!("- {} — {}\n", spec.signature, spec.description));
     }
