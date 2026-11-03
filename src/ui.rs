@@ -30,6 +30,20 @@ const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan);
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 const ERROR_STYLE: Style = Style::new().fg(Color::Red);
 
+/// The kind of the last transcript block. Everything but two tool calls in a
+/// row is separated from what came before it by one blank line.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Block {
+    /// The line the user committed.
+    User,
+    /// Reasoning.
+    Thought,
+    /// Model text, or a command's output.
+    Text,
+    /// A tool call and its outcome.
+    Tool,
+}
+
 /// What a key asked the caller to do.
 pub enum Action {
     /// Nothing to submit.
@@ -55,6 +69,8 @@ pub struct Screen {
     queued: Option<String>,
     /// The last killed text: one slot, enough for Ctrl-U ... Ctrl-Y.
     killed: String,
+    /// The last block written, for the blank line between blocks.
+    last: Option<Block>,
     restored: bool,
 }
 
@@ -74,6 +90,7 @@ impl Screen {
             status: String::new(),
             queued: None,
             killed: String::new(),
+            last: None,
             restored: false,
         })
     }
@@ -154,7 +171,7 @@ impl Screen {
     pub fn commit(&mut self) -> String {
         let line = self.take();
         let text = format!("{}{}", self.prompt, line);
-        self.insert(vec![Line::styled(text, PROMPT_STYLE)]);
+        self.insert(vec![Line::styled(text, PROMPT_STYLE)], Block::User);
         self.status.clear();
         line
     }
@@ -162,7 +179,16 @@ impl Screen {
     /// Append lines to the transcript, above the live region. A line longer
     /// than the screen is wrapped, which is what the terminal would have done:
     /// the transcript scrolls, so it must not lose the tail of a long line.
-    pub fn insert(&mut self, lines: Vec<Line<'static>>) {
+    ///
+    /// Blocks are separated by one blank line, so a message never sits against
+    /// the tool call that followed it. Consecutive tool calls are one block:
+    /// they belong together.
+    pub fn insert(&mut self, lines: Vec<Line<'static>>, block: Block) {
+        let mut lines = lines;
+        if block != Block::Tool || self.last != Some(Block::Tool) {
+            lines.insert(0, Line::default());
+        }
+        self.last = Some(block);
         let width = self.term.size().map(|s| s.width).unwrap_or(80).max(1) as usize;
         // Wrap and render inside the margin, so nothing lands on the edge.
         let margin = PAD.min(width.saturating_sub(1) as u16);
@@ -175,15 +201,14 @@ impl Screen {
         let _ = self.draw();
     }
 
-    /// Plain text, split into transcript lines. Blank lines are kept: they are
-    /// the gap between blocks.
+    /// Plain text, split into transcript lines.
     pub fn text(&mut self, text: &str) {
         let lines: Vec<Line<'static>> = split(text)
             .into_iter()
             .map(|line| Line::raw(line.to_string()))
             .collect();
         if !lines.is_empty() {
-            self.insert(lines);
+            self.insert(lines, Block::Text);
         }
     }
 
@@ -197,7 +222,7 @@ impl Screen {
             .into_iter()
             .map(|line| Line::styled(line.to_string(), DIM))
             .collect();
-        self.insert(lines);
+        self.insert(lines, Block::Thought);
     }
 
     /// A warning or an error: same as `text`, in red.
@@ -207,7 +232,7 @@ impl Screen {
             .map(|line| Line::styled(line.to_string(), ERROR_STYLE))
             .collect();
         if !lines.is_empty() {
-            self.insert(lines);
+            self.insert(lines, Block::Text);
         }
     }
 

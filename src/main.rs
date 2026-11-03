@@ -334,7 +334,7 @@ impl Session {
                             // The command that was running is in the transcript
                             // now; the status row goes back to being empty.
                             screen.set_status("");
-                            screen.insert(vec![line_of(&spans)]);
+                            screen.insert(vec![line_of(&spans)], ui::Block::Tool);
                         }
                         // Reasoning, dim: it precedes the answer and is not the
                         // answer, and it must not disturb the status row.
