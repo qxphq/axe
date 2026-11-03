@@ -445,8 +445,11 @@ fn wrap(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     let mut rows: Vec<Line<'static>> = Vec::new();
     let mut row: Vec<Span<'static>> = Vec::new();
     let mut col = 0usize;
+    // A style set on the line does not reach its spans: `Line::styled` keeps it
+    // on the line, and the rows built here are new, so patch it in per span.
+    let base = line.style;
     for span in line.spans {
-        let style = span.style;
+        let style = base.patch(span.style);
         let mut text = String::new();
         for ch in span.content.chars() {
             let cells = ch.width().unwrap_or(1);
