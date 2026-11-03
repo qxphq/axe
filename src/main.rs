@@ -783,6 +783,12 @@ impl ChannelSink {
 
 impl Sink for ChannelSink {
     fn text(&mut self, text: &str) {
+        // Some providers send `content: ""` on every delta, reasoning ones
+        // included. Empty text is not the answer starting, so it must not end
+        // the thought: that would put one "Thought (0.0s)" line per chunk.
+        if text.is_empty() {
+            return;
+        }
         self.end_thought();
         let mut done = String::new();
         self.out.push(text, &mut done);
