@@ -43,11 +43,13 @@ fn run() -> Result<(), String> {
         .ok()
         .and_then(|dir| config::find_agents(&dir))
         .filter(|f| Some(f.as_path()) != cfg.agents.as_deref());
-    let project_agents = project_file.as_deref().and_then(|f| {
-        let text = config::read_agents(f)?;
-        eprintln!("nano: using project instructions from {}", f.display());
-        Some(text)
-    });
+    let project_agents = project_file.as_deref().and_then(config::read_agents);
+    // Named once, next to the splash: which instructions are in force is part
+    // of the session's identity, not a warning.
+    let notice = project_file
+        .as_deref()
+        .filter(|_| project_agents.is_some())
+        .map(|f| format!("nano: using project instructions from {}", f.display()));
 
     let mut providers = Vec::new();
     let session = session_id();
@@ -107,10 +109,13 @@ fn run() -> Result<(), String> {
     // and opens with a splash; a piped run owns no row and no screen, so the
     // banner is the only place the selection can appear.
     if ui::is_interactive() {
-        banner();
+        banner(notice.as_deref());
     } else {
         // One leading blank: the same margin `ui::Screen` keeps on both edges.
         println!(" {}", selection(&providers, provider, &model, &thinking));
+        if let Some(notice) = &notice {
+            println!(" {notice}");
+        }
     }
 
     let mut system = tools::system_prompt();
@@ -915,10 +920,7 @@ fn selection(
         Some(level) => level.clone(),
         None => "default".to_string(),
     };
-    format!(
-        "model: {}/{}  ·  thinking: {}",
-        providers[provider].name, model, level
-    )
+    format!("{}/{}  ·  {}", providers[provider].name, model, level)
 }
 
 /// Splash, printed once above the live region: block letters for `nano`. It
@@ -932,11 +934,14 @@ const LOGO: &[&str] = &[
     "██   ██  ██   ██   ██   ██    █████ ",
 ];
 
-fn banner() {
+fn banner(note: Option<&str>) {
     // One leading blank: the same margin `ui::Screen` keeps on both edges.
     println!();
     for line in LOGO {
         println!(" {}", Paint::Cyan.ansi(line));
+    }
+    if let Some(note) = note {
+        println!(" {}", Paint::Dim.ansi(note));
     }
     println!();
 }
@@ -1198,8 +1203,8 @@ impl TextSink {
 // Echo tool calls compactly: show the arguments that identify the target, never
 // the raw JSON (heredoc scripts and long content are unreadable in a line).
 // A glyph per tool says what it does at a glance: read-only is dim, anything
-// that can change the tree is yellow. `bash` has no call syntax; its command
-// stands alone.
+// that can change the tree is yellow. `bash` has no call syntax, so its command
+// follows the glyph alone.
 fn call_line(call: &api::ToolCall) -> Vec<(Paint, String)> {
     let v: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     let (glyph, paint) = match call.name.as_str() {
@@ -1210,14 +1215,19 @@ fn call_line(call: &api::ToolCall) -> Vec<(Paint, String)> {
         "read" => (glyph, paint),
         "write" => ("✚", Paint::Yellow),
         "edit" => ("✎", Paint::Yellow),
-        "bash" => ("", Paint::Yellow),
+        "bash" => ("▷", Paint::Yellow),
         _ => (glyph, paint),
     };
 
     if call.name == "bash" {
         let cmd = v["command"].as_str().map(|s| summarize(s, 120));
         let cmd = cmd.unwrap_or_else(|| "bash".to_string());
-        return vec![(Paint::Plain, "  ".to_string()), (paint, cmd)];
+        return vec![
+            (Paint::Plain, "  ".to_string()),
+            (paint, glyph.to_string()),
+            (Paint::Plain, " ".to_string()),
+            (paint, cmd),
+        ];
     }
 
     let mut parts = Vec::new();
