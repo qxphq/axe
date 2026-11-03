@@ -116,19 +116,23 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let mut system = tools::system_prompt();
+    // Kept apart from the generated prompt: `/explore` swaps the tools, so the
+    // prompt is regenerated and these blocks are appended again unchanged.
+    let mut instructions = String::new();
     if let Some(text) = &global_agents {
-        system.push_str("\n\n# Instructions (global)\n\n");
-        system.push_str(text);
+        instructions.push_str("\n\n# Instructions (global)\n\n");
+        instructions.push_str(text);
     }
     if let Some(text) = &project_agents {
-        system.push_str("\n\n# Instructions (project)\n\n");
-        system.push_str(text);
+        instructions.push_str("\n\n# Instructions (project)\n\n");
+        instructions.push_str(text);
     }
     if let Some(extra) = &cfg.system {
-        system.push_str("\n\n");
-        system.push_str(extra);
+        instructions.push_str("\n\n");
+        instructions.push_str(extra);
     }
+    let mut system = tools::system_prompt(false);
+    system.push_str(&instructions);
     let messages: Vec<Value> = vec![json!({ "role": "system", "content": system })];
 
     let session = Session {
@@ -138,6 +142,8 @@ fn run() -> Result<(), String> {
         model,
         thinking,
         thoughts: false,
+        read_only: false,
+        instructions,
         messages,
     };
 
@@ -158,6 +164,11 @@ struct Session {
     /// Show reasoning in the transcript (`/thoughts`). Off by default: the
     /// status row's "thinking…" is enough unless the user asks for more.
     thoughts: bool,
+    /// Explore mode: `read` and a read-only `bash` only (`/explore`).
+    read_only: bool,
+    /// The config and project instructions appended to the generated prompt,
+    /// kept so a mode switch can rebuild the first message.
+    instructions: String,
     messages: Vec<Value>,
 }
 
@@ -170,10 +181,19 @@ enum Cmd {
     Turn(String),
 }
 
+/// What the prompt yielded: a line, or a mode toggle that is not one.
+enum Input {
+    /// The committed line.
+    Line(String),
+    /// Shift+Tab: explore mode, handled without touching the history.
+    Explore,
+}
+
 /// Slash commands, for Tab completion in the prompt. Only the name is
 /// completed; `/model` and `/thinking` take their argument as typed.
 const COMMANDS: &[&str] = &[
     "/exit",
+    "/explore",
     "/help",
     "/model",
     "/models",
@@ -201,7 +221,11 @@ impl Session {
             let line = match pending.take() {
                 Some(line) => line,
                 None => match readline(&mut screen, &rx) {
-                    Some(line) => line,
+                    Some(Input::Line(line)) => line,
+                    Some(Input::Explore) => {
+                        self.toggle_explore(&mut screen);
+                        continue;
+                    }
                     None => break,
                 },
             };
@@ -245,7 +269,34 @@ impl Session {
 
     /// The live region's last row: what this session is pointed at.
     fn info(&self) -> String {
-        selection(&self.providers, self.provider, &self.model, &self.thinking)
+        let base = selection(&self.providers, self.provider, &self.model, &self.thinking);
+        if self.read_only {
+            format!("{base}  ·  read-only")
+        } else {
+            base
+        }
+    }
+
+    /// Enter or leave explore mode. The tool set changes, and the generated
+    /// prompt changes with it: the first message is rebuilt in place, so the
+    /// history after it is untouched.
+    fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+        let mut system = tools::system_prompt(read_only);
+        system.push_str(&self.instructions);
+        self.messages[0] = json!({ "role": "system", "content": system });
+    }
+
+    /// `/explore` and Shift+Tab share one path, so the prompt color, the
+    /// selection row and the transcript never disagree about the mode.
+    fn toggle_explore(&mut self, screen: &mut ui::Screen) {
+        self.set_read_only(!self.read_only);
+        screen.set_explore(self.read_only);
+        screen.set_info(&self.info());
+        screen.text(&format!(
+            "explore: {}\n",
+            if self.read_only { "on" } else { "off" }
+        ));
     }
 
     /// Run one turn on its own thread while this one keeps drawing.
@@ -275,6 +326,7 @@ impl Session {
         let model = self.model.clone();
         let thinking = self.thinking.clone();
         let thoughts = self.thoughts;
+        let read_only = self.read_only;
         let turn_tx = tx.clone();
         let turn_cancel = &cancel;
 
@@ -291,6 +343,7 @@ impl Session {
                     &model,
                     messages,
                     thinking.as_deref(),
+                    read_only,
                     &mut sink,
                     &turn_cancel,
                 );
@@ -334,6 +387,9 @@ impl Session {
                                     dirty = true;
                                 }
                             }
+                            // The turn already captured its tool set; a mode
+                            // switch takes effect on the next one.
+                            ui::Action::Explore => {}
                             ui::Action::None => dirty = true,
                         },
                         // Model text, already spaced by the sink: everything up
@@ -437,6 +493,7 @@ impl Session {
             &model,
             &mut self.messages,
             thinking.as_deref(),
+            self.read_only,
             sink,
             cancel,
         )
@@ -465,6 +522,7 @@ impl Session {
                      /models        list models\n\
                      /thinking [l]  show or set thinking level (off, low, medium, high)\n\
                      /thoughts      show or hide the model's reasoning\n\
+                     /explore       toggle read-only mode (read and read-only shell)\n\
                      /exit          quit\n",
                 );
                 return Cmd::Continue;
@@ -534,6 +592,11 @@ impl Session {
             return Cmd::Continue;
         }
 
+        if input == "/explore" {
+            self.toggle_explore(screen);
+            return Cmd::Continue;
+        }
+
         if input == "/thoughts" {
             self.thoughts = !self.thoughts;
             screen.text(&format!(
@@ -565,6 +628,7 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
                  /models        list models\n\
                  /thinking [l]  show or set thinking level (off, low, medium, high)\n\
                  /thoughts      show or hide the model's reasoning\n\
+                 /explore       toggle read-only mode (read and read-only shell)\n\
                  /exit          quit"
             );
             return Cmd::Continue;
@@ -581,6 +645,11 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
         // hide it, so the toggle means nothing here.
         "/thoughts" => {
             eprintln!("nano: /thoughts needs a terminal");
+            return Cmd::Continue;
+        }
+        "/explore" => {
+            session.set_read_only(!session.read_only);
+            println!("explore: {}", if session.read_only { "on" } else { "off" });
             return Cmd::Continue;
         }
         _ => {}
@@ -672,7 +741,7 @@ fn spawn_input(tx: Sender<Event>) {
 }
 
 /// Collect one line from the prompt. Keys are the only input while idle.
-fn readline(screen: &mut ui::Screen, rx: &Receiver<Event>) -> Option<String> {
+fn readline(screen: &mut ui::Screen, rx: &Receiver<Event>) -> Option<Input> {
     let _ = screen.draw();
     loop {
         match rx.recv() {
@@ -680,7 +749,8 @@ fn readline(screen: &mut ui::Screen, rx: &Receiver<Event>) -> Option<String> {
                 // Enter on an empty line commits nothing: a bare prompt in the
                 // transcript is noise, and an empty line is not input.
                 ui::Action::Submit if screen.is_empty() => {}
-                ui::Action::Submit => return Some(screen.commit()),
+                ui::Action::Submit => return Some(Input::Line(screen.commit())),
+                ui::Action::Explore => return Some(Input::Explore),
                 ui::Action::Eof => return None,
                 ui::Action::None => {
                     let _ = screen.draw();
@@ -1061,7 +1131,14 @@ fn pick(
     screen.text(&text);
     let saved = screen.prompt().to_string();
     screen.set_prompt("model> ");
-    let choice = readline(screen, rx).unwrap_or_default();
+    // A mode toggle is not a model choice: keep the picker open.
+    let choice = loop {
+        match readline(screen, rx) {
+            Some(Input::Line(line)) => break line,
+            Some(Input::Explore) => continue,
+            None => break String::new(),
+        }
+    };
     screen.set_prompt(&saved);
     let choice = choice.trim().to_string();
     if choice.is_empty() {
@@ -1092,10 +1169,11 @@ fn run_turn(
     model: &str,
     messages: &mut Vec<Value>,
     thinking: Option<&str>,
+    read_only: bool,
     sink: &mut dyn Sink,
     cancel: &http::Cancel,
 ) -> Result<(), String> {
-    let tools = tools::definitions();
+    let tools = tools::definitions(read_only);
 
     loop {
         // An interrupt ends the turn here too: no further round is started.
@@ -1167,11 +1245,11 @@ fn run_turn(
             if cancel.cancelled() {
                 return Ok(());
             }
-            let echo = call_line(call);
+            let echo = call_line(call, read_only);
             // What is running, while it runs: the finished line appears below
             // once there is a result to put on it.
             sink.status(&plain_text(&echo));
-            let result = tools::execute(&call.name, &call.arguments, cancel);
+            let result = tools::execute(&call.name, &call.arguments, cancel, read_only);
             sink.echo(&echo, mark(&result));
             messages.push(json!({
                 "role": "tool",
@@ -1250,7 +1328,7 @@ impl TextSink {
 // A glyph per tool says what it does at a glance: read-only is dim, anything
 // that can change the tree is yellow. `bash` has no call syntax, so its command
 // follows the glyph alone.
-fn call_line(call: &api::ToolCall) -> Vec<(Paint, String)> {
+fn call_line(call: &api::ToolCall, read_only: bool) -> Vec<(Paint, String)> {
     let v: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     let (glyph, paint) = match call.name.as_str() {
         "read" => ("◇", Paint::Dim),
@@ -1260,7 +1338,9 @@ fn call_line(call: &api::ToolCall) -> Vec<(Paint, String)> {
         "read" => (glyph, paint),
         "write" => ("✚", Paint::Yellow),
         "edit" => ("✎", Paint::Yellow),
-        "bash" => ("▷", Paint::Yellow),
+        // In explore mode `bash` cannot change anything, so it reads like
+        // `read` rather than like the tool it usually is.
+        "bash" => ("▷", if read_only { Paint::Dim } else { Paint::Yellow }),
         _ => (glyph, paint),
     };
 

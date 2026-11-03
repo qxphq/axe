@@ -17,39 +17,80 @@ struct Spec {
     parameters: &'static str,
 }
 
-const SPECS: &[Spec] = &[
-    Spec {
-        name: "read",
-        signature: "read(path, offset?, limit?)",
-        description: "Return the contents of a text file. offset is a 1-based starting line, limit is a line count.",
-        parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path relative to the working directory"},"offset":{"type":"integer","description":"1-based first line"},"limit":{"type":"integer","description":"Maximum number of lines"}},"required":["path"]}"#,
-    },
-    Spec {
-        name: "write",
-        signature: "write(path, content)",
-        description: "Create or overwrite a file with the given content. Parent directories are created.",
-        parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path relative to the working directory"},"content":{"type":"string","description":"Full file content"}},"required":["path","content"]}"#,
-    },
-    Spec {
-        name: "edit",
-        signature: "edit(path, old, new, replace_all?)",
-        description: "Replace exact text in a file. Fails if old is absent or matches more than once unless replace_all is true.",
-        parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path relative to the working directory"},"old":{"type":"string","description":"Exact text to replace"},"new":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace every occurrence"}},"required":["path","old","new"]}"#,
-    },
-    Spec {
-        name: "bash",
-        signature: "bash(command)",
-        description: "Run a shell command in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds.",
-        parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"Command passed to sh -c"}},"required":["command"]}"#,
-    },
+const READ: Spec = Spec {
+    name: "read",
+    signature: "read(path, offset?, limit?)",
+    description: "Return the contents of a text file. offset is a 1-based starting line, limit is a line count.",
+    parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path relative to the working directory"},"offset":{"type":"integer","description":"1-based first line"},"limit":{"type":"integer","description":"Maximum number of lines"}},"required":["path"]}"#,
+};
+
+const WRITE: Spec = Spec {
+    name: "write",
+    signature: "write(path, content)",
+    description: "Create or overwrite a file with the given content. Parent directories are created.",
+    parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path relative to the working directory"},"content":{"type":"string","description":"Full file content"}},"required":["path","content"]}"#,
+};
+
+const EDIT: Spec = Spec {
+    name: "edit",
+    signature: "edit(path, old, new, replace_all?)",
+    description: "Replace exact text in a file. Fails if old is absent or matches more than once unless replace_all is true.",
+    parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path relative to the working directory"},"old":{"type":"string","description":"Exact text to replace"},"new":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace every occurrence"}},"required":["path","old","new"]}"#,
+};
+
+const BASH: Spec = Spec {
+    name: "bash",
+    signature: "bash(command)",
+    description: "Run a shell command in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds.",
+    parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"Command passed to sh -c"}},"required":["command"]}"#,
+};
+
+/// Explore mode's `bash`: same call, but only the commands below run. The
+/// restriction is part of the description because the description is the
+/// prompt — a first-token check cannot be expressed as an absent tool.
+const BASH_READ_ONLY: Spec = Spec {
+    name: "bash",
+    signature: "bash(command)",
+    description: "Run a read-only shell command in the working directory. Only these run: cat, cut, date, df, diff, du, fd, file, find, grep, head, id, jq, ls, ps, pwd, rg, sort, stat, tail, tr, tree, uname, uniq, wc, which, and git with one of blame, describe, diff, grep, log, ls-files, rev-parse, show, status. Anything else is refused. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds.",
+    parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"Command passed to sh -c"}},"required":["command"]}"#,
+};
+
+/// What `bash` may run in explore mode: commands that only read. A first-token
+/// check, not a sandbox — it keeps a model that was told to explore from
+/// rewriting the tree, and that is all it claims to do.
+const READ_ONLY: &[&str] = &[
+    "cat", "cut", "date", "df", "diff", "du", "fd", "file", "find", "grep", "head", "id", "jq",
+    "ls", "ps", "pwd", "rg", "sort", "stat", "tail", "tr", "tree", "uname", "uniq", "wc", "which",
 ];
 
-static DEFINITIONS: OnceLock<Value> = OnceLock::new();
+/// `git` reads through its subcommand, so the first token alone says nothing.
+const READ_ONLY_GIT: &[&str] = &[
+    "blame", "describe", "diff", "grep", "log", "ls-files", "rev-parse", "show", "status",
+];
 
-pub fn definitions() -> &'static Value {
-    DEFINITIONS.get_or_init(|| {
+const SPECS: &[Spec] = &[READ, WRITE, EDIT, BASH];
+const SPECS_READ_ONLY: &[Spec] = &[READ, BASH_READ_ONLY];
+
+fn specs(read_only: bool) -> &'static [Spec] {
+    if read_only {
+        SPECS_READ_ONLY
+    } else {
+        SPECS
+    }
+}
+
+static DEFINITIONS: OnceLock<Value> = OnceLock::new();
+static DEFINITIONS_READ_ONLY: OnceLock<Value> = OnceLock::new();
+
+pub fn definitions(read_only: bool) -> &'static Value {
+    let slot = if read_only {
+        &DEFINITIONS_READ_ONLY
+    } else {
+        &DEFINITIONS
+    };
+    slot.get_or_init(|| {
         Value::Array(
-            SPECS
+            specs(read_only)
                 .iter()
                 .map(|spec| {
                     json!({
@@ -67,29 +108,62 @@ pub fn definitions() -> &'static Value {
     })
 }
 
-pub fn system_prompt() -> String {
+pub fn system_prompt(read_only: bool) -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     let mut out = format!("Working directory: {cwd}\n\nTools:\n");
-    for spec in SPECS {
+    for spec in specs(read_only) {
         out.push_str(&format!("- {} — {}\n", spec.signature, spec.description));
     }
     out
 }
 
-pub fn execute(name: &str, args: &str, cancel: &Cancel) -> String {
+pub fn execute(name: &str, args: &str, cancel: &Cancel, read_only: bool) -> String {
     let args: Value = match serde_json::from_str(args) {
         Ok(v) => v,
         Err(e) => return format!("error: invalid arguments: {e}"),
     };
     match name {
         "read" => read(&args),
+        "bash" if read_only => read_only_bash(&args, cancel),
+        "bash" => bash(&args, cancel),
+        // Not in the schema explore mode sends; a call is the model recalling
+        // a tool it no longer has, and the result says why.
+        "write" | "edit" if read_only => format!("error: explore mode: {name} is not available"),
         "write" => write(&args),
         "edit" => edit(&args),
-        "bash" => bash(&args, cancel),
         other => format!("error: unknown tool: {other}"),
     }
+}
+
+/// Refuse the command before it spawns: the check is on the call's first word,
+/// so nothing is left running when it fails.
+fn read_only_bash(args: &Value, cancel: &Cancel) -> String {
+    let Some(command) = args["command"].as_str() else {
+        return "error: missing \"command\"".into();
+    };
+    let mut words = command.split_whitespace();
+    let Some(first) = words.next() else {
+        return "error: missing \"command\"".into();
+    };
+    if first == "git" {
+        let sub = words.next().unwrap_or("");
+        if READ_ONLY_GIT.contains(&sub) {
+            return bash(args, cancel);
+        }
+        return format!(
+            "error: explore mode: git {sub} is not read-only; allowed: git {}",
+            READ_ONLY_GIT.join(", git ")
+        );
+    }
+    if READ_ONLY.contains(&first) {
+        return bash(args, cancel);
+    }
+    format!(
+        "error: explore mode: {first} is not read-only; allowed: {}",
+        READ_ONLY.join(", ")
+    )
 }
 
 fn read(args: &Value) -> String {

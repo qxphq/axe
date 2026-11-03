@@ -30,6 +30,8 @@ const LIVE: u16 = 5;
 const PAD: u16 = 1;
 
 const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan);
+/// Explore mode's prompt: the glyph says the tool set is read-only.
+const EXPLORE_STYLE: Style = Style::new().fg(Color::Rgb(255, 165, 0));
 /// Marker for an already committed line in the transcript.
 const MARK: &str = "█";
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
@@ -55,6 +57,8 @@ pub enum Action {
     None,
     /// The line is complete; the caller takes it with `commit`.
     Submit,
+    /// Shift+Tab: the caller swaps modes. Nothing is submitted.
+    Explore,
     /// End of input.
     Eof,
 }
@@ -63,6 +67,8 @@ pub struct Screen {
     term: Terminal<CrosstermBackend<Stdout>>,
     /// Plain text: the editor owns the color.
     prompt: String,
+    /// Color of the prompt glyph, switched by explore mode.
+    prompt_style: Style,
     buf: String,
     /// Cursor position in `buf`, in chars.
     cursor: usize,
@@ -96,6 +102,7 @@ impl Screen {
         Ok(Screen {
             term,
             prompt: prompt.to_string(),
+            prompt_style: PROMPT_STYLE,
             buf: String::new(),
             cursor: 0,
             status: String::new(),
@@ -114,6 +121,11 @@ impl Screen {
 
     pub fn set_prompt(&mut self, prompt: &str) {
         self.prompt = prompt.to_string();
+    }
+
+    /// Explore mode colors the prompt; the transcript keeps its own palette.
+    pub fn set_explore(&mut self, explore: bool) {
+        self.prompt_style = if explore { EXPLORE_STYLE } else { PROMPT_STYLE };
     }
 
     pub fn status(&self) -> &str {
@@ -164,6 +176,7 @@ impl Screen {
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.len(),
             KeyCode::Tab => self.complete_command(),
+            KeyCode::BackTab => return Action::Explore,
             // A shell's Ctrl-C: drop what was typed, keep the prompt.
             KeyCode::Char('c') if ctrl => {
                 self.buf.clear();
@@ -274,6 +287,7 @@ impl Screen {
     /// Repaint the live region.
     pub fn draw(&mut self) -> io::Result<()> {
         let prompt = self.prompt.clone();
+        let prompt_style = self.prompt_style;
         let width = self.term.size()?.width;
         let margin = PAD.min(width.saturating_sub(1));
         let cols = (width as usize).saturating_sub(2 * margin as usize);
@@ -302,7 +316,7 @@ impl Screen {
             };
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled(prompt.clone(), PROMPT_STYLE),
+                    Span::styled(prompt.clone(), prompt_style),
                     Span::raw(visible.clone()),
                 ])),
                 row(2),
