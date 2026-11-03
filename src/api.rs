@@ -15,6 +15,9 @@ pub struct ToolCall {
 
 pub struct Reply {
     pub text: String,
+    /// Thinking-mode chain of thought. Providers that enable tools require it
+    /// back on every assistant message, so the caller keeps it in the history.
+    pub reasoning: String,
     pub calls: Vec<ToolCall>,
 }
 
@@ -93,6 +96,7 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
     }
 
     let mut text = String::new();
+    let mut reasoning_text = String::new();
     let mut partials: Vec<(String, String, String)> = Vec::new();
 
     loop {
@@ -123,6 +127,7 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
             .as_str()
             .or_else(|| delta["reasoning"].as_str());
         if let Some(reasoning) = reasoning.filter(|r| !r.is_empty()) {
+            reasoning_text.push_str(reasoning);
             on_reasoning(reasoning);
         }
         if let Some(part) = delta["content"].as_str() {
@@ -163,5 +168,9 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
         })
         .collect();
 
-    Ok(Reply { text, calls })
+    Ok(Reply {
+        text,
+        reasoning: reasoning_text,
+        calls,
+    })
 }

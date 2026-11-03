@@ -1034,7 +1034,7 @@ fn run_turn(
         sink.end_round();
 
         if reply.calls.is_empty() {
-            messages.push(json!({ "role": "assistant", "content": reply.text }));
+            messages.push(assistant_message(&reply));
             return Ok(());
         }
 
@@ -1052,11 +1052,9 @@ fn run_turn(
                 })
             })
             .collect();
-        messages.push(json!({
-            "role": "assistant",
-            "content": reply.text,
-            "tool_calls": calls,
-        }));
+        let mut message = assistant_message(&reply);
+        message["tool_calls"] = json!(calls);
+        messages.push(message);
 
         for call in &reply.calls {
             if cancel.load(Ordering::SeqCst) {
@@ -1078,6 +1076,17 @@ fn run_turn(
             }
         }
     }
+}
+
+/// The assistant message as it goes back into the history. Thinking-mode
+/// providers (DeepSeek with `tools`, and the servers that share the extension)
+/// reject the next request unless the reasoning they streamed is returned.
+fn assistant_message(reply: &api::Reply) -> Value {
+    let mut message = json!({ "role": "assistant", "content": reply.text });
+    if !reply.reasoning.is_empty() {
+        message["reasoning_content"] = json!(reply.reasoning);
+    }
+    message
 }
 
 /// Streams model text to stdout, holding back newlines at the edges. Providers
