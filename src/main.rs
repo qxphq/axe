@@ -104,7 +104,7 @@ fn run() -> Result<(), String> {
 
     let stdin = io::stdin();
     loop {
-        rule();
+        println!();
         print!("> ");
         io::stdout().flush().ok();
 
@@ -281,7 +281,7 @@ fn run_turn(
     let tools = tools::definitions();
 
     loop {
-        rule();
+        println!();
         let mut printed = false;
         let reply = api::stream_chat(
             &provider.ep,
@@ -382,16 +382,6 @@ fn mark(result: &str) -> String {
     } else {
         paint("32", "✓")
     }
-}
-
-/// A dim horizontal rule delimiting each message. Width follows $COLUMNS.
-fn rule() {
-    let width = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(64)
-        .clamp(8, 200);
-    println!("{}", paint("2", &"─".repeat(width)));
 }
 
 /// ANSI colors only when stdout is a terminal, so redirected output stays plain.
