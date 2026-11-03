@@ -283,7 +283,7 @@ fn run_turn(
 
     loop {
         println!();
-        let mut printed = false;
+        let mut out = TextSink::default();
         let reply = api::stream_chat(
             &provider.ep,
             provider.key.as_deref(),
@@ -291,14 +291,10 @@ fn run_turn(
             model,
             messages,
             tools,
-            |text| {
-                print!("{text}");
-                io::stdout().flush().ok();
-                printed = true;
-            },
+            |text| out.push(text),
         )?;
 
-        if printed {
+        if out.wrote {
             println!();
         }
 
@@ -347,6 +343,40 @@ fn run_turn(
 
 // Echo tool calls compactly: show the one argument that identifies the target,
 // never the raw JSON (heredoc scripts and long content are unreadable in a line).
+/// Streams model text to stdout, holding back newlines at the edges. Providers
+/// pad `content` differently (leading or trailing blank lines); the harness
+/// owns spacing, so those would otherwise widen the gap between blocks by an
+/// amount that varies per reply.
+#[derive(Default)]
+struct TextSink {
+    started: bool,
+    pending: usize,
+    wrote: bool,
+}
+
+impl TextSink {
+    fn push(&mut self, text: &str) {
+        for ch in text.chars() {
+            if ch == '\n' {
+                if self.started {
+                    self.pending += 1;
+                }
+                continue;
+            }
+            if !self.started {
+                self.started = true;
+            }
+            for _ in 0..self.pending {
+                print!("\n");
+            }
+            self.pending = 0;
+            self.wrote = true;
+            print!("{ch}");
+        }
+        io::stdout().flush().ok();
+    }
+}
+
 fn call_line(call: &api::ToolCall) -> String {
     let v: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     let mut parts = Vec::new();
