@@ -21,9 +21,10 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthChar;
 
 /// Rows the live region always occupies: a blank gap, the queue, the prompt,
-/// and the status and selection row. Fixed, so the viewport never moves under
-/// the cursor, and the transcript never reaches the prompt.
-const LIVE: u16 = 4;
+/// the status and selection row, and a blank row under it. Fixed, so the
+/// viewport never moves under the cursor, the transcript never reaches the
+/// prompt, and nothing is written against the bottom edge.
+const LIVE: u16 = 5;
 
 /// Blank cells at each screen edge: nothing is written against the border.
 const PAD: u16 = 1;
