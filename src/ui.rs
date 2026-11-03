@@ -69,6 +69,8 @@ pub struct Screen {
     queued: Option<String>,
     /// The last killed text: one slot, enough for Ctrl-U ... Ctrl-Y.
     killed: String,
+    /// Slash commands Tab completes, in the caller's spelling.
+    commands: Vec<&'static str>,
     /// The last block written, for the blank line between blocks.
     last: Option<Block>,
     restored: bool,
@@ -90,6 +92,7 @@ impl Screen {
             status: String::new(),
             queued: None,
             killed: String::new(),
+            commands: Vec::new(),
             last: None,
             restored: false,
         })
@@ -113,6 +116,11 @@ impl Screen {
 
     pub fn set_queued(&mut self, line: Option<&str>) {
         self.queued = line.map(str::to_string);
+    }
+
+    /// The slash commands Tab completes.
+    pub fn set_commands(&mut self, commands: &[&'static str]) {
+        self.commands = commands.to_vec();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -141,6 +149,7 @@ impl Screen {
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.len()),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.len(),
+            KeyCode::Tab => self.complete_command(),
             // A shell's Ctrl-C: drop what was typed, keep the prompt.
             KeyCode::Char('c') if ctrl => {
                 self.buf.clear();
@@ -312,6 +321,43 @@ impl Screen {
         let at = self.offset(self.cursor);
         self.buf.insert(at, c);
         self.cursor += 1;
+    }
+
+    /// Tab on a bare slash word: extend it to the longest common prefix, and
+    /// finish it with a space when exactly one command matches. More than one
+    /// match also lists them, so a shared prefix like `/th` never leaves the
+    /// user guessing what was completed to. Arguments are not the screen's
+    /// business, so a line that already has one is left alone.
+    fn complete_command(&mut self) {
+        if !self.buf.starts_with('/') || self.buf.contains(char::is_whitespace) {
+            return;
+        }
+        let matches: Vec<&'static str> = self
+            .commands
+            .iter()
+            .copied()
+            .filter(|c| c.starts_with(&self.buf))
+            .collect();
+        let Some(first) = matches.first() else {
+            return;
+        };
+        let mut prefix = first.to_string();
+        for command in &matches[1..] {
+            let common = prefix
+                .bytes()
+                .zip(command.bytes())
+                .take_while(|(a, b)| a == b)
+                .count();
+            prefix.truncate(common);
+        }
+        if matches.len() == 1 {
+            prefix.push(' ');
+        }
+        self.buf = prefix;
+        self.cursor = self.len();
+        if matches.len() > 1 {
+            self.insert(vec![Line::styled(matches.join("  "), DIM)], Block::Text);
+        }
     }
 
     fn backspace(&mut self) {

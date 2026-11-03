@@ -160,12 +160,25 @@ enum Cmd {
     Turn(String),
 }
 
+/// Slash commands, for Tab completion in the prompt. Only the name is
+/// completed; `/model` and `/thinking` take their argument as typed.
+const COMMANDS: &[&str] = &[
+    "/exit",
+    "/help",
+    "/model",
+    "/models",
+    "/quit",
+    "/thinking",
+    "/thoughts",
+];
+
 impl Session {
     /// One line at a time from a terminal we own. Keys arrive on the channel, so
     /// a turn in flight never blocks the prompt.
     fn run_interactive(mut self) -> Result<(), String> {
         let mut screen =
             ui::Screen::new("❯ ").map_err(|e| format!("cannot take the terminal: {e}"))?;
+        screen.set_commands(COMMANDS);
         let (tx, rx) = mpsc::channel();
         spawn_input(tx.clone());
 
