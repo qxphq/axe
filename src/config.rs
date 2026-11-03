@@ -3,8 +3,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
+#[derive(Clone)]
 pub struct ProviderConfig {
     pub name: String,
     pub base_url: String,
@@ -12,9 +13,22 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
     pub models_url: Option<String>,
     pub session_header: Option<String>,
+    /// Level name -> JSON object merged into the request body.
+    pub thinking: Vec<(String, Value)>,
 }
 
 impl ProviderConfig {
+    /// Extra request-body fields for a thinking level. `None` means "let the
+    /// provider default apply" — true for an unset level and for `off`.
+    pub fn thinking_body(&self, level: Option<&str>) -> Option<Value> {
+        let level = level?;
+        let (_, body) = self.thinking.iter().find(|(name, _)| name == level)?;
+        match body {
+            Value::Object(map) if map.is_empty() => None,
+            other => Some(other.clone()),
+        }
+    }
+
     pub fn resolved_key(&self) -> Option<String> {
         if let Some(key) = &self.api_key {
             return Some(key.clone());
@@ -27,6 +41,8 @@ impl ProviderConfig {
 pub struct Config {
     pub providers: Vec<ProviderConfig>,
     pub model: Option<String>,
+    /// Model spec (`provider/id`) -> remembered thinking level.
+    pub thinking: Vec<(String, String)>,
     pub system: Option<String>,
     pub agents: Option<PathBuf>,
 }
@@ -55,9 +71,20 @@ const EXAMPLE: &str = r#"{
       "models_url": "https://opencode.ai/inference/go/v1/models",
       "api_key_env": "OPENCODE_API_KEY",
       "session_header": "x-opencode-session"
+    },
+    "deepseek-thinking": {
+      "base_url": "https://api.deepseek.com",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "thinking": {
+        "off": {},
+        "low": {"reasoning_effort": "low"},
+        "medium": {"reasoning_effort": "medium"},
+        "high": {"reasoning_effort": "high"}
+      }
     }
   },
   "model": "local/qwen3.8-flash-next-chat",
+  "thinking": {},
   "system": null,
   "agents": null
 }"#;
@@ -143,42 +170,63 @@ fn parse_provider(name: &str, v: &Value) -> Result<ProviderConfig, String> {
         api_key_env: text(v, "api_key_env"),
         models_url: text(v, "models_url"),
         session_header: text(v, "session_header"),
+        thinking: v["thinking"]
+            .as_object()
+            .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default(),
     })
 }
 
-/// Persist the selected model as `provider/id` in the config file. Best-effort
-/// editing: unknown keys are preserved, formatting/comments are not.
-pub fn save_model(spec: &str) {
+/// Rewrite the config file, preserving unknown keys. Formatting and comments
+/// are not preserved.
+fn edit(apply: impl Fn(&mut Value)) {
     let p = path();
     let raw = match fs::read_to_string(&p) {
         Ok(raw) => raw,
         Err(e) => {
-            eprintln!("nano: cannot save model to {}: {e}", p.display());
+            eprintln!("nano: cannot save config to {}: {e}", p.display());
             return;
         }
     };
     let mut v: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("nano: cannot save model to {}: {e}", p.display());
+            eprintln!("nano: cannot save config to {}: {e}", p.display());
             return;
         }
     };
     if !v.is_object() {
-        eprintln!("nano: cannot save model to {}: not an object", p.display());
+        eprintln!("nano: cannot save config to {}: not an object", p.display());
         return;
     }
-    v["model"] = Value::String(spec.to_string());
+    apply(&mut v);
     let text = match serde_json::to_string_pretty(&v) {
         Ok(text) => text,
         Err(e) => {
-            eprintln!("nano: cannot save model to {}: {e}", p.display());
+            eprintln!("nano: cannot save config to {}: {e}", p.display());
             return;
         }
     };
     if let Err(e) = fs::write(&p, format!("{text}\n")) {
-        eprintln!("nano: cannot save model to {}: {e}", p.display());
+        eprintln!("nano: cannot save config to {}: {e}", p.display());
     }
+}
+
+/// Persist the selected model as `provider/id`.
+pub fn save_model(spec: &str) {
+    edit(|v| v["model"] = Value::String(spec.to_string()));
+}
+
+/// Remember the thinking level for `spec` (`provider/id`). `off` is stored
+/// explicitly so that raising a provider's default level does not leak into
+/// models the user already turned off.
+pub fn save_thinking(spec: &str, level: &str) {
+    edit(|v| {
+        if !v["thinking"].is_object() {
+            v["thinking"] = json!({});
+        }
+        v["thinking"][spec] = Value::String(level.to_string());
+    });
 }
 
 pub fn load() -> Result<Config, String> {
@@ -219,6 +267,7 @@ pub fn load() -> Result<Config, String> {
             api_key_env: None,
             models_url: None,
             session_header: None,
+            thinking: Vec::new(),
         });
     } else {
         return Err(format!(
@@ -234,6 +283,14 @@ pub fn load() -> Result<Config, String> {
     Ok(Config {
         providers,
         model: text(&v, "model"),
+        thinking: v["thinking"]
+            .as_object()
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, l)| Some((k.clone(), l.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default(),
         system: text(&v, "system"),
         agents: text(&v, "agents").map(|raw| agents_file(&raw)),
     })

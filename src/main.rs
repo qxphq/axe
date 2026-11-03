@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 struct Provider {
     name: String,
+    cfg: config::ProviderConfig,
     ep: http::Endpoint,
     key: Option<String>,
     headers: Vec<(String, String)>,
@@ -68,6 +69,7 @@ fn run() -> Result<(), String> {
         match api::list_models(&models_ep, models_path, key.as_deref(), &headers) {
             Ok(models) if !models.is_empty() => providers.push(Provider {
                 name: pc.name.clone(),
+                cfg: pc.clone(),
                 ep,
                 key,
                 headers,
@@ -85,7 +87,15 @@ fn run() -> Result<(), String> {
     print_models(&providers);
 
     let (mut provider, mut model) = resolve(&providers, cfg.model.as_deref());
-    println!("model: {}/{}\n", providers[provider].name, model);
+    // Thinking level follows the model: it is remembered per `provider/id` and
+    // turned into request fields by `thinking_body`.
+    let mut thinking = cfg
+        .thinking
+        .iter()
+        .find(|(spec, _)| *spec == format!("{}/{}", providers[provider].name, model))
+        .map(|(_, level)| level.clone());
+    validate_level(&providers[provider].cfg, thinking.as_deref());
+    print_selection(&providers, provider, &model, &thinking);
 
     let mut system = tools::system_prompt();
     if let Some(text) = &global_agents {
@@ -123,9 +133,10 @@ fn run() -> Result<(), String> {
         match input {
             "/exit" | "/quit" => break,
             "/help" => {
-                println!("/model [id]  pick or switch model");
-                println!("/models      list models");
-                println!("/exit        quit");
+                println!("/model [id]    pick or switch model");
+                println!("/models        list models");
+                println!("/thinking [l]  show or set thinking level (off, low, medium, high)");
+                println!("/exit          quit");
                 continue;
             }
             "/models" => {
@@ -136,12 +147,33 @@ fn run() -> Result<(), String> {
                 if let Some((pi, id)) = pick(&providers, (provider, &model)) {
                     provider = pi;
                     model = id;
-                    println!("model: {}/{}\n", providers[provider].name, model);
+                    print_selection(&providers, provider, &model, &thinking);
                     save_selection(&providers[provider].name, &model);
                 }
                 continue;
             }
             _ => {}
+        }
+
+        if input == "/thinking" || input.starts_with("/thinking ") {
+            let rest = input.strip_prefix("/thinking").unwrap_or("").trim();
+            if rest.is_empty() {
+                println!("thinking: {}\n", thinking_label(&providers[provider].cfg, &thinking));
+                continue;
+            }
+            match set_thinking(&providers[provider].cfg, rest) {
+                Some(level) => {
+                    thinking = Some(level.clone());
+                    let spec = format!("{}/{}", providers[provider].name, model);
+                    config::save_thinking(&spec, level.as_str());
+                    println!(
+                        "thinking: {}\n",
+                        thinking_label(&providers[provider].cfg, &thinking)
+                    );
+                }
+                None => {}
+            }
+            continue;
         }
 
         if let Some(rest) = input.strip_prefix("/model ") {
@@ -150,7 +182,12 @@ fn run() -> Result<(), String> {
                 Some((pi, id)) => {
                     provider = pi;
                     model = id;
-                    println!("model: {}/{}\n", providers[provider].name, model);
+                    thinking = cfg
+                        .thinking
+                        .iter()
+                        .find(|(spec, _)| *spec == format!("{}/{}", providers[provider].name, model))
+                        .map(|(_, level)| level.clone());
+                    print_selection(&providers, provider, &model, &thinking);
                     save_selection(&providers[provider].name, &model);
                 }
                 None => eprintln!("unknown model: {spec}"),
@@ -164,12 +201,65 @@ fn run() -> Result<(), String> {
         }
 
         messages.push(json!({ "role": "user", "content": input }));
-        if let Err(e) = run_turn(&providers[provider], &model, &mut messages) {
+        if let Err(e) = run_turn(&providers[provider], &model, &mut messages, thinking.as_deref()) {
             eprintln!("nano: {e}");
         }
     }
 
     Ok(())
+}
+
+fn thinking_label(provider: &config::ProviderConfig, level: &Option<String>) -> String {
+    match level {
+        Some(level) => format!("{level}  (levels: {})", level_names(provider).join(", ")),
+        None => "default (not set)".to_string(),
+    }
+}
+
+fn level_names(provider: &config::ProviderConfig) -> Vec<String> {
+    let mut names: Vec<String> = provider.thinking.iter().map(|(k, _)| k.clone()).collect();
+    if names.is_empty() {
+        names.push("off".to_string());
+    }
+    names
+}
+
+/// Map user input onto a configured level name. Returns the canonical name, so
+/// the config never stores an alias.
+fn set_thinking(provider: &config::ProviderConfig, input: &str) -> Option<String> {
+    let names = level_names(provider);
+    let level = names
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(input))
+        .cloned();
+    if level.is_none() {
+        eprintln!("unknown thinking level: {input} (known: {})", names.join(", "));
+    }
+    level
+}
+
+/// Warn once at startup if the config remembers a level the provider dropped.
+fn validate_level(provider: &config::ProviderConfig, level: Option<&str>) {
+    let Some(level) = level else { return };
+    if !level_names(provider).iter().any(|name| name == level) {
+        eprintln!(
+            "{}: thinking level \"{level}\" is not configured, using default",
+            provider.name
+        );
+    }
+}
+
+fn print_selection(
+    providers: &[Provider],
+    provider: usize,
+    model: &str,
+    thinking: &Option<String>,
+) {
+    let level = match thinking {
+        Some(level) => level.clone(),
+        None => "default".to_string(),
+    };
+    println!("model: {}/{}\nthinking: {}\n", providers[provider].name, model, level);
 }
 
 /// Persist the current selection so the next run starts on the same model.
@@ -278,12 +368,14 @@ fn run_turn(
     provider: &Provider,
     model: &str,
     messages: &mut Vec<Value>,
+    thinking: Option<&str>,
 ) -> Result<(), String> {
     let tools = tools::definitions();
 
     loop {
         println!();
         let mut out = TextSink::default();
+        let extra = provider.cfg.thinking_body(thinking);
         let reply = api::stream_chat(
             &provider.ep,
             provider.key.as_deref(),
@@ -291,6 +383,7 @@ fn run_turn(
             model,
             messages,
             tools,
+            extra.as_ref(),
             |text| out.push(text),
         )?;
 

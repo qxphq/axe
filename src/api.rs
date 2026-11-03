@@ -49,6 +49,8 @@ pub fn list_models(
     Ok(models)
 }
 
+/// `extra` is merged into the request body last, so a thinking level can add
+/// provider-specific fields without per-provider code paths.
 pub fn chat(
     ep: &Endpoint,
     api_key: Option<&str>,
@@ -56,14 +58,20 @@ pub fn chat(
     model: &str,
     messages: &[Value],
     tools: &Value,
+    extra: Option<&Value>,
 ) -> Result<Response, String> {
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "messages": messages,
         "stream": true,
         "tools": tools,
-    })
-    .to_string();
+    });
+    if let (Some(Value::Object(extra)), Some(obj)) = (extra, body.as_object_mut()) {
+        for (k, v) in extra {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    let body = body.to_string();
     http::request(ep, "POST", "/chat/completions", api_key, headers, Some(&body))
 }
 
@@ -74,9 +82,10 @@ pub fn stream_chat<F: FnMut(&str)>(
     model: &str,
     messages: &[Value],
     tools: &Value,
+    extra: Option<&Value>,
     mut on_text: F,
 ) -> Result<Reply, String> {
-    let mut res = chat(ep, api_key, headers, model, messages, tools)?;
+    let mut res = chat(ep, api_key, headers, model, messages, tools, extra)?;
     if res.status != 200 {
         let body = res.read_all().unwrap_or_default();
         return Err(format!("HTTP {}: {}", res.status, body.trim()));
