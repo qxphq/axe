@@ -333,6 +333,10 @@ fn run_turn(
                 "tool_call_id": call.id,
                 "content": result,
             }));
+            if tools::take_interrupt() {
+                eprintln!("nano: turn interrupted, you can type again");
+                return Ok(());
+            }
         }
     }
 

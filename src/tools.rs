@@ -1,11 +1,110 @@
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+
+/// Set by the ESC watcher when the user asks to interrupt a running command.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// Consume the interrupt request, if any. The agent loop ends the turn on it.
+pub fn take_interrupt() -> bool {
+    INTERRUPTED.swap(false, Ordering::SeqCst)
+}
+
+/// Watches /dev/tty for ESC while a command runs. First ESC arms the interrupt
+/// ("press again"), the second raises `INTERRUPTED`. Restores tty settings on
+/// drop; reads are made non-blocking through termios (`min 0 time 1`) so the
+/// watcher exits within ~100 ms instead of swallowing the next REPL line.
+struct EscWatch {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+    saved: Option<String>,
+}
+
+impl EscWatch {
+    fn start() -> EscWatch {
+        let mut this = EscWatch {
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            saved: stty(&["-g"]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        };
+        if this.saved.is_none()
+            || stty(&["-icanon", "-echo", "min", "0", "time", "1"]).is_none()
+        {
+            return this;
+        }
+        let Ok(mut tty) = std::fs::OpenOptions::new().read(true).open("/dev/tty") else {
+            this.restore();
+            return this;
+        };
+
+        let stop = this.stop.clone();
+        this.thread = Some(thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let mut armed = false;
+            while !stop.load(Ordering::SeqCst) {
+                let n = match tty.read(&mut buf) {
+                    Ok(0) => continue,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                for (i, byte) in buf[..n].iter().enumerate() {
+                    if *byte != 0x1b {
+                        continue;
+                    }
+                    // ESC followed by more bytes is an escape sequence (arrows).
+                    if matches!(buf.get(i + 1), Some(b'[') | Some(b'O')) {
+                        break;
+                    }
+                    if armed {
+                        INTERRUPTED.store(true, Ordering::SeqCst);
+                        eprintln!("\nnano: interrupting…");
+                        return;
+                    }
+                    armed = true;
+                    eprintln!("\nnano: press ESC again to interrupt the running command");
+                }
+            }
+        }));
+        this
+    }
+
+    fn restore(&mut self) {
+        if let Some(saved) = self.saved.take() {
+            stty(&[&saved]);
+        }
+    }
+}
+
+impl Drop for EscWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        // Only restore after the watcher is gone, so a pending read cannot hang
+        // on blocking termios settings.
+        self.restore();
+    }
+}
+
+fn stty(args: &[&str]) -> Option<String> {
+    let out = Command::new("stty")
+        .arg("-F")
+        .arg("/dev/tty")
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
 
 struct Spec {
     name: &'static str,
@@ -187,11 +286,16 @@ fn bash(args: &Value) -> String {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Own process group, so an interrupt kills the whole pipeline.
+        .process_group(0)
         .spawn()
     {
         Ok(c) => c,
         Err(e) => return format!("error: spawn: {e}"),
     };
+    let pid = child.id() as i32;
+    INTERRUPTED.store(false, Ordering::SeqCst);
+    let watch = EscWatch::start();
 
     let stdout = child.stdout.take().expect("stdout");
     let stderr = child.stderr.take().expect("stderr");
@@ -200,17 +304,35 @@ fn bash(args: &Value) -> String {
 
     let start = Instant::now();
     let mut timed_out = false;
+    let mut interrupted = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if start.elapsed() > Duration::from_secs(120) {
-                    let _ = child.kill();
-                    timed_out = true;
+                if INTERRUPTED.load(Ordering::SeqCst) && !interrupted {
+                    interrupted = true;
+                    INTERRUPTED.store(false, Ordering::SeqCst);
+                    let _ = Command::new("kill")
+                        .arg("-TERM")
+                        .arg(format!("-{pid}"))
+                        .status();
+                    // Grace period, then the whole group gets SIGKILL.
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while Instant::now() < deadline && child.try_wait().ok().flatten().is_none() {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    let _ = Command::new("kill")
+                        .arg("-KILL")
+                        .arg(format!("-{pid}"))
+                        .status();
                     match child.wait() {
                         Ok(status) => break status,
                         Err(e) => return format!("error: wait: {e}"),
                     }
+                }
+                if !timed_out && start.elapsed() > Duration::from_secs(120) {
+                    let _ = child.kill();
+                    timed_out = true;
                 }
                 thread::sleep(Duration::from_millis(20));
             }
@@ -220,6 +342,7 @@ fn bash(args: &Value) -> String {
             }
         }
     };
+    drop(watch);
 
     let stdout = out_thread.join().unwrap_or_default();
     let stderr = err_thread.join().unwrap_or_default();
@@ -245,6 +368,8 @@ fn bash(args: &Value) -> String {
     }
     if timed_out {
         out.push_str("timed out after 120s\n");
+    } else if interrupted {
+        out.push_str("interrupted by user (ESC); the command was killed\n");
     }
     truncate(out, 30_000)
 }
