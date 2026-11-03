@@ -80,6 +80,9 @@ being streamed stays raw in the status row.
 - Style comes from `Paint` in `main.rs`, rendered either as cells or as ANSI when
   there is no screen to draw on.
 - Tool names and descriptions are part of the prompt. Change them deliberately.
+- `!cmd` at the prompt is the user's own shell: it runs through `tools::execute`
+  and its output joins the history as a `user` message, so the next turn sees it.
+  No turn follows, and explore mode does not apply — the user typed it.
 - Commit messages: imperative, one feature per commit.
 
 ## Provider notes
