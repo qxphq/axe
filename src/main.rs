@@ -105,7 +105,7 @@ fn run() -> Result<(), String> {
     let stdin = io::stdin();
     loop {
         println!();
-        print!("> ");
+        print!("{}", paint("36", "> "));
         io::stdout().flush().ok();
 
         let mut line = String::new();
@@ -118,6 +118,7 @@ fn run() -> Result<(), String> {
         if input.is_empty() {
             continue;
         }
+        redraw_input("> ", input);
 
         match input {
             "/exit" | "/quit" => break,
@@ -391,6 +392,28 @@ fn paint(code: &str, text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// The terminal already echoed our input in its default color. Rewrite those
+/// lines in color so user text is distinguishable from model output. The
+/// cursor sits alone on the last row; redraw the prompt and text there and
+/// erase the rows the echo wrapped into, bottom-up so nothing scrolls.
+fn redraw_input(prompt: &str, text: &str) {
+    if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        return;
+    }
+    let cols = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(80);
+    // Columns occupied by the prompt plus the echoed text, wrapping as the
+    // terminal did it.
+    let width = prompt.chars().count() + text.chars().count();
+    let rows = width.div_ceil(cols).max(1);
+    print!("\r\x1b[{rows}A\x1b[0J");
+    print!("{}{}\n", paint("36", prompt), paint("36", text));
+    io::stdout().flush().ok();
 }
 
 fn summarize(text: &str, max: usize) -> String {
