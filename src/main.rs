@@ -372,7 +372,6 @@ fn run_turn(
     let tools = tools::definitions();
 
     loop {
-        println!();
         let mut out = TextSink::default();
         let indicator = Indicator::default();
         indicator.show();
@@ -491,6 +490,10 @@ impl TextSink {
             }
             if !self.started {
                 self.started = true;
+                // One blank line separates a reply from whatever precedes it.
+                // Print it here, not per round: a round with no text must not
+                // widen the gap between two tool calls.
+                println!();
             }
             for _ in 0..self.pending {
                 print!("\n");
@@ -505,10 +508,27 @@ impl TextSink {
 
 // Echo tool calls compactly: show the arguments that identify the target, never
 // the raw JSON (heredoc scripts and long content are unreadable in a line).
+// A glyph per tool says what it does at a glance: read-only is dim, anything
+// that can change the tree is yellow. `bash` has no call syntax; its command
+// stands alone.
 fn call_line(call: &api::ToolCall) -> String {
     let v: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+    let (glyph, code) = match call.name.as_str() {
+        "read" => ("◇", "2"),
+        "write" => ("✚", "33"),
+        "edit" => ("✎", "33"),
+        "bash" => ("❯", "33"),
+        _ => ("◆", "33"),
+    };
+    if call.name == "bash" {
+        let cmd = v["command"].as_str().map(|s| summarize(s, 120));
+        return match cmd {
+            Some(cmd) => format!("    {} {}", paint(code, glyph), paint(code, &cmd)),
+            None => format!("    {} {}", paint(code, glyph), paint(code, "bash")),
+        };
+    }
     let mut parts = Vec::new();
-    for key in ["path", "command", "file", "pattern"] {
+    for key in ["path", "file", "pattern"] {
         if let Some(s) = v[key].as_str() {
             parts.push(summarize(s, 120));
         }
@@ -524,16 +544,12 @@ fn call_line(call: &api::ToolCall) -> String {
         });
     }
     // Read-only calls are dim; anything that can change the tree is yellow.
-    let (glyph, code) = if call.name == "read" {
-        ("◇", "2")
-    } else {
-        ("◆", "33")
-    };
     let name = paint(code, &call.name);
+    let glyph = paint(code, glyph);
     if parts.is_empty() {
-        format!("{glyph} {name}")
+        format!("    {glyph} {name}")
     } else {
-        format!("{glyph} {name}({})", parts.join(" "))
+        format!("    {glyph} {name}({})", parts.join(" "))
     }
 }
 
