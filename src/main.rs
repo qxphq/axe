@@ -84,8 +84,6 @@ fn run() -> Result<(), String> {
         return Err("no models available".into());
     }
 
-    print_models(&providers);
-
     let (mut provider, mut model) = resolve(&providers, cfg.model.as_deref());
     // Thinking level follows the model: it is remembered per `provider/id` and
     // turned into request fields by `thinking_body`.
