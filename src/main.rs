@@ -325,7 +325,7 @@ fn run_turn(
         }));
 
         for call in &reply.calls {
-            println!("→ {}({})", call.name, summarize(&call.arguments, 120));
+            println!("→ {}", call_line(call));
             let result = tools::execute(&call.name, &call.arguments);
             println!("  {}", summarize(&result, 120));
             messages.push(json!({
@@ -338,6 +338,20 @@ fn run_turn(
                 return Ok(());
             }
         }
+    }
+}
+
+// Echo tool calls compactly: show the one argument that identifies the target,
+// never the raw JSON (heredoc scripts and long content are unreadable in a line).
+fn call_line(call: &api::ToolCall) -> String {
+    let v: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+    let target = ["path", "command", "file", "pattern"]
+        .iter()
+        .find_map(|k| v[*k].as_str())
+        .map(|s| summarize(s, 120));
+    match target {
+        Some(t) => format!("{}({})", call.name, t),
+        None => call.name.clone(),
     }
 }
 
