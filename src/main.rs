@@ -341,8 +341,6 @@ fn run_turn(
     }
 }
 
-// Echo tool calls compactly: show the one argument that identifies the target,
-// never the raw JSON (heredoc scripts and long content are unreadable in a line).
 /// Streams model text to stdout, holding back newlines at the edges. Providers
 /// pad `content` differently (leading or trailing blank lines); the harness
 /// owns spacing, so those would otherwise widen the gap between blocks by an
@@ -377,6 +375,8 @@ impl TextSink {
     }
 }
 
+// Echo tool calls compactly: show the arguments that identify the target, never
+// the raw JSON (heredoc scripts and long content are unreadable in a line).
 fn call_line(call: &api::ToolCall) -> String {
     let v: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     let mut parts = Vec::new();
@@ -384,6 +384,16 @@ fn call_line(call: &api::ToolCall) -> String {
         if let Some(s) = v[key].as_str() {
             parts.push(summarize(s, 120));
         }
+    }
+    // A partial read is only reproducible with its window, so echo it.
+    let num = |key: &str| v[key].as_u64().map(|n| n.to_string());
+    let (offset, limit) = (num("offset"), num("limit"));
+    if offset.is_some() || limit.is_some() {
+        let start = offset.unwrap_or_else(|| "1".into());
+        parts.push(match limit {
+            Some(l) => format!("{start}+{l}"),
+            None => format!("{start}+"),
+        });
     }
     // Read-only calls are dim; anything that can change the tree is yellow.
     let (glyph, code) = if call.name == "read" {
