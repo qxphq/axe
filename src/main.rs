@@ -1166,19 +1166,14 @@ fn call_line(call: &api::ToolCall) -> Vec<(Paint, String)> {
         "read" => (glyph, paint),
         "write" => ("✚", Paint::Yellow),
         "edit" => ("✎", Paint::Yellow),
-        "bash" => ("$", Paint::Yellow),
+        "bash" => ("", Paint::Yellow),
         _ => (glyph, paint),
     };
 
     if call.name == "bash" {
         let cmd = v["command"].as_str().map(|s| summarize(s, 120));
         let cmd = cmd.unwrap_or_else(|| "bash".to_string());
-        return vec![
-            (Paint::Plain, "  ".to_string()),
-            (paint, glyph.to_string()),
-            (Paint::Plain, " ".to_string()),
-            (paint, cmd),
-        ];
+        return vec![(Paint::Plain, "  ".to_string()), (paint, cmd)];
     }
 
     let mut parts = Vec::new();
