@@ -44,7 +44,7 @@ providers, four tools. Roughly 1.2k LOC across five files.
 
 ## Architecture
 
-- `main.rs` — REPL, provider setup, model picker, agent loop (25 rounds).
+- `main.rs` — REPL, provider setup, model picker, agent loop (unbounded, ends on no tool calls).
 - `api.rs` — model listing, chat request, SSE parsing, tool-call accumulation.
 - `http.rs` — URL parsing, HTTP/1.1 over `TcpStream`/rustls, body decoding
   (`Content-Length`, chunked, EOF).

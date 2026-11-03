@@ -279,7 +279,7 @@ fn run_turn(
 ) -> Result<(), String> {
     let tools = tools::definitions();
 
-    for _ in 0..25 {
+    loop {
         let mut printed = false;
         let reply = api::stream_chat(
             &provider.ep,
@@ -339,8 +339,6 @@ fn run_turn(
             }
         }
     }
-
-    Err("tool loop limit reached (25)".into())
 }
 
 fn summarize(text: &str, max: usize) -> String {
