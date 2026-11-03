@@ -2,26 +2,13 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-/// Set by the ESC watcher when the user asks to interrupt a running command.
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-/// Consume the interrupt request, if any. The agent loop ends the turn on it.
-pub fn take_interrupt() -> bool {
-    INTERRUPTED.swap(false, Ordering::SeqCst)
-}
-
-/// Raise the interrupt request. The caller's event loop owns the terminal, so
-/// it decides when ESC means "stop"; `bash` only watches the flag.
-pub fn interrupt() {
-    INTERRUPTED.store(true, Ordering::SeqCst);
-}
+use crate::http::Cancel;
 
 struct Spec {
     name: &'static str,
@@ -91,7 +78,7 @@ pub fn system_prompt() -> String {
     out
 }
 
-pub fn execute(name: &str, args: &str) -> String {
+pub fn execute(name: &str, args: &str, cancel: &Cancel) -> String {
     let args: Value = match serde_json::from_str(args) {
         Ok(v) => v,
         Err(e) => return format!("error: invalid arguments: {e}"),
@@ -100,7 +87,7 @@ pub fn execute(name: &str, args: &str) -> String {
         "read" => read(&args),
         "write" => write(&args),
         "edit" => edit(&args),
-        "bash" => bash(&args),
+        "bash" => bash(&args, cancel),
         other => format!("error: unknown tool: {other}"),
     }
 }
@@ -192,14 +179,11 @@ fn edit(args: &Value) -> String {
     }
 }
 
-fn bash(args: &Value) -> String {
+fn bash(args: &Value, cancel: &Cancel) -> String {
     let Some(command) = args["command"].as_str() else {
         return "error: missing \"command\"".into();
     };
 
-    // An ESC pressed while no command ran asked for nothing; it must not kill
-    // the first command of the next round.
-    INTERRUPTED.store(false, Ordering::SeqCst);
     let mut child = match Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -227,9 +211,8 @@ fn bash(args: &Value) -> String {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if INTERRUPTED.load(Ordering::SeqCst) && !interrupted {
+                if cancel.cancelled() && !interrupted {
                     interrupted = true;
-                    INTERRUPTED.store(false, Ordering::SeqCst);
                     // `--` is not optional: without it `kill` reads the
                     // negative pid as an option and signals nothing.
                     kill("-TERM", pid);

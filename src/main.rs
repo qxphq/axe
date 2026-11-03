@@ -6,9 +6,7 @@ mod tools;
 
 use std::cell::RefCell;
 use std::io::{self, IsTerminal, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -234,7 +232,7 @@ impl Session {
                 Cmd::Continue => {}
                 Cmd::Turn(input) => {
                     let mut sink = PlainSink::default();
-                    let cancel = AtomicBool::new(false);
+                    let cancel = http::Cancel::new();
                     self.messages.push(json!({ "role": "user", "content": input }));
                     if let Err(e) = self.turn(&mut sink, &cancel) {
                         eprintln!("nano: {e}");
@@ -260,7 +258,7 @@ impl Session {
     ) -> Result<Option<String>, String> {
         self.messages.push(json!({ "role": "user", "content": input }));
 
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = http::Cancel::new();
         let mut queued: Option<String> = None;
         // Streamed text up to the last newline is permanent; the rest is the
         // line still being written and lives in the status row.
@@ -278,7 +276,7 @@ impl Session {
         let thinking = self.thinking.clone();
         let thoughts = self.thoughts;
         let turn_tx = tx.clone();
-        let turn_cancel = cancel.clone();
+        let turn_cancel = &cancel;
 
         let result = thread::scope(|scope| {
             let handle = scope.spawn(move || {
@@ -320,12 +318,12 @@ impl Session {
                 while let Some(ev) = next.take().or_else(|| rx.try_recv().ok()) {
                     match ev {
                         // ESC is the interrupt, and it means one thing: stop
-                        // the command that is running. The screen reports the
-                        // key, the tool layer watches the flag.
-                        Event::Key(key) if key.code == KeyCode::Esc => tools::interrupt(),
+                        // the turn now. The flag ends it between requests; the
+                        // socket shutdown unblocks the one in flight.
+                        Event::Key(key) if key.code == KeyCode::Esc => cancel.cancel(),
                         Event::Key(key) => match screen.apply_key(key) {
                             ui::Action::Eof => {
-                                cancel.store(true, Ordering::SeqCst);
+                                cancel.cancel();
                                 done = true;
                             }
                             ui::Action::Submit => {
@@ -400,18 +398,21 @@ impl Session {
                             done = true;
                         }
                         Event::Eof => {
-                            cancel.store(true, Ordering::SeqCst);
+                            cancel.cancel();
                             done = true;
                         }
                     }
-                    if done || cancel.load(Ordering::SeqCst) {
+                    // An interrupt does not break the loop: the turn thread
+                    // still reports what the killed command did, and `Done`
+                    // is the only event that ends the drain.
+                    if done {
                         break;
                     }
                 }
                 if dirty {
                     let _ = screen.draw();
                 }
-                if done || cancel.load(Ordering::SeqCst) {
+                if done {
                     break;
                 }
             }
@@ -426,7 +427,7 @@ impl Session {
         Ok(queued)
     }
 
-    fn turn(&mut self, sink: &mut dyn Sink, cancel: &AtomicBool) -> Result<(), String> {
+    fn turn(&mut self, sink: &mut dyn Sink, cancel: &http::Cancel) -> Result<(), String> {
         let provider = &self.providers[self.provider];
         let model = self.model.clone();
         let thinking = self.thinking.clone();
@@ -1066,21 +1067,21 @@ fn run_turn(
     messages: &mut Vec<Value>,
     thinking: Option<&str>,
     sink: &mut dyn Sink,
-    cancel: &AtomicBool,
+    cancel: &http::Cancel,
 ) -> Result<(), String> {
     let tools = tools::definitions();
 
     loop {
-        // Quitting ends the turn here: no further round is started once the
-        // terminal is gone. The user message stays; there is no reply to pair
-        // it with, which is exactly what happened.
-        if cancel.load(Ordering::SeqCst) {
+        // An interrupt ends the turn here too: no further round is started.
+        // The user message stays without a reply, which is what happened.
+        if cancel.cancelled() {
             return Ok(());
         }
         let extra = provider.cfg.thinking_body(thinking);
         // Both callbacks borrow the sink, so it is shared rather than captured
-        // twice.
-        let reply = {
+        // twice. The borrow ends with the block, so the turn can still report
+        // through it after the stream is over.
+        let result = {
             let sink = RefCell::new(&mut *sink);
             api::stream_chat(
                 &provider.ep,
@@ -1090,11 +1091,28 @@ fn run_turn(
                 messages,
                 tools,
                 extra.as_ref(),
+                cancel,
                 |text| sink.borrow_mut().text(text),
                 |text| sink.borrow_mut().reasoning(text),
-            )?
+            )
+        };
+        let reply = match result {
+            Ok(reply) => reply,
+            // Closing the socket under a read is how the interrupt unblocks
+            // it; the error is the interruption, not a failure. What arrived
+            // is still printed, but the turn is over.
+            Err(_) if cancel.cancelled() => {
+                sink.end_round();
+                return Ok(());
+            }
+            Err(e) => return Err(e),
         };
         sink.end_round();
+        // A shut-down read can also end the stream without an error. A cut
+        // reply is not an assistant message, and its calls never run.
+        if cancel.cancelled() {
+            return Ok(());
+        }
 
         if reply.calls.is_empty() {
             messages.push(assistant_message(&reply));
@@ -1120,21 +1138,21 @@ fn run_turn(
         messages.push(message);
 
         for call in &reply.calls {
-            if cancel.load(Ordering::SeqCst) {
+            if cancel.cancelled() {
                 return Ok(());
             }
             let echo = call_line(call);
             // What is running, while it runs: the finished line appears below
             // once there is a result to put on it.
             sink.status(&plain_text(&echo));
-            let result = tools::execute(&call.name, &call.arguments);
+            let result = tools::execute(&call.name, &call.arguments, cancel);
             sink.echo(&echo, mark(&result));
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call.id,
                 "content": result,
             }));
-            if tools::take_interrupt() {
+            if cancel.cancelled() {
                 return Ok(());
             }
         }

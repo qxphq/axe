@@ -1,6 +1,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
-use std::sync::{Arc, OnceLock};
+use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use rustls::pki_types::ServerName;
@@ -18,6 +19,50 @@ pub struct Endpoint {
     pub host: String,
     pub port: u16,
     pub prefix: String,
+}
+
+/// Stops an in-flight request: the socket is shut down so a blocked read
+/// returns at once, and the flag lets the turn loop stop between requests. A
+/// turn owns one, so a stale request can never stop the next turn.
+pub struct Cancel {
+    flag: AtomicBool,
+    socket: Mutex<Option<TcpStream>>,
+}
+
+impl Cancel {
+    pub fn new() -> Cancel {
+        Cancel {
+            flag: AtomicBool::new(false),
+            socket: Mutex::new(None),
+        }
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    /// Raise the flag and unblock the request in flight, if there is one.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        let socket = self.socket.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(socket) = socket {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// The request in flight hands over a handle it can be closed with. The
+    /// previous request is finished or abandoned, so it is replaced. The flag
+    /// is read under the same lock `cancel` takes, so an interrupt that lands
+    /// between the connect and this call is not lost.
+    fn watch(&self, socket: &TcpStream) {
+        let Ok(clone) = socket.try_clone() else { return };
+        let Ok(mut slot) = self.socket.lock() else { return };
+        if self.cancelled() {
+            let _ = clone.shutdown(Shutdown::Both);
+        } else {
+            *slot = Some(clone);
+        }
+    }
 }
 
 pub fn parse_url(url: &str) -> Result<Endpoint, String> {
@@ -108,13 +153,19 @@ fn tls_config() -> Result<Arc<ClientConfig>, String> {
     Ok(config)
 }
 
-fn connect(ep: &Endpoint) -> Result<Stream, String> {
+fn connect(ep: &Endpoint, cancel: Option<&Cancel>) -> Result<Stream, String> {
+    if cancel.is_some_and(Cancel::cancelled) {
+        return Err("interrupted".into());
+    }
     let stream = TcpStream::connect((ep.host.as_str(), ep.port))
         .map_err(|e| format!("connect {}:{}: {e}", ep.host, ep.port))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(300)))
         .map_err(|e| format!("set timeout: {e}"))?;
     let _ = stream.set_nodelay(true);
+    if let Some(cancel) = cancel {
+        cancel.watch(&stream);
+    }
 
     match ep.scheme {
         Scheme::Http => Ok(Stream::Plain(stream)),
@@ -238,8 +289,9 @@ pub fn request(
     api_key: Option<&str>,
     headers: &[(String, String)],
     body: Option<&str>,
+    cancel: Option<&Cancel>,
 ) -> Result<Response, String> {
-    let mut stream = connect(ep)?;
+    let mut stream = connect(ep, cancel)?;
 
     let target = format!("{}{}", ep.prefix, path);
     let mut head = format!(

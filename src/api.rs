@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-use crate::http::{self, Endpoint, Response};
+use crate::http::{self, Cancel, Endpoint, Response};
 
 pub struct ModelInfo {
     pub id: String,
@@ -27,7 +27,7 @@ pub fn list_models(
     api_key: Option<&str>,
     headers: &[(String, String)],
 ) -> Result<Vec<ModelInfo>, String> {
-    let mut res = http::request(ep, "GET", path, api_key, headers, None)?;
+    let mut res = http::request(ep, "GET", path, api_key, headers, None, None)?;
     let body = res.read_all().map_err(|e| format!("read models: {e}"))?;
     if res.status != 200 {
         return Err(format!("models: HTTP {}: {}", res.status, body.trim()));
@@ -62,6 +62,7 @@ pub fn chat(
     messages: &[Value],
     tools: &Value,
     extra: Option<&Value>,
+    cancel: &Cancel,
 ) -> Result<Response, String> {
     let mut body = json!({
         "model": model,
@@ -75,7 +76,15 @@ pub fn chat(
         }
     }
     let body = body.to_string();
-    http::request(ep, "POST", "/chat/completions", api_key, headers, Some(&body))
+    http::request(
+        ep,
+        "POST",
+        "/chat/completions",
+        api_key,
+        headers,
+        Some(&body),
+        Some(cancel),
+    )
 }
 
 pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
@@ -86,10 +95,11 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
     messages: &[Value],
     tools: &Value,
     extra: Option<&Value>,
+    cancel: &Cancel,
     mut on_text: F,
     mut on_reasoning: G,
 ) -> Result<Reply, String> {
-    let mut res = chat(ep, api_key, headers, model, messages, tools, extra)?;
+    let mut res = chat(ep, api_key, headers, model, messages, tools, extra, cancel)?;
     if res.status != 200 {
         let body = res.read_all().unwrap_or_default();
         return Err(format!("HTTP {}: {}", res.status, body.trim()));
