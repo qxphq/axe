@@ -103,8 +103,15 @@ fn run() -> Result<(), String> {
         .find(|(spec, _)| *spec == format!("{}/{}", providers[provider].name, model))
         .map(|(_, level)| level.clone());
     validate_level(&providers[provider].cfg, thinking.as_deref());
-    // One leading blank: the same margin `ui::Screen` keeps on both edges.
-    println!(" {}", selection(&providers, provider, &model, &thinking));
+    // An interactive run carries the selection in the live region's last row
+    // and opens with a splash; a piped run owns no row and no screen, so the
+    // banner is the only place the selection can appear.
+    if ui::is_interactive() {
+        banner();
+    } else {
+        // One leading blank: the same margin `ui::Screen` keeps on both edges.
+        println!(" {}", selection(&providers, provider, &model, &thinking));
+    }
 
     let mut system = tools::system_prompt();
     if let Some(text) = &global_agents {
@@ -179,6 +186,7 @@ impl Session {
         let mut screen =
             ui::Screen::new("❯ ").map_err(|e| format!("cannot take the terminal: {e}"))?;
         screen.set_commands(COMMANDS);
+        screen.set_info(&self.info());
         let (tx, rx) = mpsc::channel();
         spawn_input(tx.clone());
 
@@ -230,6 +238,11 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// The live region's last row: what this session is pointed at.
+    fn info(&self) -> String {
+        selection(&self.providers, self.provider, &self.model, &self.thinking)
     }
 
     /// Run one turn on its own thread while this one keeps drawing.
@@ -458,7 +471,8 @@ impl Session {
                 if let Some((pi, id)) = pick(providers, (provider, model), screen, rx) {
                     self.provider = pi;
                     self.model = id;
-                    let text = selection(providers, self.provider, &self.model, &self.thinking);
+                    let text = self.info();
+                    screen.set_info(&text);
                     screen.text(&format!("{text}\n"));
                     save_selection(&providers[self.provider].name, &self.model);
                 }
@@ -478,6 +492,7 @@ impl Session {
             }
             if let Some(level) = set_thinking(&providers[self.provider].cfg, rest) {
                 self.thinking = Some(level.clone());
+                screen.set_info(&self.info());
                 let spec = format!("{}/{}", providers[self.provider].name, self.model);
                 config::save_thinking(&spec, level.as_str());
                 screen.text(&format!(
@@ -502,7 +517,8 @@ impl Session {
                             *spec == format!("{}/{}", providers[self.provider].name, self.model)
                         })
                         .map(|(_, level)| level.clone());
-                    let text = selection(providers, self.provider, &self.model, &self.thinking);
+                    let text = self.info();
+                    screen.set_info(&text);
                     screen.text(&format!("{text}\n"));
                     save_selection(&providers[self.provider].name, &self.model);
                 }
@@ -787,6 +803,7 @@ impl Sink for ChannelSink {
 enum Paint {
     Plain,
     Dim,
+    Cyan,
     Yellow,
     Green,
     Red,
@@ -797,6 +814,7 @@ impl Paint {
         match self {
             Paint::Plain => Style::new(),
             Paint::Dim => Style::new().add_modifier(Modifier::DIM),
+            Paint::Cyan => Style::new().fg(Color::Cyan),
             Paint::Yellow => Style::new().fg(Color::Yellow),
             Paint::Green => Style::new().fg(Color::Green),
             Paint::Red => Style::new().fg(Color::Red),
@@ -809,6 +827,7 @@ impl Paint {
         let code = match self {
             Paint::Plain => return text.to_string(),
             Paint::Dim => "2",
+            Paint::Cyan => "36",
             Paint::Yellow => "33",
             Paint::Green => "32",
             Paint::Red => "31",
@@ -897,9 +916,29 @@ fn selection(
         None => "default".to_string(),
     };
     format!(
-        "model: {}/{}\nthinking: {}",
+        "model: {}/{}  ·  thinking: {}",
         providers[provider].name, model, level
     )
+}
+
+/// Splash, printed once above the live region: block letters for `nano`. It
+/// lands in the transcript and is never repainted, so it must be narrower than
+/// the terminal's margin-to-margin width on a narrow window.
+const LOGO: &[&str] = &[
+    "██   ██   █████    ██   ██    █████ ",
+    "███  ██  ██   ██   ███  ██   ██   ██",
+    "██ █ ██  ███████   ██ █ ██   ██   ██",
+    "██  ███  ██   ██   ██  ███   ██   ██",
+    "██   ██  ██   ██   ██   ██    █████ ",
+];
+
+fn banner() {
+    // One leading blank: the same margin `ui::Screen` keeps on both edges.
+    println!();
+    for line in LOGO {
+        println!(" {}", Paint::Cyan.ansi(line));
+    }
+    println!();
 }
 
 /// Persist the current selection so the next run starts on the same model.

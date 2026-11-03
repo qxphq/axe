@@ -4,24 +4,26 @@
 //! `ratatui` owns everything that used to be arithmetic here: how many rows the
 //! prompt occupies, where the cursor goes, what to repaint after a resize, and
 //! how to push a line into scrollback without losing the drawing. This module
-//! only decides *what* the live region contains: the prompt line, a status row,
-//! and the queued row.
+//! only decides *what* the live region contains: a blank row that keeps the
+//! transcript off the prompt, the queued row, the prompt line, and one row
+//! under it with the status on the left and the selection on the right.
 
 use std::io::{self, IsTerminal, Stdout, Write};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::crossterm::{cursor, execute, terminal};
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthChar;
 
-/// Rows the live region always occupies: prompt, status, queued. Fixed, so the
-/// viewport never moves under the cursor.
-const LIVE: u16 = 3;
+/// Rows the live region always occupies: a blank gap, the queue, the prompt,
+/// and the status and selection row. Fixed, so the viewport never moves under
+/// the cursor, and the transcript never reaches the prompt.
+const LIVE: u16 = 4;
 
 /// Blank cells at each screen edge: nothing is written against the border.
 const PAD: u16 = 1;
@@ -61,12 +63,16 @@ pub struct Screen {
     buf: String,
     /// Cursor position in `buf`, in chars.
     cursor: usize,
-    /// One dim line under the prompt: thinking, or the line being written.
+    /// Left half of the row under the prompt: thinking, or what is running.
     status: String,
-    /// The line submitted mid-turn, waiting for the boundary. Its own row: the
-    /// status row changes constantly, and a queued line that scrolls away
-    /// silently looks like the Enter was lost.
+    /// The line submitted mid-turn, waiting for the boundary. Its own row,
+    /// above the prompt: the queue grows where the user is about to type, and
+    /// a queued line that scrolls away silently looks like the Enter was lost.
     queued: Option<String>,
+    /// Right half of the row under the prompt, permanent: what this session is
+    /// pointed at. Set by the caller, which owns the model and the thinking
+    /// level.
+    info: String,
     /// The last killed text: one slot, enough for Ctrl-U ... Ctrl-Y.
     killed: String,
     /// Slash commands Tab completes, in the caller's spelling.
@@ -91,6 +97,7 @@ impl Screen {
             cursor: 0,
             status: String::new(),
             queued: None,
+            info: String::new(),
             killed: String::new(),
             commands: Vec::new(),
             last: None,
@@ -116,6 +123,10 @@ impl Screen {
 
     pub fn set_queued(&mut self, line: Option<&str>) {
         self.queued = line.map(str::to_string);
+    }
+
+    pub fn set_info(&mut self, text: &str) {
+        self.info = text.to_string();
     }
 
     /// The slash commands Tab completes.
@@ -261,16 +272,21 @@ impl Screen {
         let prompt = self.prompt.clone();
         let width = self.term.size()?.width;
         let margin = PAD.min(width.saturating_sub(1));
-        let avail = (width as usize)
-            .saturating_sub(2 * margin as usize)
-            .saturating_sub(prompt.chars().count())
-            .max(1);
+        let cols = (width as usize).saturating_sub(2 * margin as usize);
+        let avail = cols.saturating_sub(prompt.chars().count()).max(1);
         // One row, scrolled horizontally: no wrapping to predict.
         let scroll = if self.cursor >= avail { self.cursor + 1 - avail } else { 0 };
         let visible: String = self.buf.chars().skip(scroll).take(avail).collect();
         let col = (prompt.chars().count() + self.cursor - scroll) as u16;
-        let status = self.status.clone();
         let queued = self.queued.clone();
+        // The selection is the invariant half of the last row: it must not be
+        // cut, so a long status is trimmed first. One blank cell keeps the two
+        // apart.
+        let info = clip(&self.info, cols);
+        let status = clip(
+            &self.status,
+            cols.saturating_sub(info.chars().count() + 1),
+        );
 
         self.term.draw(|frame| {
             let area = frame.area();
@@ -285,19 +301,27 @@ impl Screen {
                     Span::styled(prompt.clone(), PROMPT_STYLE),
                     Span::raw(visible.clone()),
                 ])),
-                row(0),
+                row(2),
             );
-            if area.height > 1 {
-                frame.render_widget(Paragraph::new(Line::styled(status.clone(), DIM)), row(1));
+            if area.height > 3 {
+                frame.render_widget(
+                    Paragraph::new(Line::styled(status.clone(), DIM)),
+                    row(3),
+                );
+                frame.render_widget(
+                    Paragraph::new(Line::styled(info.clone(), DIM))
+                        .alignment(Alignment::Right),
+                    row(3),
+                );
             }
-            if area.height > 2 {
+            if area.height > 1 {
                 let label = match &queued {
-                    Some(line) => format!("queued: {line}"),
+                    Some(line) => clip(&format!("queued: {line}"), cols),
                     None => String::new(),
                 };
-                frame.render_widget(Paragraph::new(Line::styled(label, DIM)), row(2));
+                frame.render_widget(Paragraph::new(Line::styled(label, DIM)), row(1));
             }
-            frame.set_cursor_position(Position::new(area.x + col, area.y));
+            frame.set_cursor_position(Position::new(area.x + col, area.y + 2));
         })
         .map(|_| ())
     }
@@ -530,6 +554,21 @@ impl Drop for Screen {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Fit text into `width` cells. The selection row is the only row whose length
+/// the user controls (`model` ids and thinking levels), so a narrow terminal
+/// gets an ellipsis instead of a word cut in half.
+fn clip(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// The area with `pad` blank cells taken off the left and right edges.
