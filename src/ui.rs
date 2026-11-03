@@ -191,10 +191,14 @@ impl Screen {
     ///
     /// Blocks are separated by one blank line, so a message never sits against
     /// the tool call that followed it. Consecutive tool calls are one block:
-    /// they belong together.
+    /// they belong together. So are the fragments of a message or a thought,
+    /// which arrive split at their newlines: a separator per fragment would
+    /// put a blank line between the lines of one paragraph.
     pub fn insert(&mut self, lines: Vec<Line<'static>>, block: Block) {
         let mut lines = lines;
-        if block != Block::Tool || self.last != Some(Block::Tool) {
+        // A run of one kind is one block, except user lines: each is its own.
+        let continues = block != Block::User && self.last == Some(block);
+        if !continues {
             lines.insert(0, Line::default());
         }
         self.last = Some(block);
@@ -210,9 +214,16 @@ impl Screen {
         let _ = self.draw();
     }
 
-    /// Plain text, split into transcript lines.
+    /// Plain text, split into transcript lines. A blank line at the start is
+    /// the separator the sink wrote for its own output, and `insert` owns that
+    /// here; blank lines inside the text are paragraph breaks and stay.
     pub fn text(&mut self, text: &str) {
-        let lines: Vec<Line<'static>> = split(text)
+        let mut lines: Vec<&str> = split(text);
+        if self.last != Some(Block::Text) {
+            let lead = lines.iter().take_while(|line| line.is_empty()).count();
+            lines.drain(..lead);
+        }
+        let lines: Vec<Line<'static>> = lines
             .into_iter()
             .map(|line| Line::raw(line.to_string()))
             .collect();

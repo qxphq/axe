@@ -328,12 +328,17 @@ impl Session {
                             let tail = std::mem::take(&mut thought);
                             screen.thought(&tail);
                             partial.push_str(&text);
-                            let finished = match partial.rfind('\n') {
-                                Some(at) => partial.drain(..=at).collect::<String>(),
-                                None => String::new(),
-                            };
-                            if !finished.is_empty() {
-                                screen.text(&finished);
+                            // Lines end at a newline; blank lines at the tail
+                            // are the separator before whatever comes next, so
+                            // they wait. A chunk boundary cannot then split one
+                            // paragraph break into two.
+                            let tail = partial.len() - partial.trim_end_matches('\n').len();
+                            if tail > 0 {
+                                let end = partial.len() - (tail - 1);
+                                let finished: String = partial.drain(..end).collect();
+                                if !finished.is_empty() {
+                                    screen.text(&finished);
+                                }
                             }
                             screen.set_status(&stripped(&partial));
                         }
