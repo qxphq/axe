@@ -1133,7 +1133,7 @@ const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 const ITALIC: Style = Style::new().add_modifier(Modifier::ITALIC);
 const STRIKE: Style = Style::new().add_modifier(Modifier::CROSSED_OUT);
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
-const CODE: Style = Style::new().fg(Color::Magenta);
+const CODE: Style = Style::new().fg(Color::Green);
 const LINK: Style = Style::new()
     .fg(Color::Cyan)
     .add_modifier(Modifier::UNDERLINED);
@@ -1643,7 +1643,6 @@ fn ansi_codes(style: Style) -> Vec<&'static str> {
     let mut codes = Vec::new();
     match style.fg {
         Some(Color::Cyan) => codes.push("36"),
-        Some(Color::Magenta) => codes.push("35"),
         Some(Color::Green) => codes.push("32"),
         Some(Color::Yellow) => codes.push("33"),
         Some(Color::Red) => codes.push("31"),
