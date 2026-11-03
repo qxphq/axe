@@ -1152,7 +1152,7 @@ fn call_line(call: &api::ToolCall) -> Vec<(Paint, String)> {
         let cmd = v["command"].as_str().map(|s| summarize(s, 120));
         let cmd = cmd.unwrap_or_else(|| "bash".to_string());
         return vec![
-            (Paint::Plain, "    ".to_string()),
+            (Paint::Plain, "  ".to_string()),
             (paint, glyph.to_string()),
             (Paint::Plain, " ".to_string()),
             (paint, cmd),
@@ -1177,7 +1177,7 @@ fn call_line(call: &api::ToolCall) -> Vec<(Paint, String)> {
     }
 
     let mut spans = vec![
-        (Paint::Plain, "    ".to_string()),
+        (Paint::Plain, "  ".to_string()),
         (paint, glyph.to_string()),
         (Paint::Plain, " ".to_string()),
         (paint, call.name.clone()),
