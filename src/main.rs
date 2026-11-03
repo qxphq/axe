@@ -165,7 +165,7 @@ impl Session {
     /// a turn in flight never blocks the prompt.
     fn run_interactive(mut self) -> Result<(), String> {
         let mut screen =
-            ui::Screen::new("> ").map_err(|e| format!("cannot take the terminal: {e}"))?;
+            ui::Screen::new("❯ ").map_err(|e| format!("cannot take the terminal: {e}"))?;
         let (tx, rx) = mpsc::channel();
         spawn_input(tx.clone());
 
@@ -196,7 +196,7 @@ impl Session {
     /// No tty: the kernel edits the line and the turn prints as it streams.
     fn run_piped(mut self) -> Result<(), String> {
         loop {
-            let Some(line) = ui::cooked_line("> ") else {
+            let Some(line) = ui::cooked_line("❯ ") else {
                 break;
             };
             let cmd = match line.trim() {
@@ -1144,7 +1144,7 @@ fn call_line(call: &api::ToolCall) -> Vec<(Paint, String)> {
         "read" => (glyph, paint),
         "write" => ("✚", Paint::Yellow),
         "edit" => ("✎", Paint::Yellow),
-        "bash" => ("❯", Paint::Yellow),
+        "bash" => ("$", Paint::Yellow),
         _ => (glyph, paint),
     };
 
