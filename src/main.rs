@@ -16,6 +16,11 @@ struct Provider {
 }
 
 fn main() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_tty_on_panic();
+        default_hook(info);
+    }));
     if let Err(e) = run() {
         eprintln!("nano: {e}");
         std::process::exit(1);
@@ -102,23 +107,19 @@ fn run() -> Result<(), String> {
     }
     let mut messages: Vec<Value> = vec![json!({ "role": "system", "content": system })];
 
-    let stdin = io::stdin();
+    let mut tty = RawPrompt::open();
+
     loop {
         println!();
         print!("{}", paint("36", "> "));
         io::stdout().flush().ok();
 
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
+        let Some(line) = tty.read_line() else { break };
 
         let input = line.trim();
         if input.is_empty() {
             continue;
         }
-        redraw_input("> ", input);
 
         match input {
             "/exit" | "/quit" => break,
@@ -133,7 +134,7 @@ fn run() -> Result<(), String> {
                 continue;
             }
             "/model" => {
-                if let Some((pi, id)) = pick(&providers, (provider, &model)) {
+                if let Some((pi, id)) = pick(&providers, (provider, &model), &mut tty) {
                     provider = pi;
                     model = id;
                     println!("model: {}/{}\n", providers[provider].name, model);
@@ -229,7 +230,11 @@ fn resolve(providers: &[Provider], spec: Option<&str>) -> (usize, String) {
     (0, providers[0].models[0].id.clone())
 }
 
-fn pick(providers: &[Provider], current: (usize, &str)) -> Option<(usize, String)> {
+fn pick(
+    providers: &[Provider],
+    current: (usize, &str),
+    tty: &mut RawPrompt,
+) -> Option<(usize, String)> {
     let mut items: Vec<(usize, String)> = Vec::new();
     for (pi, p) in providers.iter().enumerate() {
         for m in &p.models {
@@ -246,10 +251,7 @@ fn pick(providers: &[Provider], current: (usize, &str)) -> Option<(usize, String
     print!("model> ");
     io::stdout().flush().ok();
 
-    let mut line = String::new();
-    if io::stdin().lock().read_line(&mut line).ok()? == 0 {
-        return None;
-    }
+    let line = tty.read_line()?;
     let choice = line.trim();
     if choice.is_empty() {
         return None;
@@ -394,26 +396,105 @@ fn paint(code: &str, text: &str) -> String {
     }
 }
 
-/// The terminal already echoed our input in its default color. Rewrite those
-/// lines in color so user text is distinguishable from model output. The
-/// cursor sits alone on the last row; redraw the prompt and text there and
-/// erase the rows the echo wrapped into, bottom-up so nothing scrolls.
-fn redraw_input(prompt: &str, text: &str) {
-    if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
-        return;
+/// Line input for the REPL. On a terminal the tty is switched to raw mode and
+/// every keystroke is echoed in cyan, so typed input matches the prompt instead
+/// of the terminal's default white. Settings are restored on drop, including on
+/// panic, so a crash never leaves the shell unechoed.
+struct RawPrompt {
+    tty: Option<std::fs::File>,
+    saved: Option<String>,
+}
+
+impl RawPrompt {
+    fn open() -> RawPrompt {
+        let tty = io::stdin()
+            .is_terminal()
+            .then(|| std::fs::File::open("/dev/tty").ok())
+            .flatten();
+        let saved = match (&tty, io::stdout().is_terminal()) {
+            (Some(_), true) => tools::raw_input(),
+            _ => None,
+        };
+        // If raw mode is unavailable, keep reading whole lines from stdin.
+        let tty = if saved.is_some() { tty } else { None };
+        if saved.is_some() {
+            RESTORE_ON_PANIC.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        RawPrompt { tty, saved }
     }
-    let cols = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(80);
-    // Columns occupied by the prompt plus the echoed text, wrapping as the
-    // terminal did it.
-    let width = prompt.chars().count() + text.chars().count();
-    let rows = width.div_ceil(cols).max(1);
-    print!("\r\x1b[{rows}A\x1b[0J");
-    print!("{}{}\n", paint("36", prompt), paint("36", text));
-    io::stdout().flush().ok();
+
+    /// One line, without the newline. `None` on EOF or interrupt.
+    fn read_line(&mut self) -> Option<String> {
+        match &mut self.tty {
+            Some(tty) => read_line_raw(tty),
+            None => {
+                let mut line = String::new();
+                match io::stdin().lock().read_line(&mut line) {
+                    Ok(0) | Err(_) => None,
+                    Ok(_) => Some(line.trim_end_matches(['\n', '\r']).to_string()),
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RawPrompt {
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved.take() {
+            tools::restore_tty(&saved);
+            RESTORE_ON_PANIC.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Set while the tty is in raw mode, so the panic hook below can hand the
+/// terminal back before the process dies unechoed.
+static RESTORE_ON_PANIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn restore_tty_on_panic() {
+    if RESTORE_ON_PANIC.load(std::sync::atomic::Ordering::SeqCst) {
+        let _ = tools::restore_tty_now();
+    }
+}
+
+/// Read one line from a tty in raw mode, echoing each keystroke in cyan.
+/// `None` means EOF, Ctrl-C or Ctrl-D: leave the REPL.
+fn read_line_raw(tty: &mut std::fs::File) -> Option<String> {
+    let mut text: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        let n = match tty.read(&mut buf) {
+            Ok(0) => return None,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        for byte in &buf[..n] {
+            match *byte {
+                b'\r' | b'\n' => {
+                    println!("\x1b[0m");
+                    io::stdout().flush().ok();
+                    return Some(String::from_utf8_lossy(&text).into_owned());
+                }
+                0x03 | 0x04 => return None,
+                0x7f | 0x08 => {
+                    // Before the prompt's end position: erase the last glyph.
+                    if !text.is_empty() {
+                        text.pop();
+                        print!("\x08 \x08");
+                        io::stdout().flush().ok();
+                    }
+                }
+                byte if byte >= 0x20 => {
+                    // Printable ASCII, or one byte of a UTF-8 sequence.
+                    text.push(byte);
+                    print!("{}", paint("36", &(byte as char).to_string()));
+                    io::stdout().flush().ok();
+                }
+                _ => {} // arrows, bracketed-paste markers, other control keys
+            }
+        }
+    }
 }
 
 fn summarize(text: &str, max: usize) -> String {
