@@ -180,6 +180,8 @@ enum Cmd {
     Continue,
     /// Send this to the model.
     Turn(String),
+    /// Run this locally (`!cmd`); the output joins the history without a turn.
+    Shell(String),
 }
 
 /// What the prompt yielded: a line, or a mode toggle that is not one.
@@ -236,6 +238,7 @@ impl Session {
                 Cmd::Turn(input) => {
                     pending = self.messages_turn(&input, &tx, &rx, &mut screen)?;
                 }
+                Cmd::Shell(command) => self.shell(&command, &mut screen),
             }
         }
         screen.close();
@@ -262,6 +265,11 @@ impl Session {
                     if let Err(e) = self.turn(&mut sink, &cancel) {
                         eprintln!("nano: {e}");
                     }
+                }
+                Cmd::Shell(command) => {
+                    println!("{}", plain_text(&shell_line(&command, false)));
+                    let result = self.run_shell(&command);
+                    print!("{result}");
                 }
             }
         }
@@ -298,6 +306,33 @@ impl Session {
             "explore: {}\n",
             if self.read_only { "on" } else { "off" }
         ));
+    }
+
+    /// `!cmd`: run it here, show it, and let the output join the history. No
+    /// turn follows — the model sees it when the user next asks something.
+    fn shell(&mut self, command: &str, screen: &mut ui::Screen) {
+        screen.insert(vec![line_of(&shell_line(command, false))], ui::Block::Tool);
+        let _ = screen.draw();
+        let result = self.run_shell(command);
+        screen.output(&result);
+        let _ = screen.draw();
+    }
+
+    /// The command and its output as a user message. The `!` is the prompt's
+    /// syntax, not the model's, so the message reads as a shell transcript.
+    fn run_shell(&mut self, command: &str) -> String {
+        let cancel = http::Cancel::new();
+        let result = tools::execute(
+            "bash",
+            &json!({ "command": command }).to_string(),
+            &cancel,
+            false,
+        );
+        self.messages.push(json!({
+            "role": "user",
+            "content": format!("$ {command}\n{result}"),
+        }));
+        result
     }
 
     /// Run one turn on its own thread while this one keeps drawing.
@@ -526,6 +561,7 @@ impl Session {
                      /thinking [l]  show or set thinking level (off, low, medium, high)\n\
                      /thoughts      show or hide the model's reasoning\n\
                      /explore       toggle read-only mode (read and read-only shell)\n\
+                     !cmd           run a shell command; its output joins the context\n\
                      /exit          quit\n",
                 );
                 return Cmd::Continue;
@@ -614,6 +650,10 @@ impl Session {
             return Cmd::Continue;
         }
 
+        if let Some(command) = shell_command(input) {
+            return command;
+        }
+
         Cmd::Turn(input.to_string())
     }
 }
@@ -632,6 +672,7 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
                  /thinking [l]  show or set thinking level (off, low, medium, high)\n\
                  /thoughts      show or hide the model's reasoning\n\
                  /explore       toggle read-only mode (read and read-only shell)\n\
+                 !cmd           run a shell command; its output joins the context\n\
                  /exit          quit"
             );
             return Cmd::Continue;
@@ -705,7 +746,20 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
         eprintln!("nano: unknown command: {input}");
         return Cmd::Continue;
     }
+    if let Some(command) = shell_command(input) {
+        return command;
+    }
     Cmd::Turn(input.to_string())
+}
+
+/// `!cmd`: a command for this machine, not a message for the model. A bare
+/// `!` is nothing to run.
+fn shell_command(input: &str) -> Option<Cmd> {
+    let command = input.strip_prefix('!')?.trim();
+    if command.is_empty() {
+        return Some(Cmd::Continue);
+    }
+    Some(Cmd::Shell(command.to_string()))
 }
 
 /// Events from the two producers that never draw: keys, and the turn.
@@ -1373,11 +1427,22 @@ impl TextSink {
     }
 }
 
+// A shell command, the user's (`!cmd`) or the model's, on one line: the glyph
+// says what runs, and the command follows it, since `bash` has no call syntax.
+fn shell_line(command: &str, read_only: bool) -> Vec<(Paint, String)> {
+    let paint = if read_only { Paint::Dim } else { Paint::Yellow };
+    vec![
+        (Paint::Plain, "  ".to_string()),
+        (paint, "▷".to_string()),
+        (Paint::Plain, " ".to_string()),
+        (paint, summarize(command, 120)),
+    ]
+}
+
 // Echo tool calls compactly: show the arguments that identify the target, never
 // the raw JSON (heredoc scripts and long content are unreadable in a line).
 // A glyph per tool says what it does at a glance: read-only is dim, anything
-// that can change the tree is yellow. `bash` has no call syntax, so its command
-// follows the glyph alone.
+// that can change the tree is yellow.
 fn call_line(call: &api::ToolCall, read_only: bool) -> Vec<(Paint, String)> {
     let v: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     let (glyph, paint) = match call.name.as_str() {
@@ -1388,21 +1453,12 @@ fn call_line(call: &api::ToolCall, read_only: bool) -> Vec<(Paint, String)> {
         "read" => (glyph, paint),
         "write" => ("✚", Paint::Yellow),
         "edit" => ("✎", Paint::Yellow),
-        // In explore mode `bash` cannot change anything, so it reads like
-        // `read` rather than like the tool it usually is.
-        "bash" => ("▷", if read_only { Paint::Dim } else { Paint::Yellow }),
         _ => (glyph, paint),
     };
 
     if call.name == "bash" {
-        let cmd = v["command"].as_str().map(|s| summarize(s, 120));
-        let cmd = cmd.unwrap_or_else(|| "bash".to_string());
-        return vec![
-            (Paint::Plain, "  ".to_string()),
-            (paint, glyph.to_string()),
-            (Paint::Plain, " ".to_string()),
-            (paint, cmd),
-        ];
+        let command = v["command"].as_str().unwrap_or("bash");
+        return shell_line(command, read_only);
     }
 
     let mut parts = Vec::new();
