@@ -18,7 +18,10 @@ providers, four tools. Roughly 1.2k LOC across five files.
 5. **The prompt is structure.** The built-in system prompt describes only the
    available tools and the working directory, and is generated from the same tool
    registry used for the `tools` array. No behavioral advice, no workflow rules.
-   `system` from config is appended after it, never replaces it.
+   `system` from config is appended after it, never replaces it. The same rule
+   covers instructions: `agents` (config) then the nearest `AGENTS.md` at or above
+   cwd, each capped at 48 KB, then `system`. All read once at startup; never
+   re-read mid-session.
 6. **Stable prefix, append-only history.** System prompt and tool schemas first,
    volatile content last. Never inject timestamps, status, or cwd changes into the
    prefix: it invalidates provider prompt caching. When sessions arrive: append-only
@@ -45,7 +48,7 @@ providers, four tools. Roughly 1.2k LOC across five files.
 - `api.rs` — model listing, chat request, SSE parsing, tool-call accumulation.
 - `http.rs` — URL parsing, HTTP/1.1 over `TcpStream`/rustls, body decoding
   (`Content-Length`, chunked, EOF).
-- `config.rs` — load and validate the config.
+- `config.rs` — load and validate the config; resolve the `agents` file.
 - `tools.rs` — tool registry, JSON schemas, generated prompt, execution.
 
 ## Conventions

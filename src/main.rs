@@ -24,6 +24,20 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let cfg = config::load()?;
+    // Instructions are read once at startup, before any request: the system
+    // prompt is a stable prefix and must not change mid-session.
+    // Order: config `agents`, then the project's AGENTS.md, then `system`.
+    let global_agents = cfg.agents.as_deref().and_then(config::read_agents);
+    let project_file = std::env::current_dir()
+        .ok()
+        .and_then(|dir| config::find_agents(&dir))
+        .filter(|f| Some(f.as_path()) != cfg.agents.as_deref());
+    let project_agents = project_file.as_deref().and_then(|f| {
+        let text = config::read_agents(f)?;
+        eprintln!("nano: using project instructions from {}", f.display());
+        Some(text)
+    });
+
     let mut providers = Vec::new();
     let session = session_id();
 
@@ -74,6 +88,14 @@ fn run() -> Result<(), String> {
     println!("model: {}/{}\n", providers[provider].name, model);
 
     let mut system = tools::system_prompt();
+    if let Some(text) = &global_agents {
+        system.push_str("\n\n# Instructions (global)\n\n");
+        system.push_str(text);
+    }
+    if let Some(text) = &project_agents {
+        system.push_str("\n\n# Instructions (project)\n\n");
+        system.push_str(text);
+    }
     if let Some(extra) = &cfg.system {
         system.push_str("\n\n");
         system.push_str(extra);

@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -27,6 +28,7 @@ pub struct Config {
     pub providers: Vec<ProviderConfig>,
     pub model: Option<String>,
     pub system: Option<String>,
+    pub agents: Option<PathBuf>,
 }
 
 pub fn path() -> PathBuf {
@@ -56,8 +58,73 @@ const EXAMPLE: &str = r#"{
     }
   },
   "model": "local/qwen3.8-flash-next-chat",
-  "system": null
+  "system": null,
+  "agents": null
 }"#;
+
+const AGENTS_LIMIT: usize = 48 * 1024;
+
+/// Read an AGENTS.md-style file. Best-effort: a missing file is silent, other
+/// errors and truncation are warnings. Capped so one file cannot flood context.
+pub fn read_agents(file: &Path) -> Option<String> {
+    let text = match fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!("nano: cannot read {}: {e}", file.display());
+            return None;
+        }
+    };
+    if text.trim().is_empty() {
+        return None;
+    }
+    if text.len() > AGENTS_LIMIT {
+        eprintln!(
+            "nano: {} is {} bytes, truncated to {}",
+            file.display(),
+            text.len(),
+            AGENTS_LIMIT
+        );
+        let mut cut = AGENTS_LIMIT;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        return Some(text[..cut].to_string());
+    }
+    Some(text)
+}
+
+/// Nearest `AGENTS.md` at or above `dir`.
+pub fn find_agents(dir: &Path) -> Option<PathBuf> {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        let file = d.join("AGENTS.md");
+        if file.is_file() {
+            return Some(file);
+        }
+        cur = d.parent();
+    }
+    None
+}
+
+/// Resolve the `agents` config key: `~` and `~/` are expanded, relative paths
+/// are relative to the directory holding the config file.
+fn agents_file(raw: &str) -> PathBuf {
+    let home = || PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into()));
+    if raw == "~" {
+        return home();
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return home().join(rest);
+    }
+    let p = PathBuf::from(raw);
+    if p.is_relative() {
+        if let Some(dir) = path().parent() {
+            return dir.join(p);
+        }
+    }
+    p
+}
 
 fn text(v: &Value, key: &str) -> Option<String> {
     v[key]
@@ -133,5 +200,6 @@ pub fn load() -> Result<Config, String> {
         providers,
         model: text(&v, "model"),
         system: text(&v, "system"),
+        agents: text(&v, "agents").map(|raw| agents_file(&raw)),
     })
 }
