@@ -6,11 +6,13 @@ use std::time::Duration;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
+#[derive(Clone)]
 enum Scheme {
     Http,
     Https,
 }
 
+#[derive(Clone)]
 pub struct Endpoint {
     scheme: Scheme,
     pub host: String,
@@ -234,17 +236,22 @@ pub fn request(
     method: &str,
     path: &str,
     api_key: Option<&str>,
+    headers: &[(String, String)],
     body: Option<&str>,
 ) -> Result<Response, String> {
     let mut stream = connect(ep)?;
 
     let target = format!("{}{}", ep.prefix, path);
     let mut head = format!(
-        "{method} {target} HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\nConnection: close\r\n",
-        ep.host
+        "{method} {target} HTTP/1.1\r\nHost: {}\r\nUser-Agent: nano/{}\r\nAccept: */*\r\nConnection: close\r\n",
+        ep.host,
+        env!("CARGO_PKG_VERSION")
     );
     if let Some(key) = api_key {
         head.push_str(&format!("Authorization: Bearer {key}\r\n"));
+    }
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
     }
     if let Some(b) = body {
         head.push_str("Content-Type: application/json\r\n");

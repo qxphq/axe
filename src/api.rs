@@ -7,8 +7,13 @@ pub struct ModelInfo {
     pub context: Option<u64>,
 }
 
-pub fn list_models(ep: &Endpoint, api_key: Option<&str>) -> Result<Vec<ModelInfo>, String> {
-    let mut res = http::request(ep, "GET", "/models", api_key, None)?;
+pub fn list_models(
+    ep: &Endpoint,
+    path: &str,
+    api_key: Option<&str>,
+    headers: &[(String, String)],
+) -> Result<Vec<ModelInfo>, String> {
+    let mut res = http::request(ep, "GET", path, api_key, headers, None)?;
     let body = res.read_all().map_err(|e| format!("read models: {e}"))?;
     if res.status != 200 {
         return Err(format!("models: HTTP {}: {}", res.status, body.trim()));
@@ -36,6 +41,7 @@ pub fn list_models(ep: &Endpoint, api_key: Option<&str>) -> Result<Vec<ModelInfo
 pub fn chat(
     ep: &Endpoint,
     api_key: Option<&str>,
+    headers: &[(String, String)],
     model: &str,
     messages: &[Value],
 ) -> Result<Response, String> {
@@ -45,5 +51,5 @@ pub fn chat(
         "stream": true,
     })
     .to_string();
-    http::request(ep, "POST", "/chat/completions", api_key, Some(&body))
+    http::request(ep, "POST", "/chat/completions", api_key, headers, Some(&body))
 }

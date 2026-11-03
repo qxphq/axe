@@ -2,7 +2,7 @@ mod api;
 mod config;
 mod http;
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use serde_json::{json, Value};
 
@@ -10,6 +10,7 @@ struct Provider {
     name: String,
     ep: http::Endpoint,
     key: Option<String>,
+    headers: Vec<(String, String)>,
     models: Vec<api::ModelInfo>,
 }
 
@@ -23,6 +24,7 @@ fn main() {
 fn run() -> Result<(), String> {
     let cfg = config::load()?;
     let mut providers = Vec::new();
+    let session = session_id();
 
     for pc in &cfg.providers {
         let ep = http::parse_url(&pc.base_url).map_err(|e| format!("{}: {e}", pc.name))?;
@@ -33,11 +35,27 @@ fn run() -> Result<(), String> {
                 continue;
             }
         }
-        match api::list_models(&ep, key.as_deref()) {
+
+        let mut headers = Vec::new();
+        if let Some(name) = &pc.session_header {
+            headers.push((name.clone(), session.clone()));
+        }
+
+        let (models_ep, models_path) = match &pc.models_url {
+            Some(url) => {
+                let ep = http::parse_url(url).map_err(|e| format!("{}: {e}", pc.name))?;
+                let path = if ep.prefix.is_empty() { "/models" } else { "" };
+                (ep, path)
+            }
+            None => (ep.clone(), "/models"),
+        };
+
+        match api::list_models(&models_ep, models_path, key.as_deref(), &headers) {
             Ok(models) if !models.is_empty() => providers.push(Provider {
                 name: pc.name.clone(),
                 ep,
                 key,
+                headers,
                 models,
             }),
             Ok(_) => eprintln!("{}: no models", pc.name),
@@ -132,6 +150,20 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn session_id() -> String {
+    let mut bytes = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(&mut bytes).is_ok() {
+            return bytes.iter().map(|b| format!("{b:02x}")).collect();
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{:x}{:x}", std::process::id(), nanos)
+}
+
 fn print_models(providers: &[Provider]) {
     for p in providers {
         println!("{}:", p.name);
@@ -216,7 +248,13 @@ fn pick(providers: &[Provider], current: (usize, &str)) -> Option<(usize, String
 }
 
 fn stream_reply(provider: &Provider, model: &str, messages: &[Value]) -> Result<String, String> {
-    let mut res = api::chat(&provider.ep, provider.key.as_deref(), model, messages)?;
+    let mut res = api::chat(
+        &provider.ep,
+        provider.key.as_deref(),
+        &provider.headers,
+        model,
+        messages,
+    )?;
     if res.status != 200 {
         let body = res.read_all().unwrap_or_default();
         return Err(format!("HTTP {}: {}", res.status, body.trim()));

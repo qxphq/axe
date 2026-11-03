@@ -9,6 +9,8 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
+    pub models_url: Option<String>,
+    pub session_header: Option<String>,
 }
 
 impl ProviderConfig {
@@ -45,6 +47,12 @@ const EXAMPLE: &str = r#"{
     "deepseek": {
       "base_url": "https://api.deepseek.com",
       "api_key_env": "DEEPSEEK_API_KEY"
+    },
+    "opencode-go": {
+      "base_url": "https://opencode.ai/inference/go/openai/v1",
+      "models_url": "https://opencode.ai/inference/go/v1/models",
+      "api_key_env": "OPENCODE_API_KEY",
+      "session_header": "x-opencode-session"
     }
   },
   "model": "local/qwen3.8-flash-next-chat",
@@ -66,6 +74,8 @@ fn parse_provider(name: &str, v: &Value) -> Result<ProviderConfig, String> {
         base_url: base_url.trim_end_matches('/').to_string(),
         api_key: text(v, "api_key"),
         api_key_env: text(v, "api_key_env"),
+        models_url: text(v, "models_url"),
+        session_header: text(v, "session_header"),
     })
 }
 
@@ -105,6 +115,8 @@ pub fn load() -> Result<Config, String> {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: text(&v, "api_key"),
             api_key_env: None,
+            models_url: None,
+            session_header: None,
         });
     } else {
         return Err(format!(
