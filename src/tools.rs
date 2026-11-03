@@ -135,7 +135,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "bash",
         signature: "bash(command)",
-        description: "Run a shell command in the working directory. Returns exit code, stdout, and stderr. Times out after 120 seconds.",
+        description: "Run a shell command in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds.",
         parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"Command passed to sh -c"}},"required":["command"]}"#,
     },
 ];
