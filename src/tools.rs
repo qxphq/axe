@@ -82,28 +82,6 @@ impl EscWatch {
     }
 }
 
-/// Put the tty into immediate, unechoed input mode for the REPL. Returns the
-/// previous settings, to be handed back to `restore_tty`; `None` if `stty`
-/// is unavailable, in which case the caller reads whole lines as usual.
-pub fn raw_input() -> Option<String> {
-    let saved = stty(&["-g"])
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())?;
-    stty(&["-icanon", "-echo", "-isig", "min", "1", "time", "0"])?;
-    Some(saved)
-}
-
-/// Restore settings captured by `raw_input`.
-pub fn restore_tty(saved: &str) {
-    stty(&[saved]);
-}
-
-/// Panic-hook variant: re-enable canonical echo from the tty's own defaults,
-/// since the saved settings string is not reachable there.
-pub fn restore_tty_now() -> Option<String> {
-    stty(&["echo", "icanon", "isig"])
-}
-
 impl Drop for EscWatch {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
