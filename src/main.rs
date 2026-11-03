@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::io::{self, IsTerminal, Read, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEventKind};
 use ratatui::style::{Color, Modifier, Style};
@@ -284,6 +284,7 @@ impl Session {
                     tx: turn_tx.clone(),
                     out: TextSink::default(),
                     thoughts,
+                    thought: None,
                 };
                 let result = run_turn(
                     provider,
@@ -705,8 +706,8 @@ trait Sink {
     /// Streamed model text. `TextSink` owns the spacing: finished lines go out
     /// permanently, the unfinished one is exposed as a tail.
     fn text(&mut self, text: &str);
-    /// Streamed reasoning. Shown or not is the sink's business; the label is
-    /// what appears when it is hidden.
+    /// Streamed reasoning. Shown or not is the sink's business; when it is
+    /// hidden, one line with its duration stands in for it.
     fn reasoning(&mut self, text: &str);
     /// A transient label for the live region: "thinking…", a running command.
     fn status(&mut self, text: &str);
@@ -757,16 +758,32 @@ struct ChannelSink {
     out: TextSink,
     /// Reasoning is shown in the transcript unless `/thoughts` turned it off.
     thoughts: bool,
+    /// When the hidden reasoning of this round began, for the one line that
+    /// replaces it in the transcript.
+    thought: Option<Instant>,
 }
 
 impl ChannelSink {
     fn send(&self, event: Event) {
         let _ = self.tx.send(event);
     }
+
+    /// Hidden reasoning ends at the first thing that follows it: the answer,
+    /// a tool call, or the round itself. What reaches the transcript then is
+    /// its duration, on one line, where the thought would have been.
+    fn end_thought(&mut self) {
+        if let Some(start) = self.thought.take() {
+            self.send(Event::Thought(format!(
+                "Thought ({:.1}s)\n",
+                start.elapsed().as_secs_f32()
+            )));
+        }
+    }
 }
 
 impl Sink for ChannelSink {
     fn text(&mut self, text: &str) {
+        self.end_thought();
         let mut done = String::new();
         self.out.push(text, &mut done);
         if !done.is_empty() {
@@ -779,6 +796,7 @@ impl Sink for ChannelSink {
     }
 
     fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str)) {
+        self.end_thought();
         let mut spans = call.to_vec();
         spans.push((Paint::Plain, " ".to_string()));
         spans.push((mark.0, mark.1.to_string()));
@@ -786,6 +804,7 @@ impl Sink for ChannelSink {
     }
 
     fn end_round(&mut self) {
+        self.end_thought();
         self.out.commit();
         if std::mem::take(&mut self.out.wrote) {
             // The reply ended without a final newline, so the line it left
@@ -798,6 +817,9 @@ impl Sink for ChannelSink {
         if self.thoughts {
             self.send(Event::Thought(text.to_string()));
         } else {
+            // The thought is hidden, but not its cost: its first chunk starts
+            // the clock, and `end_thought` puts the duration in its place.
+            self.thought.get_or_insert_with(Instant::now);
             self.send(Event::Status("thinking…".to_string()));
         }
     }
