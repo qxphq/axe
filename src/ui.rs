@@ -30,6 +30,8 @@ const LIVE: u16 = 5;
 const PAD: u16 = 1;
 
 const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan);
+/// Marker for an already committed line in the transcript.
+const MARK: &str = "█";
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 const ERROR_STYLE: Style = Style::new().fg(Color::Red);
 
@@ -188,10 +190,11 @@ impl Screen {
         Action::None
     }
 
-    /// Commit the line: echo it into the transcript and return it.
+    /// Commit the line: echo it into the transcript and return it. The marker
+    /// is `█`, not the live prompt's `❯`: the line is settled, not editable.
     pub fn commit(&mut self) -> String {
         let line = self.take();
-        let text = format!("{}{}", self.prompt, line);
+        let text = format!("{MARK} {line}");
         self.insert(vec![Line::styled(text, PROMPT_STYLE)], Block::User);
         self.status.clear();
         line
