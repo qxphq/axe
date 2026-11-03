@@ -38,9 +38,9 @@ providers, four tools. Roughly 2.6k LOC across six files.
 10. **One config file.** `~/.config/nano/config.json` (respects `XDG_CONFIG_HOME`),
     auto-created with an example on first run. Secrets only through `api_key_env`.
     Never commit keys, never read another app's auth store.
-11. **Verify against reality.** Test with real providers. Use a local mock for
-    protocol edge cases (chunked SSE, keep-alive comments, session headers). No
-    speculative fixes; only fix what a reproduction shows.
+11. **Verify against reality.** Test locally against `mock.py` (chunked SSE,
+    keep-alive comments, session headers). No speculative fixes; only fix what a
+    reproduction shows.
 12. **A scrolling REPL, not a TUI.** No alt-screen: the transcript is the user's
     scrollback. The only owned region is a fixed three-row live area at the bottom
     (prompt, status, queued) inside a `Viewport::Inline`. Everything above it is
@@ -90,7 +90,7 @@ cargo build
 cargo run
 ```
 
-No test suite yet. Verify changes against a real provider and `mock.py` (an
-OpenAI-compatible mock that streams SSE, tool calls, reasoning and keep-alives) for
-protocol and rendering behavior. A pty plus a virtual terminal is the only way to
-see what the user sees; `cargo test` cannot.
+No test suite yet. Verify changes against `mock.py` (an OpenAI-compatible mock
+that streams SSE, tool calls, reasoning and keep-alives) for protocol and
+rendering behavior. A pty plus a virtual terminal is the only way to see what the
+user sees; `cargo test` cannot.
