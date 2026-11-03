@@ -135,6 +135,7 @@ fn run() -> Result<(), String> {
                     provider = pi;
                     model = id;
                     println!("model: {}/{}\n", providers[provider].name, model);
+                    save_selection(&providers[provider].name, &model);
                 }
                 continue;
             }
@@ -148,6 +149,7 @@ fn run() -> Result<(), String> {
                     provider = pi;
                     model = id;
                     println!("model: {}/{}\n", providers[provider].name, model);
+                    save_selection(&providers[provider].name, &model);
                 }
                 None => eprintln!("unknown model: {spec}"),
             }
@@ -166,6 +168,11 @@ fn run() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Persist the current selection so the next run starts on the same model.
+fn save_selection(provider: &str, model: &str) {
+    config::save_model(&format!("{provider}/{model}"));
 }
 
 fn session_id() -> String {

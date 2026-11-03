@@ -146,6 +146,41 @@ fn parse_provider(name: &str, v: &Value) -> Result<ProviderConfig, String> {
     })
 }
 
+/// Persist the selected model as `provider/id` in the config file. Best-effort
+/// editing: unknown keys are preserved, formatting/comments are not.
+pub fn save_model(spec: &str) {
+    let p = path();
+    let raw = match fs::read_to_string(&p) {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("nano: cannot save model to {}: {e}", p.display());
+            return;
+        }
+    };
+    let mut v: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("nano: cannot save model to {}: {e}", p.display());
+            return;
+        }
+    };
+    if !v.is_object() {
+        eprintln!("nano: cannot save model to {}: not an object", p.display());
+        return;
+    }
+    v["model"] = Value::String(spec.to_string());
+    let text = match serde_json::to_string_pretty(&v) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("nano: cannot save model to {}: {e}", p.display());
+            return;
+        }
+    };
+    if let Err(e) = fs::write(&p, format!("{text}\n")) {
+        eprintln!("nano: cannot save model to {}: {e}", p.display());
+    }
+}
+
 pub fn load() -> Result<Config, String> {
     let p = path();
     let raw = match fs::read_to_string(&p) {
