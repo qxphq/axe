@@ -432,11 +432,7 @@ fn redraw_input(prompt: &str, text: &str) {
     if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
         return;
     }
-    let cols = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(80);
+    let cols = tty_columns();
     // Columns occupied by the prompt plus the echoed text, wrapping as the
     // terminal did it.
     let width = prompt.chars().count() + text.chars().count();
@@ -446,8 +442,27 @@ fn redraw_input(prompt: &str, text: &str) {
     io::stdout().flush().ok();
 }
 
-fn summarize(text: &str, max: usize) -> String {
-    let line = text.lines().next().unwrap_or("");
+/// Terminal width for the redraw. `COLUMNS` is not exported by the shell, so
+/// ask the tty; 80 only when both fail.
+fn tty_columns() -> usize {
+    let out = std::process::Command::new("stty")
+        .arg("-F")
+        .arg("/dev/tty")
+        .arg("size")
+        .output();
+    out.ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .nth(1)
+                .and_then(|n| n.parse::<usize>().ok())
+        })
+        .filter(|n| *n > 0)
+        .unwrap_or(80)
+}
+
+fn summarize(text: &str, max: usize) -> String {    let line = text.lines().next().unwrap_or("");
     let mut out: String = line.chars().take(max).collect();
     if line.chars().count() > max || text.lines().count() > 1 {
         out.push('…');
