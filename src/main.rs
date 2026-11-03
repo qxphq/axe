@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod http;
+mod tools;
 
 use std::io::{self, BufRead, Read, Write};
 
@@ -72,10 +73,12 @@ fn run() -> Result<(), String> {
     let (mut provider, mut model) = resolve(&providers, cfg.model.as_deref());
     println!("model: {}/{}\n", providers[provider].name, model);
 
-    let mut messages: Vec<Value> = Vec::new();
-    if let Some(system) = &cfg.system {
-        messages.push(json!({ "role": "system", "content": system }));
+    let mut system = tools::system_prompt();
+    if let Some(extra) = &cfg.system {
+        system.push_str("\n\n");
+        system.push_str(extra);
     }
+    let mut messages: Vec<Value> = vec![json!({ "role": "system", "content": system })];
 
     let stdin = io::stdin();
     loop {
@@ -135,15 +138,8 @@ fn run() -> Result<(), String> {
         }
 
         messages.push(json!({ "role": "user", "content": input }));
-        match stream_reply(&providers[provider], &model, &messages) {
-            Ok(reply) => {
-                println!();
-                messages.push(json!({ "role": "assistant", "content": reply }));
-            }
-            Err(e) => {
-                println!();
-                eprintln!("nano: {e}");
-            }
+        if let Err(e) = run_turn(&providers[provider], &model, &mut messages) {
+            eprintln!("nano: {e}");
         }
     }
 
@@ -247,48 +243,78 @@ fn pick(providers: &[Provider], current: (usize, &str)) -> Option<(usize, String
     }
 }
 
-fn stream_reply(provider: &Provider, model: &str, messages: &[Value]) -> Result<String, String> {
-    let mut res = api::chat(
-        &provider.ep,
-        provider.key.as_deref(),
-        &provider.headers,
-        model,
-        messages,
-    )?;
-    if res.status != 200 {
-        let body = res.read_all().unwrap_or_default();
-        return Err(format!("HTTP {}: {}", res.status, body.trim()));
+fn run_turn(
+    provider: &Provider,
+    model: &str,
+    messages: &mut Vec<Value>,
+) -> Result<(), String> {
+    let tools = tools::definitions();
+
+    for _ in 0..25 {
+        let mut printed = false;
+        let reply = api::stream_chat(
+            &provider.ep,
+            provider.key.as_deref(),
+            &provider.headers,
+            model,
+            messages,
+            tools,
+            |text| {
+                print!("{text}");
+                io::stdout().flush().ok();
+                printed = true;
+            },
+        )?;
+
+        if printed {
+            println!();
+        }
+
+        if reply.calls.is_empty() {
+            messages.push(json!({ "role": "assistant", "content": reply.text }));
+            return Ok(());
+        }
+
+        let calls: Vec<Value> = reply
+            .calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    }
+                })
+            })
+            .collect();
+        messages.push(json!({
+            "role": "assistant",
+            "content": reply.text,
+            "tool_calls": calls,
+        }));
+
+        for call in &reply.calls {
+            println!("→ {}({})", call.name, summarize(&call.arguments, 120));
+            let result = tools::execute(&call.name, &call.arguments);
+            println!("  {}", summarize(&result, 120));
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": result,
+            }));
+        }
     }
 
-    let stdout = io::stdout();
-    let mut reply = String::new();
+    Err("tool loop limit reached (25)".into())
+}
 
-    loop {
-        let line = match res.read_line() {
-            Ok(Some(line)) => line,
-            Ok(None) => break,
-            Err(e) => return Err(format!("read stream: {e}")),
-        };
-        let line = line.trim_end_matches(|c| c == '\r' || c == '\n');
-        if line.is_empty() {
-            continue;
-        }
-        let Some(data) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data == "[DONE]" {
-            break;
-        }
-        let Ok(chunk) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
-        if let Some(text) = chunk["choices"][0]["delta"]["content"].as_str() {
-            print!("{text}");
-            stdout.lock().flush().ok();
-            reply.push_str(text);
-        }
+fn summarize(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or("");
+    let mut out: String = line.chars().take(max).collect();
+    if line.chars().count() > max || text.lines().count() > 1 {
+        out.push('…');
     }
-
-    Ok(reply)
+    out
 }
