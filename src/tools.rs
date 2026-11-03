@@ -3,7 +3,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,93 +17,10 @@ pub fn take_interrupt() -> bool {
     INTERRUPTED.swap(false, Ordering::SeqCst)
 }
 
-/// Watches /dev/tty for ESC while a command runs. First ESC arms the interrupt
-/// ("press again"), the second raises `INTERRUPTED`. Restores tty settings on
-/// drop; reads are made non-blocking through termios (`min 0 time 1`) so the
-/// watcher exits within ~100 ms instead of swallowing the next REPL line.
-struct EscWatch {
-    stop: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
-    saved: Option<String>,
-}
-
-impl EscWatch {
-    fn start() -> EscWatch {
-        let mut this = EscWatch {
-            stop: Arc::new(AtomicBool::new(false)),
-            thread: None,
-            saved: stty(&["-g"]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-        };
-        if this.saved.is_none()
-            || stty(&["-icanon", "-echo", "min", "0", "time", "1"]).is_none()
-        {
-            return this;
-        }
-        let Ok(mut tty) = std::fs::OpenOptions::new().read(true).open("/dev/tty") else {
-            this.restore();
-            return this;
-        };
-
-        let stop = this.stop.clone();
-        this.thread = Some(thread::spawn(move || {
-            let mut buf = [0u8; 64];
-            let mut armed = false;
-            while !stop.load(Ordering::SeqCst) {
-                let n = match tty.read(&mut buf) {
-                    Ok(0) => continue,
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                for (i, byte) in buf[..n].iter().enumerate() {
-                    if *byte != 0x1b {
-                        continue;
-                    }
-                    // ESC followed by more bytes is an escape sequence (arrows).
-                    if matches!(buf.get(i + 1), Some(b'[') | Some(b'O')) {
-                        break;
-                    }
-                    if armed {
-                        INTERRUPTED.store(true, Ordering::SeqCst);
-                        eprintln!("\nnano: interrupting…");
-                        return;
-                    }
-                    armed = true;
-                    eprintln!("\nnano: press ESC again to interrupt the running command");
-                }
-            }
-        }));
-        this
-    }
-
-    fn restore(&mut self) {
-        if let Some(saved) = self.saved.take() {
-            stty(&[&saved]);
-        }
-    }
-}
-
-impl Drop for EscWatch {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        // Only restore after the watcher is gone, so a pending read cannot hang
-        // on blocking termios settings.
-        self.restore();
-    }
-}
-
-fn stty(args: &[&str]) -> Option<String> {
-    let out = Command::new("stty")
-        .arg("-F")
-        .arg("/dev/tty")
-        .args(args)
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+/// Raise the interrupt request. The caller's event loop owns the terminal, so
+/// it decides when ESC means "stop"; `bash` only watches the flag.
+pub fn interrupt() {
+    INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
 struct Spec {
@@ -280,6 +197,9 @@ fn bash(args: &Value) -> String {
         return "error: missing \"command\"".into();
     };
 
+    // An ESC pressed while no command ran asked for nothing; it must not kill
+    // the first command of the next round.
+    INTERRUPTED.store(false, Ordering::SeqCst);
     let mut child = match Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -294,8 +214,6 @@ fn bash(args: &Value) -> String {
         Err(e) => return format!("error: spawn: {e}"),
     };
     let pid = child.id() as i32;
-    INTERRUPTED.store(false, Ordering::SeqCst);
-    let watch = EscWatch::start();
 
     let stdout = child.stdout.take().expect("stdout");
     let stderr = child.stderr.take().expect("stderr");
@@ -312,19 +230,17 @@ fn bash(args: &Value) -> String {
                 if INTERRUPTED.load(Ordering::SeqCst) && !interrupted {
                     interrupted = true;
                     INTERRUPTED.store(false, Ordering::SeqCst);
-                    let _ = Command::new("kill")
-                        .arg("-TERM")
-                        .arg(format!("-{pid}"))
-                        .status();
+                    // `--` is not optional: without it `kill` reads the
+                    // negative pid as an option and signals nothing.
+                    kill("-TERM", pid);
                     // Grace period, then the whole group gets SIGKILL.
                     let deadline = Instant::now() + Duration::from_secs(2);
                     while Instant::now() < deadline && child.try_wait().ok().flatten().is_none() {
                         thread::sleep(Duration::from_millis(20));
                     }
-                    let _ = Command::new("kill")
-                        .arg("-KILL")
-                        .arg(format!("-{pid}"))
-                        .status();
+                    if child.try_wait().ok().flatten().is_none() {
+                        kill("-KILL", pid);
+                    }
                     match child.wait() {
                         Ok(status) => break status,
                         Err(e) => return format!("error: wait: {e}"),
@@ -342,7 +258,6 @@ fn bash(args: &Value) -> String {
             }
         }
     };
-    drop(watch);
 
     let stdout = out_thread.join().unwrap_or_default();
     let stderr = err_thread.join().unwrap_or_default();
@@ -372,6 +287,19 @@ fn bash(args: &Value) -> String {
         out.push_str("interrupted by user (ESC); the command was killed\n");
     }
     truncate(out, 30_000)
+}
+
+/// Signal the whole process group: a pipeline must not outlive its `sh`.
+/// `--` is not optional and the error output is dropped: by the time the group
+/// is gone, `kill` reporting that is noise on the user's terminal.
+fn kill(signal: &str, pid: i32) {
+    let _ = Command::new("kill")
+        .arg(signal)
+        .arg("--")
+        .arg(format!("-{pid}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn read_all(mut reader: impl Read) -> String {
