@@ -5,8 +5,9 @@
 //! prompt occupies, where the cursor goes, what to repaint after a resize, and
 //! how to push a line into scrollback without losing the drawing. This module
 //! only decides *what* the live region contains: a blank row that keeps the
-//! transcript off the prompt, the queued row, the prompt line, and one row
-//! under it with the status on the left and the selection on the right.
+//! transcript off the prompt, the queued row, the prompt line, an empty row
+//! under it, and below that one row with the status on the left and the
+//! selection on the right.
 
 use std::io::{self, IsTerminal, Stdout, Write};
 
@@ -21,10 +22,10 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthChar;
 
 /// Rows the live region always occupies: a blank gap, the queue, the prompt,
-/// the status and selection row, and a blank row under it. Fixed, so the
-/// viewport never moves under the cursor, the transcript never reaches the
-/// prompt, and nothing is written against the bottom edge.
-const LIVE: u16 = 5;
+/// an empty row, the status and selection row, and a blank row under it.
+/// Fixed, so the viewport never moves under the cursor, the transcript never
+/// reaches the prompt, and nothing is written against the bottom edge.
+const LIVE: u16 = 6;
 
 /// Blank cells at each screen edge: nothing is written against the border.
 const PAD: u16 = 1;
@@ -321,15 +322,15 @@ impl Screen {
                 ])),
                 row(2),
             );
-            if area.height > 3 {
+            if area.height > 4 {
                 frame.render_widget(
                     Paragraph::new(Line::styled(status.clone(), DIM)),
-                    row(3),
+                    row(4),
                 );
                 frame.render_widget(
                     Paragraph::new(Line::styled(info.clone(), DIM))
                         .alignment(Alignment::Right),
-                    row(3),
+                    row(4),
                 );
             }
             if area.height > 1 {
