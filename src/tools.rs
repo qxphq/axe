@@ -150,8 +150,9 @@ fn read_only_bash(args: &Value, cancel: &Cancel) -> String {
     let Some(first) = words.next() else {
         return "error: missing \"command\"".into();
     };
+    let first = bare(first);
     if first == "git" {
-        let sub = words.next().unwrap_or("");
+        let sub = bare(words.next().unwrap_or(""));
         if READ_ONLY_GIT.contains(&sub) {
             return bash(args, cancel);
         }
@@ -167,6 +168,13 @@ fn read_only_bash(args: &Value, cancel: &Cancel) -> String {
         "error: explore mode: {first} is not read-only; allowed: {}",
         READ_ONLY.join(", ")
     )
+}
+
+/// A word with the shell punctuation that separated it from the next command
+/// removed: `ls;` is `ls`. The whole command still goes to `sh -c`, so this is
+/// not a sandbox — it only keeps the leading word from reading as a new name.
+fn bare(word: &str) -> &str {
+    word.trim_end_matches(&[';', '&', '|'][..])
 }
 
 fn read(args: &Value) -> String {
