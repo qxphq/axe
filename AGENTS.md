@@ -90,7 +90,30 @@ cargo build
 cargo run
 ```
 
-No test suite yet. Verify changes against `mock.py` (an OpenAI-compatible mock
-that streams SSE, tool calls, reasoning and keep-alives) for protocol and
-rendering behavior. A pty plus a virtual terminal is the only way to see what the
-user sees; `cargo test` cannot.
+No test suite yet. Verify changes with `./harness.py` (below): a pty plus a
+virtual terminal is the only way to see what the user sees, and `cargo test`
+cannot.
+
+## Testing
+
+`harness.py` is the loop. It starts `mock.py` in-process, writes a throwaway
+config, runs the binary in a tmux pty of a fixed size, sends the keystrokes and
+prints the final screen. Nothing is shared between runs.
+
+```sh
+./harness.py                              # one turn: text:ok
+./harness.py "text:hi" "tool:read:src/ui.rs"
+./harness.py --size 40x12 "blank:hi"
+./harness.py "!a b c" "!C-u" "text:why"   # raw tmux keys, no Enter
+./harness.py --keep "text:ok"             # keep the temp workdir
+```
+
+Each positional argument is a turn: typed, then Enter. One starting with `!` is
+a list of tmux key names sent as-is. `--ansi` keeps colors, `--scroll N` widens
+the history in the dump, `--wait` and `--timeout` bound idling, `--bin` selects
+the binary (built on first use). Mock replies are listed in `mock.py`.
+
+A `tool:` turn keeps calling the same tool: the mock answers from the last user
+message, and a tool result is not one. Interrupt it with `!Escape`.
+
+Requires python3 and tmux; no new crates.
