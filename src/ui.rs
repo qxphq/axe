@@ -346,6 +346,19 @@ impl Screen {
         }
     }
 
+    /// A failed tool call's own words, red, directly under the call: it is part
+    /// of the call's block, so no blank line separates the two.
+    pub fn fail(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let lines: Vec<Line<'static>> = split(text)
+            .into_iter()
+            .map(|line| Line::styled(format!("    {line}"), ERROR_STYLE))
+            .collect();
+        self.insert(lines, Block::Tool);
+    }
+
     /// Repaint the live region.
     pub fn draw(&mut self) -> io::Result<()> {
         let prompt = self.prompt.clone();

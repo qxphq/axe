@@ -452,7 +452,7 @@ impl Session {
                             screen.set_status(&stripped(&partial));
                         }
                         // A tool call and its outcome, on one line.
-                        Event::Echo(spans) => {
+                        Event::Echo(spans, error) => {
                             dirty = true;
                             // A round that only reasoned and called a tool: its
                             // thought ends here, before the call it produced.
@@ -462,6 +462,9 @@ impl Session {
                             // now; the status row goes back to being empty.
                             screen.set_status("");
                             screen.insert(vec![line_of(&spans)], ui::Block::Tool);
+                            if let Some(error) = &error {
+                                screen.fail(error);
+                            }
                         }
                         // Reasoning, dim: it precedes the answer and is not the
                         // answer, and it must not disturb the status row.
@@ -767,8 +770,9 @@ enum Event {
     Key(ratatui::crossterm::event::KeyEvent),
     /// Transcript text: finished model lines, already spaced.
     Printed(String),
-    /// One tool call and its outcome, as styled spans.
-    Echo(Vec<(Paint, String)>),
+    /// One tool call and its outcome, as styled spans, and the failure's own
+    /// words when it failed.
+    Echo(Vec<(Paint, String)>, Option<String>),
     /// A transient label for the status row.
     Status(String),
     /// Streamed reasoning, before any answer text.
@@ -838,8 +842,14 @@ trait Sink {
     fn reasoning(&mut self, text: &str);
     /// A transient label for the live region: "thinking…", a running command.
     fn status(&mut self, text: &str);
-    /// One tool call, finished: the call and its outcome on one line.
-    fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str));
+    /// One tool call, finished: the call and its outcome on one line, and the
+    /// failure's own words beneath it.
+    fn echo(
+        &mut self,
+        call: &[(Paint, String)],
+        mark: (Paint, &'static str),
+        error: Option<&str>,
+    );
     /// A round's text is over; close its last line if it wrote one.
     fn end_round(&mut self);
 }
@@ -903,7 +913,12 @@ impl Sink for PlainSink {
 
     fn status(&mut self, _text: &str) {}
 
-    fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str)) {
+    fn echo(
+        &mut self,
+        call: &[(Paint, String)],
+        mark: (Paint, &'static str),
+        error: Option<&str>,
+    ) {
         self.flush();
         let mut line = String::new();
         for (paint, text) in call {
@@ -912,6 +927,9 @@ impl Sink for PlainSink {
         line.push(' ');
         line.push_str(&mark.0.ansi(mark.1));
         print!("{line}\n");
+        if let Some(error) = error {
+            print!("    {}\n", Paint::Red.ansi(error));
+        }
         io::stdout().flush().ok();
     }
 
@@ -975,12 +993,17 @@ impl Sink for ChannelSink {
         self.send(Event::Status(text.to_string()));
     }
 
-    fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str)) {
+    fn echo(
+        &mut self,
+        call: &[(Paint, String)],
+        mark: (Paint, &'static str),
+        error: Option<&str>,
+    ) {
         self.end_thought();
         let mut spans = call.to_vec();
         spans.push((Paint::Plain, " ".to_string()));
         spans.push((mark.0, mark.1.to_string()));
-        self.send(Event::Echo(spans));
+        self.send(Event::Echo(spans, error.map(str::to_string)));
     }
 
     fn end_round(&mut self) {
@@ -1354,7 +1377,8 @@ fn run_turn(
             // once there is a result to put on it.
             sink.status(&plain_text(&echo));
             let result = tools::execute(&call.name, &call.arguments, cancel, read_only);
-            sink.echo(&echo, mark(&result));
+            let error = failed(&result).then(|| detail(&result));
+            sink.echo(&echo, mark(&result), error.as_deref());
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call.id,
@@ -1490,20 +1514,34 @@ fn call_line(call: &api::ToolCall, read_only: bool) -> Vec<(Paint, String)> {
     spans
 }
 
-/// One glyph for the outcome. A failed tool result is a result, not an error:
-/// tools report failures as text, either `error: ...` or a non-zero `exit: N`.
-fn mark(result: &str) -> (Paint, &'static str) {
-    let failed = if let Some(rest) = result.strip_prefix("exit: ") {
-        let code = rest.lines().next().unwrap_or("").trim();
-        code != "0"
+/// A failed tool result is a result, not an error: tools report failures as
+/// text, either `error: ...` or a non-zero `exit: N`.
+fn failed(result: &str) -> bool {
+    if let Some(rest) = result.strip_prefix("exit: ") {
+        rest.lines().next().unwrap_or("").trim() != "0"
     } else {
         result.starts_with("error:")
-    };
-    if failed {
+    }
+}
+
+/// One glyph for the outcome.
+fn mark(result: &str) -> (Paint, &'static str) {
+    if failed(result) {
         (Paint::Red, "✗")
     } else {
         (Paint::Green, "✓")
     }
+}
+
+/// What to say under a failed call: one line. The `exit: N` header is dropped,
+/// since the mark already reports the failure. The full result still reaches
+/// the model; a build log must not reach the transcript.
+fn detail(result: &str) -> String {
+    let body = match result.strip_prefix("exit: ") {
+        Some(rest) => rest.split_once('\n').map(|(_, body)| body).unwrap_or(""),
+        None => result,
+    };
+    summarize(body.trim_start_matches('\n'), 120)
 }
 
 fn summarize(text: &str, max: usize) -> String {
