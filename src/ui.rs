@@ -23,6 +23,9 @@ use unicode_width::UnicodeWidthChar;
 /// viewport never moves under the cursor.
 const LIVE: u16 = 3;
 
+/// Blank cells at each screen edge: nothing is written against the border.
+const PAD: u16 = 1;
+
 const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan);
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 const ERROR_STYLE: Style = Style::new().fg(Color::Red);
@@ -161,10 +164,13 @@ impl Screen {
     /// the transcript scrolls, so it must not lose the tail of a long line.
     pub fn insert(&mut self, lines: Vec<Line<'static>>) {
         let width = self.term.size().map(|s| s.width).unwrap_or(80).max(1) as usize;
+        // Wrap and render inside the margin, so nothing lands on the edge.
+        let margin = PAD.min(width.saturating_sub(1) as u16);
+        let width = width.saturating_sub(2 * margin as usize).max(1);
         let rows: Vec<Line<'static>> = lines.into_iter().flat_map(|line| wrap(line, width)).collect();
         let height = rows.len() as u16;
         let _ = self.term.insert_before(height, |buf| {
-            Paragraph::new(rows).render(buf.area, buf);
+            Paragraph::new(rows).render(inset(buf.area, margin), buf);
         });
         let _ = self.draw();
     }
@@ -209,7 +215,11 @@ impl Screen {
     pub fn draw(&mut self) -> io::Result<()> {
         let prompt = self.prompt.clone();
         let width = self.term.size()?.width;
-        let avail = (width as usize).saturating_sub(prompt.chars().count()).max(1);
+        let margin = PAD.min(width.saturating_sub(1));
+        let avail = (width as usize)
+            .saturating_sub(2 * margin as usize)
+            .saturating_sub(prompt.chars().count())
+            .max(1);
         // One row, scrolled horizontally: no wrapping to predict.
         let scroll = if self.cursor >= avail { self.cursor + 1 - avail } else { 0 };
         let visible: String = self.buf.chars().skip(scroll).take(avail).collect();
@@ -219,6 +229,7 @@ impl Screen {
 
         self.term.draw(|frame| {
             let area = frame.area();
+            let area = inset(area, margin);
             let row = |offset: u16| Rect {
                 y: area.y + offset,
                 height: 1,
@@ -436,6 +447,15 @@ impl Screen {
 impl Drop for Screen {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+/// The area with `pad` blank cells taken off the left and right edges.
+fn inset(area: Rect, pad: u16) -> Rect {
+    Rect {
+        x: area.x + pad,
+        width: area.width.saturating_sub(2 * pad),
+        ..area
     }
 }
 

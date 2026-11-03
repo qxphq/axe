@@ -103,7 +103,8 @@ fn run() -> Result<(), String> {
         .find(|(spec, _)| *spec == format!("{}/{}", providers[provider].name, model))
         .map(|(_, level)| level.clone());
     validate_level(&providers[provider].cfg, thinking.as_deref());
-    println!("{}", selection(&providers, provider, &model, &thinking));
+    // One leading blank: the same margin `ui::Screen` keeps on both edges.
+    println!(" {}", selection(&providers, provider, &model, &thinking));
 
     let mut system = tools::system_prompt();
     if let Some(text) = &global_agents {
