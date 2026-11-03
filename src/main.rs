@@ -1,7 +1,7 @@
 mod api;
 mod config;
 mod http;
-mod term;
+mod ui;
 mod tools;
 
 use std::cell::RefCell;
@@ -12,8 +12,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use ratatui::crossterm::event::{KeyCode, KeyEventKind};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use serde_json::{json, Value};
-use termion::event::Key;
 
 struct Provider {
     name: String,
@@ -26,7 +28,7 @@ struct Provider {
 
 fn main() {
     if let Err(e) = run() {
-        warn(&format!("nano: {e}\n"));
+        eprintln!("nano: {e}");
         std::process::exit(1);
     }
 }
@@ -101,7 +103,7 @@ fn run() -> Result<(), String> {
         .find(|(spec, _)| *spec == format!("{}/{}", providers[provider].name, model))
         .map(|(_, level)| level.clone());
     validate_level(&providers[provider].cfg, thinking.as_deref());
-    print_selection(&providers, provider, &model, &thinking);
+    println!("{}", selection(&providers, provider, &model, &thinking));
 
     let mut system = tools::system_prompt();
     if let Some(text) = &global_agents {
@@ -127,7 +129,7 @@ fn run() -> Result<(), String> {
         messages,
     };
 
-    if term::is_interactive() {
+    if ui::is_interactive() {
         session.run_interactive()
     } else {
         session.run_piped()
@@ -157,10 +159,11 @@ impl Session {
     /// One line at a time from a terminal we own. Keys arrive on the channel, so
     /// a turn in flight never blocks the prompt.
     fn run_interactive(mut self) -> Result<(), String> {
+        let mut screen =
+            ui::Screen::new("> ").map_err(|e| format!("cannot take the terminal: {e}"))?;
         let (tx, rx) = mpsc::channel();
         spawn_input(tx.clone());
 
-        let mut editor = term::Editor::new().open();
         // A line submitted mid-turn waits here until the turn boundary, where it
         // is dispatched exactly like a line typed while idle. That is why slash
         // commands are handled in this loop and not only where they are parsed.
@@ -168,43 +171,34 @@ impl Session {
         loop {
             let line = match pending.take() {
                 Some(line) => line,
-                None => {
-                    // Erase first: the previous drawing still sits on screen,
-                    // and a newline under it would leave a phantom prompt.
-                    editor.erase();
-                    term::out("\n");
-                    let Some(line) = read_line(&mut editor, &rx) else {
-                        break;
-                    };
-                    line
-                }
+                None => match readline(&mut screen, &rx) {
+                    Some(line) => line,
+                    None => break,
+                },
             };
-            match self.dispatch(&line, &mut |prompt| {
-                // A command's own prompt is temporary: restore the REPL's once
-                // the line is in.
-                let saved = editor.prompt().to_string();
-                editor.set_prompt(prompt);
-                let line = read_line(&mut editor, &rx);
-                editor.set_prompt(&saved);
-                line
-            }) {
+            match self.dispatch(&line, &mut screen, &rx) {
                 Cmd::Exit => break,
                 Cmd::Continue => {}
                 Cmd::Turn(input) => {
-                    pending = self.messages_turn(&input, &tx, &rx, &mut editor)?;
+                    pending = self.messages_turn(&input, &tx, &rx, &mut screen)?;
                 }
             }
         }
+        screen.close();
         Ok(())
     }
 
     /// No tty: the kernel edits the line and the turn prints as it streams.
     fn run_piped(mut self) -> Result<(), String> {
         loop {
-            let Some(line) = term::cooked_line("> ") else {
+            let Some(line) = ui::cooked_line("> ") else {
                 break;
             };
-            match self.dispatch(&line, &mut |prompt| term::cooked_line(prompt)) {
+            let cmd = match line.trim() {
+                "" => Cmd::Continue,
+                _ => dispatch_piped(&mut self, &line),
+            };
+            match cmd {
                 Cmd::Exit => break,
                 Cmd::Continue => {}
                 Cmd::Turn(input) => {
@@ -212,7 +206,7 @@ impl Session {
                     let cancel = AtomicBool::new(false);
                     self.messages.push(json!({ "role": "user", "content": input }));
                     if let Err(e) = self.turn(&mut sink, &cancel) {
-                        warn(&format!("nano: {e}\n"));
+                        eprintln!("nano: {e}");
                     }
                 }
             }
@@ -226,18 +220,18 @@ impl Session {
         input: &str,
         tx: &Sender<Event>,
         rx: &Receiver<Event>,
-        editor: &mut term::Editor,
+        screen: &mut ui::Screen,
     ) -> Result<Option<String>, String> {
         self.messages.push(json!({ "role": "user", "content": input }));
 
         let cancel = Arc::new(AtomicBool::new(false));
         let mut queued: Option<String> = None;
         // Streamed text up to the last newline is permanent; the rest is the
-        // line still being written and is drawn, not printed.
+        // line still being written and lives in the status row.
         let mut partial = String::new();
 
-        editor.set_status("thinking…");
-        editor.draw();
+        screen.set_status("thinking…");
+        let _ = screen.draw();
 
         let messages = &mut self.messages;
         let provider = &self.providers[self.provider];
@@ -265,8 +259,7 @@ impl Session {
 
             loop {
                 // Block for the first event, then take everything already
-                // queued before drawing once: a repaint per token is unusable,
-                // and the output is the same either way.
+                // queued before drawing once: a repaint per token is a waste.
                 let first = match rx.recv_timeout(Duration::from_millis(50)) {
                     Ok(ev) => Some(ev),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -286,66 +279,56 @@ impl Session {
                 while let Some(ev) = next.take().or_else(|| rx.try_recv().ok()) {
                     match ev {
                         // ESC is the interrupt, and it means one thing: stop
-                        // the command that is running. The editor reports the
+                        // the command that is running. The screen reports the
                         // key, the tool layer watches the flag.
-                        Event::Key(Key::Esc) => tools::interrupt(),
-                        Event::Key(key) => match editor.apply_key(key) {
-                            term::Action::Eof => {
+                        Event::Key(key) if key.code == KeyCode::Esc => tools::interrupt(),
+                        Event::Key(key) => match screen.apply_key(key) {
+                            ui::Action::Eof => {
                                 cancel.store(true, Ordering::SeqCst);
                                 done = true;
                             }
-                            term::Action::Submit => {
-                                if !editor.is_empty() && queued.is_none() {
-                                    queued = Some(editor.commit());
-                                    editor.set_queued(queued.as_deref());
+                            ui::Action::Submit => {
+                                if !screen.is_empty() && queued.is_none() {
+                                    queued = Some(screen.commit());
+                                    screen.set_queued(queued.as_deref());
                                     dirty = true;
                                 }
                             }
-                            term::Action::None => dirty = true,
+                            ui::Action::None => dirty = true,
                         },
-                        Event::Raw(text) => {
-                            // Tool-call echoes are not model text: they must not
-                            // disturb the unfinished line, only the drawing.
-                            dirty = true;
-                            editor.erase();
-                            term::out(&format!("{text}\n"));
-                        }
+                        // Model text, already spaced by the sink: everything up
+                        // to the last newline is a finished line.
                         Event::Printed(text) => {
                             dirty = true;
                             partial.push_str(&text);
-                            // Everything up to the last newline is permanent;
-                            // what follows it is the line still being written.
-                            let done = match partial.rfind('\n') {
+                            let finished = match partial.rfind('\n') {
                                 Some(at) => partial.drain(..=at).collect::<String>(),
                                 None => String::new(),
                             };
-                            // Status first: `say` redraws, and it must redraw the
-                            // new state, not the line it is about to print.
-                            editor.set_status(&stripped(&partial));
-                            if !done.is_empty() {
-                                say(editor, &done);
+                            if !finished.is_empty() {
+                                screen.text(&finished);
                             }
+                            screen.set_status(&stripped(&partial));
                         }
-                        Event::Reasoning => {
-                            let label = stripped(&partial);
-                            let label = if label.is_empty() {
-                                "thinking…".to_string()
-                            } else {
-                                label
-                            };
-                            if editor.status() != label {
+                        // A tool call and its outcome, on one line.
+                        Event::Echo(spans) => {
+                            dirty = true;
+                            // The command that was running is in the transcript
+                            // now; the status row goes back to being empty.
+                            screen.set_status("");
+                            screen.insert(vec![line_of(&spans)]);
+                        }
+                        Event::Status(text) => {
+                            if screen.status() != text {
                                 dirty = true;
-                                editor.set_status(&label);
+                                screen.set_status(&text);
                             }
                         }
                         Event::Done(Err(e)) => {
-                            editor.erase();
-                            warn(&format!("nano: {e}\n"));
+                            screen.error(&format!("nano: {e}\n"));
                             done = true;
                         }
                         Event::Done(Ok(())) => {
-                            // `end_round` closed the last line, so nothing is
-                            // left pending.
                             partial.clear();
                             done = true;
                         }
@@ -359,7 +342,7 @@ impl Session {
                     }
                 }
                 if dirty {
-                    editor.draw();
+                    let _ = screen.draw();
                 }
                 if done || cancel.load(Ordering::SeqCst) {
                     break;
@@ -367,11 +350,11 @@ impl Session {
             }
             handle.join().is_ok()
         });
-        editor.set_status("");
-        editor.set_queued(None);
+        screen.set_status("");
+        screen.set_queued(None);
 
         if !result {
-            warn("nano: turn failed\n");
+            screen.error("nano: turn failed\n");
         }
         Ok(queued)
     }
@@ -390,12 +373,13 @@ impl Session {
         )
     }
 
-    /// Slash commands and selection changes. `read` supplies a line from the
-    /// terminal for the model picker; piped mode passes a no-op.
+    /// Slash commands and selection changes. `screen` supplies a line from the
+    /// terminal for the model picker.
     fn dispatch(
         &mut self,
         line: &str,
-        read: &mut dyn FnMut(&str) -> Option<String>,
+        screen: &mut ui::Screen,
+        rx: &Receiver<Event>,
     ) -> Cmd {
         let input = line.trim();
         if input.is_empty() {
@@ -407,7 +391,7 @@ impl Session {
         match input {
             "/exit" | "/quit" => return Cmd::Exit,
             "/help" => {
-                say_all(
+                screen.text(
                     "/model [id]    pick or switch model\n\
                      /models        list models\n\
                      /thinking [l]  show or set thinking level (off, low, medium, high)\n\
@@ -416,14 +400,16 @@ impl Session {
                 return Cmd::Continue;
             }
             "/models" => {
-                print_models(providers);
+                let text = models(&providers);
+                screen.text(&text);
                 return Cmd::Continue;
             }
             "/model" => {
-                if let Some((pi, id)) = pick(providers, (provider, model), read) {
+                if let Some((pi, id)) = pick(providers, (provider, model), screen, rx) {
                     self.provider = pi;
                     self.model = id;
-                    print_selection(providers, self.provider, &self.model, &self.thinking);
+                    let text = selection(providers, self.provider, &self.model, &self.thinking);
+                    screen.text(&format!("{text}\n"));
                     save_selection(&providers[self.provider].name, &self.model);
                 }
                 return Cmd::Continue;
@@ -434,7 +420,7 @@ impl Session {
         if input == "/thinking" || input.starts_with("/thinking ") {
             let rest = input.strip_prefix("/thinking").unwrap_or("").trim();
             if rest.is_empty() {
-                say_all(&format!(
+                screen.text(&format!(
                     "thinking: {}\n\n",
                     thinking_label(&providers[self.provider].cfg, &self.thinking)
                 ));
@@ -444,7 +430,7 @@ impl Session {
                 self.thinking = Some(level.clone());
                 let spec = format!("{}/{}", providers[self.provider].name, self.model);
                 config::save_thinking(&spec, level.as_str());
-                say_all(&format!(
+                screen.text(&format!(
                     "thinking: {}\n\n",
                     thinking_label(&providers[self.provider].cfg, &self.thinking)
                 ));
@@ -466,21 +452,17 @@ impl Session {
                             *spec == format!("{}/{}", providers[self.provider].name, self.model)
                         })
                         .map(|(_, level)| level.clone());
-                    print_selection(
-                        providers,
-                        self.provider,
-                        &self.model,
-                        &self.thinking,
-                    );
+                    let text = selection(providers, self.provider, &self.model, &self.thinking);
+                    screen.text(&format!("{text}\n"));
                     save_selection(&providers[self.provider].name, &self.model);
                 }
-                None => eprintln!("unknown model: {spec}"),
+                None => screen.error(&format!("unknown model: {spec}\n")),
             }
             return Cmd::Continue;
         }
 
         if input.starts_with('/') {
-            warn(&format!("unknown command: {input}\n"));
+            screen.error(&format!("unknown command: {input}\n"));
             return Cmd::Continue;
         }
 
@@ -488,15 +470,92 @@ impl Session {
     }
 }
 
+/// The same dispatch for a terminal that is not ours: commands only, warnings
+/// on stderr, no picker.
+fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
+    let input = line.trim();
+    let providers = &session.providers;
+    match input {
+        "/exit" | "/quit" => return Cmd::Exit,
+        "/help" => {
+            println!(
+                "/model [id]    pick or switch model\n\
+                 /models        list models\n\
+                 /thinking [l]  show or set thinking level (off, low, medium, high)\n\
+                 /exit          quit"
+            );
+            return Cmd::Continue;
+        }
+        "/models" => {
+            println!("{}", models(providers).trim_end());
+            return Cmd::Continue;
+        }
+        "/model" => {
+            eprintln!("nano: /model needs a terminal");
+            return Cmd::Continue;
+        }
+        _ => {}
+    }
+    if let Some(rest) = input.strip_prefix("/model ") {
+        match find(providers, rest.trim()) {
+            Some((pi, id)) => {
+                session.provider = pi;
+                session.model = id;
+                session.thinking = session
+                    .cfg
+                    .thinking
+                    .iter()
+                    .find(|(spec, _)| {
+                        *spec == format!("{}/{}", providers[session.provider].name, session.model)
+                    })
+                    .map(|(_, level)| level.clone());
+                println!(
+                    "{}",
+                    selection(
+                        providers,
+                        session.provider,
+                        &session.model,
+                        &session.thinking
+                    )
+                );
+                save_selection(&providers[session.provider].name, &session.model);
+            }
+            None => eprintln!("nano: unknown model: {}", rest.trim()),
+        }
+        return Cmd::Continue;
+    }
+    if input == "/thinking" || input.starts_with("/thinking ") {
+        let rest = input.strip_prefix("/thinking").unwrap_or("").trim();
+        if rest.is_empty() {
+            println!(
+                "thinking: {}",
+                thinking_label(&providers[session.provider].cfg, &session.thinking)
+            );
+            return Cmd::Continue;
+        }
+        if let Some(level) = set_thinking(&providers[session.provider].cfg, rest) {
+            session.thinking = Some(level.clone());
+            let spec = format!("{}/{}", providers[session.provider].name, session.model);
+            config::save_thinking(&spec, level.as_str());
+        }
+        return Cmd::Continue;
+    }
+    if input.starts_with('/') {
+        eprintln!("nano: unknown command: {input}");
+        return Cmd::Continue;
+    }
+    Cmd::Turn(input.to_string())
+}
+
 /// Events from the two producers that never draw: keys, and the turn.
 enum Event {
-    Key(Key),
-    /// Finished model lines, printed permanently above the prompt.
+    Key(ratatui::crossterm::event::KeyEvent),
+    /// Transcript text: finished model lines, already spaced.
     Printed(String),
-    /// Raw output (a tool-call echo): permanent, but not model text.
-    Raw(String),
-    /// The model is reasoning; no answer text yet.
-    Reasoning,
+    /// One tool call and its outcome, as styled spans.
+    Echo(Vec<(Paint, String)>),
+    /// A transient label for the status row.
+    Status(String),
     Done(Result<(), String>),
     Eof,
 }
@@ -504,66 +563,50 @@ enum Event {
 /// Blocking `read` for the terminal's keys. Nothing else may read stdin.
 fn spawn_input(tx: Sender<Event>) {
     thread::spawn(move || {
-        use termion::input::TermRead;
-        for event in io::stdin().events() {
-            let Ok(termion::event::Event::Key(key)) = event else {
-                continue;
-            };
-            if tx.send(Event::Key(key)).is_err() {
-                return;
+        use ratatui::crossterm::event::{read, Event as TermEvent};
+        loop {
+            match read() {
+                // Key releases (kitty protocol) are not new input.
+                Ok(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
+                    if tx.send(Event::Key(key)).is_err() {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
             }
         }
         let _ = tx.send(Event::Eof);
     });
 }
 
-/// Collect one line from the editor. Keys are the only input while idle.
-fn read_line(editor: &mut term::Editor, rx: &Receiver<Event>) -> Option<String> {
-    editor.draw();
+/// Collect one line from the prompt. Keys are the only input while idle.
+fn readline(screen: &mut ui::Screen, rx: &Receiver<Event>) -> Option<String> {
+    let _ = screen.draw();
     loop {
         match rx.recv() {
-            Ok(Event::Key(key)) => match editor.apply_key(key) {
-                term::Action::Submit => return Some(editor.commit()),
-                term::Action::Eof => {
-                    editor.erase();
-                    return None;
+            Ok(Event::Key(key)) => match screen.apply_key(key) {
+                // Enter on an empty line commits nothing: a bare prompt in the
+                // transcript is noise, and an empty line is not input.
+                ui::Action::Submit if screen.is_empty() => {}
+                ui::Action::Submit => return Some(screen.commit()),
+                ui::Action::Eof => return None,
+                ui::Action::None => {
+                    let _ = screen.draw();
                 }
-                term::Action::None => editor.draw(),
             },
-            Ok(Event::Eof) | Err(_) => {
-                editor.erase();
-                return None;
-            }
+            Ok(Event::Eof) | Err(_) => return None,
             // A turn's events cannot arrive while idle; drop them if they do.
             Ok(_) => {}
         }
     }
 }
 
+/// Print text that arrives outside the drawing loop (a slash command's output).
+/// It is permanent, exactly like streamed text.
 /// A drawn row, so it must not carry the newlines that end transcript lines.
 fn stripped(text: &str) -> String {
     text.trim_start_matches(['\n', '\r']).replace(['\n', '\r'], " ")
-}
-
-/// A command's output. No drawing is on screen when one runs: the line was
-/// committed before `dispatch` saw it.
-fn say_all(text: &str) {
-    term::out(text);
-}
-
-/// The same for warnings, which go to stderr but share the terminal.
-fn warn(text: &str) {
-    term::err(text);
-}
-
-fn say(editor: &mut term::Editor, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    // Permanent text: erase the drawing, write, redraw underneath.
-    editor.erase();
-    term::out(text);
-    editor.draw();
 }
 
 /// Where a turn's output goes: straight to stdout when piped, onto the channel
@@ -572,9 +615,10 @@ trait Sink {
     /// Streamed model text. `TextSink` owns the spacing: finished lines go out
     /// permanently, the unfinished one is exposed as a tail.
     fn text(&mut self, text: &str);
-    /// Raw output: no spacing decisions, no trailing newline. Goes out
-    /// permanently, so a tool-call line is never lost to a redrawn frame.
-    fn append(&mut self, text: &str);
+    /// A transient label for the live region: "thinking…", a running command.
+    fn status(&mut self, text: &str);
+    /// One tool call, finished: the call and its outcome on one line.
+    fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str));
     /// A round's text is over; close its last line if it wrote one.
     fn end_round(&mut self);
     fn reasoning(&mut self);
@@ -593,8 +637,16 @@ impl Sink for PlainSink {
         io::stdout().flush().ok();
     }
 
-    fn append(&mut self, text: &str) {
-        print!("{text}");
+    fn status(&mut self, _text: &str) {}
+
+    fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str)) {
+        let mut line = String::new();
+        for (paint, text) in call {
+            line.push_str(&paint.ansi(text));
+        }
+        line.push(' ');
+        line.push_str(&mark.0.ansi(mark.1));
+        print!("{line}\n");
         io::stdout().flush().ok();
     }
 
@@ -614,11 +666,8 @@ struct ChannelSink {
 }
 
 impl ChannelSink {
-    /// Permanent text first, then the unfinished line: one order, always.
-    fn publish(&self, done: String) {
-        if !done.is_empty() {
-            let _ = self.tx.send(Event::Printed(done));
-        }
+    fn send(&self, event: Event) {
+        let _ = self.tx.send(event);
     }
 }
 
@@ -626,13 +675,20 @@ impl Sink for ChannelSink {
     fn text(&mut self, text: &str) {
         let mut done = String::new();
         self.out.push(text, &mut done);
-        self.publish(done);
+        if !done.is_empty() {
+            self.send(Event::Printed(done));
+        }
     }
 
-    fn append(&mut self, text: &str) {
-        if !text.is_empty() {
-            let _ = self.tx.send(Event::Raw(text.to_string()));
-        }
+    fn status(&mut self, text: &str) {
+        self.send(Event::Status(text.to_string()));
+    }
+
+    fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str)) {
+        let mut spans = call.to_vec();
+        spans.push((Paint::Plain, " ".to_string()));
+        spans.push((mark.0, mark.1.to_string()));
+        self.send(Event::Echo(spans));
     }
 
     fn end_round(&mut self) {
@@ -640,13 +696,75 @@ impl Sink for ChannelSink {
         if std::mem::take(&mut self.out.wrote) {
             // The reply ended without a final newline, so the line it left
             // unfinished becomes permanent here.
-            self.publish("\n".to_string());
+            self.send(Event::Printed("\n".to_string()));
         }
     }
 
     fn reasoning(&mut self) {
-        let _ = self.tx.send(Event::Reasoning);
+        self.send(Event::Status("thinking…".to_string()));
     }
+}
+
+/// A style this binary uses for transcript text. Two renderers read it: the
+/// screen's cells, and ANSI escapes when there is no screen.
+#[derive(Clone, Copy)]
+enum Paint {
+    Plain,
+    Dim,
+    Yellow,
+    Green,
+    Red,
+}
+
+impl Paint {
+    fn style(self) -> Style {
+        match self {
+            Paint::Plain => Style::new(),
+            Paint::Dim => Style::new().add_modifier(Modifier::DIM),
+            Paint::Yellow => Style::new().fg(Color::Yellow),
+            Paint::Green => Style::new().fg(Color::Green),
+            Paint::Red => Style::new().fg(Color::Red),
+        }
+    }
+
+    /// ANSI colors only when stdout is a terminal, so redirected output stays
+    /// plain.
+    fn ansi(self, text: &str) -> String {
+        let code = match self {
+            Paint::Plain => return text.to_string(),
+            Paint::Dim => "2",
+            Paint::Yellow => "33",
+            Paint::Green => "32",
+            Paint::Red => "31",
+        };
+        if io::stdout().is_terminal() {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn span(self, text: String) -> Span<'static> {
+        Span::styled(text, self.style())
+    }
+}
+
+fn line_of(spans: &[(Paint, String)]) -> Line<'static> {
+    Line::from(
+        spans
+            .iter()
+            .map(|(paint, text)| paint.span(text.clone()))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn plain_text(spans: &[(Paint, String)]) -> String {
+    spans
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn thinking_label(provider: &config::ProviderConfig, level: &Option<String>) -> String {
@@ -673,7 +791,10 @@ fn set_thinking(provider: &config::ProviderConfig, input: &str) -> Option<String
         .find(|name| name.eq_ignore_ascii_case(input))
         .cloned();
     if level.is_none() {
-        warn(&format!("unknown thinking level: {input} (known: {})\n", names.join(", ")));
+        eprintln!(
+            "nano: unknown thinking level: {input} (known: {})",
+            names.join(", ")
+        );
     }
     level
 }
@@ -682,27 +803,27 @@ fn set_thinking(provider: &config::ProviderConfig, input: &str) -> Option<String
 fn validate_level(provider: &config::ProviderConfig, level: Option<&str>) {
     let Some(level) = level else { return };
     if !level_names(provider).iter().any(|name| name == level) {
-        warn(&format!(
-            "{}: thinking level \"{level}\" is not configured, using default\n",
+        eprintln!(
+            "nano: {}: thinking level \"{level}\" is not configured, using default",
             provider.name
-        ));
+        );
     }
 }
 
-fn print_selection(
+fn selection(
     providers: &[Provider],
     provider: usize,
     model: &str,
     thinking: &Option<String>,
-) {
+) -> String {
     let level = match thinking {
         Some(level) => level.clone(),
         None => "default".to_string(),
     };
-    say_all(&format!(
-        "model: {}/{}\nthinking: {}\n",
+    format!(
+        "model: {}/{}\nthinking: {}",
         providers[provider].name, model, level
-    ));
+    )
 }
 
 /// Persist the current selection so the next run starts on the same model.
@@ -724,21 +845,18 @@ fn session_id() -> String {
     format!("{:x}{:x}", std::process::id(), nanos)
 }
 
-fn print_models(providers: &[Provider]) {
+fn models(providers: &[Provider]) -> String {
     let mut text = String::new();
     for p in providers {
         text.push_str(&format!("{}:\n", p.name));
         for m in &p.models {
             match m.context {
                 Some(ctx) => text.push_str(&format!("  {}/{}  ({} ctx)\n", p.name, m.id, ctx)),
-                None => text.push_str(&format!("  {}/{}", p.name, m.id)),
-            }
-            if m.context.is_none() {
-                text.push('\n');
+                None => text.push_str(&format!("  {}/{}\n", p.name, m.id)),
             }
         }
     }
-    say_all(&text);
+    text
 }
 
 fn find(providers: &[Provider], spec: &str) -> Option<(usize, String)> {
@@ -762,7 +880,7 @@ fn resolve(providers: &[Provider], spec: Option<&str>) -> (usize, String) {
         if let Some(hit) = find(providers, spec) {
             return hit;
         }
-        warn(&format!("model {spec:?} not available, using default\n"));
+        eprintln!("nano: model {spec:?} not available, using default");
     }
     (0, providers[0].models[0].id.clone())
 }
@@ -770,7 +888,8 @@ fn resolve(providers: &[Provider], spec: Option<&str>) -> (usize, String) {
 fn pick(
     providers: &[Provider],
     current: (usize, &str),
-    read: &mut dyn FnMut(&str) -> Option<String>,
+    screen: &mut ui::Screen,
+    rx: &Receiver<Event>,
 ) -> Option<(usize, String)> {
     let mut items: Vec<(usize, String)> = Vec::new();
     let mut text = String::new();
@@ -791,9 +910,12 @@ fn pick(
         }
     }
 
-    say_all(&text);
-    let line = read("model> ")?;
-    let choice = line.trim();
+    screen.text(&text);
+    let saved = screen.prompt().to_string();
+    screen.set_prompt("model> ");
+    let choice = readline(screen, rx).unwrap_or_default();
+    screen.set_prompt(&saved);
+    let choice = choice.trim().to_string();
     if choice.is_empty() {
         return None;
     }
@@ -802,16 +924,16 @@ fn pick(
         return match items.get(n.wrapping_sub(1)) {
             Some(hit) if n >= 1 => Some(hit.clone()),
             _ => {
-                warn(&format!("no model #{n}\n"));
+                screen.error(&format!("no model #{n}\n"));
                 None
             }
         };
     }
 
-    match find(providers, choice) {
+    match find(providers, &choice) {
         Some(hit) => Some(hit),
         None => {
-            warn(&format!("unknown model: {choice}\n"));
+            screen.error(&format!("unknown model: {choice}\n"));
             None
         }
     }
@@ -882,9 +1004,12 @@ fn run_turn(
             if cancel.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            sink.append(&call_line(call));
+            let echo = call_line(call);
+            // What is running, while it runs: the finished line appears below
+            // once there is a result to put on it.
+            sink.status(&plain_text(&echo));
             let result = tools::execute(&call.name, &call.arguments);
-            sink.append(&format!(" {}", mark(&result)));
+            sink.echo(&echo, mark(&result));
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call.id,
@@ -914,8 +1039,7 @@ impl TextSink {
     /// Feed streamed text and append whatever may be printed now.
     ///
     /// Text is emitted as it arrives: holding a line until its newline would
-    /// mean nothing appears until the line ends. `out` must be permanent, not
-    /// part of a redrawn frame: frames that scroll off the top are gone.
+    /// mean nothing appears until the line ends.
     fn push(&mut self, text: &str, out: &mut String) {
         for ch in text.chars() {
             if ch == '\n' {
@@ -929,7 +1053,7 @@ impl TextSink {
                 // One blank line separates a reply from whatever precedes it.
                 // Emitted here, not per round: a round with no text must not
                 // widen the gap between two tool calls.
-                out.push_str("\n\n");
+                out.push('\n');
             }
             for _ in 0..self.pending {
                 out.push('\n');
@@ -952,22 +1076,31 @@ impl TextSink {
 // A glyph per tool says what it does at a glance: read-only is dim, anything
 // that can change the tree is yellow. `bash` has no call syntax; its command
 // stands alone.
-fn call_line(call: &api::ToolCall) -> String {
+fn call_line(call: &api::ToolCall) -> Vec<(Paint, String)> {
     let v: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-    let (glyph, code) = match call.name.as_str() {
-        "read" => ("◇", "2"),
-        "write" => ("✚", "33"),
-        "edit" => ("✎", "33"),
-        "bash" => ("❯", "33"),
-        _ => ("◆", "33"),
+    let (glyph, paint) = match call.name.as_str() {
+        "read" => ("◇", Paint::Dim),
+        _ => ("✚", Paint::Yellow),
     };
+    let (glyph, paint) = match call.name.as_str() {
+        "read" => (glyph, paint),
+        "write" => ("✚", Paint::Yellow),
+        "edit" => ("✎", Paint::Yellow),
+        "bash" => ("❯", Paint::Yellow),
+        _ => (glyph, paint),
+    };
+
     if call.name == "bash" {
         let cmd = v["command"].as_str().map(|s| summarize(s, 120));
-        return match cmd {
-            Some(cmd) => format!("    {} {}", paint(code, glyph), paint(code, &cmd)),
-            None => format!("    {} {}", paint(code, glyph), paint(code, "bash")),
-        };
+        let cmd = cmd.unwrap_or_else(|| "bash".to_string());
+        return vec![
+            (Paint::Plain, "    ".to_string()),
+            (paint, glyph.to_string()),
+            (Paint::Plain, " ".to_string()),
+            (paint, cmd),
+        ];
     }
+
     let mut parts = Vec::new();
     for key in ["path", "file", "pattern"] {
         if let Some(s) = v[key].as_str() {
@@ -984,19 +1117,23 @@ fn call_line(call: &api::ToolCall) -> String {
             None => format!("{start}+"),
         });
     }
-    // Read-only calls are dim; anything that can change the tree is yellow.
-    let name = paint(code, &call.name);
-    let glyph = paint(code, glyph);
+
+    let mut spans = vec![
+        (Paint::Plain, "    ".to_string()),
+        (paint, glyph.to_string()),
+        (Paint::Plain, " ".to_string()),
+        (paint, call.name.clone()),
+    ];
     if parts.is_empty() {
-        format!("    {glyph} {name}")
-    } else {
-        format!("    {glyph} {name}({})", parts.join(" "))
+        return spans;
     }
+    spans.push((Paint::Plain, format!("({})", parts.join(" "))));
+    spans
 }
 
 /// One glyph for the outcome. A failed tool result is a result, not an error:
 /// tools report failures as text, either `error: ...` or a non-zero `exit: N`.
-fn mark(result: &str) -> String {
+fn mark(result: &str) -> (Paint, &'static str) {
     let failed = if let Some(rest) = result.strip_prefix("exit: ") {
         let code = rest.lines().next().unwrap_or("").trim();
         code != "0"
@@ -1004,22 +1141,14 @@ fn mark(result: &str) -> String {
         result.starts_with("error:")
     };
     if failed {
-        paint("31", "✗")
+        (Paint::Red, "✗")
     } else {
-        paint("32", "✓")
+        (Paint::Green, "✓")
     }
 }
 
-/// ANSI colors only when stdout is a terminal, so redirected output stays plain.
-fn paint(code: &str, text: &str) -> String {
-    if io::stdout().is_terminal() {
-        format!("\x1b[{code}m{text}\x1b[0m")
-    } else {
-        text.to_string()
-    }
-}
-
-fn summarize(text: &str, max: usize) -> String {    let line = text.lines().next().unwrap_or("");
+fn summarize(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or("");
     let mut out: String = line.chars().take(max).collect();
     if line.chars().count() > max || text.lines().count() > 1 {
         out.push('…');
