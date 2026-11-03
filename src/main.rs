@@ -49,7 +49,7 @@ fn run() -> Result<(), String> {
     let notice = project_file
         .as_deref()
         .filter(|_| project_agents.is_some())
-        .map(|f| format!("nano: using project instructions from {}", f.display()));
+        .map(|f| format!("Using project instructions from {}", f.display()));
 
     let mut providers = Vec::new();
     let session = session_id();
@@ -941,6 +941,7 @@ fn banner(note: Option<&str>) {
         println!(" {}", Paint::Cyan.ansi(line));
     }
     if let Some(note) = note {
+        println!();
         println!(" {}", Paint::Dim.ansi(note));
     }
     println!();
