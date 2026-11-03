@@ -42,19 +42,25 @@ providers, four tools. Roughly 4.5k LOC across seven files.
     keep-alive comments, session headers). No speculative fixes; only fix what a
     reproduction shows.
 12. **A scrolling REPL, not a TUI.** No alt-screen: the transcript is the user's
-    scrollback. The only owned region is a fixed six-row live area at the bottom
-    (queued, prompt, an empty row, status) inside a `Viewport::Inline`. Everything
-    above it is appended, never repainted.
+    scrollback. The only owned region is a live area at the bottom (queued, one row
+    per wrapped prompt line, an empty row, status) inside a `Viewport::Inline`. It is
+    five rows of chrome plus the prompt, capped at half the screen: growing it pushes
+    transcript lines into scrollback, shrinking leaves their rows blank until the
+    next output fills them. Everything above it is appended, never repainted.
 13. **One writer.** Only `ui::Screen` touches the terminal. An event may mutate state
     and ask for output; nothing else prints. A stray `print!` is a rendering bug.
+14. **The prompt is a block.** Every line of the prompt carries its glyph (the live
+    `❯ `, the committed `█ `), so a wrapped line reads as one block, not as text
+    running off the edge.
 
 ## Architecture
 
 - `main.rs` — REPL, provider setup, model picker, agent loop (unbounded, ends on no
   tool calls). Two producers (keys, a turn) feed one `mpsc` channel; the main thread
   applies events and draws once per batch.
-- `ui.rs` — the screen: prompt buffer and key mapping, the six-row live region, and
-  `insert` for transcript lines (wrapped here, since a clipped line would be lost).
+- `ui.rs` — the screen: prompt buffer and key mapping, the live region (chrome plus
+  the wrapped prompt, resized by `fit`), and `insert` for transcript lines (wrapped
+  here, since a clipped line would be lost).
 - `md.rs` — markdown: a port of `md.ts` (blocks, inlines, tables, entities, URL
   checks), plus the renderer that turns its AST into transcript lines. `Stream`
   feeds it a line at a time and lays a block out when it ends.

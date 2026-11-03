@@ -5,9 +5,9 @@
 //! prompt occupies, where the cursor goes, what to repaint after a resize, and
 //! how to push a line into scrollback without losing the drawing. This module
 //! only decides *what* the live region contains: a blank row that keeps the
-//! transcript off the prompt, the queued row, the prompt line, an empty row
-//! under it, and below that one row with the status on the left and the
-//! selection on the right.
+//! transcript off the prompt, the queued row, one prompt row per wrapped line,
+//! an empty row under them, and below that one row with the status on the left
+//! and the selection on the right.
 
 use std::io::{self, IsTerminal, Stdout, Write};
 
@@ -16,18 +16,17 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::crossterm::{cursor, execute, terminal};
 use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthChar;
 
 use crate::md;
 
-/// Rows the live region always occupies: a blank gap, the queue, the prompt,
-/// an empty row, the status and selection row, and a blank row under it.
-/// Fixed, so the viewport never moves under the cursor, the transcript never
-/// reaches the prompt, and nothing is written against the bottom edge.
-const LIVE: u16 = 6;
+/// Rows the live region occupies besides the prompt itself: a blank gap, the
+/// queue, an empty row under the prompt, the status and selection row, and a
+/// blank row under it. Nothing is written against the bottom edge.
+const CHROME: u16 = 5;
 
 /// Blank cells at each screen edge: nothing is written against the border.
 const PAD: u16 = 1;
@@ -103,7 +102,7 @@ impl Screen {
     pub fn new(prompt: &str) -> io::Result<Screen> {
         // No alternate screen: the transcript is the user's scrollback.
         let term = ratatui::try_init_with_options(TerminalOptions {
-            viewport: Viewport::Inline(LIVE),
+            viewport: Viewport::Inline(CHROME + 1),
         })?;
         Ok(Screen {
             term,
@@ -212,6 +211,7 @@ impl Screen {
 
     /// Commit the line: echo it into the transcript and return it. The marker
     /// is `█`, not the live prompt's `❯`: the line is settled, not editable.
+    /// Every row carries it, so a wrapped line reads as one block.
     /// What was typed is markdown, laid out here because it is complete.
     pub fn commit(&mut self) -> String {
         let line = self.take();
@@ -221,14 +221,8 @@ impl Screen {
         }
         let rows: Vec<Line<'static>> = lines
             .into_iter()
-            .enumerate()
-            .map(|(k, row)| {
-                let head = if k == 0 {
-                    format!("{MARK} ")
-                } else {
-                    "  ".to_string()
-                };
-                let mut spans = vec![Span::styled(head, PROMPT_STYLE)];
+            .map(|row| {
+                let mut spans = vec![Span::styled(format!("{MARK} "), PROMPT_STYLE)];
                 spans.extend(row.spans);
                 Line::from(spans)
             })
@@ -363,14 +357,30 @@ impl Screen {
     pub fn draw(&mut self) -> io::Result<()> {
         let prompt = self.prompt.clone();
         let prompt_style = self.prompt_style;
-        let width = self.term.size()?.width;
+        let size = self.term.size()?;
+        // A resize since the last frame changes the area under us; settle it
+        // before deciding the height. A failure only delays it to the next draw.
+        let _ = self.term.autoresize();
+        let width = size.width;
         let margin = PAD.min(width.saturating_sub(1));
         let cols = (width as usize).saturating_sub(2 * margin as usize);
-        let avail = cols.saturating_sub(prompt.chars().count()).max(1);
-        // One row, scrolled horizontally: no wrapping to predict.
-        let scroll = if self.cursor >= avail { self.cursor + 1 - avail } else { 0 };
-        let visible: String = self.buf.chars().skip(scroll).take(avail).collect();
-        let col = (prompt.chars().count() + self.cursor - scroll) as u16;
+        let gutter: usize = prompt.chars().map(|c| c.width().unwrap_or(1)).sum();
+        let max_rows = rows_max(size.height);
+        let (rows, first, (crow, ccol)) =
+            prompt_layout(gutter, &self.buf, self.cursor, cols, max_rows);
+        let visible = &rows[first..];
+        let rows_n = visible.len() as u16;
+        self.fit(CHROME + rows_n)?;
+        // Every row carries the glyph, so a wrapped line reads as one prompt.
+        let prompt_rows: Text<'static> = visible
+            .iter()
+            .map(|row| {
+                Line::from(vec![
+                    Span::styled(prompt.clone(), prompt_style),
+                    Span::raw(row.clone()),
+                ])
+            })
+            .collect();
         let queued = self.queued.clone();
         // The selection is the invariant half of the last row: it must not be
         // cut, so a long status is trimmed first. One blank cell keeps the two
@@ -382,41 +392,88 @@ impl Screen {
         );
 
         self.term.draw(|frame| {
-            let area = frame.area();
-            let area = inset(area, margin);
+            let area = inset(frame.area(), margin);
             let row = |offset: u16| Rect {
                 y: area.y + offset,
                 height: 1,
                 ..area
             };
+            let below = 2 + rows_n + 1;
             frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(prompt.clone(), prompt_style),
-                    Span::raw(visible.clone()),
-                ])),
-                row(2),
+                Paragraph::new(prompt_rows),
+                Rect {
+                    y: area.y + 2,
+                    height: rows_n,
+                    ..area
+                },
             );
-            if area.height > 4 {
-                frame.render_widget(
-                    Paragraph::new(Line::styled(status.clone(), DIM)),
-                    row(4),
-                );
-                frame.render_widget(
-                    Paragraph::new(Line::styled(info.clone(), DIM))
-                        .alignment(Alignment::Right),
-                    row(4),
-                );
-            }
-            if area.height > 1 {
-                let label = match &queued {
-                    Some(line) => clip(&format!("queued: {line}"), cols),
-                    None => String::new(),
-                };
-                frame.render_widget(Paragraph::new(Line::styled(label, DIM)), row(1));
-            }
-            frame.set_cursor_position(Position::new(area.x + col, area.y + 2));
+            frame.render_widget(
+                Paragraph::new(Line::styled(status, DIM)),
+                row(below),
+            );
+            frame.render_widget(
+                Paragraph::new(Line::styled(info, DIM))
+                    .alignment(Alignment::Right),
+                row(below),
+            );
+            let label = match &queued {
+                Some(line) => clip(&format!("queued: {line}"), cols),
+                None => String::new(),
+            };
+            frame.render_widget(Paragraph::new(Line::styled(label, DIM)), row(1));
+            frame.set_cursor_position(Position::new(
+                area.x + gutter as u16 + ccol,
+                area.y + 2 + crow,
+            ));
         })
         .map(|_| ())
+    }
+
+    /// Give the live region `height` rows. It keeps its bottom at the screen
+    /// bottom, so growing it upward would cover the last transcript rows: they
+    /// are pushed into scrollback first, which leaves blank rows for the new
+    /// prompt lines.
+    fn fit(&mut self, height: u16) -> io::Result<()> {
+        let size = self.term.size()?;
+        let height = height.min(size.height).max(1);
+        let area = self.term.get_frame().area();
+        if area.height == height {
+            return Ok(());
+        }
+        if height > area.height {
+            self.term.insert_before(height - area.height, |_| {})?;
+        } else {
+            // The rows the region gives up are above the new top, where the new
+            // terminal's clear cannot reach.
+            self.term.clear()?;
+        }
+        // An inline area starts at the cursor row and this one's bottom is the
+        // screen's, so the cursor goes where the new top has to be.
+        let top = size.height - height;
+        self.term.set_cursor_position(Position::new(0, top))?;
+        // That derivation asks the terminal where its cursor is, and crossterm
+        // answers only while it holds the event reader: the input thread takes
+        // it in short turns, so this can miss a few times before it lands.
+        let mut tries = 0;
+        let term = loop {
+            match Terminal::with_options(
+                CrosstermBackend::new(io::stdout()),
+                TerminalOptions {
+                    viewport: Viewport::Inline(height),
+                },
+            ) {
+                Ok(term) => break term,
+                Err(_) if tries < 50 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        self.term = term;
+        // Blank the whole region and force a full repaint.
+        self.term.clear()?;
+        Ok(())
     }
 
     /// Give the terminal back: erase the live region so the shell prompt lands
@@ -647,6 +704,53 @@ impl Drop for Screen {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Prompt rows the live region may use: at most half the screen, so the
+/// transcript keeps a place to be read, and never none.
+fn rows_max(screen_height: u16) -> usize {
+    let live = (screen_height / 2).max(CHROME + 1);
+    live.saturating_sub(CHROME).max(1) as usize
+}
+
+/// Lay the prompt buffer out at `width` cells, with `gutter` cells at the left
+/// of every row. Returns the rows (text after the gutter), the index of the
+/// first visible row, and the cursor as (row in that window, column after the
+/// gutter). A buffer that fills a row to its last cell puts the cursor on the
+/// next, empty one: the text broke there, so the cursor did too.
+fn prompt_layout(
+    gutter: usize,
+    buf: &str,
+    cursor: usize,
+    width: usize,
+    rows_max: usize,
+) -> (Vec<String>, usize, (u16, u16)) {
+    let limit = width.saturating_sub(gutter).max(1);
+    let len = buf.chars().count();
+    let mut rows: Vec<String> = vec![String::new()];
+    let mut col = 0usize;
+    let mut at = (0usize, 0usize);
+    for (i, ch) in buf.chars().enumerate() {
+        let cells = ch.width().unwrap_or(1);
+        if col > 0 && col + cells > limit {
+            rows.push(String::new());
+            col = 0;
+        }
+        if i == cursor {
+            at = (rows.len() - 1, col);
+        }
+        rows.last_mut().expect("a row").push(ch);
+        col += cells;
+    }
+    if cursor >= len {
+        at = (rows.len() - 1, col);
+        if col >= limit {
+            rows.push(String::new());
+            at = (rows.len() - 1, 0);
+        }
+    }
+    let first = (at.0 + 1).saturating_sub(rows_max.max(1));
+    (rows, first, ((at.0 - first) as u16, at.1 as u16))
 }
 
 /// Fit text into `width` cells. The selection row is the only row whose length

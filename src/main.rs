@@ -781,11 +781,24 @@ enum Event {
     Eof,
 }
 
-/// Blocking `read` for the terminal's keys. Nothing else may read stdin.
+/// The terminal's keys. Nothing else may read stdin.
 fn spawn_input(tx: Sender<Event>) {
     thread::spawn(move || {
-        use ratatui::crossterm::event::{read, Event as TermEvent};
+        use ratatui::crossterm::event::{poll, read, Event as TermEvent};
         loop {
+            // A zero timeout, not `read`: waiting for a key holds crossterm's
+            // event-reader lock, and the screen needs it to ask the terminal
+            // where the cursor is when the prompt wraps. A poll holds it for
+            // microseconds and releases it; input is picked up a few
+            // milliseconds later.
+            match poll(Duration::ZERO) {
+                Ok(true) => {}
+                Ok(false) => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
+            }
             match read() {
                 // Key releases (kitty protocol) are not new input.
                 Ok(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
