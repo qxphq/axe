@@ -75,7 +75,7 @@ pub fn chat(
     http::request(ep, "POST", "/chat/completions", api_key, headers, Some(&body))
 }
 
-pub fn stream_chat<F: FnMut(&str)>(
+pub fn stream_chat<F: FnMut(&str), G: FnMut()>(
     ep: &Endpoint,
     api_key: Option<&str>,
     headers: &[(String, String)],
@@ -84,6 +84,7 @@ pub fn stream_chat<F: FnMut(&str)>(
     tools: &Value,
     extra: Option<&Value>,
     mut on_text: F,
+    mut on_reasoning: G,
 ) -> Result<Reply, String> {
     let mut res = chat(ep, api_key, headers, model, messages, tools, extra)?;
     if res.status != 200 {
@@ -116,6 +117,14 @@ pub fn stream_chat<F: FnMut(&str)>(
         };
 
         let delta = &chunk["choices"][0]["delta"];
+        // Providers disagree on the key; any non-empty delta means the model is
+        // still reasoning and no answer has started.
+        let reasoning = delta["reasoning_content"]
+            .as_str()
+            .or_else(|| delta["reasoning"].as_str());
+        if reasoning.is_some_and(|r| !r.is_empty()) {
+            on_reasoning();
+        }
         if let Some(part) = delta["content"].as_str() {
             text.push_str(part);
             on_text(part);

@@ -3,6 +3,7 @@ mod config;
 mod http;
 mod tools;
 
+use std::cell::Cell;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 
 use serde_json::{json, Value};
@@ -373,8 +374,10 @@ fn run_turn(
     loop {
         println!();
         let mut out = TextSink::default();
+        let indicator = Indicator::default();
+        indicator.show();
         let extra = provider.cfg.thinking_body(thinking);
-        let reply = api::stream_chat(
+        let result = api::stream_chat(
             &provider.ep,
             provider.key.as_deref(),
             &provider.headers,
@@ -382,8 +385,14 @@ fn run_turn(
             messages,
             tools,
             extra.as_ref(),
-            |text| out.push(text),
-        )?;
+            |text| {
+                indicator.clear();
+                out.push(text);
+            },
+            || indicator.show(),
+        );
+        indicator.clear();
+        let reply = result?;
 
         if out.wrote {
             println!();
@@ -429,6 +438,34 @@ fn run_turn(
                 return Ok(());
             }
         }
+    }
+}
+
+/// A one-line "thinking" hint on the current row. Shown while a request is in
+/// flight and erased before any answer text lands, so it never shares a line
+/// with output. Silent when stdout is not a terminal.
+#[derive(Default)]
+struct Indicator {
+    shown: Cell<bool>,
+}
+
+impl Indicator {
+    fn show(&self) {
+        if self.shown.get() || !io::stdout().is_terminal() {
+            return;
+        }
+        self.shown.set(true);
+        print!("\r\x1b[0K{}", paint("2", "thinking…"));
+        io::stdout().flush().ok();
+    }
+
+    fn clear(&self) {
+        if !self.shown.get() {
+            return;
+        }
+        self.shown.set(false);
+        print!("\r\x1b[0K");
+        io::stdout().flush().ok();
     }
 }
 
