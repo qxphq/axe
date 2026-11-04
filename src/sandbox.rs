@@ -35,7 +35,7 @@ pub fn init() -> Option<String> {
 }
 
 /// Keep other processes — including a `bash` child that knows this pid — from
-/// reading nano's environment through `/proc`. Best effort: the kernel may
+/// reading axe's environment through `/proc`. Best effort: the kernel may
 /// refuse, and the `/proc/self/environ` path of the parent itself is closed in
 /// the `read` tool, not here.
 #[cfg(target_os = "linux")]
@@ -107,7 +107,7 @@ fn scratch() -> Option<&'static Path> {
         .get_or_init(|| {
             use std::os::unix::fs::DirBuilderExt;
             for n in 0..16 {
-                let path = std::env::temp_dir().join(format!("nano-{}-{n}", std::process::id()));
+                let path = std::env::temp_dir().join(format!("axe-{}-{n}", std::process::id()));
                 match std::fs::DirBuilder::new().mode(0o700).create(&path) {
                     Ok(()) => return std::fs::canonicalize(&path).ok(),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,

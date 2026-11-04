@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive nano against mock.py and print the final screen.
+"""Drive axe against mock.py and print the final screen.
 
 One command replaces the manual bootstrap: a throwaway config, an in-process
 mock provider, a tmux pty of a known size, the keystrokes, and a virtual
@@ -36,14 +36,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_BIN = HERE / "target/debug/nano"
+DEFAULT_BIN = HERE / "target/debug/axe"
 
 # Importing mock.py must not leave a __pycache__ in the repo.
 sys.dont_write_bytecode = True
 
 
 def load_mock():
-    spec = importlib.util.spec_from_file_location("nano_mock", HERE / "mock.py")
+    spec = importlib.util.spec_from_file_location("axe_mock", HERE / "mock.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     # The mock calls its model "mock/mock-1"; the provider is "mock", so make
@@ -151,7 +151,7 @@ def fixture_server():
 
 
 class Tmux:
-    def __init__(self, socket, conf, session="nano"):
+    def __init__(self, socket, conf, session="axe"):
         self.base = ["tmux", "-L", socket, "-f", str(conf)]
         self.session = session
 
@@ -215,7 +215,7 @@ def parse_size(raw):
 
 
 def write_config(root, port):
-    cfg = Path(root) / "config" / "nano"
+    cfg = Path(root) / "config" / "axe"
     cfg.mkdir(parents=True)
     (cfg / "config.json").write_text(
         json.dumps(
@@ -251,11 +251,11 @@ def settle(tmux, wait, timeout, scroll, ansi):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Run nano against mock.py in a pty and print the screen.",
+        description="Run axe against mock.py in a pty and print the screen.",
         epilog="An argument starting with ! is sent as tmux keys, not as a turn.",
     )
     ap.add_argument("turns", nargs="*", metavar="ARG")
-    ap.add_argument("--bin", default=str(DEFAULT_BIN), help="nano binary")
+    ap.add_argument("--bin", default=str(DEFAULT_BIN), help="axe binary")
     ap.add_argument("--size", default="80x24", metavar="COLSxROWS")
     ap.add_argument("--scroll", type=int, default=200, metavar="N",
                     help="capture N lines of history above the screen")
@@ -280,11 +280,11 @@ def main():
 
     binary = Path(args.bin).resolve()
     if not binary.exists():
-        print("harness: building nano...", file=sys.stderr)
+        print("harness: building axe...", file=sys.stderr)
         subprocess.run(["cargo", "build"], cwd=HERE, check=True)
     size = parse_size(args.size)
 
-    work = tempfile.mkdtemp(prefix="nano-harness-")
+    work = tempfile.mkdtemp(prefix="axe-harness-")
     if args.work:
         # A stable directory means a stable cwd key: sessions and state from a
         # previous run are still there, which is what resume tests need.
@@ -304,7 +304,7 @@ def main():
     pages, fetch_base = fixture_server()
     mock.FETCH_BASE = fetch_base
 
-    socket = f"nano-harness-{os.getpid()}"
+    socket = f"axe-harness-{os.getpid()}"
     tmux = Tmux(socket, conf)
     ok = False
     try:
@@ -316,7 +316,7 @@ def main():
         ]
         if not args.no_fetch_local:
             # The fixture server is on loopback, which the host guard refuses.
-            env.append("NANO_FETCH_ALLOW_LOCAL=1")
+            env.append("AXE_FETCH_ALLOW_LOCAL=1")
         command = "env {} {}".format(
             " ".join(shlex.quote(item) for item in env), shlex.quote(str(binary))
         )

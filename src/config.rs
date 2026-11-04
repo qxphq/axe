@@ -61,11 +61,11 @@ pub struct Config {
 pub fn path() -> PathBuf {
     if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
         if !dir.is_empty() {
-            return PathBuf::from(dir).join("nano/config.json");
+            return PathBuf::from(dir).join("axe/config.json");
         }
     }
     let home = env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config/nano/config.json")
+    PathBuf::from(home).join(".config/axe/config.json")
 }
 
 const EXAMPLE: &str = r#"{
@@ -115,7 +115,7 @@ pub fn read_agents(file: &Path) -> Option<String> {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
         Err(e) => {
-            eprintln!("nano: cannot read {}: {e}", file.display());
+            eprintln!("axe: cannot read {}: {e}", file.display());
             return None;
         }
     };
@@ -124,7 +124,7 @@ pub fn read_agents(file: &Path) -> Option<String> {
     }
     if text.len() > AGENTS_LIMIT {
         eprintln!(
-            "nano: {} is {} bytes, truncated to {}",
+            "axe: {} is {} bytes, truncated to {}",
             file.display(),
             text.len(),
             AGENTS_LIMIT
@@ -339,11 +339,11 @@ mod tests {
 
     #[test]
     fn provider_level_and_key_helpers() {
-        std::env::set_var("NANO_TEST_PROVIDER_KEY", "secret");
+        std::env::set_var("AXE_TEST_PROVIDER_KEY", "secret");
         let provider = ProviderConfig {
             name: "p".into(),
             base_url: "http://p".into(),
-            api_key_env: Some("NANO_TEST_PROVIDER_KEY".into()),
+            api_key_env: Some("AXE_TEST_PROVIDER_KEY".into()),
             models_url: None,
             session_header: None,
             thinking: vec![
@@ -358,7 +358,7 @@ mod tests {
         );
         assert_eq!(provider.thinking_body(Some("off")), None);
         assert_eq!(provider.thinking_body(Some("missing")), None);
-        std::env::remove_var("NANO_TEST_PROVIDER_KEY");
+        std::env::remove_var("AXE_TEST_PROVIDER_KEY");
         assert_eq!(provider.resolved_key(), None);
     }
 
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn agents_are_read_and_found_upwards() {
-        let dir = std::env::temp_dir().join(format!("nano-test-agents-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("axe-test-agents-{}", std::process::id()));
         let nested = dir.join("a/b");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(dir.join("AGENTS.md"), "rules").unwrap();

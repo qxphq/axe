@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-/// What nano remembers for one working directory: the selection, and how much
+/// What axe remembers for one working directory: the selection, and how much
 /// of the reasoning is drawn. State is written, config is read — nothing here
-/// ever touches `~/.config/nano/config.json`.
+/// ever touches `~/.config/axe/config.json`.
 #[derive(Default)]
 pub struct State {
     /// The directory this belongs to. Empty when `current_dir` failed, which
@@ -25,19 +25,19 @@ pub struct State {
     pub thoughts: bool,
 }
 
-/// `$XDG_STATE_HOME` or `$HOME/.local/state`, then `nano`.
+/// `$XDG_STATE_HOME` or `$HOME/.local/state`, then `axe`.
 fn root() -> PathBuf {
     if let Ok(dir) = env::var("XDG_STATE_HOME") {
         if !dir.is_empty() {
-            return PathBuf::from(dir).join("nano");
+            return PathBuf::from(dir).join("axe");
         }
     }
     let home = env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".local/state/nano")
+    PathBuf::from(home).join(".local/state/axe")
 }
 
 /// The cwd as one path component: every byte outside `[A-Za-z0-9._-]` written
-/// as `%XX`, so `/home/anon/nano` becomes `%2Fhome%2Fanon%2Fnano`. Reversible,
+/// as `%XX`, so `/home/anon/axe` becomes `%2Fhome%2Fanon%2Faxe`. Reversible,
 /// and injective because `%` is escaped too.
 fn key(cwd: &Path) -> String {
     let path = cwd.to_string_lossy();
@@ -73,12 +73,12 @@ pub fn project(cwd: &Path) -> PathBuf {
     root().join("projects").join(key(cwd))
 }
 
-/// `<state>/nano/projects/<key>/state.json`.
+/// `<state>/axe/projects/<key>/state.json`.
 fn file(cwd: &Path) -> PathBuf {
     project(cwd).join("state.json")
 }
 
-/// Create `dir` and the nano-owned directories above it, all `0700`: a
+/// Create `dir` and the axe-owned directories above it, all `0700`: a
 /// directory's state and its sessions are private to the user.
 pub fn private_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
@@ -126,14 +126,14 @@ pub fn load(cwd: &Path) -> State {
         Ok(raw) => raw,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return state,
         Err(e) => {
-            eprintln!("nano: cannot read {}: {e}", file.display());
+            eprintln!("axe: cannot read {}: {e}", file.display());
             return state;
         }
     };
     let v: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("nano: cannot parse {}: {e}", file.display());
+            eprintln!("axe: cannot parse {}: {e}", file.display());
             return state;
         }
     };
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn key_is_reversible_and_safe() {
-        assert_eq!(key(Path::new("/home/anon/nano")), "%2Fhome%2Fanon%2Fnano");
+        assert_eq!(key(Path::new("/home/anon/axe")), "%2Fhome%2Fanon%2Faxe");
         assert!(!key(Path::new("/a/../b")).contains('/'));
     }
 
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn private_files_have_private_modes() {
-        let dir = std::env::temp_dir().join(format!("nano-test-private-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("axe-test-private-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         private_dir(&dir).unwrap();
         let file = dir.join("state.json");
