@@ -116,7 +116,7 @@ model sees it the next time you ask something.
 | `/thinking [level]` | show or set the thinking level |
 | `/thoughts` | show or hide the model's reasoning |
 | `/explore` | toggle explore mode (also Shift+Tab) |
-| `/new` | start a new session, naming the old one |
+| `/new` | start a new session, naming the old one and clearing the screen |
 | `/sessions [query]` | browse or search this directory's sessions |
 | `/help` | list the commands, the config path and its keys |
 | `/exit`, `/quit` | quit |

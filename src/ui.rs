@@ -669,6 +669,41 @@ impl Screen {
         self.insert(lines, Block::Tool);
     }
 
+    /// `/new`: the transcript above belongs to the session that just ended, so
+    /// it goes with it, scrollback included, and the live region starts blank.
+    /// The one place the transcript is erased: a session is a boundary.
+    pub fn reset(&mut self) {
+        // Collected markdown would otherwise join the new session's first
+        // block; the transcript starts with no block to continue.
+        self.md = markdown::Stream::new();
+        self.thought = markdown::Stream::new();
+        self.last = None;
+        self.menu = None;
+        self.status.clear();
+        self.queued = None;
+        #[cfg(test)]
+        if matches!(self.term, Term::Test(_)) {
+            return;
+        }
+        match &mut self.term {
+            Term::Real(term) => {
+                // `terminal::Clear(All)` only reaches the screen; what scrolled
+                // off is in the terminal's own history, which `Purge` drops.
+                let _ = execute!(
+                    term.backend_mut(),
+                    terminal::Clear(terminal::ClearType::All),
+                    terminal::Clear(terminal::ClearType::Purge)
+                );
+                // Repaints the region once and, as importantly, resets the
+                // back buffer, so the next draw is not diffed against a blank
+                // screen.
+                let _ = term.clear();
+            }
+            #[cfg(test)]
+            Term::Test(_) => {}
+        }
+    }
+
     /// Repaint the live region.
     pub fn draw(&mut self) -> io::Result<()> {
         let prompt = self.prompt.clone();
@@ -1503,6 +1538,25 @@ mod tests {
         assert_eq!(screen.status(), "Thinking…");
         screen.set_commands(&["/help", "/exit"]);
         assert_eq!(screen.commands, vec!["/help", "/exit"]);
+    }
+
+    #[test]
+    fn reset_starts_the_transcript_over() {
+        let mut screen = Screen::test_screen(40, 12);
+        // Collected but not yet laid out: without the reset it would join the
+        // new session's first block.
+        screen.text("stale paragraph");
+        screen.set_menu("Header", vec!["one".into()], false);
+        screen.set_status("Thinking…");
+        screen.set_queued(Some("later"));
+        screen.reset();
+        assert!(screen.menu.is_none());
+        assert!(screen.status().is_empty());
+        assert!(screen.last.is_none());
+        // Nothing is left to lay out: a flush finds an empty stream and writes
+        // no block, so the new session's first text has no separator to skip.
+        screen.flush();
+        assert!(screen.last.is_none());
     }
 
     #[test]

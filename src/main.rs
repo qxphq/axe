@@ -994,7 +994,7 @@ impl Session {
         self.used = None;
         self.set_session_header();
         if let Some(screen) = screen {
-            screen.clear_menu(false);
+            screen.reset();
             screen.output("New session\n");
             screen.set_info(&self.info());
         }

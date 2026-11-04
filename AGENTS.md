@@ -52,7 +52,8 @@ invariants a change must not break.
     The only owned region is an inline live area at the bottom (queued row,
     wrapped prompt, status), capped at half the screen. A chooser may own a header
     plus entries; when it closes without resuming, its rows are committed to
-    scrollback. Everything above is appended, never repainted.
+    scrollback. Everything above is appended, never repainted — except `/new`,
+    which wipes the screen and its scrollback: a session boundary.
 13. **One writer.** While `ui::Screen` owns the terminal, only it draws. Startup
     banner and piped output run before/without a `Screen`; a stray `print!` while
     it exists is a rendering bug.
