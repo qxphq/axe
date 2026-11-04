@@ -358,7 +358,7 @@ impl Session {
         screen.set_explore(self.read_only);
         screen.set_info(&self.info());
         screen.output(&format!(
-            "explore: {}\n",
+            "Explore: {}\n",
             if self.read_only { "on" } else { "off" }
         ));
     }
@@ -411,7 +411,7 @@ impl Session {
         // answer starts or the round ends, so it is held until then.
         let mut thought = String::new();
 
-        screen.set_status("thinking…");
+        screen.set_status("Thinking…");
         let _ = screen.draw();
 
         // What the last round counted, handed back by the turn's thread. The
@@ -514,7 +514,9 @@ impl Session {
                                     screen.text(&finished);
                                 }
                             }
-                            screen.set_status(&stripped(&partial));
+                            // The unfinished line is not the status: the row
+                            // says what the turn is doing, not what it says.
+                            screen.set_status("Responding…");
                         }
                         // A tool call and its outcome, on one line.
                         Event::Echo(spans, error) => {
@@ -719,7 +721,7 @@ impl Session {
             self.state.thoughts = !self.state.thoughts;
             self.state.save();
             screen.output(&format!(
-                "thoughts: {}\n\n",
+                "Thoughts: {}\n\n",
                 if self.state.thoughts { "on" } else { "off" }
             ));
             return Cmd::Continue;
@@ -773,7 +775,7 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
         }
         "/explore" => {
             session.set_read_only(!session.read_only);
-            println!("explore: {}", if session.read_only { "on" } else { "off" });
+            println!("Explore: {}", if session.read_only { "on" } else { "off" });
             return Cmd::Continue;
         }
         _ => {}
@@ -924,13 +926,6 @@ fn readline(screen: &mut ui::Screen, rx: &Receiver<Event>) -> Option<Input> {
     }
 }
 
-/// Print text that arrives outside the drawing loop (a slash command's output).
-/// It is permanent, exactly like streamed text.
-/// A drawn row, so it must not carry the newlines that end transcript lines.
-fn stripped(text: &str) -> String {
-    text.trim_start_matches(['\n', '\r']).replace(['\n', '\r'], " ")
-}
-
 /// Where a turn's output goes: straight to stdout when piped, onto the channel
 /// when a prompt is on screen.
 trait Sink {
@@ -940,7 +935,7 @@ trait Sink {
     /// Streamed reasoning. Shown or not is the sink's business; when it is
     /// hidden, one line with its duration stands in for it.
     fn reasoning(&mut self, text: &str);
-    /// A transient label for the live region: "thinking…", a running command.
+    /// A transient label for the live region: "Thinking…", a running command.
     fn status(&mut self, text: &str);
     /// One tool call, finished: the call and its outcome on one line, and the
     /// failure's own words beneath it.
@@ -1123,7 +1118,7 @@ impl Sink for ChannelSink {
             // The thought is hidden, but not its cost: its first chunk starts
             // the clock, and `end_thought` puts the duration in its place.
             self.thought.get_or_insert_with(Instant::now);
-            self.send(Event::Status("thinking…".to_string()));
+            self.send(Event::Status("Thinking…".to_string()));
         }
     }
 }

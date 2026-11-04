@@ -437,7 +437,7 @@ impl Screen {
             );
             let label = match &queued {
                 // One row: a queued message's own line breaks would be lost.
-                Some(line) => clip(&format!("queued: {}", line.replace('\n', " ")), cols),
+                Some(line) => clip(&format!("Queued: {}", line.replace('\n', " ")), cols),
                 None => String::new(),
             };
             frame.render_widget(Paragraph::new(Line::styled(label, DIM)), row(1));
