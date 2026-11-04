@@ -1575,6 +1575,7 @@ fn call_line(call: &api::ToolCall, read_only: bool) -> Vec<(Paint, String)> {
     let v: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     let (glyph, paint) = match call.name.as_str() {
         "read" => ("◇", Paint::Cyan),
+        "fetch" => ("↗", Paint::Cyan),
         "write" => ("✚", Paint::Yellow),
         "edit" => ("✎", Paint::Yellow),
         _ => ("✚", Paint::Yellow),
@@ -1586,14 +1587,18 @@ fn call_line(call: &api::ToolCall, read_only: bool) -> Vec<(Paint, String)> {
     }
 
     let mut parts = Vec::new();
-    for key in ["path", "file", "pattern"] {
+    for key in ["path", "file", "pattern", "url"] {
         if let Some(s) = v[key].as_str() {
             parts.push(summarize(s, 120));
         }
     }
-    // A partial read is only reproducible with its window, so echo it.
+    // A partial read is only reproducible with its window, so echo it. `fetch`
+    // pages with start/chars; `read` with offset/limit.
     let num = |key: &str| v[key].as_u64().map(|n| n.to_string());
-    let (offset, limit) = (num("offset"), num("limit"));
+    let (offset, limit) = (
+        num("offset").or_else(|| num("start")),
+        num("limit").or_else(|| num("chars")),
+    );
     if offset.is_some() || limit.is_some() {
         let start = offset.unwrap_or_else(|| "1".into());
         parts.push(match limit {

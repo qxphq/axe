@@ -1,7 +1,7 @@
 # nano
 
 Minimal coding agent harness in Rust. One binary, a line REPL, OpenAI-compatible
-providers, four tools. Roughly 4.5k LOC across seven files.
+providers, five tools. Roughly 6k LOC across seven files.
 
 ## Principles
 
@@ -30,9 +30,12 @@ providers, four tools. Roughly 4.5k LOC across seven files.
    volatile content last. Never inject timestamps, status, or cwd changes into the
    prefix: it invalidates provider prompt caching. When sessions arrive: append-only
    JSONL, replay on resume, compaction last.
-7. **Tools are dumb.** `read`, `write`, `edit`, `bash`. No `glob`, `grep`, or `list`;
-   `bash` + `rg`/`fd` covers them. Tool errors are results for the model, not harness
-   failures. Truncate output (30–50 KB), timeout `bash` (120 s).
+7. **Tools are dumb.** `read`, `write`, `edit`, `bash`, `fetch`. No `glob`, `grep`, or
+   `list`; `bash` + `rg`/`fd` covers them. `fetch` because explore mode's shell
+   allowlist has no `curl`, so that mode otherwise cannot read the web; it is refused
+   outside explore mode, where `bash` covers the same ground. Tool errors are results
+   for the model, not harness failures. Truncate output (30–50 KB), timeout `bash`
+   (120 s), cap `fetch` at 1 MiB off the wire and 50 000 characters to the model.
 8. **No approval prompts.** Bash runs unprompted by explicit user decision. Do not
    add a permission layer without being asked.
 9. **Real cwd, relative paths.** `current_dir()` at startup, used for the prompt and
@@ -70,7 +73,8 @@ providers, four tools. Roughly 4.5k LOC across seven files.
 - `http.rs` — URL parsing, HTTP/1.1 over `TcpStream`/rustls, body decoding
   (`Content-Length`, chunked, EOF).
 - `config.rs` — load and validate the config; resolve the `agents` file.
-- `tools.rs` — tool registry, JSON schemas, generated prompt, execution.
+- `tools.rs` — tool registry, JSON schemas, generated prompt, execution, and
+  `fetch`: the host guard, the HTML-to-text tokenizer, the sanitizer.
 
 ## Conventions
 
@@ -132,6 +136,14 @@ Each positional argument is a turn: typed, then Enter. One starting with `!` is
 a list of tmux key names sent as-is. `--ansi` keeps colors, `--scroll N` widens
 the history in the dump, `--wait` and `--timeout` bound idling, `--bin` selects
 the binary (built on first use). Mock replies are listed in `mock.py`.
+
+`fetch:PAGE` has the mock call `fetch` on a fixture page (plain, inject, big,
+image, redirect, latin1, slow); `PAGE@START+CHARS` sets the paging arguments. The
+harness serves those pages on loopback and sets `NANO_FETCH_ALLOW_LOCAL=1` in the
+child, since the host guard refuses loopback: that variable is a **test knob, off
+by default, and a live bypass for anyone who sets it**. `--no-fetch-local` runs
+without it, which is how the refusal is checked. `show:x` streams the last tool
+result back, since the transcript shows only call lines.
 
 A `tool:` turn keeps calling the same tool: the mock answers from the last user
 message, and a tool result is not one. Interrupt it with `!Escape`.

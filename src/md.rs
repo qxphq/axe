@@ -120,7 +120,7 @@ fn codepoint(cp: u32) -> Option<char> {
     char::from_u32(cp)
 }
 
-fn decode_entities(text: &str) -> String {
+pub(crate) fn decode_entities(text: &str) -> String {
     let c = as_chars(text);
     let mut out = String::new();
     let mut i = 0;
