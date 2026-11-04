@@ -1,7 +1,7 @@
 # nano
 
 Minimal coding agent harness in Rust. One binary, a line REPL, OpenAI-compatible
-providers, six tools. Roughly 8.5k LOC across ten files.
+providers, seven tools. Roughly 8.5k LOC across ten files.
 
 ## Principles
 
@@ -32,15 +32,17 @@ providers, six tools. Roughly 8.5k LOC across ten files.
    volatile content last. Never inject timestamps, status, or cwd changes into the
    prefix: it invalidates provider prompt caching. Sessions are append-only JSONL,
    replayed on resume; compaction stays last.
-7. **Tools are dumb.** `read`, `write`, `edit`, `bash`, `fetch`, `web_search`. No
-   `glob`, `grep`, or `list`; `bash` + `rg`/`fd` covers them. `fetch` and
-   `web_search` because explore mode's shell allowlist has no `curl`, so that mode
-   otherwise cannot read the web; both are refused outside explore mode. Search
-   uses Brave when a token is configured and DuckDuckGo's HTML endpoint otherwise;
-   a Brave query that fails or returns nothing falls back. Tool errors are results
-   for the model, not harness failures. Truncate output (30–50 KB), timeout `bash`
-   (120 s), cap `fetch` at 1 MiB off the wire and 50 000 characters to the model,
-   `web_search` at 1 MiB and 20 results.
+7. **Tools are dumb.** `read`, `write`, `edit`, `bash`, `about`, `fetch`,
+   `web_search`. No `glob`, `grep`, or `list`; `bash` + `rg`/`fd` covers them.
+   `about` returns `README.md`, compiled in with `include_str!`, so the binary
+   describes itself without a checkout and without a cwd: documentation, not a
+   code path. `fetch` and `web_search` because explore mode's shell allowlist has
+   no `curl`, so that mode otherwise cannot read the web; both are refused outside
+   explore mode. Search uses Brave when a token is configured and DuckDuckGo's
+   HTML endpoint otherwise; a Brave query that fails or returns nothing falls
+   back. Tool errors are results for the model, not harness failures. Truncate
+   output (30–50 KB), timeout `bash` (120 s), cap `fetch` at 1 MiB off the wire
+   and 50 000 characters to the model, `web_search` at 1 MiB and 20 results.
 8. **No approval prompts.** Bash runs unprompted by explicit user decision. Do not
    add a permission layer without being asked.
 9. **Real cwd, relative paths.** `current_dir()` at startup, used for the prompt and
@@ -105,7 +107,8 @@ providers, six tools. Roughly 8.5k LOC across ten files.
   listing, full-text search, gzip for old bodies, and the UTC stamp.
 - `tools.rs` — tool registry, JSON schemas, generated prompt, execution, and
   `fetch`/`web_search`: the host guard, the HTML-to-text tokenizer, the sanitizer,
-  and the Brave/DuckDuckGo result parsers.
+  and the Brave/DuckDuckGo result parsers. `about` returns `README.md`, compiled
+  into the binary.
 - `sandbox.rs` — the only `unsafe`: the seccomp filter and the Landlock ruleset on
   Linux, the `sandbox-exec` profiles on macOS, the exec allowlist, and the scratch
   directory explore mode may write to.
@@ -126,6 +129,9 @@ being streamed stays raw in the status row.
 - Style comes from `Paint` in `main.rs`, rendered either as cells or as ANSI when
   there is no screen to draw on.
 - Tool names and descriptions are part of the prompt. Change them deliberately.
+- `README.md` is the user-facing contract and the GitHub page; dev workflow stays
+  here. It ships inside the binary through `about`, so keep it factual, free of
+  vendor trivia that rots, and in the same commit as the behavior it describes.
 - Sessions live in the project state directory: `<id>.json` is a mutable sidecar
   (title, summary, dates, count, archived), `<id>.jsonl` is the append-only body of
   API messages. Bodies older than `sessions::KEEP` are gzipped to `<id>.jsonl.gz`;
@@ -212,6 +218,7 @@ back with `show:`; normal mode is a `!cmd` line, which does not loop:
 
 ```sh
 ./harness.py --scroll 400 'tool:bash:{"command":"ls | wc -l"}' '!Escape' 'show:'
+./harness.py --scroll 400 'tool:about:{}' '!Escape' 'show:'
 ./harness.py --scroll 400 'tool:bash:{"command":"echo x > /tmp/p"}' '!Escape' 'show:'
 ./harness.py --scroll 400 'tool:bash:{"command":"sed -n 1p f"}' '!Escape' 'show:'
 ./harness.py --scroll 400 'tool:bash:{"command":"git status --short"}' '!Escape' 'show:'

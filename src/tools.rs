@@ -51,6 +51,17 @@ const BASH: Spec = Spec {
     parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"Command passed to sh -c"}},"required":["command"]}"#,
 };
 
+/// nano's own README, compiled in: the binary describes itself without a
+/// checkout, a cwd, or a file to go stale on the user's disk.
+const README_TEXT: &str = include_str!("../README.md");
+
+const ABOUT: Spec = Spec {
+    name: "about",
+    signature: "about()",
+    description: "Return nano's README: its tools and limits, modes, every config key, the paths it reads and writes, and how `bash` is confined. Call this whenever the user asks what nano can do, how to configure it, or where it keeps something, instead of guessing. Compiled into the binary at build time; this is nano's user-facing documentation, not the project's AGENTS.md.",
+    parameters: r#"{"type":"object","properties":{}}"#,
+};
+
 /// Caps on a fetched page: bytes off the wire, characters the model sees, and
 /// wall time spent reading the body.
 const FETCH_BYTES: u64 = 1 << 20;
@@ -82,7 +93,7 @@ const WEB_SEARCH: Spec = Spec {
 /// to tell a sandbox denial from a missing binary or a bug.
 const DENIED: &str = "explore mode: only the read-only allowlist runs, nothing outside $TMPDIR is writable, and no command reaches the network; use `fetch` and `web_search` for the web\n";
 
-const SPECS: &[Spec] = &[READ, WRITE, EDIT, BASH, FETCH, WEB_SEARCH];
+const SPECS: &[Spec] = &[READ, WRITE, EDIT, BASH, ABOUT, FETCH, WEB_SEARCH];
 
 static DEFINITIONS: OnceLock<Value> = OnceLock::new();
 
@@ -118,6 +129,9 @@ pub fn set_brave_key(key: Option<String>) {
 /// Rules that hold for every user: one line each, no workflow. Rendered as a
 /// numbered list so a later rule can refer back to an earlier one.
 const BEHAVIOR: &[&str] = &[
+    "You are the model inside nano, a coding agent in this terminal. When the \
+     user asks what nano can do, how it is configured, or where it keeps \
+     something, call `about` instead of guessing.",
     "When asking the user a multiple-choice question, list every option on its \
      own numbered line, recommended first, marked \"(recommended)\".",
 ];
@@ -156,6 +170,8 @@ pub fn execute(name: &str, args: &str, cancel: &Cancel, read_only: bool) -> Stri
     match name {
         "read" => read(&args),
         "bash" => bash(&args, cancel, read_only),
+        // Documentation, no I/O: the same answer in both modes.
+        "about" => README_TEXT.to_string(),
         // Not in the schema explore mode sends; a call is the model recalling
         // a tool it no longer has, and the result says why.
         "write" | "edit" if read_only => format!("error: explore mode: {name} is not available"),
