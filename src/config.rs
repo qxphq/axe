@@ -3,7 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 #[derive(Clone)]
 pub struct ProviderConfig {
@@ -179,58 +179,6 @@ fn parse_provider(name: &str, v: &Value) -> Result<ProviderConfig, String> {
             .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default(),
     })
-}
-
-/// Rewrite the config file, preserving unknown keys. Formatting and comments
-/// are not preserved.
-fn edit(apply: impl Fn(&mut Value)) {
-    let p = path();
-    let raw = match fs::read_to_string(&p) {
-        Ok(raw) => raw,
-        Err(e) => {
-            eprintln!("nano: cannot save config to {}: {e}", p.display());
-            return;
-        }
-    };
-    let mut v: Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("nano: cannot save config to {}: {e}", p.display());
-            return;
-        }
-    };
-    if !v.is_object() {
-        eprintln!("nano: cannot save config to {}: not an object", p.display());
-        return;
-    }
-    apply(&mut v);
-    let text = match serde_json::to_string_pretty(&v) {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("nano: cannot save config to {}: {e}", p.display());
-            return;
-        }
-    };
-    if let Err(e) = fs::write(&p, format!("{text}\n")) {
-        eprintln!("nano: cannot save config to {}: {e}", p.display());
-    }
-}
-
-/// Persist the selected model as `provider/id`.
-pub fn save_model(spec: &str) {
-    edit(|v| v["model"] = Value::String(spec.to_string()));
-}
-
-/// Remember the thinking level for `spec` (`provider/id`). `off` is stored
-/// explicitly so that raising a provider's default level does not leak into
-/// models the user already turned off.
-pub fn save_thinking(spec: &str, level: &str) {
-    edit(|v| {
-        if !v["thinking"].is_object() {
-            v["thinking"] = json!({});
-        }
-        v["thinking"][spec] = Value::String(level.to_string());
-    });
 }
 
 pub fn load() -> Result<Config, String> {

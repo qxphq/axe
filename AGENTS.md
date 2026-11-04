@@ -1,7 +1,7 @@
 # nano
 
 Minimal coding agent harness in Rust. One binary, a line REPL, OpenAI-compatible
-providers, five tools. Roughly 6k LOC across seven files.
+providers, five tools. Roughly 6.1k LOC across eight files.
 
 ## Principles
 
@@ -13,7 +13,7 @@ providers, five tools. Roughly 6k LOC across seven files.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
    panes, sessions, compaction, subagents, MCP, or permission layer until the REPL
    is genuinely insufficient. One feature per change.
-3. **Small surface.** Seven modules. A new module needs a reason.
+3. **Small surface.** Eight modules. A new module needs a reason.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` + SSE
    only. Never add per-provider code paths; express differences as config
    (`base_url`, `models_url`, `api_key_env`, `session_header`).
@@ -40,9 +40,14 @@ providers, five tools. Roughly 6k LOC across seven files.
    add a permission layer without being asked.
 9. **Real cwd, relative paths.** `current_dir()` at startup, used for the prompt and
    every relative path. Never hardcode directories.
-10. **One config file.** `~/.config/nano/config.json` (respects `XDG_CONFIG_HOME`),
-    auto-created with an example on first run. Secrets only through `api_key_env`.
-    Never commit keys, never read another app's auth store.
+10. **One config file, and it is input.** `~/.config/nano/config.json` (respects
+    `XDG_CONFIG_HOME`), auto-created with an example on first run. Secrets only
+    through `api_key_env`. Never commit keys, never read another app's auth store.
+    Nano never writes it: what the user picked is per-directory state, in
+    `~/.local/state/nano/projects/<escaped cwd>/state.json` (respects
+    `XDG_STATE_HOME`), a sibling of the session files to come. Its `model` is the
+    default for a directory that has no state, so the config stays the answer to
+    "when I do not say otherwise".
 11. **Verify against reality.** Test locally against `mock.py` (chunked SSE,
     keep-alive comments, session headers). No speculative fixes; only fix what a
     reproduction shows.
@@ -73,6 +78,8 @@ providers, five tools. Roughly 6k LOC across seven files.
 - `http.rs` — URL parsing, HTTP/1.1 over `TcpStream`/rustls, body decoding
   (`Content-Length`, chunked, EOF).
 - `config.rs` — load and validate the config; resolve the `agents` file.
+- `state.rs` — the per-directory state file: the cwd key, load, and an atomic
+  write. Sessions join it later.
 - `tools.rs` — tool registry, JSON schemas, generated prompt, execution, and
   `fetch`: the host guard, the HTML-to-text tokenizer, the sanitizer.
 

@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod http;
 mod md;
+mod state;
 mod ui;
 mod tools;
 
@@ -38,9 +39,16 @@ fn run() -> Result<(), String> {
     // prompt is a stable prefix and must not change mid-session.
     // Order: config `agents`, then the project's AGENTS.md, then `system`.
     let global_agents = cfg.agents.as_deref().and_then(config::read_agents);
-    let project_file = std::env::current_dir()
-        .ok()
-        .and_then(|dir| config::find_agents(&dir))
+    // The working directory identifies this directory's state file and anchors
+    // the project's AGENTS.md; read it once.
+    let cwd = std::env::current_dir().ok();
+    let state = match &cwd {
+        Some(dir) => state::load(dir),
+        None => state::State::default(),
+    };
+    let project_file = cwd
+        .as_deref()
+        .and_then(config::find_agents)
         .filter(|f| Some(f.as_path()) != cfg.agents.as_deref());
     let project_agents = project_file.as_deref().and_then(config::read_agents);
     // Named once, next to the splash: which instructions are in force is part
@@ -95,14 +103,22 @@ fn run() -> Result<(), String> {
         return Err("no models available".into());
     }
 
-    let (provider, model) = resolve(&providers, cfg.model.as_deref());
-    // Thinking level follows the model: it is remembered per `provider/id` and
-    // turned into request fields by `thinking_body`.
-    let thinking = cfg
-        .thinking
-        .iter()
-        .find(|(spec, _)| *spec == format!("{}/{}", providers[provider].name, model))
-        .map(|(_, level)| level.clone());
+    // The directory's own choice wins; a directory with no state starts on the
+    // config's `model`, which is the explicit default.
+    let (provider, model) = resolve(
+        &providers,
+        state.model.as_deref().or(cfg.model.as_deref()),
+    );
+    // Thinking level follows the model: it is remembered per `provider/id`,
+    // first for this directory, then for the config, and turned into request
+    // fields by `thinking_body`.
+    let spec = format!("{}/{}", providers[provider].name, model);
+    let thinking = state.thinking_for(&spec).or_else(|| {
+        cfg.thinking
+            .iter()
+            .find(|(s, _)| *s == spec)
+            .map(|(_, level)| level.clone())
+    });
     validate_level(&providers[provider].cfg, thinking.as_deref());
     // An interactive run carries the selection in the live region's last row
     // and opens with a splash; a piped run owns no row and no screen, so the
@@ -143,12 +159,11 @@ fn run() -> Result<(), String> {
     ];
 
     let session = Session {
-        cfg,
+        state,
         providers,
         provider,
         model,
         thinking,
-        thoughts: false,
         read_only,
         used: None,
         messages,
@@ -175,14 +190,13 @@ fn mode_note(read_only: bool) -> Value {
 
 /// Everything the REPL mutates between turns: the model selection and history.
 struct Session {
-    cfg: config::Config,
+    /// What this directory remembers. Held rather than re-read so a `/model`,
+    /// `/thinking` or `/thoughts` change is a write, not a reload.
+    state: state::State,
     providers: Vec<Provider>,
     provider: usize,
     model: String,
     thinking: Option<String>,
-    /// Show reasoning in the transcript (`/thoughts`). Off by default: the
-    /// status row's "thinking…" is enough unless the user asks for more.
-    thoughts: bool,
     /// Explore mode: `read` and a read-only `bash` only (`/explore`). Starts
     /// from `cfg.explore_by_default`; the history carries the note.
     read_only: bool,
@@ -408,7 +422,7 @@ impl Session {
         let provider = &self.providers[self.provider];
         let model = self.model.clone();
         let thinking = self.thinking.clone();
-        let thoughts = self.thoughts;
+        let thoughts = self.state.thoughts;
         let read_only = self.read_only;
         let turn_tx = tx.clone();
         let turn_cancel = &cancel;
@@ -636,7 +650,9 @@ impl Session {
                     let text = self.info();
                     screen.set_info(&text);
                     screen.output(&format!("{text}\n"));
-                    save_selection(&providers[self.provider].name, &self.model);
+                    let spec = format!("{}/{}", providers[self.provider].name, self.model);
+                    self.state.set_model(&spec);
+                    self.state.save();
                 }
                 return Cmd::Continue;
             }
@@ -656,7 +672,8 @@ impl Session {
                 self.thinking = Some(level.clone());
                 screen.set_info(&self.info());
                 let spec = format!("{}/{}", providers[self.provider].name, self.model);
-                config::save_thinking(&spec, level.as_str());
+                self.state.set_thinking(&spec, level.as_str());
+                self.state.save();
                 screen.output(&format!(
                     "thinking: {}\n\n",
                     thinking_label(&providers[self.provider].cfg, &self.thinking)
@@ -673,18 +690,16 @@ impl Session {
                     self.model = id;
                     // The count belonged to the old model's window.
                     self.used = None;
-                    self.thinking = self
-                        .cfg
-                        .thinking
-                        .iter()
-                        .find(|(spec, _)| {
-                            *spec == format!("{}/{}", providers[self.provider].name, self.model)
-                        })
-                        .map(|(_, level)| level.clone());
+                    self.thinking = self.state.thinking_for(&format!(
+                        "{}/{}",
+                        providers[self.provider].name, self.model
+                    ));
                     let text = self.info();
                     screen.set_info(&text);
                     screen.output(&format!("{text}\n"));
-                    save_selection(&providers[self.provider].name, &self.model);
+                    let spec = format!("{}/{}", providers[self.provider].name, self.model);
+                    self.state.set_model(&spec);
+                    self.state.save();
                 }
                 None => screen.error(&format!("unknown model: {spec}\n")),
             }
@@ -697,10 +712,11 @@ impl Session {
         }
 
         if input == "/thoughts" {
-            self.thoughts = !self.thoughts;
+            self.state.thoughts = !self.state.thoughts;
+            self.state.save();
             screen.output(&format!(
                 "thoughts: {}\n\n",
-                if self.thoughts { "on" } else { "off" }
+                if self.state.thoughts { "on" } else { "off" }
             ));
             return Cmd::Continue;
         }
@@ -763,14 +779,10 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
             Some((pi, id)) => {
                 session.provider = pi;
                 session.model = id;
-                session.thinking = session
-                    .cfg
-                    .thinking
-                    .iter()
-                    .find(|(spec, _)| {
-                        *spec == format!("{}/{}", providers[session.provider].name, session.model)
-                    })
-                    .map(|(_, level)| level.clone());
+                session.thinking = session.state.thinking_for(&format!(
+                    "{}/{}",
+                    providers[session.provider].name, session.model
+                ));
                 println!(
                     "{}",
                     selection(
@@ -780,7 +792,9 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
                         &session.thinking
                     )
                 );
-                save_selection(&providers[session.provider].name, &session.model);
+                let spec = format!("{}/{}", providers[session.provider].name, session.model);
+                session.state.set_model(&spec);
+                session.state.save();
             }
             None => eprintln!("nano: unknown model: {}", rest.trim()),
         }
@@ -798,7 +812,8 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
         if let Some(level) = set_thinking(&providers[session.provider].cfg, rest) {
             session.thinking = Some(level.clone());
             let spec = format!("{}/{}", providers[session.provider].name, session.model);
-            config::save_thinking(&spec, level.as_str());
+            session.state.set_thinking(&spec, level.as_str());
+            session.state.save();
         }
         return Cmd::Continue;
     }
@@ -1264,11 +1279,6 @@ fn banner(note: Option<&str>) {
         println!(" {}", Paint::Dim.ansi(note));
     }
     println!();
-}
-
-/// Persist the current selection so the next run starts on the same model.
-fn save_selection(provider: &str, model: &str) {
-    config::save_model(&format!("{provider}/{model}"));
 }
 
 fn session_id() -> String {

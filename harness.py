@@ -294,7 +294,11 @@ def main():
     ok = False
     try:
         config_home = write_config(work, port)
-        env = [f"XDG_CONFIG_HOME={config_home}"]
+        env = [
+            f"XDG_CONFIG_HOME={config_home}",
+            # Keep per-directory state out of the real $HOME/.local/state.
+            f"XDG_STATE_HOME={Path(work) / 'state'}",
+        ]
         if not args.no_fetch_local:
             # The fixture server is on loopback, which the host guard refuses.
             env.append("NANO_FETCH_ALLOW_LOCAL=1")
