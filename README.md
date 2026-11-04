@@ -116,7 +116,7 @@ model sees it the next time you ask something.
 | `/explore` | toggle explore mode (also Shift+Tab) |
 | `/new` | start a new session, naming the old one |
 | `/sessions [query]` | browse or search this directory's sessions |
-| `/help` | list the commands |
+| `/help` | list the commands, the config path and its keys |
 | `/exit`, `/quit` | quit |
 
 Recent sessions for the directory are offered at startup as a chooser: Up and
