@@ -2,7 +2,7 @@
 //! `Content-Length`, chunked and close-delimited responses.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -232,15 +232,23 @@ fn tls_config() -> Result<Arc<ClientConfig>, String> {
 
 fn connect(
     ep: &Endpoint,
+    pinned: Option<&[SocketAddr]>,
     cancel: Option<&Cancel>,
     read_timeout: Duration,
 ) -> Result<Stream, String> {
     if cancel.is_some_and(Cancel::cancelled) {
         return Err("interrupted".into());
     }
-    let addrs = (ep.host.as_str(), ep.port)
-        .to_socket_addrs()
-        .map_err(|e| format!("resolve {}:{}: {e}", ep.host, ep.port))?;
+    // A caller that already resolved and vetted the name passes its addresses
+    // here, so the name is not resolved twice: DNS cannot change between the
+    // check and the connect. Everything else resolves as usual.
+    let addrs: Vec<SocketAddr> = match pinned {
+        Some(addrs) => addrs.to_vec(),
+        None => (ep.host.as_str(), ep.port)
+            .to_socket_addrs()
+            .map_err(|e| format!("resolve {}:{}: {e}", ep.host, ep.port))?
+            .collect(),
+    };
     let mut stream = None;
     let mut last: Option<io::Error> = None;
     for addr in addrs {
@@ -428,6 +436,7 @@ pub fn request(
         api_key,
         headers,
         body,
+        None,
         cancel,
         Duration::from_secs(300),
     )
@@ -443,6 +452,7 @@ pub fn request_with_timeout(
     api_key: Option<&str>,
     headers: &[(String, String)],
     body: Option<&str>,
+    pinned: Option<&[SocketAddr]>,
     cancel: Option<&Cancel>,
     read_timeout: Duration,
 ) -> Result<Response, String> {
@@ -466,7 +476,7 @@ pub fn request_with_timeout(
         }
     }
 
-    let mut stream = connect(ep, cancel, read_timeout)?;
+    let mut stream = connect(ep, pinned, cancel, read_timeout)?;
 
     let mut head = format!(
         "{method} {target} HTTP/1.1\r\nHost: {}\r\nUser-Agent: nano/{}\r\nAccept: */*\r\nConnection: close\r\n",
