@@ -326,7 +326,7 @@ def main():
         start = time.monotonic()
         while time.monotonic() - start < 5:
             screen = tmux.capture(args.scroll, args.ansi)
-            if "model:" in screen or tmux.dead():
+            if "❯" in screen or "model:" in screen or tmux.dead():
                 break
             time.sleep(0.05)
 
