@@ -61,7 +61,7 @@ pub fn fetch(args: &Value, cancel: &Cancel) -> String {
     // The harness needs loopback; a release build must not let an environment
     // variable turn the SSRF guard off, so the knob exists only in debug.
     let local =
-        cfg!(debug_assertions) && std::env::var("NANO_FETCH_ALLOW_LOCAL").is_ok_and(|v| v == "1");
+        cfg!(debug_assertions) && std::env::var("AXE_FETCH_ALLOW_LOCAL").is_ok_and(|v| v == "1");
     let pins = if local {
         None
     } else {

@@ -273,7 +273,7 @@ pub fn archive_old(cwd: &Path, keep: usize) {
         return;
     }
     if !have_gzip() {
-        eprintln!("nano: gzip not found: old session bodies stay plain");
+        eprintln!("axe: gzip not found: old session bodies stay plain");
         return;
     }
     for mut meta in old {
@@ -286,19 +286,19 @@ pub fn archive_old(cwd: &Path, keep: usize) {
             if gz.exists() {
                 meta.archived = true;
                 if let Err(e) = meta.save(&dir) {
-                    eprintln!("nano: cannot archive session {}: {e}", meta.id);
+                    eprintln!("axe: cannot archive session {}: {e}", meta.id);
                 }
             }
             continue;
         }
         if let Err(e) = compress(&dir, &meta, &plain, &gz) {
-            eprintln!("nano: cannot archive session {}: {e}", meta.id);
+            eprintln!("axe: cannot archive session {}: {e}", meta.id);
             let _ = fs::remove_file(dir.join(format!("{}.jsonl.gz.tmp", meta.id)));
             continue;
         }
         meta.archived = true;
         if let Err(e) = meta.save(&dir) {
-            eprintln!("nano: cannot archive session {}: {e}", meta.id);
+            eprintln!("axe: cannot archive session {}: {e}", meta.id);
         }
     }
 }
@@ -531,7 +531,7 @@ mod tests {
 
     #[test]
     fn meta_and_log_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("nano-test-sessions-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("axe-test-sessions-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut meta = Meta::new("abc123", "prov/model");
         meta.title = "Title".into();
@@ -568,7 +568,7 @@ mod tests {
         if !have_gzip() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("nano-test-gzip-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("axe-test-gzip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut meta = Meta::new("abc123", "p/m");
@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     fn damaged_body_is_reported() {
-        let dir = std::env::temp_dir().join(format!("nano-test-damaged-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("axe-test-damaged-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut meta = Meta::new("abc123", "p/m");

@@ -479,7 +479,7 @@ pub fn request_with_timeout(
     let mut stream = connect(ep, pinned, cancel, read_timeout)?;
 
     let mut head = format!(
-        "{method} {target} HTTP/1.1\r\nHost: {}\r\nUser-Agent: nano/{}\r\nAccept: */*\r\nConnection: close\r\n",
+        "{method} {target} HTTP/1.1\r\nHost: {}\r\nUser-Agent: axe/{}\r\nAccept: */*\r\nConnection: close\r\n",
         host_header(ep),
         env!("CARGO_PKG_VERSION")
     );

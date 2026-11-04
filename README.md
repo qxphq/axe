@@ -1,8 +1,14 @@
-# nano
+# axe
+
+```text
+ ▄▄▄  ▄▄ ▄▄ ▄▄▄▄▄
+██▀██ ▀█▄█▀ ██▄▄
+██▀██ ██ ██ ██▄▄▄
+```
 
 A minimal coding agent in Rust. One binary, one line REPL, any
 OpenAI-compatible `chat/completions` server, seven tools. The transcript is
-your scrollback: nano never takes the screen.
+your scrollback: axe never takes the screen.
 
 ## Build
 
@@ -10,7 +16,7 @@ your scrollback: nano never takes the screen.
 cargo build --release
 ```
 
-The binary is `target/release/nano`. It needs a current stable Rust toolchain
+The binary is `target/release/axe`. It needs a current stable Rust toolchain
 (edition 2021) and a C toolchain for `ring`. Linux (x86_64 or aarch64) and macOS
 are supported. Other Unix-like targets compile, but `bash` is unavailable
 there: a child that cannot be confined is not spawned. Windows is not supported.
@@ -18,8 +24,8 @@ there: a child that cannot be confined is not spawned. Windows is not supported.
 ## Run
 
 ```sh
-nano             # in the directory you want it to work on
-nano < prompts   # without a terminal: plain-text lines in, transcript out
+axe              # in the directory you want it to work on
+axe < prompts    # without a terminal: plain-text lines in, transcript out
 ```
 
 The working directory is what the prompt shows, what `AGENTS.md` is looked up
@@ -27,7 +33,7 @@ from, and the key under which the session is remembered.
 
 ## Config
 
-`~/.config/nano/config.json`, or `$XDG_CONFIG_HOME/nano/config.json`. It is
+`~/.config/axe/config.json`, or `$XDG_CONFIG_HOME/axe/config.json`. It is
 created with an example on first run and never rewritten afterwards: what you
 pick in one directory is state, not config.
 
@@ -65,7 +71,7 @@ A provider entry describes the differences between servers, never code paths:
 }
 ```
 
-Thinking levels are named by the provider, not by nano: `off`, `low`, `medium`
+Thinking levels are named by the provider, not by axe: `off`, `low`, `medium`
 and `high` are only what `/thinking` suggests. A level the provider does not
 define falls back to its default.
 
@@ -167,10 +173,10 @@ back if Brave fails or returns nothing; `count` defaults to 10 and caps at 20.
 
 ## State and sessions
 
-Per directory, under `$XDG_STATE_HOME/nano/projects/` (or
-`~/.local/state/nano/projects/`), in a subdirectory named after the working
+Per directory, under `$XDG_STATE_HOME/axe/projects/` (or
+`~/.local/state/axe/projects/`), in a subdirectory named after the working
 directory with every byte outside `[A-Za-z0-9._-]` written as `%XX` — so
-`/home/anon/nano` becomes `%2Fhome%2Fanon%2Fnano`.
+`/home/anon/axe` becomes `%2Fhome%2Fanon%2Faxe`.
 
 | file | contents |
 | --- | --- |
@@ -215,22 +221,22 @@ program that is not on the list, and an allowed program can load code with
 outside the scratch directory or open an internet socket. It degrades with one
 line at startup on a kernel without Landlock.
 
-A refusal comes from the kernel, not from nano's argument parsing, and its
+A refusal comes from the kernel, not from axe's argument parsing, and its
 message says so: a missing binary and a denied one read differently.
 
 A command child inherits a minimal environment — `PATH`, `HOME`, `LANG`,
-`LC_ALL`, `TERM`, `TMPDIR`, `USER`, `SHELL` — not nano's own. Provider and
+`LC_ALL`, `TERM`, `TMPDIR`, `USER`, `SHELL` — not axe's own. Provider and
 search tokens stay in the parent's memory.
 
 Known residuals, in both modes: `connect` over AF_UNIX, writes through an
 inherited file descriptor, metadata such as `chmod` outside the scratch
-directory, and `fetch`/`web_search`, which run in nano's own process by design.
+directory, and `fetch`/`web_search`, which run in axe's own process by design.
 In explore mode, code loaded by an allowed program (`LD_PRELOAD`, the loader)
 runs too, inside the same write and network confinement.
 
 ## Trust and security
 
-nano runs as you. The trust boundary is the operating-system user: the model
+axe runs as you. The trust boundary is the operating-system user: the model
 can reach the files, the environment and the credentials you can reach. A
 working directory is not trusted just because it is yours — a cloned
 repository, its `AGENTS.md`, a file, a fetched page or a command's output is

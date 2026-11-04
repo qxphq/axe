@@ -41,7 +41,7 @@ fn main() {
     // terminal; a static's `Drop` never runs, so this is the hook.
     sandbox::cleanup();
     if let Err(e) = result {
-        eprintln!("nano: {}", strip_control(&e));
+        eprintln!("axe: {}", strip_control(&e));
         std::process::exit(1);
     }
 }
@@ -90,7 +90,7 @@ fn run() -> Result<(), String> {
     // Confinement is announced before anything runs, once, next to the
     // provider lines: weaker than promised must never be silent.
     if let Some(note) = sandbox::init() {
-        eprintln!("nano: {}", strip_control(&note));
+        eprintln!("axe: {}", strip_control(&note));
     }
     // Instructions are read once at startup, before any request: the system
     // prompt is a stable prefix and must not change mid-session.
@@ -686,7 +686,7 @@ impl Session {
                         screen.clear_menu(false);
                         self.startup.clear();
                         if let Err(e) = self.resume(&meta.id, Some(&mut screen)) {
-                            screen.error(&format!("nano: {e}\n"));
+                            screen.error(&format!("axe: {e}\n"));
                         }
                         continue;
                     }
@@ -734,7 +734,7 @@ impl Session {
                     let cancel = http::Cancel::new();
                     self.record(json!({ "role": "user", "content": input }));
                     if let Err(e) = self.turn(&mut sink, &cancel) {
-                        eprintln!("nano: {}", strip_control(&e));
+                        eprintln!("axe: {}", strip_control(&e));
                     }
                     self.name_session();
                 }
@@ -779,8 +779,8 @@ impl Session {
             return;
         };
         match screen {
-            Some(screen) => screen.error(&format!("nano: {text}\n")),
-            None => eprintln!("nano: {}", strip_control(&text)),
+            Some(screen) => screen.error(&format!("axe: {text}\n")),
+            None => eprintln!("axe: {}", strip_control(&text)),
         }
     }
 
@@ -876,14 +876,14 @@ impl Session {
 
         if let Some(screen) = screen {
             for warning in warnings {
-                screen.error(&format!("nano: {warning}\n"));
+                screen.error(&format!("axe: {warning}\n"));
             }
             screen.output(&format!("Resumed: {title}\n"));
             self.replay(screen);
             screen.set_info(&self.info());
         } else {
             for warning in warnings {
-                eprintln!("nano: {}", strip_control(&warning));
+                eprintln!("axe: {}", strip_control(&warning));
             }
         }
         Ok(title)
@@ -1126,7 +1126,7 @@ impl Session {
                     match self.resume(&id, Some(screen)) {
                         Ok(_) => return,
                         Err(e) => {
-                            screen.error(&format!("nano: {e}\n"));
+                            screen.error(&format!("axe: {e}\n"));
                             return;
                         }
                     }
@@ -1147,7 +1147,7 @@ impl Session {
     /// replaces the list, so the numbers always refer to what was last shown.
     fn list_piped(&mut self, arg: &str) {
         if self.state.cwd.as_os_str().is_empty() {
-            eprintln!("nano: sessions need a working directory");
+            eprintln!("axe: sessions need a working directory");
             return;
         }
         if let Ok(number) = arg.parse::<usize>() {
@@ -1156,12 +1156,12 @@ impl Session {
                 .and_then(|at| self.picks.get(at))
                 .cloned()
             else {
-                eprintln!("nano: no session #{number}; run /sessions first");
+                eprintln!("axe: no session #{number}; run /sessions first");
                 return;
             };
             match self.resume(&id, None) {
                 Ok(title) => println!("Resumed: {}", terminal_text(&title)),
-                Err(e) => eprintln!("nano: {}", strip_control(&e)),
+                Err(e) => eprintln!("axe: {}", strip_control(&e)),
             }
             return;
         }
@@ -1509,7 +1509,7 @@ impl Session {
                         }
                         Event::Resize => dirty = true,
                         Event::Done(Err(e)) => {
-                            screen.error(&format!("nano: {e}\n"));
+                            screen.error(&format!("axe: {e}\n"));
                             done = true;
                         }
                         Event::Done(Ok(count)) => {
@@ -1555,7 +1555,7 @@ impl Session {
         self.flush_warnings(Some(screen));
 
         if !result {
-            screen.error("nano: turn failed\n");
+            screen.error("axe: turn failed\n");
         }
         Ok(queued)
     }
@@ -1638,7 +1638,7 @@ impl Session {
                         }
                         screen.output(&format!("thinking: {label}\n\n"));
                     }
-                    Err(e) => screen.error(&format!("nano: {e}\n")),
+                    Err(e) => screen.error(&format!("axe: {e}\n")),
                 }
                 Cmd::Continue
             }
@@ -1691,13 +1691,13 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
             Cmd::Continue
         }
         Command::Model(None) => {
-            eprintln!("nano: /model needs a terminal");
+            eprintln!("axe: /model needs a terminal");
             Cmd::Continue
         }
         Command::Model(Some(spec)) => {
             match find(&session.providers, &spec) {
                 Some((pi, id)) => println!("{}", terminal_text(&session.set_model(pi, id))),
-                None => eprintln!("nano: unknown model: {}", strip_control(&spec)),
+                None => eprintln!("axe: unknown model: {}", strip_control(&spec)),
             }
             Cmd::Continue
         }
@@ -1722,15 +1722,15 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
                     let spec = format!("{}/{}", providers[session.provider].name, session.model);
                     session.state.set_thinking(&spec, level.as_str());
                     if let Err(e) = session.state.save() {
-                        eprintln!("nano: {}", strip_control(&e));
+                        eprintln!("axe: {}", strip_control(&e));
                     }
                 }
-                Err(e) => eprintln!("nano: {}", strip_control(&e)),
+                Err(e) => eprintln!("axe: {}", strip_control(&e)),
             }
             Cmd::Continue
         }
         Command::Thoughts => {
-            eprintln!("nano: /thoughts needs a terminal");
+            eprintln!("axe: /thoughts needs a terminal");
             Cmd::Continue
         }
         Command::Explore => {
@@ -1743,7 +1743,7 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
             Cmd::Continue
         }
         Command::Unknown(input) => {
-            eprintln!("nano: unknown command: {}", strip_control(&input));
+            eprintln!("axe: unknown command: {}", strip_control(&input));
             Cmd::Continue
         }
         Command::Shell(command) => Cmd::Shell(command),
@@ -2156,7 +2156,7 @@ fn validate_level(provider: &config::ProviderConfig, level: Option<&str>) {
     let Some(level) = level else { return };
     if !level_names(provider).iter().any(|name| name == level) {
         eprintln!(
-            "nano: {}: thinking level \"{level}\" is not configured, using default",
+            "axe: {}: thinking level \"{level}\" is not configured, using default",
             provider.name
         );
     }
@@ -2204,14 +2204,10 @@ fn percent(used: u64, ctx: u64) -> String {
     }
 }
 
-/// Splash, printed once above the live region: block letters for `nano`. It
+/// Splash, printed once above the live region: block letters for `axe`. It
 /// lands in the transcript and is never repainted, so it must be narrower than
 /// the terminal's margin-to-margin width on a narrow window.
-const LOGO: &[&str] = &[
-    "████▄  ▀▀█▄ ████▄ ▄███▄",
-    "██ ██ ▄█▀██ ██ ██ ██ ██",
-    "██ ██ ▀█▄██ ██ ██ ▀███▀",
-];
+const LOGO: &[&str] = &[" ▄▄▄  ▄▄ ▄▄ ▄▄▄▄▄", "██▀██ ▀█▄█▀ ██▄▄", "██▀██ ██ ██ ██▄▄▄"];
 
 fn banner(note: Option<&str>) {
     // One leading blank: the same margin `ui::Screen` keeps on both edges.
@@ -2227,7 +2223,7 @@ fn banner(note: Option<&str>) {
     let logo: &[&str] = if width == 0 || width > logo_width {
         LOGO
     } else {
-        &["nano"]
+        &["axe"]
     };
     for line in logo {
         println!(" {}", Paint::Cyan.ansi(line));
@@ -2288,7 +2284,7 @@ fn resolve(providers: &[Provider], spec: Option<&str>) -> (usize, String) {
         if let Some(hit) = find(providers, spec) {
             return hit;
         }
-        eprintln!("nano: model {spec:?} not available, using default");
+        eprintln!("axe: model {spec:?} not available, using default");
     }
     (0, providers[0].models[0].id.clone())
 }
@@ -2869,7 +2865,7 @@ mod tests {
 
     #[test]
     fn store_records_and_finalizes() {
-        let dir = std::env::temp_dir().join(format!("nano-test-store-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("axe-test-store-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut store = Store::fresh(dir.clone(), "abc123", "p/m");
         store.record(&json!({ "role": "user", "content": "fix it" }));

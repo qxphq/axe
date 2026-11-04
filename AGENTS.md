@@ -1,4 +1,4 @@
-# nano
+# axe
 
 Minimal coding agent harness in Rust: one binary, a line REPL, OpenAI-compatible
 providers, seven tools. The code is the source of truth; this file records the
@@ -40,11 +40,11 @@ invariants a change must not break.
    add a permission layer without being asked.
 9. **Real cwd, relative paths.** `current_dir()` at startup, used for the prompt and
    every relative path. Never hardcode directories.
-10. **One config file, and it is input.** `~/.config/nano/config.json` (respects
+10. **One config file, and it is input.** `~/.config/axe/config.json` (respects
     `XDG_CONFIG_HOME`), auto-created on first run. Secrets only through
-    `api_key_env`; never commit keys or read another app's auth store. Nano never
+    `api_key_env`; never commit keys or read another app's auth store. Axe never
     writes it: the per-directory state and sessions live under
-    `~/.local/state/nano/projects/<escaped cwd>/` (respects `XDG_STATE_HOME`).
+    `~/.local/state/axe/projects/<escaped cwd>/` (respects `XDG_STATE_HOME`).
     Config `model` is the default for a directory with no state.
 11. **Verify against reality.** Test against `mock.py` (chunked SSE, keep-alive,
     session headers). No speculative fixes; reproduce first.
@@ -138,7 +138,7 @@ and `mock.py` for fixtures and replies.
 
 `fetch:PAGE` has the mock call `fetch` on a fixture page (plain, inject, big,
 image, redirect, latin1, slow); `PAGE@START+CHARS` sets paging. The harness serves
-those pages on loopback and sets `NANO_FETCH_ALLOW_LOCAL=1`; that variable is a
+those pages on loopback and sets `AXE_FETCH_ALLOW_LOCAL=1`; that variable is a
 **debug-build test knob only, off by default; release builds ignore it**.
 `--no-fetch-local` checks the refusal. `show:x` streams the last tool result back.
 
