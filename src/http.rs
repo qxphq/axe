@@ -548,4 +548,33 @@ mod tests {
         assert_eq!(ep.prefix, "/v1/models?q=1".trim_end_matches('/'));
         assert_eq!(target, "/v1/models?q=1");
     }
+
+    #[test]
+    fn split_uses_default_port_and_root() {
+        let (ep, target) = split_url("https://host").unwrap();
+        assert_eq!(ep.port, 443);
+        assert_eq!(target, "/");
+    }
+
+    #[test]
+    fn body_reads_length_and_chunked() {
+        let mut fixed = BodyReader {
+            inner: &b"abcdef"[..],
+            state: BodyState::Length(3),
+        };
+        let mut out = String::new();
+        fixed.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "abc");
+
+        let mut chunked = BodyReader {
+            inner: &b"3\r\nabc\r\n0\r\n\r\n"[..],
+            state: BodyState::Chunked {
+                remaining: 0,
+                done: false,
+            },
+        };
+        let mut out = String::new();
+        chunked.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "abc");
+    }
 }

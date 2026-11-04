@@ -537,4 +537,62 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(result.contains("read stopped at 1 MiB"), "{result}");
     }
+
+    #[test]
+    fn read_honors_offset_and_limit() {
+        let path = temp("window");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+        let result = read(&json!({
+            "path": path.to_string_lossy(),
+            "offset": 2,
+            "limit": 1,
+        }));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result, "b\n");
+    }
+
+    #[test]
+    fn write_and_edit_roundtrip() {
+        let path = temp("roundtrip");
+        let path_s = path.to_string_lossy().to_string();
+        assert!(write(&json!({ "path": path_s, "content": "one" })).starts_with("wrote"));
+        assert!(edit(&json!({
+            "path": path_s,
+            "old": "one",
+            "new": "two",
+        }))
+        .starts_with("edited"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn about_returns_readme_and_unknown_tool_errors() {
+        let cancel = Cancel::new();
+        assert!(execute("about", "{}", &cancel, false).starts_with("# nano"));
+        assert!(execute("nope", "{}", &cancel, false).starts_with("error: unknown tool"));
+    }
+
+    #[test]
+    fn bash_returns_exit_and_output() {
+        let result = execute(
+            "bash",
+            &json!({ "command": "printf hi" }).to_string(),
+            &Cancel::new(),
+            false,
+        );
+        assert!(result.contains("exit: 0"), "{result}");
+        assert!(result.contains("hi"), "{result}");
+    }
+
+    #[test]
+    fn fetch_refuses_localhost() {
+        let result = execute(
+            "fetch",
+            &json!({ "url": "http://localhost/" }).to_string(),
+            &Cancel::new(),
+            true,
+        );
+        assert!(result.contains("refused host"), "{result}");
+    }
 }

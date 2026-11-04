@@ -1280,4 +1280,28 @@ mod tests {
         assert_eq!(clip("日本語", 4), "日…");
         assert_eq!(clip("abcd", 4), "abcd");
     }
+
+    #[test]
+    fn split_drops_only_the_final_newline() {
+        assert_eq!(split("a\nb\n"), vec!["a", "b"]);
+        assert_eq!(split("a\n\nb"), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn prompt_layout_wraps_and_tracks_cursor() {
+        let (rows, first, (row, col)) = prompt_layout(2, "ab\ncd", 5, 10, 4);
+        assert_eq!(rows, vec!["ab", "cd"]);
+        assert_eq!(first, 0);
+        assert_eq!((row, col), (1, 2));
+    }
+
+    #[test]
+    fn wrap_breaks_at_cells() {
+        let rows = wrap(Line::from("hello world"), 6);
+        let text: Vec<String> = rows
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text, vec!["hello ", "world"]);
+    }
 }

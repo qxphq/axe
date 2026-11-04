@@ -2615,4 +2615,98 @@ mod tests {
         assert_eq!(parse_command("hello"), Command::Turn("hello".into()));
         assert_eq!(parse_command("/modelx"), Command::Unknown("/modelx".into()));
     }
+
+    #[test]
+    fn naming_parses_two_lines() {
+        assert_eq!(
+            parse_naming("TITLE: Fix parser\nSUMMARY: The parser was fixed."),
+            Some(("Fix parser".into(), "The parser was fixed.".into()))
+        );
+        assert_eq!(parse_naming("nothing useful"), None);
+    }
+
+    #[test]
+    fn mode_note_names_the_available_tools() {
+        let on = mode_note(true)["content"].as_str().unwrap().to_string();
+        let off = mode_note(false)["content"].as_str().unwrap().to_string();
+        assert!(on.contains("write"));
+        assert!(off.contains("fetch and web_search are unavailable"));
+    }
+
+    #[test]
+    fn display_helpers() {
+        assert_eq!(scaled(9999), "9999");
+        assert_eq!(scaled(10_000), "10k");
+        assert_eq!(scaled(1_000_000), "1.0M");
+        assert_eq!(percent(1, 1000), "<1%");
+        assert_eq!(percent(50, 100), "50%");
+        assert!(failed("exit: 1\nboom"));
+        assert!(!failed("exit: 0\nok"));
+        assert!(failed("error: nope"));
+        assert_eq!(mark("exit: 0\n").1, "✓");
+        assert_eq!(mark("exit: 1\n").1, "✗");
+        assert_eq!(detail("exit: 1\nboom\nmore"), "boom…");
+        assert_eq!(summarize("a\nb", 10), "a…");
+    }
+
+    #[test]
+    fn session_ids_are_32_hex_chars() {
+        let id = session_id();
+        assert_eq!(id.len(), 32);
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn naming_excerpt_skips_mode_and_shell_lines() {
+        let messages = vec![
+            json!({ "role": "user", "content": "explore mode: on" }),
+            json!({ "role": "user", "content": "$ !ls\nfile" }),
+            json!({ "role": "user", "content": "fix it" }),
+            json!({ "role": "assistant", "content": "fixed" }),
+        ];
+        assert_eq!(
+            naming_excerpt(&messages),
+            Some(("fix it".into(), "fixed".into()))
+        );
+    }
+
+    #[test]
+    fn model_selection_resolves_provider_and_bare_id() {
+        let provider = Provider {
+            name: "p".into(),
+            cfg: config::ProviderConfig {
+                name: "p".into(),
+                base_url: "http://p".into(),
+                api_key: None,
+                api_key_env: None,
+                models_url: None,
+                session_header: None,
+                thinking: Vec::new(),
+            },
+            ep: http::parse_url("http://p").unwrap(),
+            key: None,
+            headers: Vec::new(),
+            models: vec![api::ModelInfo {
+                id: "m".into(),
+                context: Some(100),
+            }],
+        };
+        assert_eq!(
+            find(std::slice::from_ref(&provider), "p/m"),
+            Some((0, "m".into()))
+        );
+        assert_eq!(
+            find(std::slice::from_ref(&provider), "m"),
+            Some((0, "m".into()))
+        );
+        assert_eq!(
+            resolve(std::slice::from_ref(&provider), Some("p/m")),
+            (0, "m".into())
+        );
+        assert_eq!(
+            resolve(std::slice::from_ref(&provider), Some("missing")),
+            (0, "m".into())
+        );
+        assert_eq!(selection(&[provider], 0, "m", &None), "p/m  ·  default");
+    }
 }

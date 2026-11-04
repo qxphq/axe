@@ -1692,4 +1692,33 @@ mod tests {
     fn double_strike_does_not_hide_single_tilde() {
         assert_eq!(text("~~a~~ ~b~"), "a b");
     }
+
+    #[test]
+    fn blocks_render() {
+        let out = text("# Heading\n\n- one\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |");
+        assert!(out.contains("Heading"), "{out}");
+        assert!(out.contains("• one"), "{out}");
+        assert!(out.contains("a │ b"), "{out}");
+    }
+
+    #[test]
+    fn code_and_links_render() {
+        let out = text("`a & b` [x](https://example.com) [bad](javascript:alert(1))");
+        assert!(out.contains("a & b"), "{out}");
+        assert!(out.contains("(https://example.com)"), "{out}");
+        assert!(out.contains("javascript:alert(1)"), "{out}");
+        assert!(text("```\nlet x = 1;\n```").contains("let x = 1;"));
+    }
+
+    #[test]
+    fn stream_lays_out_when_block_ends() {
+        let mut stream = Stream::new();
+        let mut out = Vec::new();
+        stream.push("hello", 80, &mut out);
+        assert!(out.is_empty());
+        stream.push("world", 80, &mut out);
+        stream.push("", 80, &mut out);
+        let rendered: Vec<String> = out.iter().map(plain).collect();
+        assert_eq!(rendered, vec!["hello world"]);
+    }
 }

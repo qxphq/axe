@@ -221,31 +221,31 @@ pub fn load() -> Result<Config, String> {
 
     let v: Value =
         serde_json::from_str(&raw).map_err(|e| format!("invalid JSON in {}: {e}", p.display()))?;
+    parse_value(&v).map_err(|e| format!("{}: {e}", p.display()))
+}
 
+fn parse_value(v: &Value) -> Result<Config, String> {
     let mut providers = Vec::new();
     if let Some(map) = v["providers"].as_object() {
         for (name, entry) in map {
             providers.push(parse_provider(name, entry)?);
         }
-    } else if let Some(base_url) = text(&v, "base_url") {
+    } else if let Some(base_url) = text(v, "base_url") {
         providers.push(ProviderConfig {
             name: "local".to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: text(&v, "api_key"),
+            api_key: text(v, "api_key"),
             api_key_env: None,
             models_url: None,
             session_header: None,
             thinking: Vec::new(),
         });
     } else {
-        return Err(format!(
-            "{}: need \"providers\" or \"base_url\"",
-            p.display()
-        ));
+        return Err("need \"providers\" or \"base_url\"".into());
     }
 
     if providers.is_empty() {
-        return Err(format!("{}: no providers configured", p.display()));
+        return Err("no providers configured".into());
     }
 
     // An unset key is not an error: search falls back to DuckDuckGo. A literal
@@ -257,7 +257,7 @@ pub fn load() -> Result<Config, String> {
 
     Ok(Config {
         providers,
-        model: text(&v, "model"),
+        model: text(v, "model"),
         explore_by_default: v["explore_by_default"].as_bool().unwrap_or(true),
         search: Search { brave_key },
         thinking: v["thinking"]
@@ -268,7 +268,25 @@ pub fn load() -> Result<Config, String> {
                     .collect()
             })
             .unwrap_or_default(),
-        system: text(&v, "system"),
-        agents: text(&v, "agents").map(|raw| agents_file(&raw)),
+        system: text(v, "system"),
+        agents: text(v, "agents").map(|raw| agents_file(&raw)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn example_config_parses() {
+        let v: Value = serde_json::from_str(EXAMPLE).unwrap();
+        let cfg = parse_value(&v).unwrap();
+        assert!(cfg.providers.len() >= 3);
+        assert_eq!(cfg.model.as_deref(), Some("local/qwen3.8-flash-next-chat"));
+        assert!(cfg.explore_by_default);
+        assert!(cfg
+            .providers
+            .iter()
+            .any(|p| p.session_header.as_deref() == Some("x-opencode-session")));
+    }
 }

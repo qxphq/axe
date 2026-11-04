@@ -547,3 +547,15 @@ mod imp {
         Err("sandbox: this platform has no sandbox; bash is unavailable".into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowlist_is_nonempty_and_resolves_sh() {
+        assert!(COMMANDS.contains(&"ls"));
+        assert!(COMMANDS.contains(&"git"));
+        assert!(resolve("sh").is_some());
+    }
+}

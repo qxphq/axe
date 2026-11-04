@@ -44,7 +44,11 @@ pub fn list_models(
     if res.status != 200 {
         return Err(format!("models: HTTP {}: {}", res.status, body.trim()));
     }
-    let v: Value = serde_json::from_str(&body).map_err(|e| format!("models json: {e}"))?;
+    parse_models(&body)
+}
+
+fn parse_models(body: &str) -> Result<Vec<ModelInfo>, String> {
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("models json: {e}"))?;
     let data = v["data"]
         .as_array()
         .ok_or_else(|| "models: missing \"data\" array".to_string())?;
@@ -124,11 +128,7 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
         return Err(format!("HTTP {}: {}", res.status, body.trim()));
     }
 
-    let mut text = String::new();
-    let mut reasoning_text = String::new();
-    let mut partials: Vec<(String, String, String)> = Vec::new();
-    let mut usage: Option<Usage> = None;
-
+    let mut assembler = Assembler::default();
     loop {
         let line = match res.read_line() {
             Ok(Some(line)) => line,
@@ -149,6 +149,26 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
             continue;
         };
+        assembler.absorb(&chunk, &mut on_text, &mut on_reasoning)?;
+    }
+    Ok(assembler.finish())
+}
+
+#[derive(Default)]
+struct Assembler {
+    text: String,
+    reasoning: String,
+    partials: Vec<(String, String, String)>,
+    usage: Option<Usage>,
+}
+
+impl Assembler {
+    fn absorb(
+        &mut self,
+        chunk: &Value,
+        on_text: &mut dyn FnMut(&str),
+        on_reasoning: &mut dyn FnMut(&str),
+    ) -> Result<(), String> {
         // Some compatible servers report an error inside a 200 SSE stream.
         if let Some(error) = chunk.get("error").filter(|error| !error.is_null()) {
             let message = error["message"]
@@ -160,7 +180,7 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
 
         // The usage chunk comes last and carries no choices at all.
         if let Some(prompt) = chunk["usage"]["prompt_tokens"].as_u64() {
-            usage = Some(Usage {
+            self.usage = Some(Usage {
                 prompt,
                 completion: chunk["usage"]["completion_tokens"].as_u64().unwrap_or(0),
             });
@@ -173,20 +193,21 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
             .as_str()
             .or_else(|| delta["reasoning"].as_str());
         if let Some(reasoning) = reasoning.filter(|r| !r.is_empty()) {
-            reasoning_text.push_str(reasoning);
+            self.reasoning.push_str(reasoning);
             on_reasoning(reasoning);
         }
         if let Some(part) = delta["content"].as_str() {
-            text.push_str(part);
+            self.text.push_str(part);
             on_text(part);
         }
         if let Some(calls) = delta["tool_calls"].as_array() {
             for call in calls {
                 let index = call["index"].as_u64().unwrap_or(0) as usize;
-                while partials.len() <= index {
-                    partials.push((String::new(), String::new(), String::new()));
+                while self.partials.len() <= index {
+                    self.partials
+                        .push((String::new(), String::new(), String::new()));
                 }
-                let partial = &mut partials[index];
+                let partial = &mut self.partials[index];
                 if let Some(id) = call["id"].as_str() {
                     if !id.is_empty() {
                         partial.0 = id.to_string();
@@ -202,22 +223,106 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
                 }
             }
         }
+        Ok(())
     }
 
-    let calls = partials
-        .into_iter()
-        .filter(|(_, name, _)| !name.is_empty())
-        .map(|(id, name, arguments)| ToolCall {
-            id,
-            name,
-            arguments,
-        })
-        .collect();
+    fn finish(self) -> Reply {
+        let calls = self
+            .partials
+            .into_iter()
+            .filter(|(_, name, _)| !name.is_empty())
+            .map(|(id, name, arguments)| ToolCall {
+                id,
+                name,
+                arguments,
+            })
+            .collect();
+        Reply {
+            text: self.text,
+            reasoning: self.reasoning,
+            calls,
+            usage: self.usage,
+        }
+    }
+}
 
-    Ok(Reply {
-        text,
-        reasoning: reasoning_text,
-        calls,
-        usage,
-    })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_lists_read_each_context_key() {
+        let models = parse_models(
+            r#"{"data":[
+                {"id":"a","context_length":100},
+                {"id":"b","context_window":200},
+                {"id":"c","limit":{"context":300}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].context, Some(100));
+        assert_eq!(models[1].context, Some(200));
+        assert_eq!(models[2].context, Some(300));
+    }
+
+    #[test]
+    fn assembler_collects_text_reasoning_calls_and_usage() {
+        let mut a = Assembler::default();
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut on_text = |part: &str| text.push_str(part);
+        let mut on_reasoning = |part: &str| reasoning.push_str(part);
+        a.absorb(
+            &serde_json::json!({"choices":[{"delta":{"reasoning_content":"think"}}]}),
+            &mut on_text,
+            &mut on_reasoning,
+        )
+        .unwrap();
+        a.absorb(
+            &serde_json::json!({"choices":[{"delta":{"content":"answer"}}]}),
+            &mut on_text,
+            &mut on_reasoning,
+        )
+        .unwrap();
+        a.absorb(
+            &serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"path\":"}},
+                {"index":0,"function":{"arguments":"\"x\"}"}}
+            ]}}]}),
+            &mut on_text,
+            &mut on_reasoning,
+        )
+        .unwrap();
+        a.absorb(
+            &serde_json::json!({"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+            &mut on_text,
+            &mut on_reasoning,
+        )
+        .unwrap();
+        let reply = a.finish();
+        assert_eq!(reply.text, "answer");
+        assert_eq!(reply.reasoning, "think");
+        assert_eq!(text, "answer");
+        assert_eq!(reasoning, "think");
+        assert_eq!(reply.calls.len(), 1);
+        assert_eq!(reply.calls[0].name, "read");
+        assert_eq!(reply.calls[0].arguments, "{\"path\":\"x\"}");
+        assert_eq!(reply.usage.unwrap().prompt, 7);
+    }
+
+    #[test]
+    fn assembler_surfaces_provider_errors() {
+        let mut a = Assembler::default();
+        let mut on_text = |_: &str| {};
+        let mut on_reasoning = |_: &str| {};
+        let err = a
+            .absorb(
+                &serde_json::json!({"error":{"message":"bad key"}}),
+                &mut on_text,
+                &mut on_reasoning,
+            )
+            .unwrap_err();
+        assert!(err.contains("bad key"));
+    }
 }

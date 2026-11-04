@@ -484,4 +484,38 @@ mod tests {
         assert_eq!(stamp(0), "1970-01-01 00:00");
         assert_eq!(stamp(1_700_000_000), "2023-11-14 22:13");
     }
+
+    #[test]
+    fn meta_and_log_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("nano-test-sessions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut meta = Meta::new("abc123", "prov/model");
+        meta.title = "Title".into();
+        meta.save(&dir).unwrap();
+        let mut log = Log::open(&dir, "abc123").unwrap();
+        log.append(&json!({ "role": "user", "content": "hello" }))
+            .unwrap();
+        log.append(&json!({ "role": "assistant", "content": "hi" }))
+            .unwrap();
+        assert_eq!(Meta::load(&dir, "abc123").unwrap().title, "Title");
+        let mut meta = Meta::load(&dir, "abc123").unwrap();
+        let mut warnings = Vec::new();
+        let messages = load_messages(&dir, &mut meta, &mut warnings).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fallback_uses_first_request_and_answer() {
+        let messages = vec![
+            json!({ "role": "user", "content": "explore mode: on" }),
+            json!({ "role": "user", "content": "fix the parser" }),
+            json!({ "role": "assistant", "content": "Done." }),
+        ];
+        let (title, summary) = fallback(&messages);
+        assert_eq!(title, "fix the parser");
+        assert!(summary.contains("Done."));
+        assert_eq!(collapse("  a\n b  ", 20), "a b");
+    }
 }

@@ -178,4 +178,15 @@ mod tests {
         assert_eq!(key(Path::new("/home/anon/nano")), "%2Fhome%2Fanon%2Fnano");
         assert!(!key(Path::new("/a/../b")).contains('/'));
     }
+
+    #[test]
+    fn selection_and_thinking_roundtrip() {
+        let mut state = State::default();
+        state.set_model("prov/model");
+        state.set_thinking("prov/model", "high");
+        assert_eq!(state.model.as_deref(), Some("prov/model"));
+        assert_eq!(state.thinking_for("prov/model").as_deref(), Some("high"));
+        state.set_thinking("prov/model", "low");
+        assert_eq!(state.thinking_for("prov/model").as_deref(), Some("low"));
+    }
 }

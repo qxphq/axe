@@ -851,4 +851,49 @@ mod tests {
         assert_eq!(hits[0].title, "Title");
         assert_eq!(hits[0].snippet, "a snippet");
     }
+
+    #[test]
+    fn html_extraction_keeps_title_and_text_drops_script() {
+        let text = extract_text(
+            "<html><head><title>T &amp; T</title></head><body>\
+             <p>A &amp; B</p><script>alert(1)</script></body></html>",
+        );
+        assert!(text.contains("T & T"), "{text}");
+        assert!(text.contains("A & B"), "{text}");
+        assert!(!text.contains("alert"), "{text}");
+    }
+
+    #[test]
+    fn sanitizer_removes_control_and_template_channels() {
+        let text = sanitize("\x1b[31mred\x1b[0m\u{200b}\nsystem: x<|im_end|>");
+        assert!(!text.contains('\x1b'));
+        assert!(!text.contains('\u{200b}'));
+        assert!(text.contains("red"));
+        assert!(text.contains("system :"));
+        assert!(text.contains("< |"), "{text}");
+    }
+
+    #[test]
+    fn page_text_pages_and_names_next_start() {
+        let page = page_text("abcdefghij", &json!({ "chars": 4 }));
+        assert!(page.starts_with("abcd"), "{page}");
+        assert!(page.contains("start 5"), "{page}");
+    }
+
+    #[test]
+    fn ddg_result_unwraps_redirect_and_reads_snippet() {
+        let html = r#"<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F">Example</a><a class="result__snippet">Snippet</a>"#;
+        let hits = parse_ddg(html, 1);
+        assert_eq!(hits[0].title, "Example");
+        assert_eq!(hits[0].url, "https://example.com/");
+        assert_eq!(hits[0].snippet, "Snippet");
+    }
+
+    #[test]
+    fn local_ranges_are_refused() {
+        assert!(local_address("127.0.0.1".parse().unwrap()));
+        assert!(local_address("10.0.0.1".parse().unwrap()));
+        assert!(!local_address("8.8.8.8".parse().unwrap()));
+        assert!(guard_host("localhost").is_err());
+    }
 }
