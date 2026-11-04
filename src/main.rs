@@ -8,8 +8,8 @@ mod md;
 mod sandbox;
 mod sessions;
 mod state;
-mod ui;
 mod tools;
+mod ui;
 mod web;
 
 use std::cell::RefCell;
@@ -125,10 +125,7 @@ fn run() -> Result<(), String> {
 
     // The directory's own choice wins; a directory with no state starts on the
     // config's `model`, which is the explicit default.
-    let (provider, model) = resolve(
-        &providers,
-        state.model.as_deref().or(cfg.model.as_deref()),
-    );
+    let (provider, model) = resolve(&providers, state.model.as_deref().or(cfg.model.as_deref()));
     // Thinking level follows the model: it is remembered per `provider/id`,
     // first for this directory, then for the config, and turned into request
     // fields by `thinking_body`.
@@ -234,8 +231,7 @@ fn naming_excerpt(messages: &[Value]) -> Option<(String, String)> {
         .iter()
         .filter(|message| message["role"].as_str() == Some("assistant"))
         .filter_map(|message| message["content"].as_str())
-        .filter(|text| !text.trim().is_empty())
-        .last()
+        .rfind(|text| !text.trim().is_empty())
         .unwrap_or("");
     Some((
         sessions::collapse(user, 1500),
@@ -371,7 +367,11 @@ impl Store {
         }
     }
 
-    fn resumed(dir: std::path::PathBuf, meta: sessions::Meta, model: &str) -> Result<Store, String> {
+    fn resumed(
+        dir: std::path::PathBuf,
+        meta: sessions::Meta,
+        model: &str,
+    ) -> Result<Store, String> {
         let log = sessions::Log::open(&dir, &meta.id)?;
         Ok(Store {
             dir,
@@ -430,7 +430,9 @@ impl Store {
     }
 
     fn set_title(&mut self, title: &str, summary: &str) {
-        let Some(meta) = self.meta.as_mut() else { return };
+        let Some(meta) = self.meta.as_mut() else {
+            return;
+        };
         meta.title = sessions::collapse(title, 60);
         if !summary.trim().is_empty() {
             meta.summary = sessions::collapse(summary, 240);
@@ -443,7 +445,9 @@ impl Store {
     /// A title no model gave: the first request stands in. Called when the
     /// session ends without one.
     fn finalize(&mut self, messages: &[Value]) {
-        let Some(meta) = self.meta.as_mut() else { return };
+        let Some(meta) = self.meta.as_mut() else {
+            return;
+        };
         if meta.title.is_empty() {
             let (title, summary) = sessions::fallback(messages);
             if !title.is_empty() {
@@ -493,7 +497,6 @@ fn session_row(meta: &sessions::Meta) -> String {
     }
     row
 }
-
 
 /// What a submitted line asks for.
 enum Cmd {
@@ -683,10 +686,7 @@ impl Session {
 
     /// No tty: the kernel edits the line and the turn prints as it streams.
     fn run_piped(mut self) -> Result<(), String> {
-        loop {
-            let Some(line) = ui::cooked_line("❯ ") else {
-                break;
-            };
+        while let Some(line) = ui::cooked_line("❯ ") {
             let cmd = match line.trim() {
                 "" => Cmd::Continue,
                 _ => dispatch_piped(&mut self, &line),
@@ -734,11 +734,7 @@ impl Session {
     /// Render the first pending warning at a safe point: the screen when there
     /// is one, stderr when the run is piped.
     fn flush_warnings(&mut self, screen: Option<&mut ui::Screen>) {
-        if let Some(text) = self
-            .store
-            .as_mut()
-            .and_then(|store| store.take_warning())
-        {
+        if let Some(text) = self.store.as_mut().and_then(|store| store.take_warning()) {
             self.warn(text);
         }
         let Some(text) = self.warning.take() else {
@@ -827,9 +823,11 @@ impl Session {
         let model = self.spec();
         let store = Store::resumed(dir, meta, &model)?;
 
-        let system = self.messages.first().cloned().unwrap_or_else(|| {
-            json!({ "role": "system", "content": tools::system_prompt() })
-        });
+        let system = self
+            .messages
+            .first()
+            .cloned()
+            .unwrap_or_else(|| json!({ "role": "system", "content": tools::system_prompt() }));
         self.messages = vec![system, mode_note(self.read_only)];
         self.messages.extend(messages);
         self.sid = id.to_string();
@@ -933,9 +931,11 @@ impl Session {
         if let Some(dir) = dir {
             self.store = Some(Store::fresh(dir, &sid, &model));
         }
-        let system = self.messages.first().cloned().unwrap_or_else(|| {
-            json!({ "role": "system", "content": tools::system_prompt() })
-        });
+        let system = self
+            .messages
+            .first()
+            .cloned()
+            .unwrap_or_else(|| json!({ "role": "system", "content": tools::system_prompt() }));
         self.messages = vec![system, mode_note(self.read_only)];
         self.sid = sid;
         self.naming = None;
@@ -951,8 +951,12 @@ impl Session {
 
     /// A generated title is attempted once, after the first answer exists.
     fn may_name(&self) -> bool {
-        let Some(store) = &self.store else { return false };
-        let Some(meta) = &store.meta else { return false };
+        let Some(store) = &self.store else {
+            return false;
+        };
+        let Some(meta) = &store.meta else {
+            return false;
+        };
         meta.title.is_empty() && !store.naming_tried && naming_excerpt(&self.messages).is_some()
     }
 
@@ -986,11 +990,7 @@ impl Session {
     /// Apply a finished background title, if one is ready. A title is metadata;
     /// waiting for the next key is enough and never blocks the prompt.
     fn poll_naming(&mut self, screen: Option<&mut ui::Screen>) {
-        let Some(received) = self
-            .naming
-            .as_ref()
-            .map(|rx| rx.try_recv())
-        else {
+        let Some(received) = self.naming.as_ref().map(|rx| rx.try_recv()) else {
             return;
         };
         match received {
@@ -1047,7 +1047,9 @@ impl Session {
         let mut query = query.trim().to_string();
         loop {
             let found: Vec<(usize, String)> = if query.is_empty() {
-                (0..metas.len()).map(|index| (index, String::new())).collect()
+                (0..metas.len())
+                    .map(|index| (index, String::new()))
+                    .collect()
             } else {
                 sessions::search(&self.state.cwd, &metas, &query)
                     .into_iter()
@@ -1133,9 +1135,7 @@ impl Session {
             return;
         }
         let selected: Vec<(sessions::Meta, String)> = if arg.trim().is_empty() {
-            all.into_iter()
-                .map(|meta| (meta, String::new()))
-                .collect()
+            all.into_iter().map(|meta| (meta, String::new())).collect()
         } else {
             sessions::search(&self.state.cwd, &all, arg)
                 .into_iter()
@@ -1176,12 +1176,7 @@ impl Session {
     fn fill(&self) -> String {
         let used = self.used.unwrap_or_else(|| estimate(&self.messages));
         match self.context() {
-            Some(ctx) => format!(
-                "{}/{} ({})",
-                scaled(used),
-                scaled(ctx),
-                percent(used, ctx)
-            ),
+            Some(ctx) => format!("{}/{} ({})", scaled(used), scaled(ctx), percent(used, ctx)),
             None => scaled(used),
         }
     }
@@ -1226,9 +1221,7 @@ impl Session {
         let args = json!({ "command": command }).to_string();
         let mut queued: Option<String> = None;
         let result = thread::scope(|scope| {
-            let handle = scope.spawn(|| {
-                tools::execute("bash", &args, &cancel, false)
-            });
+            let handle = scope.spawn(|| tools::execute("bash", &args, &cancel, false));
             loop {
                 match rx.recv_timeout(Duration::from_millis(50)) {
                     Ok(Event::Key(key)) if key.code == KeyCode::Esc => {
@@ -1271,7 +1264,9 @@ impl Session {
                     }
                 }
             }
-            handle.join().unwrap_or_else(|_| "error: shell thread panicked".into())
+            handle
+                .join()
+                .unwrap_or_else(|_| "error: shell thread panicked".into())
         });
         screen.set_status("");
         screen.output(&result);
@@ -1281,7 +1276,7 @@ impl Session {
         self.record(json!({
             "role": "user",
             "content": format!("$ {command}
-{result}"),
+        {result}"),
         }));
         screen.set_info(&self.info());
         let _ = screen.draw();
@@ -1546,12 +1541,7 @@ impl Session {
 
     /// Slash commands and selection changes. `screen` supplies a line from the
     /// terminal for the model picker.
-    fn dispatch(
-        &mut self,
-        line: &str,
-        screen: &mut ui::Screen,
-        rx: &Receiver<Event>,
-    ) -> Cmd {
+    fn dispatch(&mut self, line: &str, screen: &mut ui::Screen, rx: &Receiver<Event>) -> Cmd {
         match parse_command(line) {
             Command::Empty => Cmd::Continue,
             Command::Exit => Cmd::Exit,
@@ -1682,7 +1672,10 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
                 );
                 return Cmd::Continue;
             }
-            match set_thinking(&providers[session.provider].cfg, rest.as_deref().unwrap_or("")) {
+            match set_thinking(
+                &providers[session.provider].cfg,
+                rest.as_deref().unwrap_or(""),
+            ) {
                 Ok(level) => {
                     session.thinking = Some(level.clone());
                     let spec = format!("{}/{}", providers[session.provider].name, session.model);
@@ -1833,12 +1826,7 @@ trait Sink {
     fn status(&mut self, text: &str);
     /// One tool call, finished: the call and its outcome on one line, and the
     /// failure's own words beneath it.
-    fn echo(
-        &mut self,
-        call: &[(Paint, String)],
-        mark: (Paint, &'static str),
-        error: Option<&str>,
-    );
+    fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str), error: Option<&str>);
     /// A round's text is over; close its last line if it wrote one.
     fn end_round(&mut self);
 }
@@ -1902,12 +1890,7 @@ impl Sink for PlainSink {
 
     fn status(&mut self, _text: &str) {}
 
-    fn echo(
-        &mut self,
-        call: &[(Paint, String)],
-        mark: (Paint, &'static str),
-        error: Option<&str>,
-    ) {
+    fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str), error: Option<&str>) {
         self.flush();
         let mut line = String::new();
         for (paint, text) in call {
@@ -1915,9 +1898,9 @@ impl Sink for PlainSink {
         }
         line.push(' ');
         line.push_str(&mark.0.ansi(mark.1));
-        print!("{line}\n");
+        println!("{line}");
         if let Some(error) = error {
-            print!("    {}\n", Paint::Red.ansi(error));
+            println!("    {}", Paint::Red.ansi(error));
         }
         io::stdout().flush().ok();
     }
@@ -1982,12 +1965,7 @@ impl Sink for ChannelSink {
         self.send(Event::Status(text.to_string()));
     }
 
-    fn echo(
-        &mut self,
-        call: &[(Paint, String)],
-        mark: (Paint, &'static str),
-        error: Option<&str>,
-    ) {
+    fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str), error: Option<&str>) {
         self.end_thought();
         let mut spans = call.to_vec();
         spans.push((Paint::Plain, " ".to_string()));
@@ -2140,7 +2118,11 @@ fn selection(
 /// Four bytes per token, the usual rule of thumb for English. Only used when no
 /// provider has counted the real thing: it is off by tens of percent.
 fn estimate(messages: &[Value]) -> u64 {
-    messages.iter().map(|m| m.to_string().len() as u64).sum::<u64>() / 4
+    messages
+        .iter()
+        .map(|m| m.to_string().len() as u64)
+        .sum::<u64>()
+        / 4
 }
 
 /// Token counts in three characters where possible: `812`, `34k`, `1.0M`.
@@ -2314,6 +2296,7 @@ fn pick(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_turn(
     provider: &Provider,
     model: &str,
@@ -2497,7 +2480,11 @@ impl TextSink {
 fn shell_line(command: &str, read_only: bool) -> Vec<(Paint, String)> {
     // Cyan for a command that cannot change the tree: dim is the thought's
     // color, and the two must not read alike.
-    let paint = if read_only { Paint::Cyan } else { Paint::Yellow };
+    let paint = if read_only {
+        Paint::Cyan
+    } else {
+        Paint::Yellow
+    };
     vec![
         (Paint::Plain, "  ".to_string()),
         (paint, "▷".to_string()),
@@ -2626,9 +2613,6 @@ mod tests {
         assert_eq!(parse_command("! ls"), Command::Shell("ls".into()));
         assert_eq!(parse_command("!"), Command::Empty);
         assert_eq!(parse_command("hello"), Command::Turn("hello".into()));
-        assert_eq!(
-            parse_command("/modelx"),
-            Command::Unknown("/modelx".into())
-        );
+        assert_eq!(parse_command("/modelx"), Command::Unknown("/modelx".into()));
     }
 }

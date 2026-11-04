@@ -37,9 +37,15 @@ enum Inline {
 }
 
 enum Block {
-    Heading { level: usize, content: Vec<Inline> },
+    Heading {
+        level: usize,
+        content: Vec<Inline>,
+    },
     Paragraph(Vec<Inline>),
-    Code { lang: String, content: String },
+    Code {
+        lang: String,
+        content: String,
+    },
     Blockquote(Vec<Block>),
     List {
         ordered: bool,
@@ -52,7 +58,10 @@ enum Block {
         rows: Vec<Vec<Vec<Inline>>>,
     },
     Hr,
-    Details { summary: Vec<Inline>, blocks: Vec<Block> },
+    Details {
+        summary: Vec<Inline>,
+        blocks: Vec<Block>,
+    },
 }
 
 const MAX_NESTING_DEPTH: usize = 10;
@@ -75,7 +84,9 @@ fn at(c: &[char], i: usize) -> char {
 }
 
 fn starts(c: &[char], i: usize, pat: &str) -> bool {
-    pat.chars().enumerate().all(|(k, p)| c.get(i + k) == Some(&p))
+    pat.chars()
+        .enumerate()
+        .all(|(k, p)| c.get(i + k) == Some(&p))
 }
 
 fn find_from(c: &[char], from: usize, pat: &str) -> Option<usize> {
@@ -87,7 +98,7 @@ fn find_from(c: &[char], from: usize, pat: &str) -> Option<usize> {
 }
 
 fn backticks(n: usize) -> String {
-    std::iter::repeat('`').take(n).collect()
+    "`".repeat(n)
 }
 
 // --- Entity decoding ---
@@ -192,7 +203,10 @@ fn safe_url(url: &str) -> bool {
         // scheme only settles the answer when it really is one.
         Some(colon) => {
             let scheme = &cleaned[..colon];
-            let real = scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            let real = scheme
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic())
                 && scheme
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
@@ -806,11 +820,8 @@ fn details_start(t: &str) -> bool {
 }
 
 fn details_end(line: &str) -> bool {
-    find_ci(line, "</details").is_some_and(|at| {
-        line[at + "</details".len()..]
-            .trim_start()
-            .starts_with('>')
-    })
+    find_ci(line, "</details")
+        .is_some_and(|at| line[at + "</details".len()..].trim_start().starts_with('>'))
 }
 
 fn find_ci(hay: &str, needle: &str) -> Option<usize> {
@@ -1020,7 +1031,10 @@ fn parse_blocks(input: &str, depth: usize) -> Vec<Block> {
                 }
                 i += 1;
             }
-            blocks.push(Block::Blockquote(parse_blocks(&quoted.join("\n"), depth + 1)));
+            blocks.push(Block::Blockquote(parse_blocks(
+                &quoted.join("\n"),
+                depth + 1,
+            )));
             continue;
         }
 
@@ -1028,10 +1042,7 @@ fn parse_blocks(input: &str, depth: usize) -> Vec<Block> {
         if let Some((base_indent, first, _)) = list_item(line) {
             let ordered = first.chars().next().is_some_and(|c| c.is_ascii_digit());
             let start: usize = if ordered {
-                first
-                    .trim_end_matches(|c| c == '.' || c == ')')
-                    .parse()
-                    .unwrap_or(1)
+                first.trim_end_matches(['.', ')']).parse().unwrap_or(1)
             } else {
                 1
             };
@@ -1159,13 +1170,7 @@ fn render(blocks: &[Block], width: usize, out: &mut Vec<Line<'static>>) {
         if k > 0 {
             out.push(Line::default());
         }
-        emit(
-            std::slice::from_ref(block),
-            width,
-            Style::new(),
-            &[],
-            out,
-        );
+        emit(std::slice::from_ref(block), width, Style::new(), &[], out);
     }
 }
 
@@ -1189,7 +1194,8 @@ fn emit(
             }
             Block::Heading { level, content } => {
                 let style = if *level <= 2 {
-                    base.patch(BOLD).patch(Style::new().add_modifier(Modifier::UNDERLINED))
+                    base.patch(BOLD)
+                        .patch(Style::new().add_modifier(Modifier::UNDERLINED))
                 } else {
                     base.patch(BOLD)
                 };
@@ -1466,12 +1472,19 @@ fn table(
     gutter: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
 ) {
-    let cols = headers.len().max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    let cols = headers
+        .len()
+        .max(rows.iter().map(Vec::len).max().unwrap_or(0));
     if cols == 0 {
         return;
     }
     let mut grid: Vec<Vec<Vec<Piece>>> = Vec::new();
-    grid.push(headers.iter().map(|c| pieces(c, base.patch(BOLD))).collect());
+    grid.push(
+        headers
+            .iter()
+            .map(|c| pieces(c, base.patch(BOLD)))
+            .collect(),
+    );
     for row in rows {
         grid.push(row.iter().map(|c| pieces(c, base)).collect());
     }
@@ -1498,13 +1511,13 @@ fn table(
     let empty: &[Piece] = &[];
     for (r, row) in grid.iter().enumerate() {
         let mut spans = gutter.to_vec();
-        for k in 0..cols {
+        for (k, width) in widths.iter().enumerate().take(cols) {
             if k > 0 {
                 spans.push(Span::styled("│", border));
             }
-            let cell = clip(row.get(k).map(Vec::as_slice).unwrap_or(empty), widths[k]);
+            let cell = clip(row.get(k).map(Vec::as_slice).unwrap_or(empty), *width);
             let used = plain_width(&cell);
-            let pad = widths[k].saturating_sub(used);
+            let pad = width.saturating_sub(used);
             let (left, right) = match aligns.get(k).copied().flatten() {
                 Some(Align::Right) => (pad, 0),
                 Some(Align::Center) => (pad / 2, pad - pad / 2),
@@ -1523,11 +1536,11 @@ fn table(
         out.push(Line::from(spans));
         if r == 0 {
             let mut spans = gutter.to_vec();
-            for k in 0..cols {
+            for (k, width) in widths.iter().enumerate().take(cols) {
                 if k > 0 {
                     spans.push(Span::styled("┼", border));
                 }
-                spans.push(Span::styled("─".repeat(widths[k] + 2), border));
+                spans.push(Span::styled("─".repeat(*width + 2), border));
             }
             out.push(Line::from(spans));
         }
@@ -1629,11 +1642,7 @@ pub fn ansi(line: &Line) -> String {
         if codes.is_empty() {
             out.push_str(&span.content);
         } else {
-            out.push_str(&format!(
-                "\x1b[{}m{}\x1b[0m",
-                codes.join(";"),
-                span.content
-            ));
+            out.push_str(&format!("\x1b[{}m{}\x1b[0m", codes.join(";"), span.content));
         }
     }
     out.trim_end().to_string()
@@ -1684,4 +1693,3 @@ mod tests {
         assert_eq!(text("~~a~~ ~b~"), "a b");
     }
 }
-

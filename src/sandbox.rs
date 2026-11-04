@@ -307,9 +307,11 @@ mod imp {
 
         let mut binaries: Vec<PathBuf> = COMMANDS.iter().filter_map(|name| resolve(name)).collect();
         binaries.push(shell.to_path_buf());
-        binaries.extend(LOADERS.iter().filter_map(|path| {
-            std::fs::canonicalize(path).ok()
-        }));
+        binaries.extend(
+            LOADERS
+                .iter()
+                .filter_map(|path| std::fs::canonicalize(path).ok()),
+        );
         binaries.sort();
         binaries.dedup();
         for binary in &binaries {
@@ -464,7 +466,11 @@ mod imp {
         let profile = profile(read_only)?;
         let shell = shell_path()?;
         let mut cmd = Command::new(SANDBOX_EXEC);
-        cmd.arg("-p").arg(profile).arg(&shell).arg("-c").arg(command);
+        cmd.arg("-p")
+            .arg(profile)
+            .arg(&shell)
+            .arg("-c")
+            .arg(command);
         cmd.env("GIT_OPTIONAL_LOCKS", "0");
         if read_only {
             cmd.env("TMPDIR", scratch_dir()?);

@@ -147,8 +147,7 @@ impl State {
         let tmp = file.with_extension("json.tmp");
         fs::write(&tmp, text)
             .map_err(|e| format!("cannot save state to {}: {e}", tmp.display()))?;
-        fs::rename(&tmp, &file)
-            .map_err(|e| format!("cannot save state to {}: {e}", file.display()))
+        fs::rename(&tmp, &file).map_err(|e| format!("cannot save state to {}: {e}", file.display()))
     }
 
     pub fn thinking_for(&self, spec: &str) -> Option<String> {

@@ -260,10 +260,7 @@ impl Screen {
     pub fn menu_move(&mut self, delta: isize) {
         let Some(menu) = &mut self.menu else { return };
         let last = menu.rows.len().saturating_sub(1);
-        menu.selected = menu
-            .selected
-            .saturating_add_signed(delta)
-            .min(last);
+        menu.selected = menu.selected.saturating_add_signed(delta).min(last);
     }
 
     /// A chooser is active only when the last draw had room for it. An open
@@ -281,9 +278,7 @@ impl Screen {
         if (screen_h as usize) < base + 3 {
             return 0;
         }
-        let room = (screen_h as usize)
-            .saturating_sub(base + 3)
-            .max(1);
+        let room = (screen_h as usize).saturating_sub(base + 3).max(1);
         menu.rows.len().min(room)
     }
 
@@ -328,8 +323,9 @@ impl Screen {
             }
             // A new line, not a submission. Shift needs the kitty protocol;
             // Alt is the ESC-prefixed form every terminal sends.
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT)
-                || key.modifiers.contains(KeyModifiers::ALT) =>
+            KeyCode::Enter
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    || key.modifiers.contains(KeyModifiers::ALT) =>
             {
                 self.insert_char('\n')
             }
@@ -457,7 +453,10 @@ impl Screen {
         // Wrap and render inside the margin, so nothing lands on the edge.
         let margin = PAD.min(width.saturating_sub(1) as u16);
         let width = width.saturating_sub(2 * margin as usize).max(1);
-        let rows: Vec<Line<'static>> = lines.into_iter().flat_map(|line| wrap(line, width)).collect();
+        let rows: Vec<Line<'static>> = lines
+            .into_iter()
+            .flat_map(|line| wrap(line, width))
+            .collect();
         let height = rows.len() as u16;
         let _ = self.term.insert_before(height, |buf| {
             Paragraph::new(rows).render(inset(buf.area, margin), buf);
@@ -628,67 +627,61 @@ impl Screen {
         // cut, so a long status is trimmed first. One blank cell keeps the two
         // apart.
         let info = clip(&self.info, cols);
-        let status = clip(
-            &self.status,
-            cols.saturating_sub(info.chars().count() + 1),
-        );
+        let status = clip(&self.status, cols.saturating_sub(info.chars().count() + 1));
 
-        self.term.draw(|frame| {
-            let area = inset(frame.area(), margin);
-            let row = |offset: u16| Rect {
-                y: area.y + offset,
-                height: 1,
-                ..area
-            };
-            let top = 2 + menu_h;
-            let below = top + rows_n + 1;
-            if let Some((header, entries, selected, scroll)) = &menu {
-                frame.render_widget(
-                    Paragraph::new(Line::styled(clip(header, cols), DIM)),
-                    row(2),
-                );
-                for (at, entry) in entries.iter().enumerate() {
-                    let on = *selected == scroll + at;
-                    let marker = if on { "▸ " } else { "  " };
-                    let text = clip(entry, cols.saturating_sub(2));
-                    frame.render_widget(
-                        Paragraph::new(Line::styled(
-                            format!("{marker}{text}"),
-                            if on { PROMPT_STYLE } else { DIM },
-                        )),
-                        row(3 + at as u16),
-                    );
-                }
-            }
-            frame.render_widget(
-                Paragraph::new(prompt_rows),
-                Rect {
-                    y: area.y + top,
-                    height: rows_n,
+        self.term
+            .draw(|frame| {
+                let area = inset(frame.area(), margin);
+                let row = |offset: u16| Rect {
+                    y: area.y + offset,
+                    height: 1,
                     ..area
-                },
-            );
-            frame.render_widget(
-                Paragraph::new(Line::styled(status, DIM)),
-                row(below),
-            );
-            frame.render_widget(
-                Paragraph::new(Line::styled(info, DIM))
-                    .alignment(Alignment::Right),
-                row(below),
-            );
-            let label = match &queued {
-                // One row: a queued message's own line breaks would be lost.
-                Some(line) => clip(&format!("Queued: {}", line.replace('\n', " ")), cols),
-                None => String::new(),
-            };
-            frame.render_widget(Paragraph::new(Line::styled(label, DIM)), row(1));
-            frame.set_cursor_position(Position::new(
-                area.x + gutter as u16 + ccol,
-                area.y + top + crow,
-            ));
-        })
-        .map(|_| ())
+                };
+                let top = 2 + menu_h;
+                let below = top + rows_n + 1;
+                if let Some((header, entries, selected, scroll)) = &menu {
+                    frame.render_widget(
+                        Paragraph::new(Line::styled(clip(header, cols), DIM)),
+                        row(2),
+                    );
+                    for (at, entry) in entries.iter().enumerate() {
+                        let on = *selected == scroll + at;
+                        let marker = if on { "▸ " } else { "  " };
+                        let text = clip(entry, cols.saturating_sub(2));
+                        frame.render_widget(
+                            Paragraph::new(Line::styled(
+                                format!("{marker}{text}"),
+                                if on { PROMPT_STYLE } else { DIM },
+                            )),
+                            row(3 + at as u16),
+                        );
+                    }
+                }
+                frame.render_widget(
+                    Paragraph::new(prompt_rows),
+                    Rect {
+                        y: area.y + top,
+                        height: rows_n,
+                        ..area
+                    },
+                );
+                frame.render_widget(Paragraph::new(Line::styled(status, DIM)), row(below));
+                frame.render_widget(
+                    Paragraph::new(Line::styled(info, DIM)).alignment(Alignment::Right),
+                    row(below),
+                );
+                let label = match &queued {
+                    // One row: a queued message's own line breaks would be lost.
+                    Some(line) => clip(&format!("Queued: {}", line.replace('\n', " ")), cols),
+                    None => String::new(),
+                };
+                frame.render_widget(Paragraph::new(Line::styled(label, DIM)), row(1));
+                frame.set_cursor_position(Position::new(
+                    area.x + gutter as u16 + ccol,
+                    area.y + top + crow,
+                ));
+            })
+            .map(|_| ())
     }
 
     /// Give the live region `height` rows. It keeps its bottom at the screen
@@ -746,7 +739,14 @@ impl Screen {
         }
         self.restored = true;
         let area = self.term.get_frame().area();
-        let _ = execute!(self.term.backend_mut(), PopKeyboardEnhancementFlags, DisableBracketedPaste, cursor::MoveTo(0, area.y), terminal::Clear(terminal::ClearType::FromCursorDown), cursor::Show);
+        let _ = execute!(
+            self.term.backend_mut(),
+            PopKeyboardEnhancementFlags,
+            DisableBracketedPaste,
+            cursor::MoveTo(0, area.y),
+            terminal::Clear(terminal::ClearType::FromCursorDown),
+            cursor::Show
+        );
         let _ = self.term.flush();
         ratatui::restore();
     }
@@ -965,11 +965,19 @@ impl Screen {
     fn transpose_words(&mut self) {
         // Step back over trailing whitespace, then find the word before it.
         let mut second_end = self.cursor;
-        while second_end > 0 && self.char_at(second_end - 1).is_some_and(char::is_whitespace) {
+        while second_end > 0
+            && self
+                .char_at(second_end - 1)
+                .is_some_and(char::is_whitespace)
+        {
             second_end -= 1;
         }
         let mut second_start = second_end;
-        while second_start > 0 && self.char_at(second_start - 1).is_some_and(|c| !c.is_whitespace()) {
+        while second_start > 0
+            && self
+                .char_at(second_start - 1)
+                .is_some_and(|c| !c.is_whitespace())
+        {
             second_start -= 1;
         }
         if second_start == second_end {
@@ -980,7 +988,11 @@ impl Screen {
             first_end -= 1;
         }
         let mut first_start = first_end;
-        while first_start > 0 && self.char_at(first_start - 1).is_some_and(|c| !c.is_whitespace()) {
+        while first_start > 0
+            && self
+                .char_at(first_start - 1)
+                .is_some_and(|c| !c.is_whitespace())
+        {
             first_start -= 1;
         }
         if first_start == first_end {
@@ -989,7 +1001,11 @@ impl Screen {
         let first = self.buf[self.offset(first_start)..self.offset(first_end)].to_string();
         let between = self.buf[self.offset(first_end)..self.offset(second_start)].to_string();
         let second = self.buf[self.offset(second_start)..self.offset(second_end)].to_string();
-        self.splice(first_start, second_end, &format!("{second}{between}{first}"));
+        self.splice(
+            first_start,
+            second_end,
+            &format!("{second}{between}{first}"),
+        );
     }
 }
 

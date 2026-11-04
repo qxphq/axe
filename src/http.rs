@@ -66,8 +66,12 @@ impl Cancel {
     /// is read under the same lock `cancel` takes, so an interrupt that lands
     /// between the connect and this call is not lost.
     fn watch(&self, socket: &TcpStream) {
-        let Ok(clone) = socket.try_clone() else { return };
-        let Ok(mut slot) = self.socket.lock() else { return };
+        let Ok(clone) = socket.try_clone() else {
+            return;
+        };
+        let Ok(mut slot) = self.socket.lock() else {
+            return;
+        };
         if self.cancelled() {
             let _ = clone.shutdown(Shutdown::Both);
         } else {
@@ -90,7 +94,9 @@ pub fn split_url(url: &str) -> Result<(Endpoint, String), String> {
     } else if let Some(rest) = url.strip_prefix("https://") {
         (Scheme::Https, rest)
     } else {
-        return Err(format!("base_url must start with http:// or https://: {url}"));
+        return Err(format!(
+            "base_url must start with http:// or https://: {url}"
+        ));
     };
 
     // The authority ends at the first '/', '?' or '#': a query can follow a host
@@ -113,7 +119,11 @@ pub fn split_url(url: &str) -> Result<(Endpoint, String), String> {
     };
     // `target` is fragment-free; using it keeps a `#` out of the endpoint's
     // base path (a query on a `models_url` is kept).
-    let path = if tail.starts_with('/') { target.as_str() } else { "" };
+    let path = if tail.starts_with('/') {
+        target.as_str()
+    } else {
+        ""
+    };
 
     let default_port = match scheme {
         Scheme::Http => 80,
@@ -122,8 +132,7 @@ pub fn split_url(url: &str) -> Result<(Endpoint, String), String> {
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (
             h.to_string(),
-            p.parse::<u16>()
-                .map_err(|_| format!("bad port in {url}"))?,
+            p.parse::<u16>().map_err(|_| format!("bad port in {url}"))?,
         ),
         None => (authority.to_string(), default_port),
     };
@@ -233,8 +242,8 @@ fn connect(
         Scheme::Https => {
             let name = ServerName::try_from(ep.host.clone())
                 .map_err(|e| format!("bad hostname {}: {e}", ep.host))?;
-            let conn = ClientConnection::new(tls_config()?, name)
-                .map_err(|e| format!("tls: {e}"))?;
+            let conn =
+                ClientConnection::new(tls_config()?, name).map_err(|e| format!("tls: {e}"))?;
             Ok(Stream::Tls(Box::new(StreamOwned::new(conn, stream))))
         }
     }
@@ -256,65 +265,63 @@ impl<R: Read> Read for BodyReader<R> {
         if buf.is_empty() {
             return Ok(0);
         }
-        loop {
-            match &mut self.state {
-                BodyState::Eof => return self.inner.read(buf),
-                BodyState::Length(remaining) => {
-                    if *remaining == 0 {
-                        return Ok(0);
-                    }
-                    let max = (*remaining).min(buf.len() as u64) as usize;
-                    let n = self.inner.read(&mut buf[..max])?;
-                    if n == 0 {
-                        *remaining = 0;
-                        return Ok(0);
-                    }
-                    *remaining -= n as u64;
-                    return Ok(n);
+        match &mut self.state {
+            BodyState::Eof => self.inner.read(buf),
+            BodyState::Length(remaining) => {
+                if *remaining == 0 {
+                    return Ok(0);
                 }
-                BodyState::Chunked { remaining, done } => {
-                    if *done {
+                let max = (*remaining).min(buf.len() as u64) as usize;
+                let n = self.inner.read(&mut buf[..max])?;
+                if n == 0 {
+                    *remaining = 0;
+                    return Ok(0);
+                }
+                *remaining -= n as u64;
+                Ok(n)
+            }
+            BodyState::Chunked { remaining, done } => {
+                if *done {
+                    return Ok(0);
+                }
+                if *remaining == 0 {
+                    let line = read_line_raw(&mut self.inner)?;
+                    let size = line.trim().split(';').next().unwrap_or("").trim();
+                    if size.is_empty() {
                         return Ok(0);
                     }
-                    if *remaining == 0 {
-                        let line = read_line_raw(&mut self.inner)?;
-                        let size = line.trim().split(';').next().unwrap_or("").trim();
-                        if size.is_empty() {
-                            return Ok(0);
-                        }
-                        let size = usize::from_str_radix(size, 16).map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("bad chunk size: {line:?}"),
-                            )
-                        })?;
-                        if size == 0 {
-                            loop {
-                                let trailer = read_line_raw(&mut self.inner)?;
-                                if trailer.trim().is_empty() {
-                                    break;
-                                }
+                    let size = usize::from_str_radix(size, 16).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("bad chunk size: {line:?}"),
+                        )
+                    })?;
+                    if size == 0 {
+                        loop {
+                            let trailer = read_line_raw(&mut self.inner)?;
+                            if trailer.trim().is_empty() {
+                                break;
                             }
-                            *done = true;
-                            return Ok(0);
                         }
-                        *remaining = size;
+                        *done = true;
+                        return Ok(0);
                     }
-                    let max = (*remaining).min(buf.len());
-                    let n = self.inner.read(&mut buf[..max])?;
-                    if n == 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "truncated chunk",
-                        ));
-                    }
-                    *remaining -= n;
-                    if *remaining == 0 {
-                        let mut crlf = [0u8; 2];
-                        self.inner.read_exact(&mut crlf)?;
-                    }
-                    return Ok(n);
+                    *remaining = size;
                 }
+                let max = (*remaining).min(buf.len());
+                let n = self.inner.read(&mut buf[..max])?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated chunk",
+                    ));
+                }
+                *remaining -= n;
+                if *remaining == 0 {
+                    let mut crlf = [0u8; 2];
+                    self.inner.read_exact(&mut crlf)?;
+                }
+                Ok(n)
             }
         }
     }
@@ -452,7 +459,7 @@ pub fn request_with_timeout(
     let mut location = None;
     loop {
         let line = read_line(&mut reader)?;
-        let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+        let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
         }
@@ -461,8 +468,7 @@ pub fn request_with_timeout(
             let value = value.trim();
             if name == "content-length" {
                 content_length = value.parse::<u64>().ok();
-            } else if name == "transfer-encoding"
-                && value.to_ascii_lowercase().contains("chunked")
+            } else if name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked")
             {
                 chunked = true;
             } else if name == "content-type" {

@@ -125,6 +125,8 @@ invariants a change must not break.
 ```sh
 cargo build
 cargo test     # pure logic: markdown, parsers, caps, command parsing, keys
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 ```
 
 `harness.py` is the UI loop: `mock.py` + tmux pty + virtual terminal. It needs

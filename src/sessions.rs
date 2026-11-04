@@ -56,9 +56,7 @@ fn gz_path(dir: &Path, id: &str) -> PathBuf {
 
 /// Ids name files, so only the shape `session_id` produces may pass.
 fn valid_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id.bytes().all(|b| b.is_ascii_hexdigit())
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 pub fn now() -> u64 {
@@ -88,10 +86,9 @@ impl Meta {
             return Err(format!("not a session id: {id}"));
         }
         let file = meta_path(dir, id);
-        let raw = fs::read_to_string(&file)
-            .map_err(|e| format!("read {}: {e}", file.display()))?;
-        let v: Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("parse {}: {e}", file.display()))?;
+        let raw = fs::read_to_string(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
+        let v: Value =
+            serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", file.display()))?;
         if v["v"].as_u64().unwrap_or(0) > VERSION {
             return Err(format!("session {} uses a newer format", id));
         }
@@ -111,8 +108,7 @@ impl Meta {
 
     /// Rewrite the sidecar through a temporary, like `state.json`.
     pub fn save(&self, dir: &Path) -> Result<(), String> {
-        fs::create_dir_all(dir)
-            .map_err(|e| format!("create {}: {e}", dir.display()))?;
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let file = meta_path(dir, &self.id);
         let value = json!({
             "v": VERSION,
@@ -172,8 +168,7 @@ pub struct Log {
 
 impl Log {
     pub fn open(dir: &Path, id: &str) -> Result<Log, String> {
-        fs::create_dir_all(dir)
-            .map_err(|e| format!("create {}: {e}", dir.display()))?;
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let path = log_path(dir, id);
         let file = OpenOptions::new()
             .create(true)
@@ -185,8 +180,8 @@ impl Log {
 
     /// One API message per line, the same object the request carries.
     pub fn append(&mut self, message: &Value) -> Result<(), String> {
-        let mut line = serde_json::to_string(message)
-            .map_err(|e| format!("encode message: {e}"))?;
+        let mut line =
+            serde_json::to_string(message).map_err(|e| format!("encode message: {e}"))?;
         line.push('\n');
         self.file
             .write_all(line.as_bytes())
@@ -218,8 +213,7 @@ pub fn load_messages(
         meta.save(dir)?;
     }
 
-    let file = File::open(&plain)
-        .map_err(|e| format!("open {}: {e}", plain.display()))?;
+    let file = File::open(&plain).map_err(|e| format!("open {}: {e}", plain.display()))?;
     let mut messages = Vec::new();
     for line in BufReader::new(file).lines() {
         let line = match line {
@@ -311,7 +305,8 @@ fn compress(dir: &Path, meta: &Meta, plain: &Path, gz: &Path) -> Result<(), Stri
     let out = File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
     let mut enc = GzEncoder::new(out, Compression::default());
     io::copy(&mut src, &mut enc).map_err(|e| format!("gzip {}: {e}", plain.display()))?;
-    enc.finish().map_err(|e| format!("gzip {}: {e}", plain.display()))?;
+    enc.finish()
+        .map_err(|e| format!("gzip {}: {e}", plain.display()))?;
     drop(src);
     fs::rename(&tmp, gz).map_err(|e| format!("write {}: {e}", gz.display()))?;
     fs::remove_file(plain).map_err(|e| format!("remove {}: {e}", plain.display()))?;
@@ -427,9 +422,7 @@ pub fn fallback(messages: &[Value]) -> (String, String) {
         .iter()
         .filter(|m| m["role"].as_str() == Some("user"))
         .filter_map(|m| m["content"].as_str())
-        .find(|text| {
-            !text.starts_with("explore mode:") && !text.starts_with('$')
-        })
+        .find(|text| !text.starts_with("explore mode:") && !text.starts_with('$'))
         .map(|text| collapse(text, 240))
         .unwrap_or_default();
     if user.is_empty() {
@@ -481,7 +474,6 @@ fn civil(days: i64) -> (i64, u32, u32) {
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
-
 
 #[cfg(test)]
 mod tests {

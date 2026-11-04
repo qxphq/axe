@@ -291,9 +291,7 @@ fn edit(args: &Value) -> String {
         return format!("error: edit {path}: text not found");
     }
     if count > 1 && !replace_all {
-        return format!(
-            "error: edit {path}: {count} matches; add more context or set replace_all"
-        );
+        return format!("error: edit {path}: {count} matches; add more context or set replace_all");
     }
     let updated = if replace_all {
         text.replace(old, new)

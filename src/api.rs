@@ -68,6 +68,7 @@ pub fn list_models(
 
 /// `extra` is merged into the request body last, so a thinking level can add
 /// provider-specific fields without per-provider code paths.
+#[allow(clippy::too_many_arguments)]
 pub fn chat(
     ep: &Endpoint,
     api_key: Option<&str>,
@@ -104,6 +105,7 @@ pub fn chat(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
     ep: &Endpoint,
     api_key: Option<&str>,
@@ -133,7 +135,7 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
             Ok(None) => break,
             Err(e) => return Err(format!("read stream: {e}")),
         };
-        let line = line.trim_end_matches(|c| c == '\r' || c == '\n');
+        let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
             continue;
         }

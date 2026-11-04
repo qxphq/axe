@@ -45,7 +45,10 @@ pub fn fetch(args: &Value, cancel: &Cancel) -> String {
     // `split_url` reads the authority up to the last ':', which cannot express a
     // bracketed literal, and the v6 ranges this tool would not cover are worse
     // than an honest refusal.
-    if url.split_once("://").is_some_and(|(_, rest)| rest.starts_with('[')) {
+    if url
+        .split_once("://")
+        .is_some_and(|(_, rest)| rest.starts_with('['))
+    {
         return "error: fetch: ipv6 literals are not supported".into();
     }
     let (mut ep, target) = match http::split_url(url) {
@@ -85,7 +88,10 @@ pub fn fetch(args: &Value, cancel: &Cancel) -> String {
     // A redirect is reported, never followed: one call, one host.
     if (300..400).contains(&response.status) {
         let location = response.location.as_deref().unwrap_or("(none)");
-        return format!("error: fetch: http {} -> location: {location}", response.status);
+        return format!(
+            "error: fetch: http {} -> location: {location}",
+            response.status
+        );
     }
     if !(200..300).contains(&response.status) {
         return format!("error: fetch: http {} from {url}", response.status);
@@ -121,9 +127,7 @@ fn page_text(text: &str, args: &Value) -> String {
     if start > total {
         return format!("error: fetch: start {start} is past the end ({total} characters)");
     }
-    let chars = args["chars"]
-        .as_u64()
-        .unwrap_or(FETCH_CHARS as u64) as usize;
+    let chars = args["chars"].as_u64().unwrap_or(FETCH_CHARS as u64) as usize;
     let chars = chars.clamp(1, FETCH_CHARS);
     let head: String = text.chars().skip(start - 1).take(chars).collect();
     let shown = head.chars().count();
@@ -417,7 +421,10 @@ fn http_url(raw: &str) -> Option<String> {
 
 /// JSON text as one sanitized line.
 fn flat(text: &str) -> String {
-    sanitize(text).split_whitespace().collect::<Vec<_>>().join(" ")
+    sanitize(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// HTML fragment as one sanitized line.
@@ -426,7 +433,9 @@ fn fragment(html: &str) -> String {
 }
 
 fn has_class(class: &str, name: &str) -> bool {
-    class.split_whitespace().any(|c| c.eq_ignore_ascii_case(name))
+    class
+        .split_whitespace()
+        .any(|c| c.eq_ignore_ascii_case(name))
 }
 
 /// Value of `name` in a tag body (the text between `<` and `>`). Attribute
@@ -760,7 +769,10 @@ fn title_text(lower: &str, html: &str, from: usize, to: usize) -> Option<String>
     let open = from + lower[from..to].find("<title")?;
     let body = open + lower[open..to].find('>')? + 1;
     let close = body + lower[body..to].find("</title")?;
-    let title = html[body..close].split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = html[body..close]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     (!title.is_empty()).then_some(title)
 }
 

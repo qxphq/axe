@@ -181,8 +181,8 @@ fn text(v: &Value, key: &str) -> Option<String> {
 }
 
 fn parse_provider(name: &str, v: &Value) -> Result<ProviderConfig, String> {
-    let base_url = text(v, "base_url")
-        .ok_or_else(|| format!("provider \"{name}\": missing \"base_url\""))?;
+    let base_url =
+        text(v, "base_url").ok_or_else(|| format!("provider \"{name}\": missing \"base_url\""))?;
     Ok(ProviderConfig {
         name: name.to_string(),
         base_url: base_url.trim_end_matches('/').to_string(),
@@ -219,8 +219,8 @@ pub fn load() -> Result<Config, String> {
         Err(e) => return Err(format!("cannot read {}: {e}", p.display())),
     };
 
-    let v: Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("invalid JSON in {}: {e}", p.display()))?;
+    let v: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid JSON in {}: {e}", p.display()))?;
 
     let mut providers = Vec::new();
     if let Some(map) = v["providers"].as_object() {
