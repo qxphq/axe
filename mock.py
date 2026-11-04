@@ -12,6 +12,9 @@ The reply is chosen by the last user message:
   blank:...       same, padded with leading and trailing blank lines
   slow:...        same, one chunk every 20 ms
   tool:NAME:ARG   one tool call, arguments streamed in pieces
+  fetch:PAGE      one `fetch` call to FETCH_BASE/PAGE
+  fetch:PAGE@START+CHARS   same, with the paging arguments
+  show:           stream the last tool result back, so a test can read it
   reason:...      reasoning deltas first, then the text after `|`
   empty:          no content at all, no calls
 
@@ -24,6 +27,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODEL = "mock/mock-1"
+
+# Set by the harness: the fixture server a `fetch:PAGE` reply points at.
+FETCH_BASE = ""
+LAST_TOOL = ""
 
 CHUNKS = {
     "id": "chatcmpl-mock",
@@ -48,8 +55,25 @@ def plan(reply):
     kind, _, rest = reply.partition(":")
     out = []
 
+    if kind == "show":
+        return [(0.0, frame({"role": "assistant", "content": ""}))] + [
+            (0.0, frame({"content": piece})) for piece in wrap(LAST_TOOL, 200)
+        ] + [(0.0, frame({}, finish="stop")), (0.0, b"data: [DONE]\n\n")]
+
     if kind == "empty":
         return [(0.0, frame({"role": "assistant", "content": ""})), (0.0, b"data: [DONE]\n\n")]
+
+    if kind == "fetch":
+        page, _, window = rest.partition("@")
+        args = {"url": f"{FETCH_BASE}/{page}"}
+        if window:
+            # PAGE@START+CHARS: the paging arguments, so a test can read a
+            # window instead of the whole page.
+            start, _, chars = window.partition("+")
+            args["start"] = int(start)
+            if chars:
+                args["chars"] = int(chars)
+        kind, rest = "tool", "fetch:" + json.dumps(args)
 
     if kind == "tool":
         name, _, args = rest.partition(":")
@@ -132,6 +156,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         request = json.loads(self.rfile.read(length) or b"{}")
+        global LAST_TOOL
+        for message in request.get("messages", []):
+            if message.get("role") == "tool":
+                LAST_TOOL = message.get("content") or ""
         reply = "text:ok"
         for message in reversed(request.get("messages", [])):
             if message.get("role") == "user":
