@@ -2764,7 +2764,6 @@ mod tests {
             cfg: config::ProviderConfig {
                 name: "p".into(),
                 base_url: "http://p".into(),
-                api_key: None,
                 api_key_env: None,
                 models_url: None,
                 session_header: None,
@@ -2803,7 +2802,6 @@ mod tests {
             cfg: config::ProviderConfig {
                 name: "p".into(),
                 base_url: "http://p".into(),
-                api_key: None,
                 api_key_env: None,
                 models_url: None,
                 session_header: None,

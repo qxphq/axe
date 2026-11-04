@@ -13,7 +13,6 @@ use serde_json::Value;
 pub struct ProviderConfig {
     pub name: String,
     pub base_url: String,
-    pub api_key: Option<String>,
     pub api_key_env: Option<String>,
     pub models_url: Option<String>,
     pub session_header: Option<String>,
@@ -34,16 +33,13 @@ impl ProviderConfig {
     }
 
     pub fn resolved_key(&self) -> Option<String> {
-        if let Some(key) = &self.api_key {
-            return Some(key.clone());
-        }
         let var = self.api_key_env.as_ref()?;
         env::var(var).ok().filter(|s| !s.is_empty())
     }
 }
 
 pub struct Search {
-    /// Brave Search API token, resolved from `api_key` or `api_key_env`.
+    /// Brave Search API token, resolved from `api_key_env`.
     /// `None` sends queries to DuckDuckGo.
     pub brave_key: Option<String>,
 }
@@ -184,10 +180,15 @@ fn text(v: &Value, key: &str) -> Option<String> {
 fn parse_provider(name: &str, v: &Value) -> Result<ProviderConfig, String> {
     let base_url =
         text(v, "base_url").ok_or_else(|| format!("provider \"{name}\": missing \"base_url\""))?;
+    if v.get("api_key").is_some() {
+        return Err(format!(
+            "provider \"{name}\": \"api_key\" is not supported; put the secret in the \
+             environment and point \"api_key_env\" at it"
+        ));
+    }
     Ok(ProviderConfig {
         name: name.to_string(),
         base_url: base_url.trim_end_matches('/').to_string(),
-        api_key: text(v, "api_key"),
         api_key_env: text(v, "api_key_env"),
         models_url: text(v, "models_url"),
         session_header: text(v, "session_header"),
@@ -242,10 +243,16 @@ fn parse_value(v: &Value) -> Result<Config, String> {
             providers.push(parse_provider(name, entry)?);
         }
     } else if let Some(base_url) = text(v, "base_url") {
+        if v.get("api_key").is_some() {
+            return Err(
+                "\"api_key\" is not supported; put the secret in the environment \
+                 and point \"api_key_env\" at it"
+                    .into(),
+            );
+        }
         providers.push(ProviderConfig {
             name: "local".to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: text(v, "api_key"),
             api_key_env: None,
             models_url: None,
             session_header: None,
@@ -259,12 +266,17 @@ fn parse_value(v: &Value) -> Result<Config, String> {
         return Err("no providers configured".into());
     }
 
-    // An unset key is not an error: search falls back to DuckDuckGo. A literal
-    // `api_key` wins, the same order providers use.
+    // An unset key is not an error: search falls back to DuckDuckGo.
     let brave = &v["search"]["brave"];
-    let brave_key = text(brave, "api_key").or_else(|| {
-        text(brave, "api_key_env").and_then(|var| env::var(var).ok().filter(|s| !s.is_empty()))
-    });
+    if brave.get("api_key").is_some() {
+        return Err(
+            "\"search.brave.api_key\" is not supported; put the secret in the \
+             environment and point \"search.brave.api_key_env\" at it"
+                .into(),
+        );
+    }
+    let brave_key =
+        text(brave, "api_key_env").and_then(|var| env::var(var).ok().filter(|s| !s.is_empty()));
 
     Ok(Config {
         providers,
@@ -327,11 +339,11 @@ mod tests {
 
     #[test]
     fn provider_level_and_key_helpers() {
-        let mut provider = ProviderConfig {
+        std::env::set_var("NANO_TEST_PROVIDER_KEY", "secret");
+        let provider = ProviderConfig {
             name: "p".into(),
             base_url: "http://p".into(),
-            api_key: Some("secret".into()),
-            api_key_env: None,
+            api_key_env: Some("NANO_TEST_PROVIDER_KEY".into()),
             models_url: None,
             session_header: None,
             thinking: vec![
@@ -346,8 +358,26 @@ mod tests {
         );
         assert_eq!(provider.thinking_body(Some("off")), None);
         assert_eq!(provider.thinking_body(Some("missing")), None);
-        provider.api_key = None;
+        std::env::remove_var("NANO_TEST_PROVIDER_KEY");
         assert_eq!(provider.resolved_key(), None);
+    }
+
+    #[test]
+    fn literal_api_keys_are_rejected() {
+        assert!(parse_value(&serde_json::json!({
+            "providers": {"p": {"base_url": "http://p", "api_key": "secret"}}
+        }))
+        .is_err());
+        assert!(parse_value(&serde_json::json!({
+            "providers": {"p": {"base_url": "http://p"}},
+            "search": {"brave": {"api_key": "secret"}}
+        }))
+        .is_err());
+        assert!(parse_value(&serde_json::json!({
+            "base_url": "http://p",
+            "api_key": "secret"
+        }))
+        .is_err());
     }
 
     #[test]

@@ -47,7 +47,6 @@ A provider entry describes the differences between servers, never code paths:
 | --- | --- |
 | `base_url` | required; `chat/completions` hangs under it |
 | `api_key_env` | environment variable holding the token |
-| `api_key` | literal token; accepted, but it puts the secret in the file |
 | `models_url` | where the model list lives, when not `base_url` + `/models` |
 | `session_header` | header that must carry a stable session id |
 | `thinking` | level name → object merged into the request body |
@@ -78,8 +77,8 @@ define falls back to its default.
 ```
 
 Secrets belong in the environment: `api_key_env` is read at startup. A provider
-whose variable is unset is skipped, not retried; a literal `api_key` is accepted
-but puts the secret in the file.
+whose variable is unset is skipped, not retried. A literal `api_key` in the
+config is rejected — the file is not the place for a secret.
 
 ## Instructions
 
@@ -262,7 +261,7 @@ What the model reads enters the conversation and goes to the provider with the
 next request. Treat the provider as inside the trust boundary, along with
 anyone who can read the session files: plaintext JSONL, `0600`, unencrypted.
 
-Provider and search tokens are read from the environment at startup and stay in
-memory. Command children do not inherit them, and `read` refuses `/proc`
-environment files. A literal `api_key` in the config puts the secret in the
-config file instead; `api_key_env` is the safer setup.
+Provider and search tokens are read from the environment at startup and stay
+in memory. Command children do not inherit them, and `read` refuses `/proc`
+environment files. The config only names the variables; it is rejected if it
+carries a literal key.
