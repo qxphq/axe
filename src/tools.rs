@@ -89,8 +89,8 @@ pub fn definitions() -> &'static Value {
 /// Rules that hold for every user: one line each, no workflow. Rendered as a
 /// numbered list so a later rule can refer back to an earlier one.
 const BEHAVIOR: &[&str] = &[
-    "When asking the user a multiple-choice question, put the recommended option \
-     first and mark it with \"(recommended)\".",
+    "When asking the user a multiple-choice question, list every option on its \
+     own numbered line, recommended first, marked \"(recommended)\".",
 ];
 
 pub fn system_prompt() -> String {
