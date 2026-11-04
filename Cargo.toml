@@ -9,3 +9,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "1"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 unicode-width = "0.2"
+
+# Landlock and seccomp are syscalls, and std exposes neither. Already in the
+# lock file through rustls, so this adds no download; Linux-only, because the
+# macOS side needs nothing below std.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

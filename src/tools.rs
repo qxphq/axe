@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use crate::http::{self, Cancel};
 use crate::md;
+use crate::sandbox;
 
 struct Spec {
     name: &'static str,
@@ -46,7 +47,7 @@ const EDIT: Spec = Spec {
 const BASH: Spec = Spec {
     name: "bash",
     signature: "bash(command)",
-    description: "Run a shell command in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds. In explore mode only read-only commands run: cat, cut, date, df, diff, du, fd, file, find, grep, head, id, jq, ls, ps, pwd, rg, sort, stat, tail, tr, tree, uname, uniq, wc, which, and git with one of blame, describe, diff, grep, log, ls-files, rev-parse, show, status. Anything else is refused.",
+    description: "Run a shell command in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds. No command reaches the network, in any mode. In explore mode only a fixed allowlist runs (ls, cat, head, tail, grep, rg, fd, find, sort, wc, diff, du, df, file, jq, stat, tree, uname, uniq, id, ps, pwd, date, cut, tr, which, git, sh), nothing outside a scratch directory is writable, and `fetch` is the way to the web.",
     parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"Command passed to sh -c"}},"required":["command"]}"#,
 };
 
@@ -63,18 +64,9 @@ const FETCH: Spec = Spec {
     parameters: r#"{"type":"object","properties":{"url":{"type":"string","description":"Absolute http:// or https:// URL"},"start":{"type":"integer","description":"1-based character offset"},"chars":{"type":"integer","description":"Maximum characters, at most 50000"}},"required":["url"]}"#,
 };
 
-/// What `bash` may run in explore mode: commands that only read. A first-token
-/// check, not a sandbox — it keeps a model that was told to explore from
-/// rewriting the tree, and that is all it claims to do.
-const READ_ONLY: &[&str] = &[
-    "cat", "cut", "date", "df", "diff", "du", "fd", "file", "find", "grep", "head", "id", "jq",
-    "ls", "ps", "pwd", "rg", "sort", "stat", "tail", "tr", "tree", "uname", "uniq", "wc", "which",
-];
-
-/// `git` reads through its subcommand, so the first token alone says nothing.
-const READ_ONLY_GIT: &[&str] = &[
-    "blame", "describe", "diff", "grep", "log", "ls-files", "rev-parse", "show", "status",
-];
+/// Appended when the kernel, not the command, refused something: the model has
+/// to tell a sandbox denial from a missing binary or a bug.
+const DENIED: &str = "explore mode: only the read-only allowlist runs, nothing outside $TMPDIR is writable, and no command reaches the network; use `fetch` for the web\n";
 
 const SPECS: &[Spec] = &[READ, WRITE, EDIT, BASH, FETCH];
 
@@ -116,10 +108,11 @@ pub fn system_prompt() -> String {
     out.push_str(
         "Explore mode: read the working directory, read the web through `fetch`, \
          and run read-only commands to understand it, answer, and propose changes. \
-         `write` and `edit` are unavailable, and `bash` runs read-only commands \
-         only. The user may leave the mode at any time; every change is announced \
-         in the conversation as `explore mode: on` or `explore mode: off`, and the \
-         latest note says which mode is in force.\n",
+         `write` and `edit` are unavailable, `bash` runs only a fixed allowlist of \
+         read-only commands and writes only to a scratch directory, and no command \
+         reaches the network in either mode. The user may leave the mode at any \
+         time; every change is announced in the conversation as `explore mode: on` \
+         or `explore mode: off`, and the latest note says which mode is in force.\n",
     );
     out.push_str("\nBehavior:\n");
     for (i, rule) in BEHAVIOR.iter().enumerate() {
@@ -139,8 +132,7 @@ pub fn execute(name: &str, args: &str, cancel: &Cancel, read_only: bool) -> Stri
     };
     match name {
         "read" => read(&args),
-        "bash" if read_only => read_only_bash(&args, cancel),
-        "bash" => bash(&args, cancel),
+        "bash" => bash(&args, cancel, read_only),
         // Not in the schema explore mode sends; a call is the model recalling
         // a tool it no longer has, and the result says why.
         "write" | "edit" if read_only => format!("error: explore mode: {name} is not available"),
@@ -150,43 +142,6 @@ pub fn execute(name: &str, args: &str, cancel: &Cancel, read_only: bool) -> Stri
         "edit" => edit(&args),
         other => format!("error: unknown tool: {other}"),
     }
-}
-
-/// Refuse the command before it spawns: the check is on the call's first word,
-/// so nothing is left running when it fails.
-fn read_only_bash(args: &Value, cancel: &Cancel) -> String {
-    let Some(command) = args["command"].as_str() else {
-        return "error: missing \"command\"".into();
-    };
-    let mut words = command.split_whitespace();
-    let Some(first) = words.next() else {
-        return "error: missing \"command\"".into();
-    };
-    let first = bare(first);
-    if first == "git" {
-        let sub = bare(words.next().unwrap_or(""));
-        if READ_ONLY_GIT.contains(&sub) {
-            return bash(args, cancel);
-        }
-        return format!(
-            "error: explore mode: git {sub} is not read-only; allowed: git {}",
-            READ_ONLY_GIT.join(", git ")
-        );
-    }
-    if READ_ONLY.contains(&first) {
-        return bash(args, cancel);
-    }
-    format!(
-        "error: explore mode: {first} is not read-only; allowed: {}",
-        READ_ONLY.join(", ")
-    )
-}
-
-/// A word with the shell punctuation that separated it from the next command
-/// removed: `ls;` is `ls`. The whole command still goes to `sh -c`, so this is
-/// not a sandbox — it only keeps the leading word from reading as a new name.
-fn bare(word: &str) -> &str {
-    word.trim_end_matches(&[';', '&', '|'][..])
 }
 
 fn read(args: &Value) -> String {
@@ -276,7 +231,7 @@ fn edit(args: &Value) -> String {
     }
 }
 
-fn bash(args: &Value, cancel: &Cancel) -> String {
+fn bash(args: &Value, cancel: &Cancel, read_only: bool) -> String {
     let Some(command) = args["command"].as_str() else {
         return "error: missing \"command\"".into();
     };
@@ -293,9 +248,13 @@ fn bash(args: &Value, cancel: &Cancel) -> String {
         (Err(e), _) | (_, Err(e)) => return format!("error: scratch file: {e}"),
     };
 
-    let mut child = match Command::new("sh")
-        .arg("-c")
-        .arg(command)
+    // The program and its argv come from `sandbox`: the platform decides how a
+    // command is confined, and this function never names a shell.
+    let mut cmd = match sandbox::shell(command, read_only) {
+        Ok(cmd) => cmd,
+        Err(e) => return format!("error: {e}"),
+    };
+    let mut child = match cmd
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_write))
         .stderr(Stdio::from(err_write))
@@ -373,7 +332,16 @@ fn bash(args: &Value, cancel: &Cancel) -> String {
     } else if interrupted {
         out.push_str("interrupted by user (ESC); the command was killed\n");
     }
+    if read_only && denied(&stderr) {
+        out.push_str(DENIED);
+    }
     truncate(out, 30_000)
+}
+
+/// `EACCES` from Landlock and `EPERM` from seccomp both arrive as one of these
+/// two strings from `sh`, which is the only signal the tool gets.
+fn denied(stderr: &str) -> bool {
+    stderr.contains("Permission denied") || stderr.contains("Operation not permitted")
 }
 
 /// Signal the whole process group: a pipeline must not outlive its `sh`.

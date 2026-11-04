@@ -1,7 +1,7 @@
 # nano
 
 Minimal coding agent harness in Rust. One binary, a line REPL, OpenAI-compatible
-providers, five tools. Roughly 6.1k LOC across eight files.
+providers, five tools. Roughly 6.8k LOC across nine files.
 
 ## Principles
 
@@ -13,7 +13,7 @@ providers, five tools. Roughly 6.1k LOC across eight files.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
    panes, sessions, compaction, subagents, MCP, or permission layer until the REPL
    is genuinely insufficient. One feature per change.
-3. **Small surface.** Eight modules. A new module needs a reason.
+3. **Small surface.** Nine modules. A new module needs a reason.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` + SSE
    only. Never add per-provider code paths; express differences as config
    (`base_url`, `models_url`, `api_key_env`, `session_header`).
@@ -62,6 +62,17 @@ providers, five tools. Roughly 6.1k LOC across eight files.
 14. **The prompt is a block.** Every line of the prompt carries its glyph (the live
     `❯ `, the committed `█ `), so a wrapped line reads as one block, not as text
     running off the edge.
+15. **`bash` is confined by the kernel, not by strings.** No child reaches the
+    network, in either mode: seccomp refuses `socket` for the internet families on
+    Linux, `(deny network*)` on macOS. Explore mode also denies every write outside
+    a session scratch directory and every exec outside a fixed allowlist (Landlock
+    on Linux, Seatbelt on macOS). Layer 1 is mandatory — a command that cannot be
+    confined does not run; Layer 2 degrades with one startup line on a kernel
+    without Landlock. A leading-word check is never a substitute. Accepted cost: no
+    child TCP, ever — `git clone/fetch/push`, `ssh`, `gh`, `docker` and `cargo` with
+    a cold cache are dead inside a tool call, and `!cmd` is no exception. Residuals:
+    AF_UNIX `connect`, writes through an inherited fd, metadata (`chmod`) outside
+    the scratch dir, and `fetch`, which runs in the parent by design.
 
 ## Architecture
 
@@ -82,6 +93,9 @@ providers, five tools. Roughly 6.1k LOC across eight files.
   write. Sessions join it later.
 - `tools.rs` — tool registry, JSON schemas, generated prompt, execution, and
   `fetch`: the host guard, the HTML-to-text tokenizer, the sanitizer.
+- `sandbox.rs` — the only `unsafe`: the seccomp filter and the Landlock ruleset on
+  Linux, the `sandbox-exec` profiles on macOS, the exec allowlist, and the scratch
+  directory explore mode may write to.
 
 ## Conventions
 
@@ -101,7 +115,8 @@ being streamed stays raw in the status row.
 - Tool names and descriptions are part of the prompt. Change them deliberately.
 - `!cmd` at the prompt is the user's own shell: it runs through `tools::execute`
   and its output joins the history as a `user` message, so the next turn sees it.
-  No turn follows, and explore mode does not apply — the user typed it.
+  No turn follows, explore mode's write confinement does not apply — the user typed
+  it — and the network deny does, like every other child.
 - Commit messages: imperative, one feature per commit.
 
 ## Provider notes
@@ -154,5 +169,20 @@ result back, since the transcript shows only call lines.
 
 A `tool:` turn keeps calling the same tool: the mock answers from the last user
 message, and a tool result is not one. Interrupt it with `!Escape`.
+
+The sandbox is checked with the same harness. `tool:bash:{...}` takes JSON
+arguments, and because that turn loops, end it with `!Escape` and read the result
+back with `show:`; normal mode is a `!cmd` line, which does not loop:
+
+```sh
+./harness.py --scroll 400 'tool:bash:{"command":"ls | wc -l"}' '!Escape' 'show:'
+./harness.py --scroll 400 'tool:bash:{"command":"echo x > /tmp/p"}' '!Escape' 'show:'
+./harness.py --scroll 400 'tool:bash:{"command":"sed -n 1p f"}' '!Escape' 'show:'
+./harness.py --scroll 400 'tool:bash:{"command":"git status --short"}' '!Escape' 'show:'
+./harness.py --scroll 400 ' !python3 -c "import socket; socket.socket()"'
+```
+
+The leading space in the last line is load-bearing: the harness reads an argument
+starting with `!` as tmux key names, and the REPL trims it back to a `!cmd`.
 
 Requires python3 and tmux; no new crates.

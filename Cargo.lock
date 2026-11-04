@@ -281,6 +281,7 @@ dependencies = [
 name = "nano"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "ratatui",
  "rustls",
  "serde_json",

@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod http;
 mod md;
+mod sandbox;
 mod state;
 mod ui;
 mod tools;
@@ -27,7 +28,11 @@ struct Provider {
 }
 
 fn main() {
-    if let Err(e) = run() {
+    let result = run();
+    // The scratch directory is the one thing a session creates outside the
+    // terminal; a static's `Drop` never runs, so this is the hook.
+    sandbox::cleanup();
+    if let Err(e) = result {
         eprintln!("nano: {e}");
         std::process::exit(1);
     }
@@ -35,6 +40,11 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let cfg = config::load()?;
+    // Confinement is announced before anything runs, once, next to the
+    // provider lines: weaker than promised must never be silent.
+    if let Some(note) = sandbox::init() {
+        eprintln!("nano: {note}");
+    }
     // Instructions are read once at startup, before any request: the system
     // prompt is a stable prefix and must not change mid-session.
     // Order: config `agents`, then the project's AGENTS.md, then `system`.
@@ -181,9 +191,11 @@ fn run() -> Result<(), String> {
 /// it never changes.
 fn mode_note(read_only: bool) -> Value {
     let content = if read_only {
-        "explore mode: on — write and edit are unavailable; bash runs read-only commands only."
+        "explore mode: on — write and edit are unavailable; bash runs read-only \
+         commands, writes only to a scratch directory, and nothing reaches the \
+         network."
     } else {
-        "explore mode: off — all tools are available."
+        "explore mode: off — all tools are available; bash cannot reach the network."
     };
     json!({ "role": "user", "content": content })
 }
@@ -636,7 +648,7 @@ impl Session {
                      /models        list models\n\
                      /thinking [l]  show or set thinking level (off, low, medium, high)\n\
                      /thoughts      show or hide the model's reasoning\n\
-                     /explore       toggle read-only mode (read and read-only shell)\n\
+                     /explore       toggle explore mode (read-only shell)\n\
                      !cmd           run a shell command; its output joins the context\n\
                      /exit          quit\n",
                 );
@@ -753,7 +765,7 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
                  /models        list models\n\
                  /thinking [l]  show or set thinking level (off, low, medium, high)\n\
                  /thoughts      show or hide the model's reasoning\n\
-                 /explore       toggle read-only mode (read and read-only shell)\n\
+                 /explore       toggle explore mode (read-only shell)\n\
                  !cmd           run a shell command; its output joins the context\n\
                  /exit          quit"
             );
