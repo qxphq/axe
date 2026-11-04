@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 
 use crate::http::{self, Cancel, Endpoint, Response};
 
+#[derive(Clone)]
 pub struct ModelInfo {
     pub id: String,
     pub context: Option<u64>,
@@ -143,6 +144,14 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
             continue;
         };
+        // Some compatible servers report an error inside a 200 SSE stream.
+        if let Some(error) = chunk.get("error").filter(|error| !error.is_null()) {
+            let message = error["message"]
+                .as_str()
+                .or_else(|| error.as_str())
+                .unwrap_or("provider error");
+            return Err(format!("provider: {message}"));
+        }
 
         // The usage chunk comes last and carries no choices at all.
         if let Some(prompt) = chunk["usage"]["prompt_tokens"].as_u64() {

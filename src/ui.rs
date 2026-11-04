@@ -84,6 +84,9 @@ struct Menu {
     rows: Vec<String>,
     selected: usize,
     scroll: usize,
+    /// Rows the last draw had room for. Zero means the chooser is open but not
+    /// visible, so its keys must not act.
+    visible: usize,
     /// Typing starts a new session instead of searching: startup's behaviour.
     collapse_on_type: bool,
 }
@@ -137,12 +140,23 @@ impl Screen {
             hook(info);
         }));
         terminal::enable_raw_mode()?;
-        let term = Terminal::with_options(
+        // A terminal shorter than the normal live region must still start.
+        let rows = terminal::size()
+            .map(|(_, height)| height)
+            .unwrap_or(CHROME + 1)
+            .clamp(1, CHROME + 1);
+        let term = match Terminal::with_options(
             Tail(CrosstermBackend::new(io::stdout())),
             TerminalOptions {
-                viewport: Viewport::Inline(CHROME + 1),
+                viewport: Viewport::Inline(rows),
             },
-        )?;
+        ) {
+            Ok(term) => term,
+            Err(e) => {
+                let _ = terminal::disable_raw_mode();
+                return Err(e);
+            }
+        };
         // Shift+Enter is only distinguishable from Enter under the kitty
         // keyboard protocol; bracketed paste keeps a pasted block one buffer
         // instead of one submission per line. A terminal that knows neither
@@ -217,6 +231,7 @@ impl Screen {
             rows,
             selected: 0,
             scroll: 0,
+            visible: 0,
             collapse_on_type,
         });
     }
@@ -249,6 +264,12 @@ impl Screen {
             .selected
             .saturating_add_signed(delta)
             .min(last);
+    }
+
+    /// A chooser is active only when the last draw had room for it. An open
+    /// menu on a short screen must not eat Enter or the arrows.
+    fn menu_active(&self) -> bool {
+        self.menu.as_ref().is_some_and(|menu| menu.visible > 0)
     }
 
     /// Visible entries: whatever the prompt does not need, but at least one.
@@ -299,10 +320,10 @@ impl Screen {
         match key.code {
             // A chooser owns the arrows and Esc while it is open. Enter on an
             // empty line accepts it; Enter on a search query submits as usual.
-            KeyCode::Up if self.menu.is_some() => return Action::MenuStep(-1),
-            KeyCode::Down if self.menu.is_some() => return Action::MenuStep(1),
+            KeyCode::Up if self.menu_active() => return Action::MenuStep(-1),
+            KeyCode::Down if self.menu_active() => return Action::MenuStep(1),
             KeyCode::Esc if self.menu.is_some() => return Action::MenuCancel,
-            KeyCode::Enter if self.menu.is_some() && self.buf.is_empty() => {
+            KeyCode::Enter if self.menu_active() && self.buf.is_empty() => {
                 return Action::MenuAccept
             }
             // A new line, not a submission. Shift needs the kitty protocol;
@@ -558,10 +579,10 @@ impl Screen {
     pub fn draw(&mut self) -> io::Result<()> {
         let prompt = self.prompt.clone();
         let prompt_style = self.prompt_style;
-        let size = self.term.size()?;
         // A resize since the last frame changes the area under us; settle it
-        // before deciding the height. A failure only delays it to the next draw.
+        // before reading the size. A failure only delays it to the next draw.
         let _ = self.term.autoresize();
+        let size = self.term.size()?;
         let width = size.width;
         let margin = PAD.min(width.saturating_sub(1));
         let cols = (width as usize).saturating_sub(2 * margin as usize);
@@ -575,6 +596,9 @@ impl Screen {
         // transcript keeps a place to be read even with 15 sessions on screen.
         let slots = self.menu_visible(rows_n, size.height);
         self.menu_follow(slots);
+        if let Some(menu) = &mut self.menu {
+            menu.visible = slots;
+        }
         let menu = self.menu.as_ref().filter(|_| slots > 0).map(|menu| {
             let start = menu.scroll;
             (
@@ -1036,10 +1060,20 @@ fn clip(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    if text.chars().count() <= width {
+    if text.width() <= width {
         return text.to_string();
     }
-    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    let limit = width.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let cells = c.width().unwrap_or(1);
+        if used + cells > limit {
+            break;
+        }
+        out.push(c);
+        used += cells;
+    }
     out.push('…');
     out
 }
@@ -1218,5 +1252,16 @@ impl<W: Write> Backend for Tail<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         Backend::flush(&mut self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clip_counts_cells_not_chars() {
+        assert_eq!(clip("日本語", 4), "日…");
+        assert_eq!(clip("abcd", 4), "abcd");
     }
 }

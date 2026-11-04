@@ -117,16 +117,16 @@ impl State {
     /// Rewrite the file whole, through a temporary: a kill mid-write leaves the
     /// previous state intact. Two instances in one directory are
     /// last-write-wins; there is no lock.
-    pub fn save(&self) {
+    pub fn save(&self) -> Result<(), String> {
         if self.cwd.as_os_str().is_empty() {
-            return;
+            return Ok(());
         }
         let file = file(&self.cwd);
-        let Some(dir) = file.parent() else { return };
-        if let Err(e) = fs::create_dir_all(dir) {
-            eprintln!("nano: cannot save state to {}: {e}", file.display());
-            return;
-        }
+        let Some(dir) = file.parent() else {
+            return Ok(());
+        };
+        fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot save state to {}: {e}", file.display()))?;
         let thinking: serde_json::Map<String, Value> = self
             .thinking
             .iter()
@@ -138,21 +138,14 @@ impl State {
             "thinking": thinking,
             "thoughts": self.thoughts,
         });
-        let text = match serde_json::to_string_pretty(&value) {
-            Ok(text) => format!("{text}\n"),
-            Err(e) => {
-                eprintln!("nano: cannot save state to {}: {e}", file.display());
-                return;
-            }
-        };
+        let text = serde_json::to_string_pretty(&value)
+            .map(|text| format!("{text}\n"))
+            .map_err(|e| format!("cannot save state to {}: {e}", file.display()))?;
         let tmp = file.with_extension("json.tmp");
-        if let Err(e) = fs::write(&tmp, text) {
-            eprintln!("nano: cannot save state to {}: {e}", tmp.display());
-            return;
-        }
-        if let Err(e) = fs::rename(&tmp, &file) {
-            eprintln!("nano: cannot save state to {}: {e}", file.display());
-        }
+        fs::write(&tmp, text)
+            .map_err(|e| format!("cannot save state to {}: {e}", tmp.display()))?;
+        fs::rename(&tmp, &file)
+            .map_err(|e| format!("cannot save state to {}: {e}", file.display()))
     }
 
     pub fn thinking_for(&self, spec: &str) -> Option<String> {
@@ -171,5 +164,16 @@ impl State {
             Some((_, remembered)) => *remembered = level.to_string(),
             None => self.thinking.push((spec.to_string(), level.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_is_reversible_and_safe() {
+        assert_eq!(key(Path::new("/home/anon/nano")), "%2Fhome%2Fanon%2Fnano");
+        assert!(!key(Path::new("/a/../b")).contains('/'));
     }
 }

@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::{IpAddr, ToSocketAddrs};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
@@ -27,21 +27,21 @@ const READ: Spec = Spec {
     name: "read",
     signature: "read(path, offset?, limit?)",
     description: "Return the contents of a text file. offset is a 1-based starting line, limit is a line count.",
-    parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path relative to the working directory"},"offset":{"type":"integer","description":"1-based first line"},"limit":{"type":"integer","description":"Maximum number of lines"}},"required":["path"]}"#,
+    parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path; relative paths resolve from the working directory"},"offset":{"type":"integer","description":"1-based first line"},"limit":{"type":"integer","description":"Maximum number of lines"}},"required":["path"]}"#,
 };
 
 const WRITE: Spec = Spec {
     name: "write",
     signature: "write(path, content)",
     description: "Create or overwrite a file with the given content. Parent directories are created. Unavailable in explore mode.",
-    parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path relative to the working directory"},"content":{"type":"string","description":"Full file content"}},"required":["path","content"]}"#,
+    parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path; relative paths resolve from the working directory"},"content":{"type":"string","description":"Full file content"}},"required":["path","content"]}"#,
 };
 
 const EDIT: Spec = Spec {
     name: "edit",
     signature: "edit(path, old, new, replace_all?)",
     description: "Replace exact text in a file. Fails if old is absent or matches more than once unless replace_all is true. Unavailable in explore mode.",
-    parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path relative to the working directory"},"old":{"type":"string","description":"Exact text to replace"},"new":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace every occurrence"}},"required":["path","old","new"]}"#,
+    parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path; relative paths resolve from the working directory"},"old":{"type":"string","description":"Exact text to replace"},"new":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace every occurrence"}},"required":["path","old","new"]}"#,
 };
 
 const BASH: Spec = Spec {
@@ -61,6 +61,18 @@ const ABOUT: Spec = Spec {
     description: "Return nano's README: its tools and limits, modes, every config key, the paths it reads and writes, and how `bash` is confined. Call this whenever the user asks what nano can do, how to configure it, or where it keeps something, instead of guessing. Compiled into the binary at build time; this is nano's user-facing documentation, not the project's AGENTS.md.",
     parameters: r#"{"type":"object","properties":{}}"#,
 };
+
+/// Bytes a `read` call takes off disk before it stops. The model-facing cap is
+/// lower; this keeps one call from loading a huge file into the parent.
+const READ_BYTES: u64 = 1 << 20;
+
+/// Bytes of a command's output the parent reads. The model-facing cap is 30k;
+/// this keeps one call from loading a huge scratch file into memory.
+const BASH_BYTES: u64 = 1 << 20;
+
+/// Disk cap for one command's combined output files. The parent reads only
+/// `BASH_BYTES`; this stops a runaway command before it fills the disk.
+const BASH_OUTPUT_CAP: u64 = 64 << 20;
 
 /// Caps on a fetched page: bytes off the wire, characters the model sees, and
 /// wall time spent reading the body.
@@ -142,14 +154,15 @@ pub fn system_prompt() -> String {
         .unwrap_or_else(|_| ".".to_string());
     let mut out = format!("Working directory: {cwd}\n\n");
     out.push_str(
-        "Explore mode: read the working directory, read the web through `fetch` and \
-         `web_search`, and run read-only commands to understand it, answer, and \
-         propose changes. `write` and `edit` are unavailable, `bash` runs only a \
-         fixed allowlist of read-only commands and writes only to a scratch \
-         directory, and no command reaches the network in either mode. The user may \
-         leave the mode at any time; every change is announced in the conversation \
-         as `explore mode: on` or `explore mode: off`, and the latest note says \
-         which mode is in force.\n",
+        "Modes: explore mode is a session setting, announced in the conversation as \
+         `explore mode: on` or `explore mode: off`. The latest note says which mode \
+         is in force. In explore mode, read the working directory, read the web \
+         through `fetch` and `web_search`, and run read-only commands to understand \
+         it, answer, and propose changes: `write` and `edit` are unavailable, `bash` \
+         runs only a fixed read-only allowlist and writes only to a scratch \
+         directory. Outside explore mode, `write`, `edit` and a full `bash` are \
+         available, and `fetch` and `web_search` are unavailable. No command reaches \
+         the network in either mode.\n",
     );
     out.push_str("\nBehavior:\n");
     for (i, rule) in BEHAVIOR.iter().enumerate() {
@@ -189,29 +202,67 @@ fn read(args: &Value) -> String {
     let Some(path) = args["path"].as_str() else {
         return "error: missing \"path\"".into();
     };
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
+    // Reject directories, FIFOs and devices before opening: `File::open` on a
+    // FIFO blocks and `/dev/zero` never ends. `metadata` follows symlinks.
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
         Err(e) => return format!("error: read {path}: {e}"),
     };
-    let text = String::from_utf8_lossy(&bytes);
+    if !meta.is_file() {
+        return format!("error: read {path}: not a regular file");
+    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) => return format!("error: read {path}: {e}"),
+    };
     let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
     let limit = args["limit"].as_u64().map(|n| n as usize);
 
+    // Stream lines so an offset past 1 MiB still works; stop accumulating once
+    // the read cap is reached. One very long line can still allocate itself,
+    // but the whole file no longer does.
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
     let mut out = String::new();
+    let mut index = 0usize;
     let mut taken = 0usize;
-    for (index, line) in text.lines().enumerate() {
-        let number = index + 1;
-        if number < offset {
+    let mut bytes = 0u64;
+    let mut stopped = false;
+    loop {
+        line.clear();
+        let read = match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(e) => return format!("error: read {path}: {e}"),
+        };
+        index += 1;
+        if index < offset {
             continue;
         }
-        if let Some(limit) = limit {
-            if taken >= limit {
-                break;
-            }
+        if limit.is_some_and(|limit| taken >= limit) {
+            break;
         }
-        out.push_str(line);
+        if bytes >= READ_BYTES {
+            stopped = true;
+            break;
+        }
+        let text = String::from_utf8_lossy(&line);
+        let text = text.strip_suffix('\n').unwrap_or(&text);
+        let text = text.strip_suffix('\r').unwrap_or(text);
+        out.push_str(text);
         out.push('\n');
         taken += 1;
+        bytes += read as u64;
+        if bytes >= READ_BYTES {
+            stopped = true;
+            break;
+        }
+    }
+    if taken == 0 && offset > 1 && limit != Some(0) && offset > index {
+        return format!("error: read {path}: offset {offset} is past the end ({index} lines)");
+    }
+    if stopped {
+        out.push_str("\n...[read stopped at 1 MiB]...\n");
     }
     truncate(out, 50_000)
 }
@@ -246,6 +297,9 @@ fn edit(args: &Value) -> String {
     let Some(new) = args["new"].as_str() else {
         return "error: missing \"new\"".into();
     };
+    if old.is_empty() {
+        return "error: edit: \"old\" must not be empty".into();
+    }
     let replace_all = args["replace_all"].as_bool().unwrap_or(false);
 
     let text = match std::fs::read_to_string(path) {
@@ -311,6 +365,7 @@ fn bash(args: &Value, cancel: &Cancel, read_only: bool) -> String {
     let start = Instant::now();
     let mut timed_out = false;
     let mut interrupted = false;
+    let mut too_big = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -334,20 +389,30 @@ fn bash(args: &Value, cancel: &Cancel, read_only: bool) -> String {
                     }
                 }
                 if !timed_out && start.elapsed() > Duration::from_secs(120) {
-                    let _ = child.kill();
+                    // Kill the group, not just `sh`: a pipeline must not
+                    // survive its timeout.
+                    kill("-KILL", pid);
                     timed_out = true;
+                }
+                if !too_big {
+                    let size = out_file.metadata().map(|m| m.len()).unwrap_or(0)
+                        + err_file.metadata().map(|m| m.len()).unwrap_or(0);
+                    if size > BASH_OUTPUT_CAP {
+                        kill("-KILL", pid);
+                        too_big = true;
+                    }
                 }
                 thread::sleep(Duration::from_millis(20));
             }
             Err(e) => {
-                let _ = child.kill();
+                kill("-KILL", pid);
                 return format!("error: wait: {e}");
             }
         }
     };
 
-    let stdout = read_all(&mut out_file);
-    let stderr = read_all(&mut err_file);
+    let stdout = read_output(&mut out_file, BASH_BYTES);
+    let stderr = read_output(&mut err_file, BASH_BYTES);
 
     let mut out = format!(
         "exit: {}\n",
@@ -370,6 +435,8 @@ fn bash(args: &Value, cancel: &Cancel, read_only: bool) -> String {
     }
     if timed_out {
         out.push_str("timed out after 120s\n");
+    } else if too_big {
+        out.push_str("output limit 64 MiB exceeded; the command was killed\n");
     } else if interrupted {
         out.push_str("interrupted by user (ESC); the command was killed\n");
     }
@@ -385,9 +452,6 @@ fn denied(stderr: &str) -> bool {
     stderr.contains("Permission denied") || stderr.contains("Operation not permitted")
 }
 
-/// Signal the whole process group: a pipeline must not outlive its `sh`.
-/// `--` is not optional and the error output is dropped: by the time the group
-/// is gone, `kill` reporting that is noise on the user's terminal.
 fn fetch(args: &Value, cancel: &Cancel) -> String {
     let Some(url) = args["url"].as_str() else {
         return "error: missing \"url\"".into();
@@ -418,7 +482,16 @@ fn fetch(args: &Value, cancel: &Cancel) -> String {
         }
     }
 
-    let mut response = match http::request(&ep, "GET", &target, None, &[], None, Some(cancel)) {
+    let mut response = match http::request_with_timeout(
+        &ep,
+        "GET",
+        &target,
+        None,
+        &[],
+        None,
+        Some(cancel),
+        Duration::from_secs(FETCH_SECONDS),
+    ) {
         Ok(response) => response,
         Err(e) => return format!("error: fetch: {e}"),
     };
@@ -473,8 +546,9 @@ fn page_text(text: &str, args: &Value) -> String {
     let head: String = text.chars().skip(start - 1).take(chars).collect();
     let shown = head.chars().count();
     if start - 1 + shown < total {
+        let next = start + shown;
         format!(
-            "{head}\n...[truncated after {shown} of {total} characters; use start to continue]..."
+            "{head}\n...[truncated after {shown} of {total} characters; use start {next} to continue]..."
         )
     } else {
         head
@@ -552,8 +626,8 @@ fn parse_brave(json: &Value, count: usize) -> Vec<Hit> {
             let Some(url) = item["url"].as_str().and_then(http_url) else {
                 continue;
             };
-            let title = flat(item["title"].as_str().unwrap_or(""));
-            let snippet = flat(item["description"].as_str().unwrap_or(""));
+            let title = fragment(item["title"].as_str().unwrap_or(""));
+            let snippet = fragment(item["description"].as_str().unwrap_or(""));
             hits.push(Hit {
                 title: if title.is_empty() { url.clone() } else { title },
                 url,
@@ -647,7 +721,16 @@ fn get(url: &str, headers: &[(String, String)], cancel: &Cancel) -> Result<Strin
     let (mut ep, target) = http::split_url(url)?;
     ep.prefix.clear();
     guard_host(&ep.host)?;
-    let mut response = http::request(&ep, "GET", &target, None, headers, None, Some(cancel))?;
+    let mut response = http::request_with_timeout(
+        &ep,
+        "GET",
+        &target,
+        None,
+        headers,
+        None,
+        Some(cancel),
+        Duration::from_secs(SEARCH_SECONDS),
+    )?;
     // One call, one host: a redirect is reported, never followed.
     if (300..400).contains(&response.status) {
         let location = response.location.as_deref().unwrap_or("(none)");
@@ -1152,6 +1235,9 @@ fn collapse(text: &str) -> String {
     out
 }
 
+/// Signal the whole process group: a pipeline must not outlive its `sh`.
+/// `--` is not optional and the error output is dropped: by the time the group
+/// is gone, `kill` reporting that is noise on the user's terminal.
 fn kill(signal: &str, pid: i32) {
     let _ = Command::new("kill")
         .arg(signal)
@@ -1182,11 +1268,23 @@ fn scratch(kind: &str) -> std::io::Result<File> {
     Ok(file)
 }
 
-fn read_all(file: &mut File) -> String {
+fn read_output(file: &mut File, max: u64) -> String {
+    let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
     let mut bytes = Vec::new();
-    let _ = file.seek(SeekFrom::Start(0));
-    let _ = file.read_to_end(&mut bytes);
-    String::from_utf8_lossy(&bytes).into_owned()
+    if len > max {
+        // Keep the tail: errors and final results are there.
+        let _ = file.seek(SeekFrom::Start(len - max));
+        let _ = file.take(max).read_to_end(&mut bytes);
+        format!(
+            "...[truncated {} bytes]...\n{}",
+            len - max,
+            String::from_utf8_lossy(&bytes)
+        )
+    } else {
+        let _ = file.seek(SeekFrom::Start(0));
+        let _ = file.read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 }
 
 fn plural(n: usize) -> &'static str {
@@ -1202,7 +1300,64 @@ fn truncate(text: String, max: usize) -> String {
     if total <= max {
         return text;
     }
-    let head: String = text.chars().take(max * 2 / 3).collect();
-    let tail: String = text.chars().skip(total - max / 3).collect();
-    format!("{head}\n...[truncated]...\n{tail}")
+    let marker = "\n...[truncated]...\n";
+    let room = max.saturating_sub(marker.chars().count());
+    if room == 0 {
+        return text.chars().take(max).collect();
+    }
+    let head_len = room * 2 / 3;
+    let tail_len = room - head_len;
+    let head: String = text.chars().take(head_len).collect();
+    let tail: String = text.chars().skip(total - tail_len).collect();
+    format!("{head}{marker}{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("nano-test-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn edit_rejects_empty_old() {
+        let path = temp("empty-old");
+        std::fs::write(&path, "abc").unwrap();
+        let result = edit(&json!({
+            "path": path.to_string_lossy(),
+            "old": "",
+            "new": "x",
+            "replace_all": true,
+        }));
+        let _ = std::fs::remove_file(&path);
+        assert!(result.starts_with("error:"), "{result}");
+    }
+
+    #[test]
+    fn read_caps_large_files() {
+        let path = temp("large");
+        std::fs::write(&path, "a".repeat((READ_BYTES + 64) as usize)).unwrap();
+        let result = read(&json!({ "path": path.to_string_lossy() }));
+        let _ = std::fs::remove_file(&path);
+        assert!(result.contains("read stopped at 1 MiB"), "{result}");
+    }
+
+    #[test]
+    fn brave_fields_strip_html() {
+        let hits = parse_brave(
+            &json!({
+                "web": {
+                    "results": [{
+                        "url": "https://example.com/",
+                        "title": "<strong>Title</strong>",
+                        "description": "a <em>snippet</em>"
+                    }]
+                }
+            }),
+            1,
+        );
+        assert_eq!(hits[0].title, "Title");
+        assert_eq!(hits[0].snippet, "a snippet");
+    }
 }

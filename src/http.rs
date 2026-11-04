@@ -1,11 +1,19 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+
+/// One line of a status/header/SSE stream. A server must not grow the parent's
+/// memory with an unterminated line.
+const LINE_MAX: u64 = 1 << 20;
+/// Whole-body cap for model lists and error bodies.
+const BODY_MAX: u64 = 8 << 20;
+const CONNECT_SECONDS: u64 = 10;
+const WRITE_SECONDS: u64 = 30;
 
 #[derive(Clone)]
 enum Scheme {
@@ -100,7 +108,9 @@ pub fn split_url(url: &str) -> Result<(Endpoint, String), String> {
         Some(i) => target[..i].to_string(),
         None => target,
     };
-    let path = if tail.starts_with('/') { tail } else { "" };
+    // `target` is fragment-free; using it keeps a `#` out of the endpoint's
+    // base path (a query on a `models_url` is kept).
+    let path = if tail.starts_with('/') { target.as_str() } else { "" };
 
     let default_port = match scheme {
         Scheme::Http => 80,
@@ -176,14 +186,39 @@ fn tls_config() -> Result<Arc<ClientConfig>, String> {
     Ok(config)
 }
 
-fn connect(ep: &Endpoint, cancel: Option<&Cancel>) -> Result<Stream, String> {
+fn connect(
+    ep: &Endpoint,
+    cancel: Option<&Cancel>,
+    read_timeout: Duration,
+) -> Result<Stream, String> {
     if cancel.is_some_and(Cancel::cancelled) {
         return Err("interrupted".into());
     }
-    let stream = TcpStream::connect((ep.host.as_str(), ep.port))
-        .map_err(|e| format!("connect {}:{}: {e}", ep.host, ep.port))?;
+    let addrs = (ep.host.as_str(), ep.port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {}:{}: {e}", ep.host, ep.port))?;
+    let mut stream = None;
+    let mut last: Option<io::Error> = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(CONNECT_SECONDS)) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    let stream = stream.ok_or_else(|| {
+        let why = last
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "no addresses".to_string());
+        format!("connect {}:{}: {why}", ep.host, ep.port)
+    })?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(300)))
+        .set_read_timeout(Some(read_timeout))
+        .map_err(|e| format!("set timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(WRITE_SECONDS)))
         .map_err(|e| format!("set timeout: {e}"))?;
     let _ = stream.set_nodelay(true);
     if let Some(cancel) = cancel {
@@ -292,7 +327,10 @@ pub struct Response {
 impl Response {
     pub fn read_all(&mut self) -> io::Result<String> {
         let mut out = String::new();
-        self.reader.read_to_string(&mut out)?;
+        self.reader
+            .by_ref()
+            .take(BODY_MAX)
+            .read_to_string(&mut out)?;
         Ok(out)
     }
 
@@ -318,9 +356,14 @@ impl Response {
 
     pub fn read_line(&mut self) -> io::Result<Option<String>> {
         let mut line = String::new();
-        let n = self.reader.read_line(&mut line)?;
+        let n = self.reader.by_ref().take(LINE_MAX).read_line(&mut line)?;
         if n == 0 {
             Ok(None)
+        } else if !line.ends_with('\n') && n as u64 >= LINE_MAX {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream line too long",
+            ))
         } else {
             Ok(Some(line))
         }
@@ -336,7 +379,32 @@ pub fn request(
     body: Option<&str>,
     cancel: Option<&Cancel>,
 ) -> Result<Response, String> {
-    let mut stream = connect(ep, cancel)?;
+    request_with_timeout(
+        ep,
+        method,
+        path,
+        api_key,
+        headers,
+        body,
+        cancel,
+        Duration::from_secs(300),
+    )
+}
+
+/// Like `request`, with the socket read timeout chosen by the caller. The body
+/// reader still has its own deadline; this bounds a single blocked read.
+#[allow(clippy::too_many_arguments)]
+pub fn request_with_timeout(
+    ep: &Endpoint,
+    method: &str,
+    path: &str,
+    api_key: Option<&str>,
+    headers: &[(String, String)],
+    body: Option<&str>,
+    cancel: Option<&Cancel>,
+    read_timeout: Duration,
+) -> Result<Response, String> {
+    let mut stream = connect(ep, cancel, read_timeout)?;
 
     let target = format!("{}{}", ep.prefix, path);
     let mut head = format!(
@@ -426,9 +494,16 @@ pub fn request(
 
 fn read_line<R: BufRead>(reader: &mut R) -> Result<String, String> {
     let mut line = String::new();
-    let n = reader.read_line(&mut line).map_err(|e| format!("read: {e}"))?;
+    let n = reader
+        .by_ref()
+        .take(LINE_MAX)
+        .read_line(&mut line)
+        .map_err(|e| format!("read: {e}"))?;
     if n == 0 {
         return Err("connection closed before response".into());
+    }
+    if !line.ends_with('\n') && n as u64 >= LINE_MAX {
+        return Err("response line too long".into());
     }
     Ok(line)
 }
@@ -445,6 +520,23 @@ fn read_line_raw<R: Read>(reader: &mut R) -> io::Result<String> {
         if byte[0] == b'\n' {
             break;
         }
+        if out.len() as u64 >= LINE_MAX {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+        }
     }
     Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_keeps_base_path_and_target() {
+        let (ep, target) = split_url("http://host:8080/v1/models?q=1#frag").unwrap();
+        assert_eq!(ep.host, "host");
+        assert_eq!(ep.port, 8080);
+        assert_eq!(ep.prefix, "/v1/models?q=1".trim_end_matches('/'));
+        assert_eq!(target, "/v1/models?q=1");
+    }
 }

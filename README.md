@@ -11,8 +11,9 @@ cargo build --release
 ```
 
 The binary is `target/release/nano`. It needs a current stable Rust toolchain
-(edition 2021) on Linux (x86_64 or aarch64) or macOS. Elsewhere it still runs,
-but `bash` is unavailable: a child that cannot be confined is not spawned.
+(edition 2021) and a C toolchain for `ring`. Linux (x86_64 or aarch64) and macOS
+are supported. Other Unix-like targets compile, but `bash` is unavailable
+there: a child that cannot be confined is not spawned. Windows is not supported.
 
 ## Run
 
@@ -76,17 +77,18 @@ define falls back to its default.
 }
 ```
 
-Secrets belong in the environment: `api_key_env` is read at startup, and a
-missing variable is not an error until the provider refuses the request.
+Secrets belong in the environment: `api_key_env` is read at startup. A provider
+whose variable is unset is skipped, not retried; a literal `api_key` is accepted
+but puts the secret in the file.
 
 ## Instructions
 
 The built-in prompt is the working directory, a short numbered list of rules,
 and the tool list. Instructions are appended after it, in this order: `agents`
 from the config, then the nearest `AGENTS.md` at or above the working
-directory, then `system`. Each is capped at 48 KB. All are read once at
-startup; nothing is re-read mid-session, and the mode is carried in the
-conversation, not the prompt.
+directory, then `system`. `agents` and `AGENTS.md` are capped at 48 KB;
+`system` is not. All are read once at startup; nothing is re-read mid-session,
+and the mode is carried in the conversation, not the prompt.
 
 ## REPL
 
@@ -144,7 +146,7 @@ knows which side it is on.
 
 | tool | what it does |
 | --- | --- |
-| `read(path, offset?, limit?)` | a text file, up to 50 000 characters |
+| `read(path, offset?, limit?)` | a text file; relative paths resolve from cwd; up to 50 000 characters |
 | `write(path, content)` | create or overwrite; parent directories are created |
 | `edit(path, old, new, replace_all?)` | exact text; ambiguous `old` fails |
 | `bash(command)` | run `sh -c` here; 120 s, 30 000 characters, no network |
@@ -173,7 +175,8 @@ directory with every byte outside `[A-Za-z0-9._-]` written as `%XX` — so
 | `<id>.jsonl` | the session body: one API message per line, append-only |
 | `<id>.jsonl.gz` | a body older than the 30 most recent, gzipped |
 
-Bodies are never rewritten, so a crash can only leave an unfinished last line.
+The active body is append-only, so a crash can only leave an unfinished last
+line. Archiving gzips and removes it; resuming unpacks it back to plain.
 Listing and search read the sidecar, which stays plain: an archived body still
 answers from its title and summary. Resuming one unpacks it back to plain. The
 system prompt and mode notes are not logged; resume rebuilds them from the

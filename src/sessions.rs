@@ -92,6 +92,9 @@ impl Meta {
             .map_err(|e| format!("read {}: {e}", file.display()))?;
         let v: Value = serde_json::from_str(&raw)
             .map_err(|e| format!("parse {}: {e}", file.display()))?;
+        if v["v"].as_u64().unwrap_or(0) > VERSION {
+            return Err(format!("session {} uses a newer format", id));
+        }
         let text = |key: &str| v[key].as_str().unwrap_or("").to_string();
         Ok(Meta {
             // The filename is the identity; a sidecar cannot point elsewhere.
@@ -193,7 +196,11 @@ impl Log {
 
 /// Read a body, unpacking it first when it was archived. The plain file is
 /// left behind: resuming makes the session live again.
-pub fn load_messages(dir: &Path, meta: &mut Meta) -> Result<Vec<Value>, String> {
+pub fn load_messages(
+    dir: &Path,
+    meta: &mut Meta,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Value>, String> {
     let plain = log_path(dir, &meta.id);
     let gz = gz_path(dir, &meta.id);
     if !plain.exists() {
@@ -218,7 +225,7 @@ pub fn load_messages(dir: &Path, meta: &mut Meta) -> Result<Vec<Value>, String> 
         let line = match line {
             Ok(line) => line,
             Err(e) => {
-                eprintln!("nano: read {}: {e}", plain.display());
+                warnings.push(format!("read {}: {e}", plain.display()));
                 break;
             }
         };
@@ -229,7 +236,7 @@ pub fn load_messages(dir: &Path, meta: &mut Meta) -> Result<Vec<Value>, String> 
             Ok(message) => message,
             // A kill mid-append leaves one partial line, always last.
             Err(_) => {
-                eprintln!("nano: skipping a damaged line in {}", plain.display());
+                warnings.push(format!("skipping a damaged line in {}", plain.display()));
                 break;
             }
         };
@@ -359,7 +366,7 @@ pub fn search(cwd: &Path, metas: &[Meta], query: &str) -> Vec<Hit> {
                     if marked {
                         mark(&lower, &terms, &mut seen);
                         if snippet.is_empty() {
-                            snippet = snip(text);
+                            snippet = snip(text, &terms);
                         }
                     }
                     if seen.iter().all(|seen| *seen) {
@@ -370,7 +377,7 @@ pub fn search(cwd: &Path, metas: &[Meta], query: &str) -> Vec<Hit> {
         }
         if seen.iter().all(|seen| *seen) {
             if snippet.is_empty() {
-                snippet = snip(&meta.summary);
+                snippet = snip(&meta.summary, &terms);
             }
             hits.push(Hit { index, snippet });
         }
@@ -386,12 +393,19 @@ fn mark(text: &str, terms: &[String], seen: &mut [bool]) {
     }
 }
 
-/// The first useful line of a matched text, whitespace collapsed.
-fn snip(text: &str) -> String {
-    let line = text
+/// The first line that contains a query term, else the first useful line.
+/// Whitespace is collapsed so the row stays one line.
+fn snip(text: &str, terms: &[String]) -> String {
+    let lines: Vec<&str> = text
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
+        .filter(|line| !line.is_empty())
+        .collect();
+    let line = lines
+        .iter()
+        .copied()
+        .find(|line| terms.iter().any(|term| line.to_lowercase().contains(term)))
+        .or_else(|| lines.first().copied())
         .unwrap_or("");
     collapse(line, 100)
 }
@@ -468,3 +482,14 @@ fn civil(days: i64) -> (i64, u32, u32) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stamp_is_utc() {
+        assert_eq!(stamp(0), "1970-01-01 00:00");
+        assert_eq!(stamp(1_700_000_000), "2023-11-14 22:13");
+    }
+}

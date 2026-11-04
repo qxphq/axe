@@ -15,10 +15,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEventKind};
+use ratatui::crossterm::terminal;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::{json, Value};
 
+#[derive(Clone)]
 struct Provider {
     name: String,
     cfg: config::ProviderConfig,
@@ -198,6 +200,8 @@ fn run() -> Result<(), String> {
         store,
         startup,
         picks: Vec::new(),
+        naming: None,
+        warning: None,
     };
 
     if ui::is_interactive() {
@@ -299,7 +303,8 @@ fn mode_note(read_only: bool) -> Value {
          commands, writes only to a scratch directory, and no command reaches the \
          network."
     } else {
-        "explore mode: off — all tools are available; bash cannot reach the network."
+        "explore mode: off — write, edit and a full bash are available; fetch and web_search \
+         are unavailable; bash cannot reach the network."
     };
     json!({ "role": "user", "content": content })
 }
@@ -329,6 +334,10 @@ struct Session {
     startup: Vec<sessions::Meta>,
     /// The ids a piped `/sessions` listing numbered, for `/sessions N`.
     picks: Vec<String>,
+    /// A background title request, when one is in flight.
+    naming: Option<Receiver<Option<(String, String)>>>,
+    /// A user-facing warning to render at the next safe point.
+    warning: Option<String>,
 }
 
 /// The session on disk. `meta` is loaded with the first message or on resume,
@@ -341,6 +350,7 @@ struct Store {
     meta: Option<sessions::Meta>,
     naming_tried: bool,
     warned: bool,
+    warning: Option<String>,
 }
 
 impl Store {
@@ -353,6 +363,7 @@ impl Store {
             meta: None,
             naming_tried: false,
             warned: false,
+            warning: None,
         }
     }
 
@@ -366,6 +377,7 @@ impl Store {
             meta: Some(meta),
             naming_tried: false,
             warned: false,
+            warning: None,
         })
     }
 
@@ -375,9 +387,19 @@ impl Store {
         if let Err(e) = self.try_record(message) {
             if !self.warned {
                 self.warned = true;
-                eprintln!("nano: session: {e}");
+                self.warn(format!("session: {e}"));
             }
         }
+    }
+
+    fn warn(&mut self, text: String) {
+        if self.warning.is_none() {
+            self.warning = Some(text);
+        }
+    }
+
+    fn take_warning(&mut self) -> Option<String> {
+        self.warning.take()
     }
 
     fn try_record(&mut self, message: &Value) -> Result<(), String> {
@@ -410,7 +432,7 @@ impl Store {
             meta.summary = sessions::collapse(summary, 240);
         }
         if let Err(e) = meta.save(&self.dir) {
-            eprintln!("nano: session meta: {e}");
+            self.warn(format!("session meta: {e}"));
         }
     }
 
@@ -428,7 +450,7 @@ impl Store {
             }
         }
         if let Err(e) = meta.save(&self.dir) {
-            eprintln!("nano: session meta: {e}");
+            self.warn(format!("session meta: {e}"));
         }
     }
 }
@@ -438,7 +460,7 @@ fn user_summary(message: &Value) -> Option<String> {
         return None;
     }
     let text = message["content"].as_str()?;
-    if text.starts_with("explore mode:") {
+    if text.starts_with("explore mode:") || text.starts_with('$') {
         return None;
     }
     Some(sessions::collapse(text, 240))
@@ -507,6 +529,16 @@ const COMMANDS: &[&str] = &[
     "/thoughts",
 ];
 
+const HELP: &str = "/model [id]    pick or switch model\n\
+                    /models        list models\n\
+                    /thinking [l]  show or set thinking level (off, low, medium, high)\n\
+                    /thoughts      show or hide the model's reasoning\n\
+                    /sessions [q]  list, search and resume sessions\n\
+                    /new           start a new session\n\
+                    /explore       toggle explore mode (read-only shell)\n\
+                    !cmd           run a shell command; its output joins the context\n\
+                    /exit          quit\n";
+
 impl Session {
     /// One line at a time from a terminal we own. Keys arrive on the channel, so
     /// a turn in flight never blocks the prompt.
@@ -534,10 +566,11 @@ impl Session {
         // commands are handled in this loop and not only where they are parsed.
         let mut pending: Option<String> = None;
         loop {
-            let line = match pending.take() {
-                Some(line) => line,
+            self.poll_naming(Some(&mut screen));
+            let (line, was_queued) = match pending.take() {
+                Some(line) => (line, true),
                 None => match readline(&mut screen, &rx) {
-                    Some(Input::Line(line)) => line,
+                    Some(Input::Line(line)) => (line, false),
                     Some(Input::Explore) => {
                         self.toggle_explore(&mut screen);
                         continue;
@@ -560,15 +593,24 @@ impl Session {
                     None => break,
                 },
             };
+            // A committed line is echoed by `readline`; a queued one was not.
+            if was_queued {
+                screen.echo_user(&line);
+            }
             match self.dispatch(&line, &mut screen, &rx) {
                 Cmd::Exit => break,
                 Cmd::Continue => {}
                 Cmd::Turn(input) => {
                     pending = self.messages_turn(&input, &tx, &rx, &mut screen)?;
                 }
-                Cmd::Shell(command) => self.shell(&command, &mut screen),
+                Cmd::Shell(command) => {
+                    pending = self.shell(&command, &mut screen, &rx);
+                }
             }
+            self.flush_warnings(Some(&mut screen));
         }
+        self.finalize_session();
+        self.flush_warnings(Some(&mut screen));
         screen.close();
         Ok(())
     }
@@ -601,8 +643,10 @@ impl Session {
                     print!("{result}");
                 }
             }
+            self.flush_warnings(None);
         }
         self.finalize_session();
+        self.flush_warnings(None);
         Ok(())
     }
 
@@ -615,8 +659,57 @@ impl Session {
         self.messages.push(message);
     }
 
+    fn warn(&mut self, text: String) {
+        if self.warning.is_none() {
+            self.warning = Some(text);
+        }
+    }
+
+    /// Render the first pending warning at a safe point: the screen when there
+    /// is one, stderr when the run is piped.
+    fn flush_warnings(&mut self, screen: Option<&mut ui::Screen>) {
+        if let Some(text) = self
+            .store
+            .as_mut()
+            .and_then(|store| store.take_warning())
+        {
+            self.warn(text);
+        }
+        let Some(text) = self.warning.take() else {
+            return;
+        };
+        match screen {
+            Some(screen) => screen.error(&format!("nano: {text}\n")),
+            None => eprintln!("nano: {text}"),
+        }
+    }
+
     fn spec(&self) -> String {
         format!("{}/{}", self.providers[self.provider].name, self.model)
+    }
+
+    /// Switch model: reset the fill count, remember the level for the new
+    /// `provider/id` (state first, then config), persist the selection, and
+    /// return the new info row.
+    fn set_model(&mut self, provider: usize, id: String) -> String {
+        self.provider = provider;
+        self.model = id;
+        // The count belonged to the old model's window.
+        self.used = None;
+        let spec = self.spec();
+        self.thinking = self.state.thinking_for(&spec).or_else(|| {
+            self.providers[provider]
+                .cfg
+                .thinking
+                .iter()
+                .find(|(name, _)| name == &spec)
+                .map(|(level, _)| level.clone())
+        });
+        self.state.set_model(&spec);
+        if let Err(e) = self.state.save() {
+            self.warn(format!("state: {e}"));
+        }
+        self.info()
     }
 
     fn finalize_session(&mut self) {
@@ -655,13 +748,14 @@ impl Session {
             .map(|store| store.dir.clone())
             .ok_or_else(|| "no working directory to keep sessions in".to_string())?;
         let mut meta = sessions::Meta::load(&dir, id)?;
-        let messages = sessions::load_messages(&dir, &mut meta)?;
+        let mut warnings = Vec::new();
+        let messages = sessions::load_messages(&dir, &mut meta, &mut warnings)?;
         // Selecting a session is activity: it moves to the top of the listing
         // and is not re-archived on the next start. A read-only state directory
         // must not make the history unreadable.
         meta.updated = sessions::now();
         if let Err(e) = meta.save(&dir) {
-            eprintln!("nano: session meta: {e}");
+            warnings.push(format!("session meta: {e}"));
         }
         let title = session_title(&meta);
         let model = self.spec();
@@ -674,13 +768,21 @@ impl Session {
         self.messages.extend(messages);
         self.sid = id.to_string();
         self.store = Some(store);
+        self.naming = None;
         self.used = None;
         self.set_session_header();
 
         if let Some(screen) = screen {
+            for warning in warnings {
+                screen.error(&format!("nano: {warning}\n"));
+            }
             screen.output(&format!("Resumed: {title}\n"));
             self.replay(screen);
             screen.set_info(&self.info());
+        } else {
+            for warning in warnings {
+                eprintln!("nano: {warning}");
+            }
         }
         Ok(title)
     }
@@ -770,6 +872,8 @@ impl Session {
         });
         self.messages = vec![system, mode_note(self.read_only)];
         self.sid = sid;
+        self.naming = None;
+        self.picks.clear();
         self.used = None;
         self.set_session_header();
         if let Some(screen) = screen {
@@ -784,6 +888,58 @@ impl Session {
         let Some(store) = &self.store else { return false };
         let Some(meta) = &store.meta else { return false };
         meta.title.is_empty() && !store.naming_tried && naming_excerpt(&self.messages).is_some()
+    }
+
+    /// Start the title request off the UI thread. The prompt stays live; the
+    /// result is applied at the next idle poll. Piped runs keep the synchronous
+    /// `name_session` because they have no UI to block.
+    fn start_naming(&mut self) {
+        if !self.may_name() {
+            return;
+        }
+        let Some((user, assistant)) = naming_excerpt(&self.messages) else {
+            return;
+        };
+        if let Some(store) = self.store.as_mut() {
+            store.naming_tried = true;
+        }
+        let provider = self.providers[self.provider].clone();
+        let model = self.model.clone();
+        let fallback = sessions::fallback(&self.messages);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let named = title_request(&provider, &model, &user, &assistant)
+                .as_deref()
+                .and_then(parse_naming)
+                .unwrap_or(fallback);
+            let _ = tx.send(Some(named));
+        });
+        self.naming = Some(rx);
+    }
+
+    /// Apply a finished background title, if one is ready. A title is metadata;
+    /// waiting for the next key is enough and never blocks the prompt.
+    fn poll_naming(&mut self, screen: Option<&mut ui::Screen>) {
+        let Some(received) = self
+            .naming
+            .as_ref()
+            .map(|rx| rx.try_recv())
+        else {
+            return;
+        };
+        match received {
+            Ok(Some((title, summary))) => {
+                self.naming = None;
+                if !title.is_empty() {
+                    if let Some(store) = self.store.as_mut() {
+                        store.set_title(&title, &summary);
+                    }
+                }
+                self.flush_warnings(screen);
+            }
+            Ok(None) | Err(mpsc::TryRecvError::Disconnected) => self.naming = None,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
     }
 
     fn name_session(&mut self) {
@@ -991,14 +1147,79 @@ impl Session {
 
     /// `!cmd`: run it here, show it, and let the output join the history. No
     /// turn follows — the model sees it when the user next asks something.
-    fn shell(&mut self, command: &str, screen: &mut ui::Screen) {
+    fn shell(
+        &mut self,
+        command: &str,
+        screen: &mut ui::Screen,
+        rx: &Receiver<Event>,
+    ) -> Option<String> {
         screen.insert(vec![line_of(&shell_line(command, false))], ui::Block::Tool);
+        screen.set_status("Running…");
         let _ = screen.draw();
-        let result = self.run_shell(command);
+        let cancel = http::Cancel::new();
+        let args = json!({ "command": command }).to_string();
+        let mut queued: Option<String> = None;
+        let result = thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                tools::execute("bash", &args, &cancel, false)
+            });
+            loop {
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(Event::Key(key)) if key.code == KeyCode::Esc => {
+                        cancel.cancel();
+                        screen.set_status("Interrupting…");
+                        let _ = screen.draw();
+                    }
+                    Ok(Event::Key(key)) => match screen.apply_key(key) {
+                        ui::Action::Submit if !screen.is_empty() && queued.is_none() => {
+                            queued = Some(screen.take());
+                        }
+                        ui::Action::Eof => {
+                            cancel.cancel();
+                            break;
+                        }
+                        _ => {
+                            let _ = screen.draw();
+                        }
+                    },
+                    Ok(Event::Paste(text)) => {
+                        screen.insert_text(&text);
+                        let _ = screen.draw();
+                    }
+                    Ok(Event::Resize) => {
+                        let _ = screen.draw();
+                    }
+                    Ok(Event::Eof) => {
+                        cancel.cancel();
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if handle.is_finished() {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        cancel.cancel();
+                        break;
+                    }
+                }
+            }
+            handle.join().unwrap_or_else(|_| "error: shell thread panicked".into())
+        });
+        screen.set_status("");
         screen.output(&result);
-        // The output is part of the history now: the fill moved.
+        // The output is part of the history now: drop the provider's last
+        // count so the fill estimate includes it.
+        self.used = None;
+        self.record(json!({
+            "role": "user",
+            "content": format!("$ {command}
+{result}"),
+        }));
         screen.set_info(&self.info());
         let _ = screen.draw();
+        queued
     }
 
     /// The command and its output as a user message. The `!` is the prompt's
@@ -1070,7 +1291,7 @@ impl Session {
                     thinking.as_deref(),
                     read_only,
                     &mut sink,
-                    &turn_cancel,
+                    turn_cancel,
                 );
                 let _ = turn_tx.send(Event::Done(result));
             });
@@ -1080,12 +1301,14 @@ impl Session {
                 // queued before drawing once: a repaint per token is a waste.
                 let first = match rx.recv_timeout(Duration::from_millis(50)) {
                     Ok(ev) => Some(ev),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if handle.is_finished() {
-                            break;
-                        }
-                        None
-                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => match rx.try_recv() {
+                        // The turn may have sent Done just before finishing;
+                        // process that event rather than dropping it.
+                        Ok(ev) => Some(ev),
+                        Err(mpsc::TryRecvError::Empty) if handle.is_finished() => break,
+                        Err(mpsc::TryRecvError::Empty) => None,
+                        Err(mpsc::TryRecvError::Disconnected) => break,
+                    },
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
                 let mut dirty = false;
@@ -1107,7 +1330,10 @@ impl Session {
                             }
                             ui::Action::Submit => {
                                 if !screen.is_empty() && queued.is_none() {
-                                    queued = Some(screen.commit());
+                                    // Queue without echoing: the line is
+                                    // dispatched at the boundary, below the
+                                    // answer it arrived during.
+                                    queued = Some(screen.take());
                                     screen.set_queued(queued.as_deref());
                                     dirty = true;
                                 }
@@ -1182,6 +1408,7 @@ impl Session {
                                 screen.set_status(&text);
                             }
                         }
+                        Event::Resize => dirty = true,
                         Event::Done(Err(e)) => {
                             screen.error(&format!("nano: {e}\n"));
                             done = true;
@@ -1223,18 +1450,10 @@ impl Session {
         self.used = used;
         screen.set_info(&self.info());
 
-        // One small request names the session, once. It is made after the
-        // turn so the answer never waits for it.
-        let naming = self.may_name();
-        if naming {
-            screen.set_status("Naming…");
-            let _ = screen.draw();
-        }
-        self.name_session();
-        if naming {
-            screen.set_status("");
-            let _ = screen.draw();
-        }
+        // One small request names the session, once, off the UI thread. The
+        // prompt is live immediately; the result is applied at the next poll.
+        self.start_naming();
+        self.flush_warnings(Some(screen));
 
         if !result {
             screen.error("nano: turn failed\n");
@@ -1275,17 +1494,7 @@ impl Session {
         match input {
             "/exit" | "/quit" => return Cmd::Exit,
             "/help" => {
-                screen.output(
-                    "/model [id]    pick or switch model\n\
-                     /models        list models\n\
-                     /thinking [l]  show or set thinking level (off, low, medium, high)\n\
-                     /thoughts      show or hide the model's reasoning\n\
-                     /sessions [q]  list, search and resume sessions\n\
-                     /new           start a new session\n\
-                     /explore       toggle explore mode (read-only shell)\n\
-                     !cmd           run a shell command; its output joins the context\n\
-                     /exit          quit\n",
-                );
+                screen.output(HELP);
                 return Cmd::Continue;
             }
             "/new" => {
@@ -1305,16 +1514,9 @@ impl Session {
                 if let Some((pi, id)) =
                     pick(&self.providers, (self.provider, &self.model), screen, rx)
                 {
-                    self.provider = pi;
-                    self.model = id;
-                    // The count belonged to the old model's window.
-                    self.used = None;
-                    let text = self.info();
+                    let text = self.set_model(pi, id);
                     screen.set_info(&text);
                     screen.output(&format!("{text}\n"));
-                    let spec = format!("{}/{}", self.providers[self.provider].name, self.model);
-                    self.state.set_model(&spec);
-                    self.state.save();
                 }
                 return Cmd::Continue;
             }
@@ -1332,16 +1534,20 @@ impl Session {
                 ));
                 return Cmd::Continue;
             }
-            if let Some(level) = set_thinking(&providers[self.provider].cfg, rest) {
-                self.thinking = Some(level.clone());
-                screen.set_info(&self.info());
-                let spec = format!("{}/{}", providers[self.provider].name, self.model);
-                self.state.set_thinking(&spec, level.as_str());
-                self.state.save();
-                screen.output(&format!(
-                    "thinking: {}\n\n",
-                    thinking_label(&providers[self.provider].cfg, &self.thinking)
-                ));
+            match set_thinking(&providers[self.provider].cfg, rest) {
+                Ok(level) => {
+                    self.thinking = Some(level.clone());
+                    screen.set_info(&self.info());
+                    let spec = format!("{}/{}", providers[self.provider].name, self.model);
+                    self.state.set_thinking(&spec, level.as_str());
+                    let save_error = self.state.save().err();
+                    let label = thinking_label(&providers[self.provider].cfg, &self.thinking);
+                    if let Some(e) = save_error {
+                        self.warn(format!("state: {e}"));
+                    }
+                    screen.output(&format!("thinking: {label}\n\n"));
+                }
+                Err(e) => screen.error(&format!("nano: {e}\n")),
             }
             return Cmd::Continue;
         }
@@ -1350,20 +1556,9 @@ impl Session {
             let spec = rest.trim();
             match find(providers, spec) {
                 Some((pi, id)) => {
-                    self.provider = pi;
-                    self.model = id;
-                    // The count belonged to the old model's window.
-                    self.used = None;
-                    self.thinking = self.state.thinking_for(&format!(
-                        "{}/{}",
-                        providers[self.provider].name, self.model
-                    ));
-                    let text = self.info();
+                    let text = self.set_model(pi, id);
                     screen.set_info(&text);
                     screen.output(&format!("{text}\n"));
-                    let spec = format!("{}/{}", providers[self.provider].name, self.model);
-                    self.state.set_model(&spec);
-                    self.state.save();
                 }
                 None => screen.error(&format!("unknown model: {spec}\n")),
             }
@@ -1377,7 +1572,9 @@ impl Session {
 
         if input == "/thoughts" {
             self.state.thoughts = !self.state.thoughts;
-            self.state.save();
+            if let Err(e) = self.state.save() {
+                self.warn(format!("state: {e}"));
+            }
             screen.output(&format!(
                 "Thoughts: {}\n\n",
                 if self.state.thoughts { "on" } else { "off" }
@@ -1427,17 +1624,7 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
     match input {
         "/exit" | "/quit" => return Cmd::Exit,
         "/help" => {
-            println!(
-                "/model [id]    pick or switch model\n\
-                 /models        list models\n\
-                 /thinking [l]  show or set thinking level (off, low, medium, high)\n\
-                 /thoughts      show or hide the model's reasoning\n\
-                 /sessions [q]  list, search and resume sessions\n\
-                 /new           start a new session\n\
-                 /explore       toggle explore mode (read-only shell)\n\
-                 !cmd           run a shell command; its output joins the context\n\
-                 /exit          quit"
-            );
+            println!("{}", HELP.trim_end());
             return Cmd::Continue;
         }
         "/models" => {
@@ -1448,8 +1635,7 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
             eprintln!("nano: /model needs a terminal");
             return Cmd::Continue;
         }
-        // Reasoning goes to stdout in a piped run; only the live region can
-        // hide it, so the toggle means nothing here.
+        // There is no live region to toggle; piped runs do not print reasoning.
         "/thoughts" => {
             eprintln!("nano: /thoughts needs a terminal");
             return Cmd::Continue;
@@ -1463,26 +1649,7 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
     }
     if let Some(rest) = input.strip_prefix("/model ") {
         match find(providers, rest.trim()) {
-            Some((pi, id)) => {
-                session.provider = pi;
-                session.model = id;
-                session.thinking = session.state.thinking_for(&format!(
-                    "{}/{}",
-                    providers[session.provider].name, session.model
-                ));
-                println!(
-                    "{}",
-                    selection(
-                        providers,
-                        session.provider,
-                        &session.model,
-                        &session.thinking
-                    )
-                );
-                let spec = format!("{}/{}", providers[session.provider].name, session.model);
-                session.state.set_model(&spec);
-                session.state.save();
-            }
+            Some((pi, id)) => println!("{}", session.set_model(pi, id)),
             None => eprintln!("nano: unknown model: {}", rest.trim()),
         }
         return Cmd::Continue;
@@ -1496,11 +1663,16 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
             );
             return Cmd::Continue;
         }
-        if let Some(level) = set_thinking(&providers[session.provider].cfg, rest) {
-            session.thinking = Some(level.clone());
-            let spec = format!("{}/{}", providers[session.provider].name, session.model);
-            session.state.set_thinking(&spec, level.as_str());
-            session.state.save();
+        match set_thinking(&providers[session.provider].cfg, rest) {
+            Ok(level) => {
+                session.thinking = Some(level.clone());
+                let spec = format!("{}/{}", providers[session.provider].name, session.model);
+                session.state.set_thinking(&spec, level.as_str());
+                if let Err(e) = session.state.save() {
+                    eprintln!("nano: {e}");
+                }
+            }
+            Err(e) => eprintln!("nano: {e}"),
         }
         return Cmd::Continue;
     }
@@ -1538,6 +1710,8 @@ enum Event {
     Status(String),
     /// Streamed reasoning, before any answer text.
     Thought(String),
+    /// The terminal changed size; the live region must repaint.
+    Resize,
     Done(Result<Option<u64>, String>),
     Eof,
 }
@@ -1572,6 +1746,11 @@ fn spawn_input(tx: Sender<Event>) {
                         return;
                     }
                 }
+                Ok(TermEvent::Resize(_, _)) => {
+                    if tx.send(Event::Resize).is_err() {
+                        return;
+                    }
+                }
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -1601,8 +1780,6 @@ fn readline(screen: &mut ui::Screen, rx: &Receiver<Event>) -> Option<Input> {
                     let _ = screen.draw();
                     return Some(Input::Cancel);
                 }
-                // Enter on an empty line commits nothing: a bare prompt in the
-                // transcript is noise, and an empty line is not input.
                 ui::Action::Eof => return None,
                 ui::Action::None => {
                     let _ = screen.draw();
@@ -1610,6 +1787,9 @@ fn readline(screen: &mut ui::Screen, rx: &Receiver<Event>) -> Option<Input> {
             },
             Ok(Event::Paste(text)) => {
                 screen.insert_text(&text);
+                let _ = screen.draw();
+            }
+            Ok(Event::Resize) => {
                 let _ = screen.draw();
             }
             Ok(Event::Eof) | Err(_) => return None,
@@ -1898,19 +2078,18 @@ fn level_names(provider: &config::ProviderConfig) -> Vec<String> {
 
 /// Map user input onto a configured level name. Returns the canonical name, so
 /// the config never stores an alias.
-fn set_thinking(provider: &config::ProviderConfig, input: &str) -> Option<String> {
+fn set_thinking(provider: &config::ProviderConfig, input: &str) -> Result<String, String> {
     let names = level_names(provider);
-    let level = names
+    names
         .iter()
         .find(|name| name.eq_ignore_ascii_case(input))
-        .cloned();
-    if level.is_none() {
-        eprintln!(
-            "nano: unknown thinking level: {input} (known: {})",
-            names.join(", ")
-        );
-    }
-    level
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "unknown thinking level: {input} (known: {})",
+                names.join(", ")
+            )
+        })
 }
 
 /// Warn once at startup if the config remembers a level the provider dropped.
@@ -1974,7 +2153,20 @@ const LOGO: &[&str] = &[
 fn banner(note: Option<&str>) {
     // One leading blank: the same margin `ui::Screen` keeps on both edges.
     println!();
-    for line in LOGO {
+    let width = terminal::size().map(|(width, _)| width).unwrap_or(0);
+    let logo_width = LOGO
+        .iter()
+        .map(|line| line.chars().count() as u16)
+        .max()
+        .unwrap_or(0);
+    // The block logo must fit between the margins; a narrow terminal gets the
+    // one-word mark instead of a wrapped banner.
+    let logo: &[&str] = if width == 0 || width > logo_width {
+        LOGO
+    } else {
+        &["nano"]
+    };
+    for line in logo {
         println!(" {}", Paint::Cyan.ansi(line));
     }
     if let Some(note) = note {
@@ -2304,6 +2496,7 @@ fn call_line(call: &api::ToolCall, read_only: bool) -> Vec<(Paint, String)> {
         "read" => ("◇", Paint::Cyan),
         "fetch" => ("↗", Paint::Cyan),
         "web_search" => ("⌕", Paint::Cyan),
+        "about" => ("ℹ", Paint::Cyan),
         "write" => ("✚", Paint::Yellow),
         "edit" => ("✎", Paint::Yellow),
         _ => ("✚", Paint::Yellow),

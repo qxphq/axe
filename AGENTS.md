@@ -1,14 +1,15 @@
 # nano
 
 Minimal coding agent harness in Rust. One binary, a line REPL, OpenAI-compatible
-providers, seven tools. Roughly 8.5k LOC across ten files.
+providers, seven tools. Roughly 9k LOC across ten files.
 
 ## Principles
 
 1. **Dependencies are debt.** Prefer `std`. A crate must be strictly necessary and
    widely maintained. Current: `serde_json`, `rustls`, `webpki-roots`, `ratatui`
    (with its `crossterm` backend), `unicode-width`, `flate2` (pure-Rust
-   `rust_backend`). `rustls` because crypto is never hand-rolled; `ratatui` because
+   `rust_backend`), and `libc` on Linux for Landlock/seccomp. `rustls` because
+   crypto is never hand-rolled; `ratatui` because
    terminal geometry is the same class of problem — the hand-rolled strip renderer
    produced a new whitespace bug per fix; `flate2` because old session bodies are
    gzipped and a compression format is never hand-rolled either.
@@ -68,8 +69,10 @@ providers, seven tools. Roughly 8.5k LOC across ten files.
     one margin row; when it closes without resuming, its rows are committed to
     scrollback, so the list survives and no blank rows are left. Everything above it
     is appended, never repainted.
-13. **One writer.** Only `ui::Screen` touches the terminal. An event may mutate state
-    and ask for output; nothing else prints. A stray `print!` is a rendering bug.
+13. **One writer.** While `ui::Screen` owns the terminal, only it draws: an
+    event may mutate state and ask for output; nothing else prints. The startup
+    banner and piped output run before/without a `Screen`; a stray `print!`
+    while it exists is a rendering bug.
 14. **The prompt is a block.** Every line of the prompt carries its glyph (the live
     `❯ `, the committed `█ `), so a wrapped line reads as one block, not as text
     running off the edge.
@@ -124,8 +127,8 @@ providers, seven tools. Roughly 8.5k LOC across ten files.
 
 Markdown is the model's and the user's, never the binary's. Blocks are laid out
 when they end — a blank line, a tool call, a thought, or the end of the turn —
-because a table needs its header and a paragraph its last line. The line still
-being streamed stays raw in the status row.
+because a table needs its header and a paragraph its last line. The live row
+shows what the turn is doing, not the unfinished line.
 - Style comes from `Paint` in `main.rs`, rendered either as cells or as ANSI when
   there is no screen to draw on.
 - Tool names and descriptions are part of the prompt. Change them deliberately.
@@ -163,9 +166,9 @@ cargo build
 cargo run
 ```
 
-No test suite yet. Verify changes with `./harness.py` (below): a pty plus a
-virtual terminal is the only way to see what the user sees, and `cargo test`
-cannot.
+`cargo test` covers pure logic (markdown, parsers, read/edit caps). Verify UI
+changes with `./harness.py` (below): a pty plus a virtual terminal is the only
+way to see what the user sees.
 
 ## Testing
 
@@ -220,8 +223,8 @@ back with `show:`; normal mode is a `!cmd` line, which does not loop:
 ./harness.py --scroll 400 'tool:bash:{"command":"ls | wc -l"}' '!Escape' 'show:'
 ./harness.py --scroll 400 'tool:about:{}' '!Escape' 'show:'
 ./harness.py --scroll 400 'tool:bash:{"command":"echo x > /tmp/p"}' '!Escape' 'show:'
-./harness.py --scroll 400 'tool:bash:{"command":"sed -n 1p f"}' '!Escape' 'show:'
-./harness.py --scroll 400 'tool:bash:{"command":"git status --short"}' '!Escape' 'show:'
+./harness.py --scroll 400 'tool:bash:{"command":"head -n 1 tmux.conf"}' '!Escape' 'show:'
+./harness.py --scroll 400 'tool:bash:{"command":"git --version"}' '!Escape' 'show:'
 ./harness.py --scroll 400 ' !python3 -c "import socket; socket.socket()"'
 ```
 

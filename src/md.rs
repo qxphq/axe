@@ -604,7 +604,7 @@ fn inline(t: &[char], depth: usize) -> Vec<Inline> {
 
         // Strikethrough: ~text~
         if ch == '~' && !starts(t, i, "~~") {
-            if let Some(end) = cached_single(t, &mut misses, "~~", i + 1, '~') {
+            if let Some(end) = cached_single(t, &mut misses, "~", i + 1, '~') {
                 flush_buf(&mut buf, &mut out);
                 out.push(Inline::Del(inline(&t[i + 1..end], depth + 1)));
                 i = end + 1;
@@ -1660,5 +1660,28 @@ fn ansi_codes(style: Style) -> Vec<&'static str> {
         }
     }
     codes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(input: &str) -> String {
+        document(input, 80)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn single_tilde_does_not_hide_double_strike() {
+        assert_eq!(text("~a ~~b~~"), "~a b");
+    }
+
+    #[test]
+    fn double_strike_does_not_hide_single_tilde() {
+        assert_eq!(text("~~a~~ ~b~"), "a b");
+    }
 }
 
