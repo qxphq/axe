@@ -896,4 +896,45 @@ mod tests {
         assert!(!local_address("8.8.8.8".parse().unwrap()));
         assert!(guard_host("localhost").is_err());
     }
+
+    #[test]
+    fn query_escaping_round_trips() {
+        assert_eq!(escape("a b&c"), "a%20b%26c");
+        assert_eq!(unescape("a%20b%26c"), "a b&c");
+        assert_eq!(escape("café"), "caf%C3%A9");
+    }
+
+    #[test]
+    fn urls_are_http_only() {
+        assert!(http_url("https://example.com/a").is_some());
+        assert!(http_url("ftp://example.com/").is_none());
+        assert!(http_url("https://example.com/a b").is_none());
+        assert_eq!(
+            url_of("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F"),
+            Some("https://example.com/".into())
+        );
+    }
+
+    #[test]
+    fn result_rows_keep_source_and_hits() {
+        let out = results(
+            "brave",
+            vec![Hit {
+                title: "T".into(),
+                url: "https://e/".into(),
+                snippet: "S".into(),
+            }],
+            1,
+        );
+        assert!(out.starts_with("source: brave"));
+        assert!(out.contains("T"));
+        assert!(out.contains("https://e/"));
+        assert!(out.contains("S"));
+    }
+
+    #[test]
+    fn page_text_rejects_empty_and_past_end() {
+        assert!(page_text("", &json!({})).starts_with("error:"));
+        assert!(page_text("abc", &json!({ "start": 4 })).starts_with("error:"));
+    }
 }

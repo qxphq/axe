@@ -595,4 +595,61 @@ mod tests {
         );
         assert!(result.contains("refused host"), "{result}");
     }
+
+    #[test]
+    fn explore_refuses_mutating_tools_and_missing_args() {
+        let cancel = Cancel::new();
+        assert!(execute("write", "{}", &cancel, true).contains("explore mode"));
+        assert!(execute("edit", "{}", &cancel, true).contains("explore mode"));
+        assert!(execute("fetch", "{}", &cancel, false).contains("explore mode"));
+        assert!(execute("read", "{}", &cancel, false).contains("missing \"path\""));
+        let path = temp("missing-args").to_string_lossy().to_string();
+        assert!(execute(
+            "write",
+            &json!({ "path": path }).to_string(),
+            &cancel,
+            false
+        )
+        .contains("missing \"content\""));
+        assert!(
+            execute("edit", &json!({ "path": path }).to_string(), &cancel, false)
+                .contains("missing \"old\"")
+        );
+    }
+
+    #[test]
+    fn read_refuses_directories() {
+        let dir = std::env::temp_dir().join(format!("nano-test-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = read(&json!({ "path": dir.to_string_lossy() }));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.contains("not a regular file"), "{result}");
+    }
+
+    #[test]
+    fn registry_and_prompt_include_every_tool() {
+        let names: Vec<&str> = definitions()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        for name in [
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "about",
+            "fetch",
+            "web_search",
+        ] {
+            assert!(names.contains(&name), "{name}");
+        }
+        let prompt = system_prompt();
+        assert!(prompt.contains("Working directory:"));
+        assert!(prompt.contains("- bash(command)"));
+        assert!(denied("Permission denied"));
+        assert!(denied("Operation not permitted"));
+        assert!(!denied("not found"));
+    }
 }

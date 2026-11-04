@@ -11,8 +11,10 @@
 
 use std::io::{self, IsTerminal, Stdout, Write};
 
+#[cfg(test)]
+use ratatui::backend::TestBackend;
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
-use ratatui::buffer::Cell;
+use ratatui::buffer::{Buffer, Cell};
 use ratatui::crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -22,7 +24,7 @@ use ratatui::layout::{Alignment, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget};
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::md;
@@ -91,8 +93,72 @@ struct Menu {
     collapse_on_type: bool,
 }
 
+enum Term {
+    Real(Terminal<Tail<Stdout>>),
+    #[cfg(test)]
+    Test(Terminal<TestBackend>),
+}
+
+impl Term {
+    fn size(&self) -> io::Result<Size> {
+        match self {
+            Term::Real(term) => term.size(),
+            #[cfg(test)]
+            Term::Test(term) => term.size(),
+        }
+    }
+
+    fn autoresize(&mut self) -> io::Result<()> {
+        match self {
+            Term::Real(term) => term.autoresize(),
+            #[cfg(test)]
+            Term::Test(term) => term.autoresize(),
+        }
+    }
+
+    fn draw<F: FnOnce(&mut Frame)>(&mut self, draw: F) -> io::Result<()> {
+        match self {
+            Term::Real(term) => term.draw(draw).map(|_| ()),
+            #[cfg(test)]
+            Term::Test(term) => term.draw(draw).map(|_| ()),
+        }
+    }
+
+    fn insert_before<F: FnOnce(&mut Buffer)>(&mut self, height: u16, draw: F) -> io::Result<()> {
+        match self {
+            Term::Real(term) => term.insert_before(height, draw),
+            #[cfg(test)]
+            Term::Test(term) => term.insert_before(height, draw),
+        }
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        match self {
+            Term::Real(term) => term.clear(),
+            #[cfg(test)]
+            Term::Test(term) => term.clear(),
+        }
+    }
+
+    fn area(&mut self) -> Rect {
+        match self {
+            Term::Real(term) => term.get_frame().area(),
+            #[cfg(test)]
+            Term::Test(term) => term.get_frame().area(),
+        }
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        match self {
+            Term::Real(term) => term.set_cursor_position(position),
+            #[cfg(test)]
+            Term::Test(term) => term.set_cursor_position(position),
+        }
+    }
+}
+
 pub struct Screen {
-    term: Terminal<Tail<Stdout>>,
+    term: Term,
     /// Plain text: the editor owns the color.
     prompt: String,
     /// Color of the prompt glyph, switched by explore mode.
@@ -167,7 +233,7 @@ impl Screen {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
         );
         Ok(Screen {
-            term,
+            term: Term::Real(term),
             prompt: prompt.to_string(),
             prompt_style: PROMPT_STYLE,
             buf: String::new(),
@@ -183,6 +249,35 @@ impl Screen {
             menu: None,
             restored: false,
         })
+    }
+
+    #[cfg(test)]
+    fn test_screen(width: u16, height: u16) -> Screen {
+        Screen {
+            term: Term::Test(Terminal::new(TestBackend::new(width, height)).unwrap()),
+            prompt: "❯ ".to_string(),
+            prompt_style: PROMPT_STYLE,
+            buf: String::new(),
+            cursor: 0,
+            status: String::new(),
+            queued: None,
+            info: String::new(),
+            killed: String::new(),
+            commands: Vec::new(),
+            last: None,
+            md: md::Stream::new(),
+            thought: md::Stream::new(),
+            menu: None,
+            restored: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn test_buffer(&self) -> &Buffer {
+        match &self.term {
+            Term::Test(term) => term.backend().buffer(),
+            Term::Real(_) => unreachable!(),
+        }
     }
 
     pub fn prompt(&self) -> &str {
@@ -689,9 +784,13 @@ impl Screen {
     /// are pushed into scrollback first, which leaves blank rows for the new
     /// prompt lines.
     fn fit(&mut self, height: u16) -> io::Result<()> {
+        #[cfg(test)]
+        if matches!(self.term, Term::Test(_)) {
+            return Ok(());
+        }
         let size = self.term.size()?;
         let height = height.min(size.height).max(1);
-        let area = self.term.get_frame().area();
+        let area = self.term.area();
         if area.height == height {
             return Ok(());
         }
@@ -725,7 +824,7 @@ impl Screen {
                 Err(e) => return Err(e),
             }
         };
-        self.term = term;
+        self.term = Term::Real(term);
         // Blank the whole region and force a full repaint.
         self.term.clear()?;
         Ok(())
@@ -738,16 +837,26 @@ impl Screen {
             return;
         }
         self.restored = true;
-        let area = self.term.get_frame().area();
-        let _ = execute!(
-            self.term.backend_mut(),
-            PopKeyboardEnhancementFlags,
-            DisableBracketedPaste,
-            cursor::MoveTo(0, area.y),
-            terminal::Clear(terminal::ClearType::FromCursorDown),
-            cursor::Show
-        );
-        let _ = self.term.flush();
+        #[cfg(test)]
+        if matches!(self.term, Term::Test(_)) {
+            return;
+        }
+        let area = self.term.area();
+        match &mut self.term {
+            Term::Real(term) => {
+                let _ = execute!(
+                    term.backend_mut(),
+                    PopKeyboardEnhancementFlags,
+                    DisableBracketedPaste,
+                    cursor::MoveTo(0, area.y),
+                    terminal::Clear(terminal::ClearType::FromCursorDown),
+                    cursor::Show
+                );
+                let _ = term.flush();
+            }
+            #[cfg(test)]
+            Term::Test(_) => {}
+        }
         ratatui::restore();
     }
 
@@ -1303,5 +1412,97 @@ mod tests {
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert_eq!(text, vec!["hello ", "world"]);
+    }
+
+    #[test]
+    fn live_region_renders_prompt_status_info_and_queue() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.buf = "hi".into();
+        screen.cursor = 2;
+        screen.set_status("Thinking…");
+        screen.set_info("p/m · default");
+        screen.set_queued(Some("later"));
+        screen.draw().unwrap();
+        let text: Vec<String> = screen
+            .test_buffer()
+            .content
+            .chunks(40)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let text = text.join("\n");
+        assert!(text.contains("❯ hi"), "{text}");
+        assert!(text.contains("Thinking…"), "{text}");
+        assert!(text.contains("p/m · default"), "{text}");
+        assert!(text.contains("Queued: later"), "{text}");
+    }
+
+    #[test]
+    fn editing_keys_do_not_need_a_terminal() {
+        let mut screen = Screen::test_screen(40, 10);
+        for c in ['a', 'b', 'c'] {
+            screen.apply_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(screen.buf, "abc");
+        screen.apply_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        screen.apply_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(screen.buf, "ac");
+        assert!(matches!(
+            screen.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Submit
+        ));
+    }
+
+    #[test]
+    fn chooser_renders_and_takes_keys() {
+        let mut screen = Screen::test_screen(40, 12);
+        screen.set_menu("Header", vec!["one".into(), "two".into()], false);
+        screen.draw().unwrap();
+        let text: Vec<String> = screen
+            .test_buffer()
+            .content
+            .chunks(40)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let text = text.join("\n");
+        assert!(text.contains("Header"), "{text}");
+        assert!(text.contains("one"), "{text}");
+        assert!(text.contains("two"), "{text}");
+        assert!(matches!(
+            screen.apply_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Action::MenuStep(1)
+        ));
+        assert!(matches!(
+            screen.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::MenuAccept
+        ));
+    }
+
+    #[test]
+    fn prompt_and_commit_work_without_a_terminal() {
+        let mut screen = Screen::test_screen(40, 10);
+        assert!(screen.is_empty());
+        screen.insert_text("hello");
+        assert_eq!(screen.take(), "hello");
+        assert!(screen.is_empty());
+        screen.insert_text("hi");
+        assert_eq!(screen.commit(), "hi");
+        assert!(screen.is_empty());
+        screen.set_prompt("model> ");
+        assert_eq!(screen.prompt(), "model> ");
+        screen.set_status("Thinking…");
+        assert_eq!(screen.status(), "Thinking…");
+        screen.set_commands(&["/help", "/exit"]);
+        assert_eq!(screen.commands, vec!["/help", "/exit"]);
+    }
+
+    #[test]
+    fn transcript_writers_do_not_need_a_terminal() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.insert(vec![Line::from("tool")], Block::Tool);
+        screen.fail("nope");
+        screen.output("binary text\n");
+        screen.error("red text\n");
+        screen.echo_user("user **markdown**");
+        screen.flush();
     }
 }

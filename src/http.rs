@@ -577,4 +577,73 @@ mod tests {
         chunked.read_to_string(&mut out).unwrap();
         assert_eq!(out, "abc");
     }
+
+    #[test]
+    fn raw_line_reads_until_newline() {
+        let mut reader = &b"3\r\nrest"[..];
+        assert_eq!(read_line_raw(&mut reader).unwrap(), "3\r\n");
+        assert_eq!(read_line_raw(&mut reader).unwrap(), "rest");
+    }
+
+    #[test]
+    fn split_rejects_bad_urls() {
+        assert!(split_url("ftp://host").is_err());
+        assert!(split_url("http://").is_err());
+        assert!(split_url("http://host:bad/").is_err());
+    }
+
+    #[test]
+    fn body_reports_truncation_and_bad_chunks() {
+        let mut truncated = BodyReader {
+            inner: &b"ab"[..],
+            state: BodyState::Chunked {
+                remaining: 3,
+                done: false,
+            },
+        };
+        let mut buf = [0u8; 4];
+        assert_eq!(truncated.read(&mut buf).unwrap(), 2);
+        assert!(truncated.read(&mut buf).is_err());
+
+        let mut bad = BodyReader {
+            inner: &b"zz\r\n"[..],
+            state: BodyState::Chunked {
+                remaining: 0,
+                done: false,
+            },
+        };
+        assert!(bad.read(&mut buf).is_err());
+    }
+
+    #[test]
+    fn body_empty_and_eof() {
+        let mut empty = BodyReader {
+            inner: &b""[..],
+            state: BodyState::Eof,
+        };
+        let mut buf = [0u8; 4];
+        assert_eq!(empty.read(&mut buf).unwrap(), 0);
+        let mut length_zero = BodyReader {
+            inner: &b"x"[..],
+            state: BodyState::Length(0),
+        };
+        assert_eq!(length_zero.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn cancel_is_sticky() {
+        let cancel = Cancel::new();
+        assert!(!cancel.cancelled());
+        cancel.cancel();
+        assert!(cancel.cancelled());
+        cancel.cancel();
+        assert!(cancel.cancelled());
+    }
+
+    #[test]
+    fn header_line_reader_reports_eof() {
+        let mut reader = &b"a: b\r\n"[..];
+        assert_eq!(read_line(&mut reader).unwrap(), "a: b\r\n");
+        assert!(read_line(&mut reader).is_err());
+    }
 }

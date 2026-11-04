@@ -518,4 +518,58 @@ mod tests {
         assert!(summary.contains("Done."));
         assert_eq!(collapse("  a\n b  ", 20), "a b");
     }
+
+    #[test]
+    fn gzip_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("nano-test-gzip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut meta = Meta::new("abc123", "p/m");
+        let plain = log_path(&dir, "abc123");
+        let gz = gz_path(&dir, "abc123");
+        std::fs::write(&plain, "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+        compress(&dir, &meta, &plain, &gz).unwrap();
+        assert!(gz.exists());
+        assert!(!plain.exists());
+        unpack(&dir, &mut meta, &gz, &plain).unwrap();
+        assert!(plain.exists());
+        assert!(!gz.exists());
+        assert!(std::fs::read_to_string(&plain).unwrap().contains("hi"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn damaged_body_is_reported() {
+        let dir = std::env::temp_dir().join(format!("nano-test-damaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut meta = Meta::new("abc123", "p/m");
+        meta.save(&dir).unwrap();
+        std::fs::write(
+            log_path(&dir, "abc123"),
+            "{\"role\":\"user\",\"content\":\"hi\"}\nnot json\n",
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let body = load_messages(&dir, &mut meta, &mut warnings).unwrap();
+        assert_eq!(body.len(), 1);
+        assert!(
+            warnings.iter().any(|w| w.contains("damaged")),
+            "{warnings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_marks_and_snips_the_matching_line() {
+        let terms = vec!["needle".to_string()];
+        let mut seen = vec![false];
+        mark("hay needle", &terms, &mut seen);
+        assert!(seen[0]);
+        let text = "first line\n  the needle is here  \nlast";
+        assert_eq!(snip(text, &terms), "the needle is here");
+        let mut seen = vec![false];
+        mark("none", &terms, &mut seen);
+        assert!(!seen[0]);
+    }
 }

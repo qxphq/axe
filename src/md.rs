@@ -1721,4 +1721,21 @@ mod tests {
         let rendered: Vec<String> = out.iter().map(plain).collect();
         assert_eq!(rendered, vec!["hello world"]);
     }
+
+    #[test]
+    fn autolinks_entities_and_breaks() {
+        let out = text("see https://example.com/x &amp; more<br>next");
+        assert!(out.contains("https://example.com/x"), "{out}");
+        assert!(out.contains("&"), "{out}");
+        assert!(out.lines().count() >= 2, "{out}");
+    }
+
+    #[test]
+    fn details_and_heading_closers_render() {
+        let out = text("<details><summary>More</summary>\nBody\n</details>");
+        assert!(out.contains("More"), "{out}");
+        assert!(out.contains("Body"), "{out}");
+        assert_eq!(text("## Title ##"), "Title");
+        assert!(text("---").contains("─"));
+    }
 }

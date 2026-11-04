@@ -558,4 +558,12 @@ mod tests {
         assert!(COMMANDS.contains(&"git"));
         assert!(resolve("sh").is_some());
     }
+
+    #[test]
+    fn init_and_shell_build_without_running() {
+        let _ = init();
+        assert!(shell("true", false).is_ok());
+        assert!(shell("true", true).is_ok());
+        cleanup();
+    }
 }

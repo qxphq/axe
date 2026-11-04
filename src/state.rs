@@ -189,4 +189,10 @@ mod tests {
         state.set_thinking("prov/model", "low");
         assert_eq!(state.thinking_for("prov/model").as_deref(), Some("low"));
     }
+
+    #[test]
+    fn fnv_hash_is_stable() {
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
 }

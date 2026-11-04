@@ -2709,4 +2709,174 @@ mod tests {
         );
         assert_eq!(selection(&[provider], 0, "m", &None), "p/m  ·  default");
     }
+
+    fn test_provider() -> Provider {
+        Provider {
+            name: "p".into(),
+            cfg: config::ProviderConfig {
+                name: "p".into(),
+                base_url: "http://p".into(),
+                api_key: None,
+                api_key_env: None,
+                models_url: None,
+                session_header: None,
+                thinking: Vec::new(),
+            },
+            ep: http::parse_url("http://p").unwrap(),
+            key: None,
+            headers: Vec::new(),
+            models: vec![api::ModelInfo {
+                id: "m".into(),
+                context: Some(100),
+            }],
+        }
+    }
+
+    #[test]
+    fn session_switches_model_and_new_session() {
+        let mut session = Session {
+            state: state::State::default(),
+            providers: vec![test_provider()],
+            provider: 0,
+            model: "m".into(),
+            thinking: None,
+            read_only: true,
+            used: Some(10),
+            messages: vec![json!({ "role": "system", "content": "s" })],
+            sid: "abc".into(),
+            store: None,
+            startup: Vec::new(),
+            picks: vec!["old".into()],
+            naming: None,
+            warning: None,
+        };
+        let info = session.set_model(0, "m".into());
+        assert!(info.contains("p/m"), "{info}");
+        assert_eq!(session.used, None);
+        assert_eq!(session.state.model.as_deref(), Some("p/m"));
+        session.new_session(None);
+        assert!(session.picks.is_empty());
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0]["content"].as_str(), Some("s"));
+    }
+
+    #[test]
+    fn summaries_and_session_rows() {
+        assert_eq!(
+            user_summary(&json!({ "role": "user", "content": "do it" })),
+            Some("do it".into())
+        );
+        assert!(user_summary(&json!({ "role": "user", "content": "$ ls" })).is_none());
+        let meta = sessions::Meta {
+            id: "abc123".into(),
+            created: 0,
+            updated: 0,
+            title: "Title".into(),
+            summary: String::new(),
+            model: "p/m".into(),
+            messages: 3,
+            archived: true,
+        };
+        assert_eq!(session_title(&meta), "Title");
+        assert!(session_row(&meta).contains("Title"));
+        assert!(session_row(&meta).contains("zip"));
+    }
+
+    #[test]
+    fn store_records_and_finalizes() {
+        let dir = std::env::temp_dir().join(format!("nano-test-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::fresh(dir.clone(), "abc123", "p/m");
+        store.record(&json!({ "role": "user", "content": "fix it" }));
+        assert!(store.take_warning().is_none());
+        assert_eq!(store.meta.as_ref().unwrap().messages, 1);
+        store.set_title("T", "S");
+        assert_eq!(store.meta.as_ref().unwrap().title, "T");
+        store.finalize(&[]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_sink_normalizes_reply_spacing() {
+        let mut sink = TextSink::default();
+        let mut out = String::new();
+        sink.push("\n\nhello", &mut out);
+        sink.push(" world\n\n", &mut out);
+        sink.commit();
+        assert_eq!(out, "\nhello world");
+        assert!(sink.wrote);
+    }
+
+    #[test]
+    fn call_and_shell_lines_are_compact() {
+        let read = call_line(
+            &api::ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: "{\"path\":\"src/ui.rs\",\"offset\":2,\"limit\":3}".into(),
+            },
+            true,
+        );
+        let text = plain_text(&read);
+        assert!(text.contains("read"));
+        assert!(text.contains("src/ui.rs"));
+        assert!(text.contains("2+3"));
+        let shell = shell_line("echo hi", false);
+        assert!(plain_text(&shell).contains("echo hi"));
+    }
+
+    #[test]
+    fn channel_sink_emits_text_and_hidden_thoughts() {
+        let (tx, rx) = mpsc::channel();
+        let mut sink = ChannelSink {
+            tx,
+            out: TextSink::default(),
+            thoughts: false,
+            thought: None,
+        };
+        sink.reasoning("think");
+        sink.text("hi");
+        sink.end_round();
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(events.iter().any(|event| matches!(event, Event::Status(_))));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Event::Printed(_))));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Event::Thought(_))));
+    }
+
+    #[test]
+    fn session_info_and_mode_note() {
+        let mut session = Session {
+            state: state::State::default(),
+            providers: vec![test_provider()],
+            provider: 0,
+            model: "m".into(),
+            thinking: None,
+            read_only: true,
+            used: None,
+            messages: vec![json!({ "role": "system", "content": "s" })],
+            sid: "abc".into(),
+            store: None,
+            startup: Vec::new(),
+            picks: Vec::new(),
+            naming: None,
+            warning: None,
+        };
+        assert!(session.info().contains("p/m"));
+        assert_eq!(session.context(), Some(100));
+        assert!(session.fill().contains("100"));
+        session.set_read_only(false);
+        assert!(!session.read_only);
+        assert_eq!(session.messages.len(), 2);
+        session.record(json!({ "role": "user", "content": "hi" }));
+        assert_eq!(session.messages.len(), 3);
+        session.warn("careful".into());
+        session.flush_warnings(None);
+    }
 }

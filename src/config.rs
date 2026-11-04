@@ -289,4 +289,68 @@ mod tests {
             .iter()
             .any(|p| p.session_header.as_deref() == Some("x-opencode-session")));
     }
+
+    #[test]
+    fn top_level_base_url_makes_local_provider() {
+        let cfg = parse_value(&serde_json::json!({
+            "base_url": "http://local:8000/v1/",
+            "explore_by_default": false,
+            "system": "be brief"
+        }))
+        .unwrap();
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.providers[0].name, "local");
+        assert_eq!(cfg.providers[0].base_url, "http://local:8000/v1");
+        assert!(!cfg.explore_by_default);
+        assert_eq!(cfg.system.as_deref(), Some("be brief"));
+    }
+
+    #[test]
+    fn config_rejects_missing_provider_keys() {
+        assert!(parse_value(&serde_json::json!({})).is_err());
+        assert!(parse_value(&serde_json::json!({
+            "providers": {"p": {}}
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn provider_level_and_key_helpers() {
+        let mut provider = ProviderConfig {
+            name: "p".into(),
+            base_url: "http://p".into(),
+            api_key: Some("secret".into()),
+            api_key_env: None,
+            models_url: None,
+            session_header: None,
+            thinking: vec![
+                ("off".into(), serde_json::json!({})),
+                ("high".into(), serde_json::json!({"effort":"high"})),
+            ],
+        };
+        assert_eq!(provider.resolved_key().as_deref(), Some("secret"));
+        assert_eq!(
+            provider.thinking_body(Some("high")),
+            Some(serde_json::json!({"effort":"high"}))
+        );
+        assert_eq!(provider.thinking_body(Some("off")), None);
+        assert_eq!(provider.thinking_body(Some("missing")), None);
+        provider.api_key = None;
+        assert_eq!(provider.resolved_key(), None);
+    }
+
+    #[test]
+    fn agents_are_read_and_found_upwards() {
+        let dir = std::env::temp_dir().join(format!("nano-test-agents-{}", std::process::id()));
+        let nested = dir.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "rules").unwrap();
+        assert_eq!(
+            read_agents(&dir.join("AGENTS.md")).as_deref(),
+            Some("rules")
+        );
+        assert!(find_agents(&nested).unwrap().ends_with("AGENTS.md"));
+        assert!(read_agents(&dir.join("missing.md")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
