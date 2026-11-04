@@ -3,7 +3,8 @@
 
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -204,8 +205,18 @@ pub fn load() -> Result<Config, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if let Some(dir) = p.parent() {
                 let _ = fs::create_dir_all(dir);
+                let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
             }
-            return match fs::write(&p, format!("{EXAMPLE}\n")) {
+            // The example carries no secret, but the file it becomes holds
+            // keys in some setups: owner-only from the first byte.
+            let created = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&p)
+                .and_then(|mut file| file.write_all(format!("{EXAMPLE}\n").as_bytes()));
+            return match created {
                 Ok(()) => Err(format!(
                     "created default config at {}\nedit it and run again",
                     p.display()

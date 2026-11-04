@@ -175,6 +175,10 @@ directory with every byte outside `[A-Za-z0-9._-]` written as `%XX` — so
 | `<id>.jsonl` | the session body: one API message per line, append-only |
 | `<id>.jsonl.gz` | a body older than the 30 most recent, gzipped |
 
+Directories are `0700` and files `0600`: a session is plaintext, readable by
+its owner only. Use a container, a separate user, or full-disk encryption when
+the local account is not the right boundary.
+
 The active body is append-only, so a crash can only leave an unfinished last
 line. Archiving gzips and removes it; resuming unpacks it back to plain. On a
 host without `gzip` nothing is archived — bodies stay plain, and a body already

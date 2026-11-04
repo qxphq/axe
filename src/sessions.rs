@@ -10,6 +10,7 @@
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -108,7 +109,7 @@ impl Meta {
 
     /// Rewrite the sidecar through a temporary, like `state.json`.
     pub fn save(&self, dir: &Path) -> Result<(), String> {
-        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        state::private_dir(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let file = meta_path(dir, &self.id);
         let value = json!({
             "v": VERSION,
@@ -124,7 +125,7 @@ impl Meta {
         let text = serde_json::to_string_pretty(&value)
             .map_err(|e| format!("encode {}: {e}", file.display()))?;
         let tmp = dir.join(format!("{}.json.tmp", self.id));
-        fs::write(&tmp, format!("{text}\n"))
+        state::write_private(&tmp, &format!("{text}\n"))
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
         fs::rename(&tmp, &file).map_err(|e| format!("write {}: {e}", file.display()))
     }
@@ -168,13 +169,18 @@ pub struct Log {
 
 impl Log {
     pub fn open(dir: &Path, id: &str) -> Result<Log, String> {
-        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        state::private_dir(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let path = log_path(dir, id);
         let file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&path)
             .map_err(|e| format!("open {}: {e}", path.display()))?;
+        // A body created before the mode was set stays readable by other
+        // local users until it is tightened here.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
         Ok(Log { file })
     }
 
@@ -328,7 +334,7 @@ fn have_gzip() -> bool {
 /// terminal, so a child writing to it would be a rendering bug. A failed run
 /// leaves no partial file behind.
 fn gzip(args: &[&OsStr], out: &Path) -> Result<(), String> {
-    let file = File::create(out).map_err(|e| format!("create {}: {e}", out.display()))?;
+    let file = state::create_private(out).map_err(|e| format!("create {}: {e}", out.display()))?;
     let err = match Command::new("gzip")
         .args(args)
         .stdin(Stdio::null())

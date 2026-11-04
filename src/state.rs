@@ -2,8 +2,9 @@
 //! Sessions live under the same project directory.
 
 use std::env;
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -77,6 +78,42 @@ fn file(cwd: &Path) -> PathBuf {
     project(cwd).join("state.json")
 }
 
+/// Create `dir` and the nano-owned directories above it, all `0700`: a
+/// directory's state and its sessions are private to the user.
+pub fn private_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    set_mode(dir, 0o700)?;
+    let root = root();
+    let mut at = dir.parent();
+    while let Some(parent) = at.filter(|parent| parent.starts_with(&root)) {
+        set_mode(parent, 0o700)?;
+        at = parent.parent();
+    }
+    Ok(())
+}
+
+/// Create (or truncate) a file only its owner can read. The mode is forced
+/// after opening, so a temporary left by an older version is tightened too.
+pub fn create_private(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    set_mode(path, 0o600)?;
+    Ok(file)
+}
+
+/// Write a whole file with `create_private`'s mode.
+pub fn write_private(path: &Path, text: &str) -> io::Result<()> {
+    create_private(path)?.write_all(text.as_bytes())
+}
+
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
 /// Best-effort: a missing file is silent, a malformed one is a warning and a
 /// fresh start. Nothing here is worth failing a run over.
 pub fn load(cwd: &Path) -> State {
@@ -128,8 +165,7 @@ impl State {
         let Some(dir) = file.parent() else {
             return Ok(());
         };
-        fs::create_dir_all(dir)
-            .map_err(|e| format!("cannot save state to {}: {e}", file.display()))?;
+        private_dir(dir).map_err(|e| format!("cannot save state to {}: {e}", file.display()))?;
         let thinking: serde_json::Map<String, Value> = self
             .thinking
             .iter()
@@ -145,7 +181,7 @@ impl State {
             .map(|text| format!("{text}\n"))
             .map_err(|e| format!("cannot save state to {}: {e}", file.display()))?;
         let tmp = file.with_extension("json.tmp");
-        fs::write(&tmp, text)
+        write_private(&tmp, &text)
             .map_err(|e| format!("cannot save state to {}: {e}", tmp.display()))?;
         fs::rename(&tmp, &file).map_err(|e| format!("cannot save state to {}: {e}", file.display()))
     }
@@ -194,5 +230,18 @@ mod tests {
     fn fnv_hash_is_stable() {
         assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
+    #[test]
+    fn private_files_have_private_modes() {
+        let dir = std::env::temp_dir().join(format!("nano-test-private-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        private_dir(&dir).unwrap();
+        let file = dir.join("state.json");
+        write_private(&file, "x").unwrap();
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&file), 0o600);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
