@@ -356,7 +356,7 @@ environment only.
 - [x] Bash output caps and process-tree kill (full-output file declined as non-security).
 - [x] HTTP header/SSE/body caps; connect/write/fetch timeouts.
 - [x] Terminal control-character stripping outside ratatui.
-- [ ] Literal `api_key` removal or warning.
+- [x] Literal `api_key` rejected at config load; `api_key_env` is the only source.
 - [x] `// SAFETY:` comments on every `unsafe` block in `sandbox.rs`.
 - [x] README/SECURITY trust section.
 - [x] Repro for loader/`LD_PRELOAD`: code runs and `ld.so` starts unlisted programs, inside the same write/network confinement; direct unlisted exec is denied.
