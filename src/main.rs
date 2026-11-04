@@ -489,6 +489,10 @@ impl Session {
                             ui::Action::Explore => {}
                             ui::Action::None => dirty = true,
                         },
+                        Event::Paste(text) => {
+                            screen.insert_text(&text);
+                            dirty = true;
+                        }
                         // Model text, already spaced by the sink: everything up
                         // to the last newline is a finished line.
                         Event::Printed(text) => {
@@ -840,6 +844,8 @@ fn shell_command(input: &str) -> Option<Cmd> {
 /// Events from the two producers that never draw: keys, and the turn.
 enum Event {
     Key(ratatui::crossterm::event::KeyEvent),
+    /// Bracketed paste: inserted at the cursor, never submitted on its own.
+    Paste(String),
     /// Transcript text: finished model lines, already spaced.
     Printed(String),
     /// One tool call and its outcome, as styled spans, and the failure's own
@@ -878,6 +884,11 @@ fn spawn_input(tx: Sender<Event>) {
                         return;
                     }
                 }
+                Ok(TermEvent::Paste(text)) if !text.is_empty() => {
+                    if tx.send(Event::Paste(text)).is_err() {
+                        return;
+                    }
+                }
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -902,6 +913,10 @@ fn readline(screen: &mut ui::Screen, rx: &Receiver<Event>) -> Option<Input> {
                     let _ = screen.draw();
                 }
             },
+            Ok(Event::Paste(text)) => {
+                screen.insert_text(&text);
+                let _ = screen.draw();
+            }
             Ok(Event::Eof) | Err(_) => return None,
             // A turn's events cannot arrive while idle; drop them if they do.
             Ok(_) => {}

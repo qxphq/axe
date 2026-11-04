@@ -12,7 +12,10 @@
 use std::io::{self, IsTerminal, Stdout, Write};
 
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use ratatui::crossterm::{cursor, execute, terminal};
 use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -104,6 +107,15 @@ impl Screen {
         let term = ratatui::try_init_with_options(TerminalOptions {
             viewport: Viewport::Inline(CHROME + 1),
         })?;
+        // Shift+Enter is only distinguishable from Enter under the kitty
+        // keyboard protocol; bracketed paste keeps a pasted block one buffer
+        // instead of one submission per line. A terminal that knows neither
+        // ignores both.
+        let _ = execute!(
+            io::stdout(),
+            EnableBracketedPaste,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        );
         Ok(Screen {
             term,
             prompt: prompt.to_string(),
@@ -171,6 +183,13 @@ impl Screen {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
+            // A new line, not a submission. Shift needs the kitty protocol;
+            // Alt is the ESC-prefixed form every terminal sends.
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT)
+                || key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.insert_char('\n')
+            }
             KeyCode::Enter => return Action::Submit,
             KeyCode::Backspace if alt || ctrl => self.kill_word_back(),
             KeyCode::Backspace => self.backspace(),
@@ -417,7 +436,8 @@ impl Screen {
                 row(below),
             );
             let label = match &queued {
-                Some(line) => clip(&format!("queued: {line}"), cols),
+                // One row: a queued message's own line breaks would be lost.
+                Some(line) => clip(&format!("queued: {}", line.replace('\n', " ")), cols),
                 None => String::new(),
             };
             frame.render_widget(Paragraph::new(Line::styled(label, DIM)), row(1));
@@ -484,7 +504,7 @@ impl Screen {
         }
         self.restored = true;
         let area = self.term.get_frame().area();
-        let _ = execute!(self.term.backend_mut(), cursor::MoveTo(0, area.y), terminal::Clear(terminal::ClearType::FromCursorDown), cursor::Show);
+        let _ = execute!(self.term.backend_mut(), PopKeyboardEnhancementFlags, DisableBracketedPaste, cursor::MoveTo(0, area.y), terminal::Clear(terminal::ClearType::FromCursorDown), cursor::Show);
         let _ = self.term.flush();
         ratatui::restore();
     }
@@ -506,6 +526,19 @@ impl Screen {
         let at = self.offset(self.cursor);
         self.buf.insert(at, c);
         self.cursor += 1;
+    }
+
+    /// Text from a paste, newlines and all: it joins the buffer as it is, so a
+    /// pasted block is one submission, not one per line. A terminal may hand
+    /// over CRLF; that is still one line break.
+    pub fn insert_text(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if text.is_empty() {
+            return;
+        }
+        let at = self.offset(self.cursor);
+        self.buf.insert_str(at, &text);
+        self.cursor += text.chars().count();
     }
 
     /// Tab on a bare slash word: extend it to the longest common prefix, and
@@ -731,13 +764,20 @@ fn prompt_layout(
     let mut col = 0usize;
     let mut at = (0usize, 0usize);
     for (i, ch) in buf.chars().enumerate() {
+        if i == cursor {
+            at = (rows.len() - 1, col);
+        }
+        // A newline is a row break the user chose: the rest of the line goes
+        // on the next row, which starts under the same glyph.
+        if ch == '\n' {
+            rows.push(String::new());
+            col = 0;
+            continue;
+        }
         let cells = ch.width().unwrap_or(1);
         if col > 0 && col + cells > limit {
             rows.push(String::new());
             col = 0;
-        }
-        if i == cursor {
-            at = (rows.len() - 1, col);
         }
         rows.last_mut().expect("a row").push(ch);
         col += cells;
