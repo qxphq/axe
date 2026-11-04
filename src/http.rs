@@ -89,6 +89,11 @@ pub fn parse_url(url: &str) -> Result<Endpoint, String> {
 /// when there is none — while the target is the path and query as written, so a
 /// page URL reaches the server intact.
 pub fn split_url(url: &str) -> Result<(Endpoint, String), String> {
+    // The target is written to the socket as given: a control byte or a space
+    // in it would split the request line.
+    if let Some(c) = url.chars().find(|c| c.is_ascii_control() || *c == ' ') {
+        return Err(format!("invalid character {c:?} in URL: {url}"));
+    }
     let (scheme, rest) = if let Some(rest) = url.strip_prefix("http://") {
         (Scheme::Http, rest)
     } else if let Some(rest) = url.strip_prefix("https://") {
@@ -146,6 +151,33 @@ pub fn split_url(url: &str) -> Result<(Endpoint, String), String> {
         },
         target,
     ))
+}
+
+/// An RFC 9110 token: what may name a header field.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// A header value may hold spaces and visible text, but no control byte:
+/// CR/LF would end the field and start another.
+fn valid_value(value: &str) -> bool {
+    !value.chars().any(|c| c.is_ascii_control())
+}
+
+/// `Host` names the port only when it is not the scheme's default.
+fn host_header(ep: &Endpoint) -> String {
+    let default = match ep.scheme {
+        Scheme::Http => 80,
+        Scheme::Https => 443,
+    };
+    if ep.port == default {
+        ep.host.clone()
+    } else {
+        format!("{}:{}", ep.host, ep.port)
+    }
 }
 
 enum Stream {
@@ -414,12 +446,31 @@ pub fn request_with_timeout(
     cancel: Option<&Cancel>,
     read_timeout: Duration,
 ) -> Result<Response, String> {
+    let target = format!("{}{}", ep.prefix, path);
+    // Every byte reaches the socket as given; a space or a control byte would
+    // end the request line early.
+    if let Some(c) = target.chars().find(|c| c.is_ascii_control() || *c == ' ') {
+        return Err(format!("invalid character {c:?} in request target"));
+    }
+    if let Some(key) = api_key {
+        if !valid_value(key) {
+            return Err("invalid value for the Authorization header".into());
+        }
+    }
+    for (name, value) in headers {
+        if !valid_name(name) {
+            return Err(format!("invalid header name: {name:?}"));
+        }
+        if !valid_value(value) {
+            return Err(format!("invalid value for header {name}"));
+        }
+    }
+
     let mut stream = connect(ep, cancel, read_timeout)?;
 
-    let target = format!("{}{}", ep.prefix, path);
     let mut head = format!(
         "{method} {target} HTTP/1.1\r\nHost: {}\r\nUser-Agent: nano/{}\r\nAccept: */*\r\nConnection: close\r\n",
-        ep.host,
+        host_header(ep),
         env!("CARGO_PKG_VERSION")
     );
     if let Some(key) = api_key {
@@ -554,6 +605,36 @@ mod tests {
         let (ep, target) = split_url("https://host").unwrap();
         assert_eq!(ep.port, 443);
         assert_eq!(target, "/");
+    }
+
+    #[test]
+    fn urls_reject_controls_and_spaces() {
+        for url in [
+            "http://host/a\r\nX: y",
+            "http://host/a\nb",
+            "http://host/a b",
+            "http://host/a\tb",
+        ] {
+            assert!(split_url(url).is_err(), "{url:?}");
+        }
+    }
+
+    #[test]
+    fn header_names_and_values_are_checked() {
+        assert!(valid_name("x-opencode-session"));
+        assert!(!valid_name(""));
+        assert!(!valid_name("X: y"));
+        assert!(valid_value("Bearer abc.DEF-123"));
+        assert!(!valid_value("a\r\nX: y"));
+        assert!(!valid_value("a\tb"));
+    }
+
+    #[test]
+    fn host_carries_a_non_default_port() {
+        let (ep, _) = split_url("http://host:8080/v1").unwrap();
+        assert_eq!(host_header(&ep), "host:8080");
+        let (ep, _) = split_url("https://host/v1").unwrap();
+        assert_eq!(host_header(&ep), "host");
     }
 
     #[test]
