@@ -14,6 +14,7 @@ mod web;
 
 use std::cell::RefCell;
 use std::io::{self, IsTerminal, Read, Write};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -43,6 +44,42 @@ fn main() {
         eprintln!("nano: {}", strip_control(&e));
         std::process::exit(1);
     }
+}
+
+/// The system prompt: built-in rules, then instructions. `global` and the
+/// config's `system` are the user's own text; the project's `AGENTS.md` comes
+/// from a repository and is wrapped in a tag that marks it as data.
+fn system_with_instructions(
+    global: Option<&str>,
+    project: Option<(&str, &Path)>,
+    extra: Option<&str>,
+) -> String {
+    let mut instructions = String::new();
+    if let Some(text) = global {
+        instructions.push_str("\n\n# Instructions (global)\n\n");
+        instructions.push_str(text);
+    }
+    if let Some((text, path)) = project {
+        instructions.push_str(&format!(
+            "\n\n<project_instructions path=\"{}\">\n{text}\n</project_instructions>",
+            tag_path(&path.display().to_string())
+        ));
+    }
+    if let Some(text) = extra {
+        instructions.push_str("\n\n");
+        instructions.push_str(text);
+    }
+    let mut system = tools::system_prompt();
+    system.push_str(&instructions);
+    system
+}
+
+/// A path inside the tag's attribute: a quote or a control byte would end or
+/// break the attribute, so both become an apostrophe.
+fn tag_path(path: &str) -> String {
+    path.chars()
+        .map(|c| if c == '"' || c.is_control() { '\'' } else { c })
+        .collect()
 }
 
 fn run() -> Result<(), String> {
@@ -158,22 +195,13 @@ fn run() -> Result<(), String> {
     }
 
     // Built once. The mode lives in the history, not here, so a toggle leaves
-    // the prefix byte-identical and the provider's cache intact.
-    let mut instructions = String::new();
-    if let Some(text) = &global_agents {
-        instructions.push_str("\n\n# Instructions (global)\n\n");
-        instructions.push_str(text);
-    }
-    if let Some(text) = &project_agents {
-        instructions.push_str("\n\n# Instructions (project)\n\n");
-        instructions.push_str(text);
-    }
-    if let Some(extra) = &cfg.system {
-        instructions.push_str("\n\n");
-        instructions.push_str(extra);
-    }
-    let mut system = tools::system_prompt();
-    system.push_str(&instructions);
+    // the prefix byte-identical and the provider's cache intact. The project's
+    // file is tagged: it is data about the repository, not authority.
+    let system = system_with_instructions(
+        global_agents.as_deref(),
+        project_agents.as_deref().zip(project_file.as_deref()),
+        cfg.system.as_deref(),
+    );
     // The mode is history, not prompt: the config decides where a session
     // starts, and the note below tells the model which side it is on.
     let read_only = cfg.explore_by_default;
@@ -2627,6 +2655,28 @@ mod tests {
     #[test]
     fn control_bytes_are_stripped_but_lines_survive() {
         assert_eq!(strip_control("a\x1b[31mb\nc\td\u{9b}"), "a[31mb\nc\td");
+    }
+
+    #[test]
+    fn project_instructions_are_tagged_between_global_and_system() {
+        let system = system_with_instructions(
+            Some("global text"),
+            Some(("project text", Path::new("/repo/AGENTS.md"))),
+            Some("config text"),
+        );
+        assert!(system.contains("# Instructions (global)\n\nglobal text"));
+        assert!(system.contains(
+            "<project_instructions path=\"/repo/AGENTS.md\">\nproject text\n</project_instructions>"
+        ));
+        assert!(
+            system.find("# Instructions (global)").unwrap()
+                < system.find("<project_instructions path=").unwrap()
+        );
+        assert!(
+            system.find("<project_instructions path=").unwrap()
+                < system.find("config text").unwrap()
+        );
+        assert_eq!(tag_path("a\"b\nc"), "a'b'c");
     }
 
     #[test]

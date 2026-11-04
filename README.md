@@ -90,6 +90,11 @@ directory, then `system`. `agents` and `AGENTS.md` are capped at 48 KB;
 `system` is not. All are read once at startup; nothing is re-read mid-session,
 and the mode is carried in the conversation, not the prompt.
 
+A project's `AGENTS.md` comes from the repository, not from you, so it is
+wrapped in `<project_instructions path="...">`. The first rule in the prompt
+says that block is data: it describes the project, and it never overrides your
+current request.
+
 ## REPL
 
 `❯ ` is the prompt. Enter submits, Shift+Enter starts a new line, Tab completes

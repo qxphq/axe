@@ -22,8 +22,9 @@ invariants a change must not break.
    list of rules that hold for every user, and the tools from the same registry as
    the `tools` array. Rules are policy: one line each, no workflow, nothing
    project- or provider-specific. Instructions are appended in order: `agents`
-   (config), the nearest `AGENTS.md` at or above cwd, then `system`. Read once at
-   startup; never re-read mid-session.
+   (config), the nearest `AGENTS.md` at or above cwd, then `system`. The project
+   file is wrapped in `<project_instructions path="...">` and the first rule
+   calls it data, not authority. Read once at startup; never re-read mid-session.
 6. **Stable prefix, append-only history.** System prompt and tool schemas first,
    volatile content last. Never inject timestamps, status, or cwd changes into the
    prefix: it invalidates provider prompt caching. Sessions are append-only JSONL,
