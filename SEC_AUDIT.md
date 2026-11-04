@@ -179,7 +179,11 @@ recorded before this change still replay without a label.
 
 **Status at HEAD.** The README "Trust and security" section states that explore
 mode bounds integrity, not confidentiality, including the `!cmd` write bypass;
-the environment and `/proc` parts are in SEC-01.
+the environment and `/proc` parts are in SEC-01. The loader path was reproduced:
+`LD_PRELOAD=/tmp/x.so cat /dev/null` ran the constructor (write outside the
+scratch directory `EACCES`, `socket` `EPERM`), and `ld.so /bin/echo` ran an
+unlisted program, while a direct `/usr/bin/env` was denied. The README now
+states both, and that loaded code stays in the same write/network domain.
 
 ### SEC-04 — Normal mode is RCE by design; AGENTS.md is remote instructions (accepted baseline; docs)
 
@@ -355,10 +359,11 @@ environment only.
 - [ ] Literal `api_key` removal or warning.
 - [x] `// SAFETY:` comments on every `unsafe` block in `sandbox.rs`.
 - [x] README/SECURITY trust section.
-- [ ] Repro for loader/`LD_PRELOAD` before claiming exec isolation.
+- [x] Repro for loader/`LD_PRELOAD`: code runs and `ld.so` starts unlisted programs, inside the same write/network confinement; direct unlisted exec is denied.
 
 ## Verification notes
 
-- The Landlock loader/`LD_PRELOAD` path is a mechanism that needs a repro before the README claim is changed.
+- The Landlock loader/`LD_PRELOAD` path is reproduced (SEC-03): loaded code keeps
+  the write and network confinement; the README claim is narrowed accordingly.
 - The env/secret paths are source-level findings; reproduce before fixing.
 - The review is static; no build/test was run in explore mode.
