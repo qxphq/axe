@@ -489,7 +489,7 @@ impl Screen {
             .into_iter()
             .map(|row| {
                 let mut spans = vec![Span::styled(format!("{MARK} "), PROMPT_STYLE)];
-                spans.extend(row.spans);
+                spans.extend(row.spans.into_iter().map(|s| s.patch_style(PROMPT_STYLE)));
                 Line::from(spans)
             })
             .collect();
