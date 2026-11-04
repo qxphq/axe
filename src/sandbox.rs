@@ -214,6 +214,9 @@ mod imp {
             // directory `cleanup` deletes.
             cmd.env("TMPDIR", scratch_dir()?);
         }
+        // SAFETY: `pre_exec` is unsafe because the closure runs in the child
+        // between fork and exec; this one calls only fixed syscalls on state
+        // inherited from the parent, before any user program runs.
         unsafe {
             cmd.pre_exec(move || {
                 no_new_privs()?;
@@ -232,6 +235,8 @@ mod imp {
     fn abi() -> Option<i32> {
         static ABI: OnceLock<Option<i32>> = OnceLock::new();
         *ABI.get_or_init(|| {
+            // SAFETY: the version probe takes a null ruleset with size 0 and
+            // the VERSION flag; the kernel reads nothing from this process.
             let ret = unsafe {
                 libc::syscall(
                     libc::SYS_landlock_create_ruleset,
@@ -289,6 +294,8 @@ mod imp {
         } else {
             8
         };
+        // SAFETY: `attr` is a valid `RulesetAttr` and `size` is the prefix
+        // the running ABI understands; the kernel copies, never retains it.
         let fd = unsafe {
             libc::syscall(
                 libc::SYS_landlock_create_ruleset,
@@ -303,6 +310,8 @@ mod imp {
                 io::Error::last_os_error()
             ));
         }
+        // SAFETY: `fd` is a fresh non-negative descriptor returned by the
+        // call above; `OwnedFd` takes ownership and closes it exactly once.
         let set = Ruleset(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
 
         let mut binaries: Vec<PathBuf> = COMMANDS.iter().filter_map(|name| resolve(name)).collect();
@@ -333,6 +342,8 @@ mod imp {
     fn allow(set: &Ruleset, access: u64, path: &Path) -> Result<(), String> {
         let c = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| format!("sandbox: path has a NUL: {}", path.display()))?;
+        // SAFETY: `c` is a NUL-terminated `CString`, and the flags are a
+        // read-only path open; the returned descriptor is checked below.
         let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         if fd < 0 {
             return Err(format!(
@@ -341,11 +352,15 @@ mod imp {
                 io::Error::last_os_error()
             ));
         }
+        // SAFETY: `fd` is the non-negative descriptor just opened; ownership
+        // moves into `OwnedFd`, which closes it once.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let rule = PathBeneathAttr {
             allowed_access: access,
             parent_fd: fd.as_raw_fd(),
         };
+        // SAFETY: the ruleset and parent descriptors are valid, and `rule`
+        // outlives the call; the kernel copies the struct.
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_landlock_add_rule,
@@ -366,6 +381,7 @@ mod imp {
     }
 
     fn no_new_privs() -> io::Result<()> {
+        // SAFETY: `prctl` with fixed constants and no pointer arguments.
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_prctl,
@@ -388,6 +404,8 @@ mod imp {
             len: filter.len() as u16,
             filter: filter.as_ptr() as *mut libc::sock_filter,
         };
+        // SAFETY: `prog` points at `filter`, a stack array that outlives the
+        // call, and its `len` matches; the kernel copies the filter.
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_prctl,
@@ -403,6 +421,8 @@ mod imp {
     }
 
     fn restrict(fd: RawFd) -> io::Result<()> {
+        // SAFETY: `fd` is the ruleset descriptor this process owns, and
+        // `restrict_self` takes no pointer arguments.
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_landlock_restrict_self,
