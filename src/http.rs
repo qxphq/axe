@@ -2,7 +2,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -66,6 +66,14 @@ impl Cancel {
 }
 
 pub fn parse_url(url: &str) -> Result<Endpoint, String> {
+    split_url(url).map(|(ep, _)| ep)
+}
+
+/// Split a URL into its endpoint and the exact request target. `prefix` keeps
+/// the provider meaning — the base path with the trailing slash trimmed, empty
+/// when there is none — while the target is the path and query as written, so a
+/// page URL reaches the server intact.
+pub fn split_url(url: &str) -> Result<(Endpoint, String), String> {
     let (scheme, rest) = if let Some(rest) = url.strip_prefix("http://") {
         (Scheme::Http, rest)
     } else if let Some(rest) = url.strip_prefix("https://") {
@@ -74,13 +82,25 @@ pub fn parse_url(url: &str) -> Result<Endpoint, String> {
         return Err(format!("base_url must start with http:// or https://: {url}"));
     };
 
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, ""),
-    };
+    // The authority ends at the first '/', '?' or '#': a query can follow a host
+    // with no path at all.
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
     if authority.is_empty() {
         return Err(format!("missing host in {url}"));
     }
+    let target = if tail.is_empty() {
+        "/".to_string()
+    } else if tail.starts_with('/') {
+        tail.to_string()
+    } else {
+        format!("/{tail}")
+    };
+    let target = match target.find('#') {
+        Some(i) => target[..i].to_string(),
+        None => target,
+    };
+    let path = if tail.starts_with('/') { tail } else { "" };
 
     let default_port = match scheme {
         Scheme::Http => 80,
@@ -95,12 +115,15 @@ pub fn parse_url(url: &str) -> Result<Endpoint, String> {
         None => (authority.to_string(), default_port),
     };
 
-    Ok(Endpoint {
-        scheme,
-        host,
-        port,
-        prefix: path.trim_end_matches('/').to_string(),
-    })
+    Ok((
+        Endpoint {
+            scheme,
+            host,
+            port,
+            prefix: path.trim_end_matches('/').to_string(),
+        },
+        target,
+    ))
 }
 
 enum Stream {
@@ -261,6 +284,8 @@ impl<R: Read> Read for BodyReader<R> {
 
 pub struct Response {
     pub status: u16,
+    pub content_type: Option<String>,
+    pub location: Option<String>,
     reader: BufReader<BodyReader<BufReader<Stream>>>,
 }
 
@@ -269,6 +294,26 @@ impl Response {
         let mut out = String::new();
         self.reader.read_to_string(&mut out)?;
         Ok(out)
+    }
+
+    /// Read at most `limit` bytes, then stop: the cap is on bytes off the wire.
+    /// Decoded lossily, so a page that is not UTF-8 is mojibake rather than an
+    /// error. `deadline` bounds the loop, not a single blocked read.
+    pub fn read_capped(&mut self, limit: u64, deadline: Instant) -> io::Result<String> {
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while (out.len() as u64) < limit {
+            if Instant::now() > deadline {
+                break;
+            }
+            let room = (limit - out.len() as u64).min(chunk.len() as u64) as usize;
+            let n = self.reader.read(&mut chunk[..room])?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+        }
+        Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
     pub fn read_line(&mut self) -> io::Result<Option<String>> {
@@ -332,6 +377,8 @@ pub fn request(
 
     let mut content_length = None;
     let mut chunked = false;
+    let mut content_type = None;
+    let mut location = None;
     loop {
         let line = read_line(&mut reader)?;
         let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
@@ -347,6 +394,10 @@ pub fn request(
                 && value.to_ascii_lowercase().contains("chunked")
             {
                 chunked = true;
+            } else if name == "content-type" {
+                content_type.get_or_insert_with(|| value.to_string());
+            } else if name == "location" {
+                location.get_or_insert_with(|| value.to_string());
             }
         }
     }
@@ -364,6 +415,8 @@ pub fn request(
 
     Ok(Response {
         status,
+        content_type,
+        location,
         reader: BufReader::new(BodyReader {
             inner: reader,
             state,
