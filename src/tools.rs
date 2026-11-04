@@ -30,31 +30,21 @@ const READ: Spec = Spec {
 const WRITE: Spec = Spec {
     name: "write",
     signature: "write(path, content)",
-    description: "Create or overwrite a file with the given content. Parent directories are created.",
+    description: "Create or overwrite a file with the given content. Parent directories are created. Unavailable in explore mode.",
     parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path relative to the working directory"},"content":{"type":"string","description":"Full file content"}},"required":["path","content"]}"#,
 };
 
 const EDIT: Spec = Spec {
     name: "edit",
     signature: "edit(path, old, new, replace_all?)",
-    description: "Replace exact text in a file. Fails if old is absent or matches more than once unless replace_all is true.",
+    description: "Replace exact text in a file. Fails if old is absent or matches more than once unless replace_all is true. Unavailable in explore mode.",
     parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path relative to the working directory"},"old":{"type":"string","description":"Exact text to replace"},"new":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace every occurrence"}},"required":["path","old","new"]}"#,
 };
 
 const BASH: Spec = Spec {
     name: "bash",
     signature: "bash(command)",
-    description: "Run a shell command in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds.",
-    parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"Command passed to sh -c"}},"required":["command"]}"#,
-};
-
-/// Explore mode's `bash`: same call, but only the commands below run. The
-/// restriction is part of the description because the description is the
-/// prompt — a first-token check cannot be expressed as an absent tool.
-const BASH_READ_ONLY: Spec = Spec {
-    name: "bash",
-    signature: "bash(command)",
-    description: "Run a read-only shell command in the working directory. Only these run: cat, cut, date, df, diff, du, fd, file, find, grep, head, id, jq, ls, ps, pwd, rg, sort, stat, tail, tr, tree, uname, uniq, wc, which, and git with one of blame, describe, diff, grep, log, ls-files, rev-parse, show, status. Anything else is refused. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds.",
+    description: "Run a shell command in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds. In explore mode only read-only commands run: cat, cut, date, df, diff, du, fd, file, find, grep, head, id, jq, ls, ps, pwd, rg, sort, stat, tail, tr, tree, uname, uniq, wc, which, and git with one of blame, describe, diff, grep, log, ls-files, rev-parse, show, status. Anything else is refused.",
     parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"Command passed to sh -c"}},"required":["command"]}"#,
 };
 
@@ -72,28 +62,13 @@ const READ_ONLY_GIT: &[&str] = &[
 ];
 
 const SPECS: &[Spec] = &[READ, WRITE, EDIT, BASH];
-const SPECS_READ_ONLY: &[Spec] = &[READ, BASH_READ_ONLY];
-
-fn specs(read_only: bool) -> &'static [Spec] {
-    if read_only {
-        SPECS_READ_ONLY
-    } else {
-        SPECS
-    }
-}
 
 static DEFINITIONS: OnceLock<Value> = OnceLock::new();
-static DEFINITIONS_READ_ONLY: OnceLock<Value> = OnceLock::new();
 
-pub fn definitions(read_only: bool) -> &'static Value {
-    let slot = if read_only {
-        &DEFINITIONS_READ_ONLY
-    } else {
-        &DEFINITIONS
-    };
-    slot.get_or_init(|| {
+pub fn definitions() -> &'static Value {
+    DEFINITIONS.get_or_init(|| {
         Value::Array(
-            specs(read_only)
+            SPECS
                 .iter()
                 .map(|spec| {
                     json!({
@@ -118,16 +93,24 @@ const BEHAVIOR: &[&str] = &[
      first and mark it with \"(recommended)\".",
 ];
 
-pub fn system_prompt(read_only: bool) -> String {
+pub fn system_prompt() -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
-    let mut out = format!("Working directory: {cwd}\n\nBehavior:\n");
+    let mut out = format!("Working directory: {cwd}\n\n");
+    out.push_str(
+        "A session starts in explore mode: read the working directory and run read-only \
+         commands to understand it, answer, and propose changes. `write` and `edit` are \
+         unavailable, and `bash` runs read-only commands only. The user may leave the mode \
+         at any time; every change is announced in the conversation as `explore mode: on` \
+         or `explore mode: off`, and the latest note says which mode is in force.\n",
+    );
+    out.push_str("\nBehavior:\n");
     for (i, rule) in BEHAVIOR.iter().enumerate() {
         out.push_str(&format!("{}. {rule}\n", i + 1));
     }
     out.push_str("\nTools:\n");
-    for spec in specs(read_only) {
+    for spec in SPECS {
         out.push_str(&format!("- {} — {}\n", spec.signature, spec.description));
     }
     out

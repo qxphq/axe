@@ -117,8 +117,8 @@ fn run() -> Result<(), String> {
         }
     }
 
-    // Kept apart from the generated prompt: `/explore` swaps the tools, so the
-    // prompt is regenerated and these blocks are appended again unchanged.
+    // Built once. The mode lives in the history, not here, so a toggle leaves
+    // the prefix byte-identical and the provider's cache intact.
     let mut instructions = String::new();
     if let Some(text) = &global_agents {
         instructions.push_str("\n\n# Instructions (global)\n\n");
@@ -132,9 +132,12 @@ fn run() -> Result<(), String> {
         instructions.push_str("\n\n");
         instructions.push_str(extra);
     }
-    let mut system = tools::system_prompt(false);
+    let mut system = tools::system_prompt();
     system.push_str(&instructions);
-    let messages: Vec<Value> = vec![json!({ "role": "system", "content": system })];
+    let messages: Vec<Value> = vec![
+        json!({ "role": "system", "content": system }),
+        mode_note(true),
+    ];
 
     let session = Session {
         cfg,
@@ -143,9 +146,8 @@ fn run() -> Result<(), String> {
         model,
         thinking,
         thoughts: false,
-        read_only: false,
+        read_only: true,
         used: None,
-        instructions,
         messages,
     };
 
@@ -154,6 +156,18 @@ fn run() -> Result<(), String> {
     } else {
         session.run_piped()
     }
+}
+
+/// The note that tells the model which mode it is in. A `user` message, the
+/// same role `!cmd` output joins as; the mode is history, so the prompt above
+/// it never changes.
+fn mode_note(read_only: bool) -> Value {
+    let content = if read_only {
+        "explore mode: on — write and edit are unavailable; bash runs read-only commands only."
+    } else {
+        "explore mode: off — all tools are available."
+    };
+    json!({ "role": "user", "content": content })
 }
 
 /// Everything the REPL mutates between turns: the model selection and history.
@@ -166,14 +180,12 @@ struct Session {
     /// Show reasoning in the transcript (`/thoughts`). Off by default: the
     /// status row's "thinking…" is enough unless the user asks for more.
     thoughts: bool,
-    /// Explore mode: `read` and a read-only `bash` only (`/explore`).
+    /// Explore mode: `read` and a read-only `bash` only (`/explore`). On until
+    /// the user leaves it; the history carries the note.
     read_only: bool,
     /// The last round's token count, from the provider. `None` until a turn
     /// reports one: the fill is then estimated from the history.
     used: Option<u64>,
-    /// The config and project instructions appended to the generated prompt,
-    /// kept so a mode switch can rebuild the first message.
-    instructions: String,
     messages: Vec<Value>,
 }
 
@@ -313,14 +325,12 @@ impl Session {
         models.iter().find(|m| m.id == self.model)?.context
     }
 
-    /// Enter or leave explore mode. The tool set changes, and the generated
-    /// prompt changes with it: the first message is rebuilt in place, so the
-    /// history after it is untouched.
+    /// Enter or leave explore mode. The prompt and the tool catalogue are
+    /// fixed, so the mode is announced in the history: the model reads the
+    /// note, and nothing before it is rewritten.
     fn set_read_only(&mut self, read_only: bool) {
         self.read_only = read_only;
-        let mut system = tools::system_prompt(read_only);
-        system.push_str(&self.instructions);
-        self.messages[0] = json!({ "role": "system", "content": system });
+        self.messages.push(mode_note(read_only));
     }
 
     /// `/explore` and Shift+Tab share one path, so the prompt color, the
@@ -1381,7 +1391,7 @@ fn run_turn(
     sink: &mut dyn Sink,
     cancel: &http::Cancel,
 ) -> Result<Option<u64>, String> {
-    let tools = tools::definitions(read_only);
+    let tools = tools::definitions();
     // The last round's own count. It measures the whole request, so it is the
     // fill; `None` when no round reported one.
     let mut used = None;
