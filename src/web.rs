@@ -4,7 +4,7 @@
 //! Brave/DuckDuckGo parsers stay together. Everything here is read-only; the
 //! result is untrusted text for the model.
 
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -62,11 +62,14 @@ pub fn fetch(args: &Value, cancel: &Cancel) -> String {
     // variable turn the SSRF guard off, so the knob exists only in debug.
     let local =
         cfg!(debug_assertions) && std::env::var("NANO_FETCH_ALLOW_LOCAL").is_ok_and(|v| v == "1");
-    if !local {
-        if let Err(e) = guard_host(&ep.host) {
-            return format!("error: fetch: {e}");
+    let pins = if local {
+        None
+    } else {
+        match guard_host(&ep.host, ep.port) {
+            Ok(addrs) => Some(addrs),
+            Err(e) => return format!("error: fetch: {e}"),
         }
-    }
+    };
 
     let mut response = match http::request_with_timeout(
         &ep,
@@ -75,6 +78,7 @@ pub fn fetch(args: &Value, cancel: &Cancel) -> String {
         None,
         &[],
         None,
+        pins.as_deref(),
         Some(cancel),
         Duration::from_secs(FETCH_SECONDS),
     ) {
@@ -310,7 +314,7 @@ fn parse_ddg(html: &str, count: usize) -> Vec<Hit> {
 fn get(url: &str, headers: &[(String, String)], cancel: &Cancel) -> Result<String, String> {
     let (mut ep, target) = http::split_url(url)?;
     ep.prefix.clear();
-    guard_host(&ep.host)?;
+    let pins = guard_host(&ep.host, ep.port)?;
     let mut response = http::request_with_timeout(
         &ep,
         "GET",
@@ -318,6 +322,7 @@ fn get(url: &str, headers: &[(String, String)], cancel: &Cancel) -> Result<Strin
         None,
         headers,
         None,
+        Some(pins.as_slice()),
         Some(cancel),
         Duration::from_secs(SEARCH_SECONDS),
     )?;
@@ -516,8 +521,9 @@ fn element_close(lower: &str, from: usize, name: &str) -> Option<(usize, usize)>
 
 /// Refuse the hosts a fetched URL must never reach: this machine, the local
 /// network, and the metadata endpoints. A resolve-and-check, not a sandbox:
-/// `connect` resolves the name again, so a rebinding DNS can walk past it.
-fn guard_host(host: &str) -> Result<(), String> {
+/// `connect` is given the addresses checked here, so the name is not resolved
+/// again and a rebinding DNS cannot change where the connection goes.
+fn guard_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
     let name = host.trim_end_matches('.').to_ascii_lowercase();
     if name.is_empty() {
         return Err("empty host".into());
@@ -527,20 +533,19 @@ fn guard_host(host: &str) -> Result<(), String> {
             return Err(format!("refused host: {host}"));
         }
     }
-    let addrs = (name.as_str(), 80u16)
+    let addrs: Vec<SocketAddr> = (name.as_str(), port)
         .to_socket_addrs()
-        .map_err(|e| format!("cannot resolve {host}: {e}"))?;
-    let mut seen = false;
-    for addr in addrs {
-        seen = true;
+        .map_err(|e| format!("cannot resolve {host}: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("cannot resolve {host}"));
+    }
+    for addr in &addrs {
         if local_address(addr.ip()) {
             return Err(format!("refused host: {host} resolves to {}", addr.ip()));
         }
     }
-    if !seen {
-        return Err(format!("cannot resolve {host}"));
-    }
-    Ok(())
+    Ok(addrs)
 }
 
 fn local_address(ip: IpAddr) -> bool {
@@ -898,7 +903,7 @@ mod tests {
         assert!(local_address("127.0.0.1".parse().unwrap()));
         assert!(local_address("10.0.0.1".parse().unwrap()));
         assert!(!local_address("8.8.8.8".parse().unwrap()));
-        assert!(guard_host("localhost").is_err());
+        assert!(guard_host("localhost", 80).is_err());
     }
 
     #[test]
