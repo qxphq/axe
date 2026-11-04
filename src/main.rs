@@ -7,6 +7,7 @@ mod sessions;
 mod state;
 mod ui;
 mod tools;
+mod web;
 
 use std::cell::RefCell;
 use std::io::{self, IsTerminal, Read, Write};
@@ -45,7 +46,7 @@ fn run() -> Result<(), String> {
     let cfg = config::load()?;
     // `web_search` holds its token rather than the config: read once, like the
     // providers, and never re-read mid-session.
-    tools::set_brave_key(cfg.search.brave_key.clone());
+    web::set_brave_key(cfg.search.brave_key.clone());
     // Confinement is announced before anything runs, once, next to the
     // provider lines: weaker than promised must never be silent.
     if let Some(note) = sandbox::init() {
@@ -500,6 +501,68 @@ enum Cmd {
     Turn(String),
     /// Run this locally (`!cmd`); the output joins the history without a turn.
     Shell(String),
+}
+
+/// A parsed prompt line. Both dispatchers share this so `/model`, `/thinking`
+/// and `/sessions` cannot drift in spelling or ordering.
+#[derive(Debug, PartialEq)]
+enum Command {
+    Empty,
+    Exit,
+    Help,
+    New,
+    Models,
+    /// None opens the picker; Some is a `provider/id` or bare model id.
+    Model(Option<String>),
+    /// None prints the current level; Some sets it.
+    Thinking(Option<String>),
+    Thoughts,
+    Explore,
+    /// A chooser in the interactive run, a numbered list when piped.
+    Sessions(Option<String>),
+    Shell(String),
+    Turn(String),
+    Unknown(String),
+}
+
+fn parse_command(line: &str) -> Command {
+    let input = line.trim();
+    if input.is_empty() {
+        return Command::Empty;
+    }
+    match input {
+        "/exit" | "/quit" => return Command::Exit,
+        "/help" => return Command::Help,
+        "/new" => return Command::New,
+        "/models" => return Command::Models,
+        "/model" => return Command::Model(None),
+        "/thinking" => return Command::Thinking(None),
+        "/thoughts" => return Command::Thoughts,
+        "/explore" => return Command::Explore,
+        "/sessions" => return Command::Sessions(None),
+        _ => {}
+    }
+    if let Some(rest) = input.strip_prefix("/model ") {
+        return Command::Model(Some(rest.trim().to_string()));
+    }
+    if let Some(rest) = input.strip_prefix("/thinking ") {
+        return Command::Thinking(Some(rest.trim().to_string()));
+    }
+    if let Some(rest) = input.strip_prefix("/sessions ") {
+        return Command::Sessions(Some(rest.trim().to_string()));
+    }
+    if let Some(rest) = input.strip_prefix('!') {
+        let command = rest.trim();
+        return if command.is_empty() {
+            Command::Empty
+        } else {
+            Command::Shell(command.to_string())
+        };
+    }
+    if input.starts_with('/') {
+        return Command::Unknown(input.to_string());
+    }
+    Command::Turn(input.to_string())
 }
 
 /// What the prompt yielded: a line, or a mode toggle that is not one.
@@ -1486,31 +1549,22 @@ impl Session {
         screen: &mut ui::Screen,
         rx: &Receiver<Event>,
     ) -> Cmd {
-        let input = line.trim();
-        if input.is_empty() {
-            return Cmd::Continue;
-        }
-
-        match input {
-            "/exit" | "/quit" => return Cmd::Exit,
-            "/help" => {
+        match parse_command(line) {
+            Command::Empty => Cmd::Continue,
+            Command::Exit => Cmd::Exit,
+            Command::Help => {
                 screen.output(HELP);
-                return Cmd::Continue;
+                Cmd::Continue
             }
-            "/new" => {
+            Command::New => {
                 self.new_session(Some(screen));
-                return Cmd::Continue;
+                Cmd::Continue
             }
-            "/sessions" => {
-                self.browse_sessions(screen, rx, "");
-                return Cmd::Continue;
+            Command::Models => {
+                screen.output(&models(&self.providers));
+                Cmd::Continue
             }
-            "/models" => {
-                let text = models(&self.providers);
-                screen.output(&text);
-                return Cmd::Continue;
-            }
-            "/model" => {
+            Command::Model(None) => {
                 if let Some((pi, id)) =
                     pick(&self.providers, (self.provider, &self.model), screen, rx)
                 {
@@ -1518,182 +1572,146 @@ impl Session {
                     screen.set_info(&text);
                     screen.output(&format!("{text}\n"));
                 }
-                return Cmd::Continue;
+                Cmd::Continue
             }
-            _ => {}
-        }
-
-        let providers = &self.providers;
-
-        if input == "/thinking" || input.starts_with("/thinking ") {
-            let rest = input.strip_prefix("/thinking").unwrap_or("").trim();
-            if rest.is_empty() {
-                screen.output(&format!(
-                    "thinking: {}\n\n",
-                    thinking_label(&providers[self.provider].cfg, &self.thinking)
-                ));
-                return Cmd::Continue;
-            }
-            match set_thinking(&providers[self.provider].cfg, rest) {
-                Ok(level) => {
-                    self.thinking = Some(level.clone());
-                    screen.set_info(&self.info());
-                    let spec = format!("{}/{}", providers[self.provider].name, self.model);
-                    self.state.set_thinking(&spec, level.as_str());
-                    let save_error = self.state.save().err();
-                    let label = thinking_label(&providers[self.provider].cfg, &self.thinking);
-                    if let Some(e) = save_error {
-                        self.warn(format!("state: {e}"));
+            Command::Model(Some(spec)) => {
+                match find(&self.providers, &spec) {
+                    Some((pi, id)) => {
+                        let text = self.set_model(pi, id);
+                        screen.set_info(&text);
+                        screen.output(&format!("{text}\n"));
                     }
-                    screen.output(&format!("thinking: {label}\n\n"));
+                    None => screen.error(&format!("unknown model: {spec}\n")),
                 }
-                Err(e) => screen.error(&format!("nano: {e}\n")),
+                Cmd::Continue
             }
-            return Cmd::Continue;
-        }
-
-        if let Some(rest) = input.strip_prefix("/model ") {
-            let spec = rest.trim();
-            match find(providers, spec) {
-                Some((pi, id)) => {
-                    let text = self.set_model(pi, id);
-                    screen.set_info(&text);
-                    screen.output(&format!("{text}\n"));
+            Command::Thinking(rest) => {
+                let providers = &self.providers;
+                if rest.as_deref().unwrap_or("").is_empty() {
+                    screen.output(&format!(
+                        "thinking: {}\n\n",
+                        thinking_label(&providers[self.provider].cfg, &self.thinking)
+                    ));
+                    return Cmd::Continue;
                 }
-                None => screen.error(&format!("unknown model: {spec}\n")),
+                match set_thinking(&providers[self.provider].cfg, rest.as_deref().unwrap_or("")) {
+                    Ok(level) => {
+                        self.thinking = Some(level.clone());
+                        screen.set_info(&self.info());
+                        let spec = format!("{}/{}", providers[self.provider].name, self.model);
+                        self.state.set_thinking(&spec, level.as_str());
+                        let save_error = self.state.save().err();
+                        let label = thinking_label(&providers[self.provider].cfg, &self.thinking);
+                        if let Some(e) = save_error {
+                            self.warn(format!("state: {e}"));
+                        }
+                        screen.output(&format!("thinking: {label}\n\n"));
+                    }
+                    Err(e) => screen.error(&format!("nano: {e}\n")),
+                }
+                Cmd::Continue
             }
-            return Cmd::Continue;
-        }
-
-        if input == "/explore" {
-            self.toggle_explore(screen);
-            return Cmd::Continue;
-        }
-
-        if input == "/thoughts" {
-            self.state.thoughts = !self.state.thoughts;
-            if let Err(e) = self.state.save() {
-                self.warn(format!("state: {e}"));
+            Command::Thoughts => {
+                self.state.thoughts = !self.state.thoughts;
+                if let Err(e) = self.state.save() {
+                    self.warn(format!("state: {e}"));
+                }
+                screen.output(&format!(
+                    "Thoughts: {}\n\n",
+                    if self.state.thoughts { "on" } else { "off" }
+                ));
+                Cmd::Continue
             }
-            screen.output(&format!(
-                "Thoughts: {}\n\n",
-                if self.state.thoughts { "on" } else { "off" }
-            ));
-            return Cmd::Continue;
+            Command::Explore => {
+                self.toggle_explore(screen);
+                Cmd::Continue
+            }
+            Command::Sessions(query) => {
+                self.browse_sessions(screen, rx, query.as_deref().unwrap_or(""));
+                Cmd::Continue
+            }
+            Command::Unknown(input) => {
+                screen.error(&format!("unknown command: {input}\n"));
+                Cmd::Continue
+            }
+            Command::Shell(command) => Cmd::Shell(command),
+            Command::Turn(input) => Cmd::Turn(input),
         }
-
-        if let Some(rest) = input.strip_prefix("/sessions ") {
-            self.browse_sessions(screen, rx, rest);
-            return Cmd::Continue;
-        }
-
-        if input.starts_with('/') {
-            screen.error(&format!("unknown command: {input}\n"));
-            return Cmd::Continue;
-        }
-
-        if let Some(command) = shell_command(input) {
-            return command;
-        }
-
-        Cmd::Turn(input.to_string())
     }
 }
 
 /// The same dispatch for a terminal that is not ours: commands only, warnings
 /// on stderr, no picker.
 fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
-    let input = line.trim();
-    match input {
-        "/new" => {
+    match parse_command(line) {
+        Command::Empty => Cmd::Continue,
+        Command::Exit => Cmd::Exit,
+        Command::Help => {
+            println!("{}", HELP.trim_end());
+            Cmd::Continue
+        }
+        Command::New => {
             session.new_session(None);
             println!("New session");
-            return Cmd::Continue;
+            Cmd::Continue
         }
-        "/sessions" => {
-            session.list_piped("");
-            return Cmd::Continue;
+        Command::Models => {
+            println!("{}", models(&session.providers).trim_end());
+            Cmd::Continue
         }
-        _ => {}
-    }
-    if let Some(rest) = input.strip_prefix("/sessions ") {
-        session.list_piped(rest.trim());
-        return Cmd::Continue;
-    }
-    let providers = &session.providers;
-    match input {
-        "/exit" | "/quit" => return Cmd::Exit,
-        "/help" => {
-            println!("{}", HELP.trim_end());
-            return Cmd::Continue;
-        }
-        "/models" => {
-            println!("{}", models(providers).trim_end());
-            return Cmd::Continue;
-        }
-        "/model" => {
+        Command::Model(None) => {
             eprintln!("nano: /model needs a terminal");
-            return Cmd::Continue;
+            Cmd::Continue
         }
-        // There is no live region to toggle; piped runs do not print reasoning.
-        "/thoughts" => {
+        Command::Model(Some(spec)) => {
+            match find(&session.providers, &spec) {
+                Some((pi, id)) => println!("{}", session.set_model(pi, id)),
+                None => eprintln!("nano: unknown model: {spec}"),
+            }
+            Cmd::Continue
+        }
+        Command::Thinking(rest) => {
+            let providers = &session.providers;
+            if rest.as_deref().unwrap_or("").is_empty() {
+                println!(
+                    "thinking: {}",
+                    thinking_label(&providers[session.provider].cfg, &session.thinking)
+                );
+                return Cmd::Continue;
+            }
+            match set_thinking(&providers[session.provider].cfg, rest.as_deref().unwrap_or("")) {
+                Ok(level) => {
+                    session.thinking = Some(level.clone());
+                    let spec = format!("{}/{}", providers[session.provider].name, session.model);
+                    session.state.set_thinking(&spec, level.as_str());
+                    if let Err(e) = session.state.save() {
+                        eprintln!("nano: {e}");
+                    }
+                }
+                Err(e) => eprintln!("nano: {e}"),
+            }
+            Cmd::Continue
+        }
+        Command::Thoughts => {
             eprintln!("nano: /thoughts needs a terminal");
-            return Cmd::Continue;
+            Cmd::Continue
         }
-        "/explore" => {
+        Command::Explore => {
             session.set_read_only(!session.read_only);
             println!("Explore: {}", if session.read_only { "on" } else { "off" });
-            return Cmd::Continue;
+            Cmd::Continue
         }
-        _ => {}
-    }
-    if let Some(rest) = input.strip_prefix("/model ") {
-        match find(providers, rest.trim()) {
-            Some((pi, id)) => println!("{}", session.set_model(pi, id)),
-            None => eprintln!("nano: unknown model: {}", rest.trim()),
+        Command::Sessions(query) => {
+            session.list_piped(query.as_deref().unwrap_or(""));
+            Cmd::Continue
         }
-        return Cmd::Continue;
-    }
-    if input == "/thinking" || input.starts_with("/thinking ") {
-        let rest = input.strip_prefix("/thinking").unwrap_or("").trim();
-        if rest.is_empty() {
-            println!(
-                "thinking: {}",
-                thinking_label(&providers[session.provider].cfg, &session.thinking)
-            );
-            return Cmd::Continue;
+        Command::Unknown(input) => {
+            eprintln!("nano: unknown command: {input}");
+            Cmd::Continue
         }
-        match set_thinking(&providers[session.provider].cfg, rest) {
-            Ok(level) => {
-                session.thinking = Some(level.clone());
-                let spec = format!("{}/{}", providers[session.provider].name, session.model);
-                session.state.set_thinking(&spec, level.as_str());
-                if let Err(e) = session.state.save() {
-                    eprintln!("nano: {e}");
-                }
-            }
-            Err(e) => eprintln!("nano: {e}"),
-        }
-        return Cmd::Continue;
+        Command::Shell(command) => Cmd::Shell(command),
+        Command::Turn(input) => Cmd::Turn(input),
     }
-    if input.starts_with('/') {
-        eprintln!("nano: unknown command: {input}");
-        return Cmd::Continue;
-    }
-    if let Some(command) = shell_command(input) {
-        return command;
-    }
-    Cmd::Turn(input.to_string())
-}
-
-/// `!cmd`: a command for this machine, not a message for the model. A bare
-/// `!` is nothing to run.
-fn shell_command(input: &str) -> Option<Cmd> {
-    let command = input.strip_prefix('!')?.trim();
-    if command.is_empty() {
-        return Some(Cmd::Continue);
-    }
-    Some(Cmd::Shell(command.to_string()))
 }
 
 /// Events from the two producers that never draw: keys, and the turn.
@@ -2578,4 +2596,36 @@ fn summarize(text: &str, max: usize) -> String {
         out.push('…');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_commands_once() {
+        assert_eq!(parse_command("  "), Command::Empty);
+        assert_eq!(parse_command("/model"), Command::Model(None));
+        assert_eq!(
+            parse_command("/model a/b"),
+            Command::Model(Some("a/b".into()))
+        );
+        assert_eq!(parse_command("/models"), Command::Models);
+        assert_eq!(parse_command("/thinking"), Command::Thinking(None));
+        assert_eq!(
+            parse_command("/thinking high"),
+            Command::Thinking(Some("high".into()))
+        );
+        assert_eq!(
+            parse_command("/sessions q"),
+            Command::Sessions(Some("q".into()))
+        );
+        assert_eq!(parse_command("! ls"), Command::Shell("ls".into()));
+        assert_eq!(parse_command("!"), Command::Empty);
+        assert_eq!(parse_command("hello"), Command::Turn("hello".into()));
+        assert_eq!(
+            parse_command("/modelx"),
+            Command::Unknown("/modelx".into())
+        );
+    }
 }

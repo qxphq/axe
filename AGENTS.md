@@ -1,7 +1,7 @@
 # nano
 
 Minimal coding agent harness in Rust. One binary, a line REPL, OpenAI-compatible
-providers, seven tools. Roughly 9k LOC across ten files.
+providers, seven tools. Roughly 9k LOC across eleven files.
 
 ## Principles
 
@@ -16,7 +16,7 @@ providers, seven tools. Roughly 9k LOC across ten files.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
    panes, compaction, subagents, MCP, or permission layer until the REPL is
    genuinely insufficient. One feature per change.
-3. **Small surface.** Ten modules. A new module needs a reason.
+3. **Small surface.** Eleven modules. A new module needs a reason.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` + SSE
    only. Never add per-provider code paths; express differences as config
    (`base_url`, `models_url`, `api_key_env`, `session_header`).
@@ -108,10 +108,10 @@ providers, seven tools. Roughly 9k LOC across ten files.
   write. Its project directory also holds the sessions.
 - `sessions.rs` — one meta sidecar and one append-only JSONL body per session;
   listing, full-text search, gzip for old bodies, and the UTC stamp.
-- `tools.rs` — tool registry, JSON schemas, generated prompt, execution, and
-  `fetch`/`web_search`: the host guard, the HTML-to-text tokenizer, the sanitizer,
-  and the Brave/DuckDuckGo result parsers. `about` returns `README.md`, compiled
-  into the binary.
+- `tools.rs` — tool registry, JSON schemas, generated prompt, local tool
+  execution, and `about` returning `README.md`, compiled into the binary.
+- `web.rs` — `fetch`/`web_search`: the host guard, the HTML-to-text tokenizer,
+  the sanitizer, the Brave/DuckDuckGo result parsers, and paging.
 - `sandbox.rs` — the only `unsafe`: the seccomp filter and the Landlock ruleset on
   Linux, the `sandbox-exec` profiles on macOS, the exec allowlist, and the scratch
   directory explore mode may write to.
