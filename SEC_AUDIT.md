@@ -278,6 +278,10 @@ A rebinding DNS name can pass the first check and connect to a private address.
 - Resolve once in `fetch`/`web_search`, filter local addresses, and connect to the pinned `SocketAddr` while keeping the hostname for TLS SNI and the `Host` header.
 - Add a request-level API for pinned addresses; do not change provider connections.
 
+**Status at HEAD.** `guard_host` resolves once and returns the addresses; the
+request connects to those addresses, so the name is not resolved again. TLS SNI
+and `Host` still use the hostname, and provider connections are unchanged.
+
 ### SEC-09 — Terminal injection paths remain outside ratatui (P2)
 
 **Evidence**
@@ -302,6 +306,10 @@ A rebinding DNS name can pass the first check and connect to a private address.
 
 - Remove literal key support, or warn at startup and change AGENTS to "prefer".
 - If kept, ensure the config file is `0600` and never returned by `read`/tools.
+
+**Status at HEAD.** Literal `api_key` and `search.brave.api_key` are rejected at
+config load with a message pointing at `api_key_env`; `resolved_key` reads the
+environment only.
 
 ## Security priorities
 
