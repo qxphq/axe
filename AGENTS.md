@@ -1,234 +1,157 @@
 # nano
 
-Minimal coding agent harness in Rust. One binary, a line REPL, OpenAI-compatible
-providers, seven tools. Roughly 9k LOC across eleven files.
+Minimal coding agent harness in Rust: one binary, a line REPL, OpenAI-compatible
+providers, seven tools. The code is the source of truth; this file records the
+invariants a change must not break.
 
 ## Principles
 
-1. **Dependencies are debt.** Prefer `std`. A crate must be strictly necessary and
+1. **Dependencies are debt.** Prefer `std`; a crate must be strictly necessary and
    widely maintained. Current: `serde_json`, `rustls`, `webpki-roots`, `ratatui`
-   (with its `crossterm` backend), `unicode-width`, `flate2` (pure-Rust
-   `rust_backend`), and `libc` on Linux for Landlock/seccomp. `rustls` because
-   crypto is never hand-rolled; `ratatui` because
-   terminal geometry is the same class of problem — the hand-rolled strip renderer
-   produced a new whitespace bug per fix; `flate2` because old session bodies are
-   gzipped and a compression format is never hand-rolled either.
+   (crossterm backend), `unicode-width`, `flate2` (pure-Rust backend), and `libc`
+   on Linux. Crypto, terminal geometry and compression are not hand-rolled.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
    panes, compaction, subagents, MCP, or permission layer until the REPL is
    genuinely insufficient. One feature per change.
-3. **Small surface.** Eleven modules. A new module needs a reason.
-4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` + SSE
-   only. Never add per-provider code paths; express differences as config
-   (`base_url`, `models_url`, `api_key_env`, `session_header`).
-5. **The prompt is structure.** The built-in system prompt is the working
-   directory, a short numbered list of behavioral rules that hold for every user,
-   and the available tools — rules and tools generated in `tools::system_prompt`,
-   tools from the same registry used for the `tools` array. Rules are policy, not
-   advice: one line each, no workflow, nothing project- or provider-specific.
-   `system` from config is appended after it, never replaces it. The same rule
-   covers instructions: `agents` (config) then the nearest `AGENTS.md` at or above
-   cwd, each capped at 48 KB, then `system`. All read once at startup; never
-   re-read mid-session.
+3. **Small surface.** Eleven modules; a new module needs a separate concern, not a
+   line count.
+4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` +
+   SSE only. Express differences as config (`base_url`, `models_url`,
+   `api_key_env`, `session_header`), never per-provider code paths.
+5. **The prompt is structure.** The built-in system prompt is cwd, a short numbered
+   list of rules that hold for every user, and the tools from the same registry as
+   the `tools` array. Rules are policy: one line each, no workflow, nothing
+   project- or provider-specific. Instructions are appended in order: `agents`
+   (config), the nearest `AGENTS.md` at or above cwd, then `system`. Read once at
+   startup; never re-read mid-session.
 6. **Stable prefix, append-only history.** System prompt and tool schemas first,
    volatile content last. Never inject timestamps, status, or cwd changes into the
    prefix: it invalidates provider prompt caching. Sessions are append-only JSONL,
    replayed on resume; compaction stays last.
 7. **Tools are dumb.** `read`, `write`, `edit`, `bash`, `about`, `fetch`,
    `web_search`. No `glob`, `grep`, or `list`; `bash` + `rg`/`fd` covers them.
-   `about` returns `README.md`, compiled in with `include_str!`, so the binary
-   describes itself without a checkout and without a cwd: documentation, not a
-   code path. `fetch` and `web_search` because explore mode's shell allowlist has
-   no `curl`, so that mode otherwise cannot read the web; both are refused outside
-   explore mode. Search uses Brave when a token is configured and DuckDuckGo's
-   HTML endpoint otherwise; a Brave query that fails or returns nothing falls
-   back. Tool errors are results for the model, not harness failures. Truncate
-   output (30–50 KB), timeout `bash` (120 s), cap `fetch` at 1 MiB off the wire
-   and 50 000 characters to the model, `web_search` at 1 MiB and 20 results.
+   `about` returns the compiled-in `README.md`: documentation, not a code path.
+   `fetch`/`web_search` exist because explore mode's shell allowlist has no
+   `curl`; both are refused outside explore mode. Tool errors are results for the
+   model, not harness failures. Truncate output, timeout `bash`, cap `fetch` at
+   1 MiB/50 000 chars and `web_search` at 1 MiB/20 results.
 8. **No approval prompts.** Bash runs unprompted by explicit user decision. Do not
    add a permission layer without being asked.
 9. **Real cwd, relative paths.** `current_dir()` at startup, used for the prompt and
    every relative path. Never hardcode directories.
 10. **One config file, and it is input.** `~/.config/nano/config.json` (respects
-    `XDG_CONFIG_HOME`), auto-created with an example on first run. Secrets only
-    through `api_key_env`. Never commit keys, never read another app's auth store.
-    Nano never writes it: what the user picked is per-directory state, in
-    `~/.local/state/nano/projects/<escaped cwd>/state.json` (respects
-    `XDG_STATE_HOME`), alongside that directory's sessions. Its `model` is the
-    default for a directory that has no state, so the config stays the answer to
-    "when I do not say otherwise".
-11. **Verify against reality.** Test locally against `mock.py` (chunked SSE,
-    keep-alive comments, session headers). No speculative fixes; only fix what a
-    reproduction shows.
-12. **A scrolling REPL, not a TUI.** No alt-screen: the transcript is the user's
-    scrollback. The only owned region is a live area at the bottom (queued, one row
-    per wrapped prompt line, an empty row, status) inside a `Viewport::Inline`. It is
-    five rows of chrome plus the prompt, capped at half the screen: growing it pushes
-    transcript lines into scrollback, shrinking leaves their rows blank until the
-    next output fills them. A session chooser (`/sessions`, the startup picker) may
-    also own one header row plus its entries, up to the screen minus the prompt and
-    one margin row; when it closes without resuming, its rows are committed to
-    scrollback, so the list survives and no blank rows are left. Everything above it
-    is appended, never repainted.
-13. **One writer.** While `ui::Screen` owns the terminal, only it draws: an
-    event may mutate state and ask for output; nothing else prints. The startup
-    banner and piped output run before/without a `Screen`; a stray `print!`
-    while it exists is a rendering bug.
-14. **The prompt is a block.** Every line of the prompt carries its glyph (the live
-    `❯ `, the committed `█ `), so a wrapped line reads as one block, not as text
-    running off the edge.
+    `XDG_CONFIG_HOME`), auto-created on first run. Secrets only through
+    `api_key_env`; never commit keys or read another app's auth store. Nano never
+    writes it: the per-directory state and sessions live under
+    `~/.local/state/nano/projects/<escaped cwd>/` (respects `XDG_STATE_HOME`).
+    Config `model` is the default for a directory with no state.
+11. **Verify against reality.** Test against `mock.py` (chunked SSE, keep-alive,
+    session headers). No speculative fixes; reproduce first.
+12. **A scrolling REPL, not a TUI.** No alt-screen: the transcript is scrollback.
+    The only owned region is an inline live area at the bottom (queued row,
+    wrapped prompt, status), capped at half the screen. A chooser may own a header
+    plus entries; when it closes without resuming, its rows are committed to
+    scrollback. Everything above is appended, never repainted.
+13. **One writer.** While `ui::Screen` owns the terminal, only it draws. Startup
+    banner and piped output run before/without a `Screen`; a stray `print!` while
+    it exists is a rendering bug.
+14. **The prompt is a block.** Every line carries its glyph (`❯ ` live, `█ `
+    committed), so a wrapped line reads as one block.
 15. **`bash` is confined by the kernel, not by strings.** No child reaches the
-    network, in either mode: seccomp refuses `socket` for the internet families on
-    Linux, `(deny network*)` on macOS. Explore mode also denies every write outside
-    a session scratch directory and every exec outside a fixed allowlist (Landlock
-    on Linux, Seatbelt on macOS). Layer 1 is mandatory — a command that cannot be
-    confined does not run; Layer 2 degrades with one startup line on a kernel
-    without Landlock. A leading-word check is never a substitute. Accepted cost: no
-    child TCP, ever — `git clone/fetch/push`, `ssh`, `gh`, `docker` and `cargo` with
-    a cold cache are dead inside a tool call, and `!cmd` is no exception. Residuals:
-    AF_UNIX `connect`, writes through an inherited fd, metadata (`chmod`) outside
-    the scratch dir, and `fetch`, which runs in the parent by design.
+    network: seccomp refuses internet-family `socket` on Linux, `(deny network*)`
+    on macOS. Explore mode also denies writes outside a scratch directory and exec
+    outside a fixed allowlist (Landlock/Seatbelt). Layer 1 is mandatory; Layer 2
+    degrades with one startup line. A leading-word check is never a substitute.
+    `!cmd` is subject to the network deny. Details and residuals: `SEC_AUDIT.md`.
 
 ## Architecture
 
 - `main.rs` — REPL, provider setup, model picker, session lifecycle (startup
-  chooser, `/sessions`, `/new`, naming), agent loop (unbounded, ends on no tool
-  calls). Two producers (keys, a turn) feed one `mpsc` channel; the main thread
-  applies events and draws once per batch.
+  chooser, `/sessions`, `/new`, naming), agent loop. Two producers (keys, a turn)
+  feed one `mpsc` channel; the main thread applies events and draws once per batch.
 - `ui.rs` — the screen: prompt buffer and key mapping, the live region (chrome plus
-  the wrapped prompt, resized by `fit`), the session chooser, and `insert` for
-  transcript lines (wrapped here, since a clipped line would be lost).
-- `md.rs` — markdown: a port of `md.ts` (blocks, inlines, tables, entities, URL
-  checks), plus the renderer that turns its AST into transcript lines. `Stream`
-  feeds it a line at a time and lays a block out when it ends.
+  the wrapped prompt, resized by `fit`), the chooser, and `insert` for transcript
+  lines (wrapped here, since a clipped line would be lost).
+- `md.rs` — markdown: blocks, inlines, tables, entities, URL checks, and the
+  renderer. `Stream` feeds it a line at a time and lays a block out when it ends.
 - `api.rs` — model listing, chat request, SSE parsing, tool-call accumulation.
 - `http.rs` — URL parsing, HTTP/1.1 over `TcpStream`/rustls, body decoding
-  (`Content-Length`, chunked, EOF).
+  (`Content-Length`, chunked, EOF), line/body caps and timeouts.
 - `config.rs` — load and validate the config; resolve the `agents` file.
-- `state.rs` — the per-directory state file: the cwd key, load, and an atomic
-  write. Its project directory also holds the sessions.
-- `sessions.rs` — one meta sidecar and one append-only JSONL body per session;
-  listing, full-text search, gzip for old bodies, and the UTC stamp.
-- `tools.rs` — tool registry, JSON schemas, generated prompt, local tool
-  execution, and `about` returning `README.md`, compiled into the binary.
-- `web.rs` — `fetch`/`web_search`: the host guard, the HTML-to-text tokenizer,
-  the sanitizer, the Brave/DuckDuckGo result parsers, and paging.
-- `sandbox.rs` — the only `unsafe`: the seccomp filter and the Landlock ruleset on
-  Linux, the `sandbox-exec` profiles on macOS, the exec allowlist, and the scratch
-  directory explore mode may write to.
+- `state.rs` — per-directory state: the cwd key, load, and an atomic write.
+- `sessions.rs` — meta sidecar and append-only JSONL body per session; listing,
+  search, gzip for old bodies, UTC stamp.
+- `tools.rs` — tool registry, schemas, generated prompt, local tools, `about`.
+- `web.rs` — `fetch`/`web_search`: host guard, HTML tokenizer, sanitizer,
+  Brave/DuckDuckGo parsers, paging.
+- `sandbox.rs` — the only `unsafe`: seccomp, Landlock, Seatbelt, exec allowlist,
+  and the explore-mode scratch directory.
 
 ## Conventions
 
 - Errors are `String`, user-facing, prefixed with context (`connect host:port: ...`).
   No error crates.
 - Keep functions short; comment only non-obvious behavior.
-- Transcript output is complete lines. `ui::Screen::text` splits on newlines and
-  collects markdown; `ui::Screen::output` writes the binary's own text verbatim,
-  one line per line.
-
-Markdown is the model's and the user's, never the binary's. Blocks are laid out
-when they end — a blank line, a tool call, a thought, or the end of the turn —
-because a table needs its header and a paragraph its last line. The live row
-shows what the turn is doing, not the unfinished line.
-- Style comes from `Paint` in `main.rs`, rendered either as cells or as ANSI when
-  there is no screen to draw on.
+- Transcript output is complete lines. `Screen::text` collects markdown;
+  `Screen::output` writes the binary's own text one line per line.
+- Markdown is the model's and the user's, never the binary's. Blocks are laid out
+  when they end; the live row says what the turn is doing, not the unfinished line.
+- Style comes from `Paint` in `main.rs`, rendered as cells or ANSI.
 - Tool names and descriptions are part of the prompt. Change them deliberately.
-- `README.md` is the user-facing contract and the GitHub page; dev workflow stays
-  here. It ships inside the binary through `about`, so keep it factual, free of
-  vendor trivia that rots, and in the same commit as the behavior it describes.
-- Sessions live in the project state directory: `<id>.json` is a mutable sidecar
-  (title, summary, dates, count, archived), `<id>.jsonl` is the append-only body of
-  API messages. Bodies older than `sessions::KEEP` are gzipped to `<id>.jsonl.gz`;
-  the sidecar stays readable, so listing and search work without unpacking, and a
-  resumed session is unpacked back to plain. The system prompt and mode notes are
-  never logged: resume rebuilds them from the current instructions and mode. A
-  title and summary are generated once, after the first answer; failing that, the
-  first request stands in.
-- `!cmd` at the prompt is the user's own shell: it runs through `tools::execute`
-  and its output joins the history as a `user` message, so the next turn sees it.
-  No turn follows, explore mode's write confinement does not apply — the user typed
-  it — and the network deny does, like every other child.
+- `README.md` is the user-facing contract and the GitHub page. It ships through
+  `about`, so keep it factual and in the same commit as the behavior it describes.
+- Sessions: `<id>.json` is the mutable sidecar; `<id>.jsonl` is append-only; bodies
+  older than `sessions::KEEP` are gzipped. The sidecar stays readable, so listing
+  and search work without unpacking. The system prompt and mode notes are never
+  logged; resume rebuilds them. A title and summary are generated once, after the
+  first answer; failing that, the first request stands in.
+- `!cmd` is the user's shell. It runs through `tools::execute`, its output joins
+  the history as a `user` message, no turn follows, explore-mode write confinement
+  does not apply, and the network deny does.
 - Commit messages: imperative, one feature per commit.
 
 ## Provider notes
 
 - `llm.local`: `http://llm.local:8000/v1`, plaintext, close-delimited bodies.
-- DeepSeek: `https://api.deepseek.com`, `DEEPSEEK_API_KEY`. Model list reports
-  `context_window`, not `context_length`.
-- OpenCode Go: chat at `https://opencode.ai/inference/go/openai/v1`, models at
-  `https://opencode.ai/inference/go/v1/models`, `OPENCODE_API_KEY`, requires a stable
-  `x-opencode-session` header. Free-tier models return 403 outside OpenCode. Console
-  API keys expire; an OAuth access token also works as a Bearer token.
+- DeepSeek: `https://api.deepseek.com`, `DEEPSEEK_API_KEY`; model list reports
+  `context_window`.
+- OpenCode Go: chat `https://opencode.ai/inference/go/openai/v1`, models
+  `https://opencode.ai/inference/go/v1/models`, `OPENCODE_API_KEY`, stable
+  `x-opencode-session`. Free-tier models 403 outside OpenCode. Console keys expire;
+  an OAuth access token also works as a Bearer token.
 
-## Build
+## Build and test
 
 ```sh
 cargo build
-cargo run
+cargo test     # pure logic: markdown, parsers, caps, command parsing, keys
 ```
 
-`cargo test` covers pure logic (markdown, parsers, read/edit caps). Verify UI
-changes with `./harness.py` (below): a pty plus a virtual terminal is the only
-way to see what the user sees.
-
-## Testing
-
-`harness.py` is the loop. It starts `mock.py` in-process, writes a throwaway
-config, runs the binary in a tmux pty of a fixed size, sends the keystrokes and
-prints the final screen. Nothing is shared between runs; `--work DIR` makes one
-directory (and its state) survive, which is how resume is tested.
-
-```sh
-./harness.py                              # one turn: text:ok
-./harness.py "text:hi" "tool:read:src/ui.rs"
-./harness.py --size 40x12 "blank:hi"
-./harness.py "!a b c" "!C-u" "text:why"   # raw tmux keys, no Enter
-./harness.py --keep "text:ok"             # keep the temp workdir
-./harness.py --work /tmp/nano-s "text:first"
-./harness.py --work /tmp/nano-s "!Down" "!Enter"   # resume the older one
-```
-
-Each positional argument is a turn: typed, then Enter. One starting with `!` is
-a list of tmux key names sent as-is. `--ansi` keeps colors, `--scroll N` widens
-the history in the dump, `--wait` and `--timeout` bound idling, `--bin` selects
-the binary (built on first use). Mock replies are listed in `mock.py`.
+`harness.py` is the UI loop: `mock.py` + tmux pty + virtual terminal. It needs
+python3 and tmux. `--work DIR` keeps one directory and its state; `--wait` and
+`--timeout` bound idling; `--bin` selects the binary; `--ansi`/`--scroll` control
+the dump. See `harness.py --help` and `mock.py` for fixtures and replies.
 
 `fetch:PAGE` has the mock call `fetch` on a fixture page (plain, inject, big,
-image, redirect, latin1, slow); `PAGE@START+CHARS` sets the paging arguments. The
-harness serves those pages on loopback and sets `NANO_FETCH_ALLOW_LOCAL=1` in the
-child, since the host guard refuses loopback: that variable is a **test knob, off
-by default, and a live bypass for anyone who sets it**. `--no-fetch-local` runs
-without it, which is how the refusal is checked. `show:x` streams the last tool
-result back, since the transcript shows only call lines.
+image, redirect, latin1, slow); `PAGE@START+CHARS` sets paging. The harness serves
+those pages on loopback and sets `NANO_FETCH_ALLOW_LOCAL=1`; that variable is a
+**test knob, off by default, and a live bypass for anyone who sets it**.
+`--no-fetch-local` checks the refusal. `show:x` streams the last tool result back.
 
-`web_search` has no fixture: it asks fixed public hosts. The fake provider can
-still call it, since `tool:` takes any name and arguments. That turn loops, so end
-it with `!Escape` and read the result back; the first line says which engine
-answered. The throwaway config binds `search.brave.api_key_env` to
-`BRAVE_SEARCH_API_KEY`, so unset means DuckDuckGo and a bogus value exercises the
-fallback:
+`web_search` asks fixed public hosts; `tool:` can call it. A `tool:` turn keeps
+calling the same tool, so end it with `!Escape` and read the result with `show:`;
+the first line says which engine answered. `BRAVE_SEARCH_API_KEY` selects Brave;
+unset means DuckDuckGo, and a bogus value exercises the fallback.
 
-```sh
-./harness.py --wait 2 --scroll 400 'tool:web_search:{"query":"rust web framework"}' '!Escape' 'show:'
-BRAVE_SEARCH_API_KEY=bogus ./harness.py --wait 2 --scroll 400 'tool:web_search:{"query":"rust"}' '!Escape' 'show:'
-```
-
-A `tool:` turn keeps calling the same tool: the mock answers from the last user
-message, and a tool result is not one. Interrupt it with `!Escape`.
-
-The sandbox is checked with the same harness. `tool:bash:{...}` takes JSON
-arguments, and because that turn loops, end it with `!Escape` and read the result
-back with `show:`; normal mode is a `!cmd` line, which does not loop:
+The sandbox is checked the same way: `tool:bash:{...}` takes JSON arguments and
+loops; end with `!Escape` and `show:`. Normal mode is a `!cmd` line, which does not
+loop. Examples:
 
 ```sh
-./harness.py --scroll 400 'tool:bash:{"command":"ls | wc -l"}' '!Escape' 'show:'
-./harness.py --scroll 400 'tool:about:{}' '!Escape' 'show:'
-./harness.py --scroll 400 'tool:bash:{"command":"echo x > /tmp/p"}' '!Escape' 'show:'
 ./harness.py --scroll 400 'tool:bash:{"command":"head -n 1 tmux.conf"}' '!Escape' 'show:'
-./harness.py --scroll 400 'tool:bash:{"command":"git --version"}' '!Escape' 'show:'
+./harness.py --scroll 400 'tool:bash:{"command":"echo x > /tmp/p"}' '!Escape' 'show:'
 ./harness.py --scroll 400 ' !python3 -c "import socket; socket.socket()"'
 ```
 
 The leading space in the last line is load-bearing: the harness reads an argument
-starting with `!` as tmux key names, and the REPL trims it back to a `!cmd`.
-
-Requires python3 and tmux; no new crates.
+starting with `!` as tmux keys, and the REPL trims it back to a `!cmd`.
