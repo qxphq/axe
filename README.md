@@ -176,7 +176,9 @@ directory with every byte outside `[A-Za-z0-9._-]` written as `%XX` — so
 | `<id>.jsonl.gz` | a body older than the 30 most recent, gzipped |
 
 The active body is append-only, so a crash can only leave an unfinished last
-line. Archiving gzips and removes it; resuming unpacks it back to plain.
+line. Archiving gzips and removes it; resuming unpacks it back to plain. On a
+host without `gzip` nothing is archived — bodies stay plain, and a body already
+archived elsewhere cannot be resumed there.
 Listing and search read the sidecar, which stays plain: an archived body still
 answers from its title and summary. Resuming one unpacks it back to plain. The
 system prompt and mode notes are not logged; resume rebuilds them from the

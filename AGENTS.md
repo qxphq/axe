@@ -8,8 +8,8 @@ invariants a change must not break.
 
 1. **Dependencies are debt.** Prefer `std`; a crate must be strictly necessary and
    widely maintained. Current: `serde_json`, `rustls`, `webpki-roots`, `ratatui`
-   (crossterm backend), `unicode-width`, `flate2` (pure-Rust backend), and `libc`
-   on Linux. Crypto, terminal geometry and compression are not hand-rolled.
+   (crossterm backend), `unicode-width`, and `libc` on Linux. Crypto and terminal
+   geometry are not hand-rolled; compression is the host's `gzip`, never a crate.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
    panes, compaction, subagents, MCP, or permission layer until the REPL is
    genuinely insufficient. One feature per change.
@@ -80,7 +80,7 @@ invariants a change must not break.
 - `config.rs` — load and validate the config; resolve the `agents` file.
 - `state.rs` — per-directory state: the cwd key, load, and an atomic write.
 - `sessions.rs` — meta sidecar and append-only JSONL body per session; listing,
-  search, gzip for old bodies, UTC stamp.
+  search, system gzip for old bodies, UTC stamp.
 - `tools.rs` — tool registry, schemas, generated prompt, local tools, `about`.
 - `web.rs` — `fetch`/`web_search`: host guard, HTML tokenizer, sanitizer,
   Brave/DuckDuckGo parsers, paging.

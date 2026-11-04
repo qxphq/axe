@@ -3,17 +3,17 @@
 //! One directory per project holds a meta file and an append-only log for each
 //! session. The meta is rewritten as the title and count change; the log is
 //! never rewritten, so a crash can only leave an unfinished tail line. Old
-//! bodies are gzipped in place: the meta stays readable, so listings and
-//! search keep working without unpacking anything.
+//! bodies are gzipped in place by the host's `gzip`: the meta stays readable,
+//! so listings and search keep working without unpacking anything, and a host
+//! without gzip leaves the bodies plain.
 
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use serde_json::{json, Value};
 
 use crate::state;
@@ -249,13 +249,8 @@ pub fn load_messages(
 }
 
 fn unpack(dir: &Path, meta: &mut Meta, gz: &Path, plain: &Path) -> Result<(), String> {
-    let file = File::open(gz).map_err(|e| format!("open {}: {e}", gz.display()))?;
-    let mut text = String::new();
-    GzDecoder::new(BufReader::new(file))
-        .read_to_string(&mut text)
-        .map_err(|e| format!("unzip {}: {e}", gz.display()))?;
     let tmp = dir.join(format!("{}.jsonl.tmp", meta.id));
-    fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    gzip(&[OsStr::new("-dc"), gz.as_os_str()], &tmp)?;
     fs::rename(&tmp, plain).map_err(|e| format!("write {}: {e}", plain.display()))?;
     let _ = fs::remove_file(gz);
     meta.archived = false;
@@ -267,7 +262,15 @@ fn unpack(dir: &Path, meta: &mut Meta, gz: &Path, plain: &Path) -> Result<(), St
 /// and the next startup tries again.
 pub fn archive_old(cwd: &Path, keep: usize) {
     let dir = dir(cwd);
-    for mut meta in list(cwd).into_iter().skip(keep) {
+    let old: Vec<Meta> = list(cwd).into_iter().skip(keep).collect();
+    if old.is_empty() {
+        return;
+    }
+    if !have_gzip() {
+        eprintln!("nano: gzip not found: old session bodies stay plain");
+        return;
+    }
+    for mut meta in old {
         if meta.archived {
             continue;
         }
@@ -300,17 +303,52 @@ fn compress(dir: &Path, meta: &Meta, plain: &Path, gz: &Path) -> Result<(), Stri
         fs::remove_file(plain).map_err(|e| format!("remove {}: {e}", plain.display()))?;
         return Ok(());
     }
-    let mut src = File::open(plain).map_err(|e| format!("open {}: {e}", plain.display()))?;
     let tmp = dir.join(format!("{}.jsonl.gz.tmp", meta.id));
-    let out = File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
-    let mut enc = GzEncoder::new(out, Compression::default());
-    io::copy(&mut src, &mut enc).map_err(|e| format!("gzip {}: {e}", plain.display()))?;
-    enc.finish()
-        .map_err(|e| format!("gzip {}: {e}", plain.display()))?;
-    drop(src);
+    gzip(&[OsStr::new("-nc"), plain.as_os_str()], &tmp)?;
     fs::rename(&tmp, gz).map_err(|e| format!("write {}: {e}", gz.display()))?;
     fs::remove_file(plain).map_err(|e| format!("remove {}: {e}", plain.display()))?;
     Ok(())
+}
+
+/// Compression is the host's: `gzip` is essential on Debian, in every BSD base
+/// and shipped by macOS, so nothing is vendored for it. A machine without it
+/// keeps bodies plain instead of failing a startup over compression.
+fn have_gzip() -> bool {
+    Command::new("gzip")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Run `gzip` with stdout on `out`. stderr is captured: the REPL owns the
+/// terminal, so a child writing to it would be a rendering bug. A failed run
+/// leaves no partial file behind.
+fn gzip(args: &[&OsStr], out: &Path) -> Result<(), String> {
+    let file = File::create(out).map_err(|e| format!("create {}: {e}", out.display()))?;
+    let err = match Command::new("gzip")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(file))
+        .output()
+    {
+        Ok(done) if done.status.success() => return Ok(()),
+        Ok(done) => {
+            let err = String::from_utf8_lossy(&done.stderr).trim().to_string();
+            if err.is_empty() {
+                format!("gzip: {}", done.status)
+            } else {
+                format!("gzip: {err}")
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => "gzip not found".to_string(),
+        Err(e) => format!("gzip: {e}"),
+    };
+    let _ = fs::remove_file(out);
+    Err(err)
 }
 
 /// One search hit: the session's position in the caller's slice, and a line
@@ -521,6 +559,9 @@ mod tests {
 
     #[test]
     fn gzip_roundtrip() {
+        if !have_gzip() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("nano-test-gzip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
