@@ -132,7 +132,8 @@ cargo clippy --all-targets -- -D warnings
 `harness.py` is the UI loop: `mock.py` + tmux pty + virtual terminal. It needs
 python3 and tmux. `--work DIR` keeps one directory and its state; `--wait` and
 `--timeout` bound idling; `--bin` selects the binary; `--ansi`/`--scroll` control
-the dump. See `harness.py --help` and `mock.py` for fixtures and replies.
+the dump, and `--expect`/`--refute` make it an assertion. See `harness.py --help`
+and `mock.py` for fixtures and replies.
 
 `fetch:PAGE` has the mock call `fetch` on a fixture page (plain, inject, big,
 image, redirect, latin1, slow); `PAGE@START+CHARS` sets paging. The harness serves

@@ -15,6 +15,7 @@ starts with `!` is a list of tmux key names sent as-is, no Enter:
   harness.py "!C-u" "!a b c"              # clear the line, type abc
   harness.py --size 40x12 "blank:hi"
   harness.py --keep "text:ok"             # keep the temp workdir
+  harness.py --expect ok "text:ok"        # assert the final screen
 
 The reply is chosen by the turn's text; see mock.py for text:, split:, blank:,
 slow:, tool:NAME:ARG, fetch:PAGE, reason:TEXT|ANSWER and empty:.
@@ -269,6 +270,10 @@ def main():
                     help="reuse DIR as cwd and state home (implies --keep)")
     ap.add_argument("--no-fetch-local", action="store_true",
                     help="do not allow fetch to reach the fixture server")
+    ap.add_argument("--expect", action="append", default=[], metavar="TEXT",
+                    help="fail unless the final screen contains TEXT; repeatable")
+    ap.add_argument("--refute", action="append", default=[], metavar="TEXT",
+                    help="fail if the final screen contains TEXT; repeatable")
     args = ap.parse_args()
     if not args.turns:
         args.turns = ["text:ok"]
@@ -341,6 +346,14 @@ def main():
         sys.stdout.write(screen)
         sys.stdout.flush()
         ok = not tmux.dead() or tmux.exit_code() in ("", "0")
+        for text in args.expect:
+            if text not in screen:
+                print(f"harness: missing expected {text!r}", file=sys.stderr)
+                ok = False
+        for text in args.refute:
+            if text in screen:
+                print(f"harness: found refuted {text!r}", file=sys.stderr)
+                ok = False
     finally:
         server.shutdown()
         server.server_close()
