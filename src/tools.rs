@@ -182,6 +182,12 @@ fn read(args: &Value) -> String {
     let Some(path) = args["path"].as_str() else {
         return "error: missing \"path\"".into();
     };
+    // `/proc` serves the environment the process was exec'd with; `unsetenv`
+    // does not clear it. Refuse the one file that holds the provider keys,
+    // whichever `/proc` route reaches it.
+    if proc_environ(Path::new(path)) {
+        return format!("error: read {path}: process environments are not readable");
+    }
     // Reject directories, FIFOs and devices before opening: `File::open` on a
     // FIFO blocks and `/dev/zero` never ends. `metadata` follows symlinks.
     let meta = match std::fs::metadata(path) {
@@ -245,6 +251,17 @@ fn read(args: &Value) -> String {
         out.push_str("\n...[read stopped at 1 MiB]...\n");
     }
     truncate(out, 50_000)
+}
+
+/// Whether `path` names a `/proc` environment file: `/proc/self/environ`,
+/// `/proc/<pid>/environ`, `/proc/<pid>/task/<tid>/environ`, or a symlink to
+/// one. Resolved first, because `/proc/self` is itself a link.
+fn proc_environ(path: &Path) -> bool {
+    if !path.ends_with("environ") {
+        return false;
+    }
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    resolved.starts_with("/proc")
 }
 
 fn write(args: &Value) -> String {
@@ -513,6 +530,15 @@ mod tests {
 
     fn temp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("nano-test-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn proc_environ_is_refused() {
+        assert!(proc_environ(Path::new("/proc/self/environ")));
+        assert!(proc_environ(Path::new("/proc/thread-self/environ")));
+        assert!(!proc_environ(Path::new("/proc/self/cmdline")));
+        assert!(!proc_environ(Path::new("/tmp/environ")));
+        assert!(read(&json!({ "path": "/proc/self/environ" })).contains("not readable"));
     }
 
     #[test]

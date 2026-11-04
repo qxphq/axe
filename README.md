@@ -210,6 +210,10 @@ kernel without Landlock.
 A refusal comes from the kernel, not from nano's argument parsing, and its
 message says so: a missing binary and a denied one read differently.
 
+A command child inherits a minimal environment — `PATH`, `HOME`, `LANG`,
+`LC_ALL`, `TERM`, `TMPDIR`, `USER`, `SHELL` — not nano's own. Provider and
+search tokens stay in the parent's memory.
+
 Known residuals, in both modes: `connect` over AF_UNIX, writes through an
 inherited file descriptor, metadata such as `chmod` outside the scratch
 directory, and `fetch`/`web_search`, which run in nano's own process by design.

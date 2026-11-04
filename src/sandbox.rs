@@ -29,7 +29,46 @@ static SCRATCH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// One line for the startup banner when confinement is weaker than promised.
 pub fn init() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    no_dump();
     imp::notice()
+}
+
+/// Keep other processes — including a `bash` child that knows this pid — from
+/// reading nano's environment through `/proc`. Best effort: the kernel may
+/// refuse, and the `/proc/self/environ` path of the parent itself is closed in
+/// the `read` tool, not here.
+#[cfg(target_os = "linux")]
+fn no_dump() {
+    const PR_SET_DUMPABLE: libc::c_long = 4;
+    // SAFETY: `prctl` with fixed constants and no pointer arguments.
+    unsafe {
+        libc::syscall(libc::SYS_prctl, PR_SET_DUMPABLE, 0 as libc::c_long);
+    }
+}
+
+/// Variables a command needs to behave like a command. Everything else —
+/// provider and search tokens included — stays in the parent.
+const CHILD_ENV: &[&str] = &[
+    "PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "USER", "SHELL",
+];
+
+fn confine_env(cmd: &mut Command, read_only: bool) -> Result<(), String> {
+    cmd.env_clear();
+    for name in CHILD_ENV {
+        if let Some(value) = std::env::var_os(name) {
+            cmd.env(name, value);
+        }
+    }
+    // A read-only `git` must not try to refresh an index it cannot write.
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    if read_only {
+        // On the child only: the parent resolves `temp_dir()` for its own
+        // output files, and a process-wide change would move them into the
+        // directory `cleanup` deletes.
+        cmd.env("TMPDIR", scratch_dir()?);
+    }
+    Ok(())
 }
 
 /// The command to spawn: the platform decides program and argv, so `bash()`
@@ -95,7 +134,7 @@ mod imp {
     use std::process::Command;
     use std::sync::OnceLock;
 
-    use super::{resolve, scratch_dir, shell_path, COMMANDS};
+    use super::{confine_env, resolve, scratch_dir, shell_path, COMMANDS};
 
     /// `socket` number and `AUDIT_ARCH_*` value the filter pins. `None` on an
     /// architecture this file has no numbers for: Layer 1 is mandatory, so no
@@ -206,14 +245,7 @@ mod imp {
         };
         let mut cmd = Command::new(&shell);
         cmd.arg("-c").arg(command);
-        // A read-only `git` must not try to refresh an index it cannot write.
-        cmd.env("GIT_OPTIONAL_LOCKS", "0");
-        if read_only {
-            // On the child only: the parent resolves `temp_dir()` for its own
-            // output files, and a process-wide change would move them into the
-            // directory `cleanup` deletes.
-            cmd.env("TMPDIR", scratch_dir()?);
-        }
+        confine_env(&mut cmd, read_only)?;
         // SAFETY: `pre_exec` is unsafe because the closure runs in the child
         // between fork and exec; this one calls only fixed syscalls on state
         // inherited from the parent, before any user program runs.
@@ -468,7 +500,7 @@ mod imp {
     use std::process::Command;
     use std::sync::OnceLock;
 
-    use super::{resolve, scratch_dir, shell_path, COMMANDS};
+    use super::{confine_env, resolve, scratch_dir, shell_path, COMMANDS};
 
     const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -491,10 +523,7 @@ mod imp {
             .arg(&shell)
             .arg("-c")
             .arg(command);
-        cmd.env("GIT_OPTIONAL_LOCKS", "0");
-        if read_only {
-            cmd.env("TMPDIR", scratch_dir()?);
-        }
+        confine_env(&mut cmd, read_only)?;
         Ok(cmd)
     }
 
@@ -577,6 +606,28 @@ mod tests {
         assert!(COMMANDS.contains(&"ls"));
         assert!(COMMANDS.contains(&"git"));
         assert!(resolve("sh").is_some());
+    }
+
+    #[test]
+    fn child_environment_is_scrubbed() {
+        // A variable the parent has and the whitelist does not.
+        let name = std::env::vars_os()
+            .filter_map(|(name, _)| name.to_str().map(str::to_string))
+            .find(|name| {
+                !CHILD_ENV.contains(&name.as_str())
+                    && name != "GIT_OPTIONAL_LOCKS"
+                    && name.bytes().enumerate().all(|(at, byte)| {
+                        byte.is_ascii_alphabetic()
+                            || byte == b'_'
+                            || (at > 0 && byte.is_ascii_digit())
+                    })
+            });
+        let Some(name) = name else { return };
+        let Ok(mut cmd) = shell(&format!("printenv {name}"), false) else {
+            return;
+        };
+        let out = cmd.output().unwrap();
+        assert!(out.stdout.is_empty(), "{name} leaked into the child");
     }
 
     #[test]
