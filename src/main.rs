@@ -552,8 +552,7 @@ enum Command {
     Exit,
     Help,
     New,
-    Models,
-    /// None opens the picker; Some is a `provider/id` or bare model id.
+    /// None lists and opens the picker; Some is a `provider/id` or bare model id.
     Model(Option<String>),
     /// None prints the current level; Some sets it.
     Thinking(Option<String>),
@@ -575,7 +574,6 @@ fn parse_command(line: &str) -> Command {
         "/exit" | "/quit" => return Command::Exit,
         "/help" => return Command::Help,
         "/new" => return Command::New,
-        "/models" => return Command::Models,
         "/model" => return Command::Model(None),
         "/thinking" => return Command::Thinking(None),
         "/thoughts" => return Command::Thoughts,
@@ -625,7 +623,6 @@ const COMMANDS: &[&str] = &[
     "/explore",
     "/help",
     "/model",
-    "/models",
     "/new",
     "/quit",
     "/sessions",
@@ -633,8 +630,7 @@ const COMMANDS: &[&str] = &[
     "/thoughts",
 ];
 
-const HELP: &str = "/model [id]    pick or switch model\n\
-                    /models        list models\n\
+const HELP: &str = "/model [id]    list models, or pick or switch one\n\
                     /thinking [l]  show or set thinking level (off, low, medium, high)\n\
                     /thoughts      show or hide the model's reasoning\n\
                     /sessions [q]  list, search and resume sessions\n\
@@ -1604,10 +1600,6 @@ impl Session {
                 self.new_session(Some(screen));
                 Cmd::Continue
             }
-            Command::Models => {
-                screen.output(&models(&self.providers));
-                Cmd::Continue
-            }
             Command::Model(None) => {
                 if let Some((pi, id)) =
                     pick(&self.providers, (self.provider, &self.model), screen, rx)
@@ -1699,12 +1691,9 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
             println!("New session");
             Cmd::Continue
         }
-        Command::Models => {
-            println!("{}", terminal_text(models(&session.providers).trim_end()));
-            Cmd::Continue
-        }
         Command::Model(None) => {
-            eprintln!("axe: /model needs a terminal");
+            // No picker without a terminal: the listing is the whole answer.
+            println!("{}", terminal_text(models(&session.providers).trim_end()));
             Cmd::Continue
         }
         Command::Model(Some(spec)) => {
@@ -2317,8 +2306,12 @@ fn pick(
             } else {
                 " "
             };
+            let ctx = match m.context {
+                Some(ctx) => format!("  ({ctx} ctx)"),
+                None => String::new(),
+            };
             text.push_str(&format!(
-                "{mark}{:>2}) {}/{}\n",
+                "{mark}{:>2}) {}/{}{ctx}\n",
                 items.len() + 1,
                 p.name,
                 m.id
@@ -2696,7 +2689,6 @@ mod tests {
             parse_command("/model a/b"),
             Command::Model(Some("a/b".into()))
         );
-        assert_eq!(parse_command("/models"), Command::Models);
         assert_eq!(parse_command("/thinking"), Command::Thinking(None));
         assert_eq!(
             parse_command("/thinking high"),
@@ -2710,6 +2702,8 @@ mod tests {
         assert_eq!(parse_command("!"), Command::Empty);
         assert_eq!(parse_command("hello"), Command::Turn("hello".into()));
         assert_eq!(parse_command("/modelx"), Command::Unknown("/modelx".into()));
+        // The listing lives on `/model` now; the old spelling is not an alias.
+        assert_eq!(parse_command("/models"), Command::Unknown("/models".into()));
     }
 
     #[test]

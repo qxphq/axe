@@ -111,8 +111,7 @@ model sees it the next time you ask something.
 
 | command | what it does |
 | --- | --- |
-| `/model [id]` | pick or switch model |
-| `/models` | list the provider's models |
+| `/model [id]` | list the provider's models, or pick or switch one; without a terminal it only lists |
 | `/thinking [level]` | show or set the thinking level |
 | `/thoughts` | show or hide the model's reasoning |
 | `/explore` | toggle explore mode (also Shift+Tab) |
