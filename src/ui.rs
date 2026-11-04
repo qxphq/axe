@@ -1159,6 +1159,9 @@ fn prompt_layout(
             col = 0;
             continue;
         }
+        // A control character occupies no cell on screen; draw a space so the
+        // cursor column and the rendered row agree.
+        let ch = if ch.is_control() { ' ' } else { ch };
         let cells = ch.width().unwrap_or(1);
         if col > 0 && col + cells > limit {
             rows.push(String::new());
@@ -1402,6 +1405,13 @@ mod tests {
         assert_eq!(rows, vec!["ab", "cd"]);
         assert_eq!(first, 0);
         assert_eq!((row, col), (1, 2));
+    }
+
+    #[test]
+    fn prompt_layout_draws_controls_as_one_cell() {
+        let (rows, _, (row, col)) = prompt_layout(2, "a\u{1}b", 3, 20, 4);
+        assert_eq!(rows, vec!["a b"]);
+        assert_eq!((row, col), (0, 3));
     }
 
     #[test]

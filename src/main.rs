@@ -40,7 +40,7 @@ fn main() {
     // terminal; a static's `Drop` never runs, so this is the hook.
     sandbox::cleanup();
     if let Err(e) = result {
-        eprintln!("nano: {e}");
+        eprintln!("nano: {}", strip_control(&e));
         std::process::exit(1);
     }
 }
@@ -53,7 +53,7 @@ fn run() -> Result<(), String> {
     // Confinement is announced before anything runs, once, next to the
     // provider lines: weaker than promised must never be silent.
     if let Some(note) = sandbox::init() {
-        eprintln!("nano: {note}");
+        eprintln!("nano: {}", strip_control(&note));
     }
     // Instructions are read once at startup, before any request: the system
     // prompt is a stable prefix and must not change mid-session.
@@ -86,7 +86,11 @@ fn run() -> Result<(), String> {
         let key = pc.resolved_key();
         if key.is_none() {
             if let Some(var) = &pc.api_key_env {
-                eprintln!("{}: {var} is not set, skipping", pc.name);
+                eprintln!(
+                    "{}: {} is not set, skipping",
+                    strip_control(&pc.name),
+                    strip_control(var)
+                );
                 continue;
             }
         }
@@ -114,8 +118,8 @@ fn run() -> Result<(), String> {
                 headers,
                 models,
             }),
-            Ok(_) => eprintln!("{}: no models", pc.name),
-            Err(e) => eprintln!("{}: {e}", pc.name),
+            Ok(_) => eprintln!("{}: no models", strip_control(&pc.name)),
+            Err(e) => eprintln!("{}: {}", strip_control(&pc.name), strip_control(&e)),
         }
     }
 
@@ -144,9 +148,12 @@ fn run() -> Result<(), String> {
         banner(notice.as_deref());
     } else {
         // One leading blank: the same margin `ui::Screen` keeps on both edges.
-        println!(" {}", selection(&providers, provider, &model, &thinking));
+        println!(
+            " {}",
+            terminal_text(&selection(&providers, provider, &model, &thinking))
+        );
         if let Some(notice) = &notice {
-            println!(" {notice}");
+            println!(" {}", terminal_text(notice));
         }
     }
 
@@ -699,14 +706,17 @@ impl Session {
                     let cancel = http::Cancel::new();
                     self.record(json!({ "role": "user", "content": input }));
                     if let Err(e) = self.turn(&mut sink, &cancel) {
-                        eprintln!("nano: {e}");
+                        eprintln!("nano: {}", strip_control(&e));
                     }
                     self.name_session();
                 }
                 Cmd::Shell(command) => {
-                    println!("{}", plain_text(&shell_line(&command, false)));
+                    println!(
+                        "{}",
+                        terminal_text(&plain_text(&shell_line(&command, false)))
+                    );
                     let result = self.run_shell(&command);
-                    print!("{result}");
+                    print!("{}", terminal_text(&result));
                 }
             }
             self.flush_warnings(None);
@@ -742,7 +752,7 @@ impl Session {
         };
         match screen {
             Some(screen) => screen.error(&format!("nano: {text}\n")),
-            None => eprintln!("nano: {text}"),
+            None => eprintln!("nano: {}", strip_control(&text)),
         }
     }
 
@@ -845,7 +855,7 @@ impl Session {
             screen.set_info(&self.info());
         } else {
             for warning in warnings {
-                eprintln!("nano: {warning}");
+                eprintln!("nano: {}", strip_control(&warning));
             }
         }
         Ok(title)
@@ -1122,8 +1132,8 @@ impl Session {
                 return;
             };
             match self.resume(&id, None) {
-                Ok(title) => println!("Resumed: {title}"),
-                Err(e) => eprintln!("nano: {e}"),
+                Ok(title) => println!("Resumed: {}", terminal_text(&title)),
+                Err(e) => eprintln!("nano: {}", strip_control(&e)),
             }
             return;
         }
@@ -1154,7 +1164,7 @@ impl Session {
                 row.push_str("  ·  ");
                 row.push_str(snippet);
             }
-            println!("{:>2}) {row}", at + 1);
+            println!("{:>2}) {}", at + 1, terminal_text(&row));
         }
     }
 
@@ -1649,7 +1659,7 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
             Cmd::Continue
         }
         Command::Models => {
-            println!("{}", models(&session.providers).trim_end());
+            println!("{}", terminal_text(models(&session.providers).trim_end()));
             Cmd::Continue
         }
         Command::Model(None) => {
@@ -1658,8 +1668,8 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
         }
         Command::Model(Some(spec)) => {
             match find(&session.providers, &spec) {
-                Some((pi, id)) => println!("{}", session.set_model(pi, id)),
-                None => eprintln!("nano: unknown model: {spec}"),
+                Some((pi, id)) => println!("{}", terminal_text(&session.set_model(pi, id))),
+                None => eprintln!("nano: unknown model: {}", strip_control(&spec)),
             }
             Cmd::Continue
         }
@@ -1668,7 +1678,10 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
             if rest.as_deref().unwrap_or("").is_empty() {
                 println!(
                     "thinking: {}",
-                    thinking_label(&providers[session.provider].cfg, &session.thinking)
+                    terminal_text(&thinking_label(
+                        &providers[session.provider].cfg,
+                        &session.thinking
+                    ))
                 );
                 return Cmd::Continue;
             }
@@ -1681,10 +1694,10 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
                     let spec = format!("{}/{}", providers[session.provider].name, session.model);
                     session.state.set_thinking(&spec, level.as_str());
                     if let Err(e) = session.state.save() {
-                        eprintln!("nano: {e}");
+                        eprintln!("nano: {}", strip_control(&e));
                     }
                 }
-                Err(e) => eprintln!("nano: {e}"),
+                Err(e) => eprintln!("nano: {}", strip_control(&e)),
             }
             Cmd::Continue
         }
@@ -1702,7 +1715,7 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
             Cmd::Continue
         }
         Command::Unknown(input) => {
-            eprintln!("nano: unknown command: {input}");
+            eprintln!("nano: unknown command: {}", strip_control(&input));
             Cmd::Continue
         }
         Command::Shell(command) => Cmd::Shell(command),
@@ -1995,6 +2008,24 @@ impl Sink for ChannelSink {
     }
 }
 
+/// Drop control characters a terminal would execute. Newlines and tabs stay:
+/// this is line output, not a raw terminal stream.
+fn strip_control(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
+}
+
+/// Text bound for stdout: stripped only when a terminal would interpret it,
+/// so redirected output stays byte-exact.
+fn terminal_text(text: &str) -> String {
+    if io::stdout().is_terminal() {
+        strip_control(text)
+    } else {
+        text.to_string()
+    }
+}
+
 /// A style this binary uses for transcript text. Two renderers read it: the
 /// screen's cells, and ANSI escapes when there is no screen.
 #[derive(Clone, Copy)]
@@ -2020,21 +2051,22 @@ impl Paint {
     }
 
     /// ANSI colors only when stdout is a terminal, so redirected output stays
-    /// plain.
+    /// plain. A terminal also gets its control bytes stripped: content can come
+    /// from a fetched page or a command, and ESC is never part of the style.
     fn ansi(self, text: &str) -> String {
+        if !io::stdout().is_terminal() {
+            return text.to_string();
+        }
+        let text = strip_control(text);
         let code = match self {
-            Paint::Plain => return text.to_string(),
+            Paint::Plain => return text,
             Paint::Dim => "2",
             Paint::Cyan => "36",
             Paint::Yellow => "33",
             Paint::Green => "32",
             Paint::Red => "31",
         };
-        if io::stdout().is_terminal() {
-            format!("\x1b[{code}m{text}\x1b[0m")
-        } else {
-            text.to_string()
-        }
+        format!("\x1b[{code}m{text}\x1b[0m")
     }
 
     fn span(self, text: String) -> Span<'static> {
@@ -2591,6 +2623,11 @@ fn summarize(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_bytes_are_stripped_but_lines_survive() {
+        assert_eq!(strip_control("a\x1b[31mb\nc\td\u{9b}"), "a[31mb\nc\td");
+    }
 
     #[test]
     fn parses_commands_once() {

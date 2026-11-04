@@ -1638,11 +1638,14 @@ pub fn ansi(line: &Line) -> String {
     }
     let mut out = String::new();
     for span in &line.spans {
+        // A span can quote a page or a command: terminal controls are removed
+        // here, before the style wraps it.
+        let content = crate::strip_control(&span.content);
         let codes = ansi_codes(span.style);
         if codes.is_empty() {
-            out.push_str(&span.content);
+            out.push_str(&content);
         } else {
-            out.push_str(&format!("\x1b[{}m{}\x1b[0m", codes.join(";"), span.content));
+            out.push_str(&format!("\x1b[{}m{}\x1b[0m", codes.join(";"), content));
         }
     }
     out.trim_end().to_string()
