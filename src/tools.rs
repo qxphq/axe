@@ -1,3 +1,6 @@
+//! The tool registry and local tools: schemas, the generated prompt, `read`,
+//! `write`, `edit`, `bash`, and `about`. Web tools live in `web.rs`.
+
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;

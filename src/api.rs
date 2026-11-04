@@ -1,3 +1,6 @@
+//! The OpenAI-compatible chat API: model listing, the chat request, SSE
+//! parsing, tool-call accumulation, and usage.
+
 use serde_json::{json, Value};
 
 use crate::http::{self, Cancel, Endpoint, Response};

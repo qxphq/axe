@@ -1,3 +1,6 @@
+//! The REPL and session lifecycle: provider setup, the line loop, slash
+//! commands, the agent turn, and the transcript formatting.
+
 mod api;
 mod config;
 mod http;

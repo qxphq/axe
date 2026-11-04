@@ -1,3 +1,6 @@
+//! The per-directory state file: the cwd key, load, and an atomic write.
+//! Sessions live under the same project directory.
+
 use std::env;
 use std::fs;
 use std::io;

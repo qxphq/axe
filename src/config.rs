@@ -1,3 +1,6 @@
+//! The one config file: load, validate, resolve `agents`, and read provider
+//! keys and thinking levels.
+
 use std::env;
 use std::fs;
 use std::io;

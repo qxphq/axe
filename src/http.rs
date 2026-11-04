@@ -1,3 +1,6 @@
+//! URL parsing and HTTP/1.1 over `TcpStream`/rustls, with body decoding for
+//! `Content-Length`, chunked and close-delimited responses.
+
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
