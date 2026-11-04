@@ -19,6 +19,14 @@ pub struct Reply {
     /// back on every assistant message, so the caller keeps it in the history.
     pub reasoning: String,
     pub calls: Vec<ToolCall>,
+    /// Tokens the provider counted for this round, when it reports them: the
+    /// whole request, so it is how full the window was.
+    pub usage: Option<Usage>,
+}
+
+pub struct Usage {
+    pub prompt: u64,
+    pub completion: u64,
 }
 
 pub fn list_models(
@@ -42,7 +50,9 @@ pub fn list_models(
         if let Some(id) = entry["id"].as_str() {
             let context = entry["context_length"]
                 .as_u64()
-                .or_else(|| entry["context_window"].as_u64());
+                .or_else(|| entry["context_window"].as_u64())
+                // opencode reports the window under `limit`, with the output cap.
+                .or_else(|| entry["limit"]["context"].as_u64());
             models.push(ModelInfo {
                 id: id.to_string(),
                 context,
@@ -69,6 +79,9 @@ pub fn chat(
         "messages": messages,
         "stream": true,
         "tools": tools,
+        // Ask for the final chunk's token counts. Servers that do not know the
+        // field ignore it, and then no `usage` arrives at all.
+        "stream_options": { "include_usage": true },
     });
     if let (Some(Value::Object(extra)), Some(obj)) = (extra, body.as_object_mut()) {
         for (k, v) in extra {
@@ -108,6 +121,7 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
     let mut text = String::new();
     let mut reasoning_text = String::new();
     let mut partials: Vec<(String, String, String)> = Vec::new();
+    let mut usage: Option<Usage> = None;
 
     loop {
         let line = match res.read_line() {
@@ -129,6 +143,14 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
             continue;
         };
+
+        // The usage chunk comes last and carries no choices at all.
+        if let Some(prompt) = chunk["usage"]["prompt_tokens"].as_u64() {
+            usage = Some(Usage {
+                prompt,
+                completion: chunk["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+            });
+        }
 
         let delta = &chunk["choices"][0]["delta"];
         // Providers disagree on the key; any non-empty delta means the model is
@@ -182,5 +204,6 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
         text,
         reasoning: reasoning_text,
         calls,
+        usage,
     })
 }

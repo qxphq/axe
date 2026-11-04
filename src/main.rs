@@ -144,6 +144,7 @@ fn run() -> Result<(), String> {
         thinking,
         thoughts: false,
         read_only: false,
+        used: None,
         instructions,
         messages,
     };
@@ -167,6 +168,9 @@ struct Session {
     thoughts: bool,
     /// Explore mode: `read` and a read-only `bash` only (`/explore`).
     read_only: bool,
+    /// The last round's token count, from the provider. `None` until a turn
+    /// reports one: the fill is then estimated from the history.
+    used: Option<u64>,
     /// The config and project instructions appended to the generated prompt,
     /// kept so a mode switch can rebuild the first message.
     instructions: String,
@@ -276,14 +280,37 @@ impl Session {
         Ok(())
     }
 
-    /// The live region's last row: what this session is pointed at.
+    /// The live region's last row: what this session is pointed at, how much of
+    /// the window it has filled, and the mode when that changes the tool set.
     fn info(&self) -> String {
         let base = selection(&self.providers, self.provider, &self.model, &self.thinking);
+        let mut text = format!("{base}  ·  {}", self.fill());
         if self.read_only {
-            format!("{base}  ·  read-only")
-        } else {
-            base
+            text.push_str("  ·  read-only");
         }
+        text
+    }
+
+    /// Used and total tokens, with the percentage between them. The provider's
+    /// own count when the last turn reported one, a character estimate
+    /// otherwise; no percentage when the model does not say how big its window
+    /// is.
+    fn fill(&self) -> String {
+        let used = self.used.unwrap_or_else(|| estimate(&self.messages));
+        match self.context() {
+            Some(ctx) => format!(
+                "{}/{} ({})",
+                scaled(used),
+                scaled(ctx),
+                percent(used, ctx)
+            ),
+            None => scaled(used),
+        }
+    }
+
+    fn context(&self) -> Option<u64> {
+        let models = &self.providers[self.provider].models;
+        models.iter().find(|m| m.id == self.model)?.context
     }
 
     /// Enter or leave explore mode. The tool set changes, and the generated
@@ -315,6 +342,8 @@ impl Session {
         let _ = screen.draw();
         let result = self.run_shell(command);
         screen.output(&result);
+        // The output is part of the history now: the fill moved.
+        screen.set_info(&self.info());
         let _ = screen.draw();
     }
 
@@ -357,6 +386,10 @@ impl Session {
         screen.set_status("thinking…");
         let _ = screen.draw();
 
+        // What the last round counted, handed back by the turn's thread. The
+        // history is borrowed by that thread, so `self` is out of reach until
+        // the scope ends.
+        let mut used: Option<u64> = None;
         let messages = &mut self.messages;
         let provider = &self.providers[self.provider];
         let model = self.model.clone();
@@ -487,7 +520,8 @@ impl Session {
                             screen.error(&format!("nano: {e}\n"));
                             done = true;
                         }
-                        Event::Done(Ok(())) => {
+                        Event::Done(Ok(count)) => {
+                            used = count;
                             let tail = std::mem::take(&mut thought);
                             screen.thought(&tail);
                             // The last block has no ending line of its own.
@@ -518,6 +552,10 @@ impl Session {
         });
         screen.set_status("");
         screen.set_queued(None);
+        // A turn that reported nothing (interrupted, or a provider that does
+        // not count) leaves the estimate in charge rather than a stale number.
+        self.used = used;
+        screen.set_info(&self.info());
 
         if !result {
             screen.error("nano: turn failed\n");
@@ -538,6 +576,7 @@ impl Session {
             sink,
             cancel,
         )
+        .map(|_| ())
     }
 
     /// Slash commands and selection changes. `screen` supplies a line from the
@@ -578,6 +617,8 @@ impl Session {
                 if let Some((pi, id)) = pick(providers, (provider, model), screen, rx) {
                     self.provider = pi;
                     self.model = id;
+                    // The count belonged to the old model's window.
+                    self.used = None;
                     let text = self.info();
                     screen.set_info(&text);
                     screen.output(&format!("{text}\n"));
@@ -616,6 +657,8 @@ impl Session {
                 Some((pi, id)) => {
                     self.provider = pi;
                     self.model = id;
+                    // The count belonged to the old model's window.
+                    self.used = None;
                     self.thinking = self
                         .cfg
                         .thinking
@@ -777,7 +820,7 @@ enum Event {
     Status(String),
     /// Streamed reasoning, before any answer text.
     Thought(String),
-    Done(Result<(), String>),
+    Done(Result<Option<u64>, String>),
     Eof,
 }
 
@@ -1162,6 +1205,31 @@ fn selection(
     format!("{}/{}  ·  {}", providers[provider].name, model, level)
 }
 
+/// Four bytes per token, the usual rule of thumb for English. Only used when no
+/// provider has counted the real thing: it is off by tens of percent.
+fn estimate(messages: &[Value]) -> u64 {
+    messages.iter().map(|m| m.to_string().len() as u64).sum::<u64>() / 4
+}
+
+/// Token counts in three characters where possible: `812`, `34k`, `1.0M`.
+fn scaled(n: u64) -> String {
+    match n {
+        0..=9_999 => n.to_string(),
+        10_000..=999_999 => format!("{}k", n / 1_000),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
+/// Whole percent, with `<1%` for a history that is started but rounds to zero:
+/// true on a million-token window, and `0%` would read as empty.
+fn percent(used: u64, ctx: u64) -> String {
+    let ctx = ctx.max(1);
+    match used * 100 / ctx {
+        0 if used > 0 => "<1%".to_string(),
+        n => format!("{n}%"),
+    }
+}
+
 /// Splash, printed once above the live region: block letters for `nano`. It
 /// lands in the transcript and is never repainted, so it must be narrower than
 /// the terminal's margin-to-margin width on a narrow window.
@@ -1312,14 +1380,17 @@ fn run_turn(
     read_only: bool,
     sink: &mut dyn Sink,
     cancel: &http::Cancel,
-) -> Result<(), String> {
+) -> Result<Option<u64>, String> {
     let tools = tools::definitions(read_only);
+    // The last round's own count. It measures the whole request, so it is the
+    // fill; `None` when no round reported one.
+    let mut used = None;
 
     loop {
         // An interrupt ends the turn here too: no further round is started.
         // The user message stays without a reply, which is what happened.
         if cancel.cancelled() {
-            return Ok(());
+            return Ok(used);
         }
         let extra = provider.cfg.thinking_body(thinking);
         // Both callbacks borrow the sink, so it is shared rather than captured
@@ -1347,20 +1418,23 @@ fn run_turn(
             // is still printed, but the turn is over.
             Err(_) if cancel.cancelled() => {
                 sink.end_round();
-                return Ok(());
+                return Ok(used);
             }
             Err(e) => return Err(e),
         };
+        if let Some(count) = &reply.usage {
+            used = Some(count.prompt + count.completion);
+        }
         sink.end_round();
         // A shut-down read can also end the stream without an error. A cut
         // reply is not an assistant message, and its calls never run.
         if cancel.cancelled() {
-            return Ok(());
+            return Ok(used);
         }
 
         if reply.calls.is_empty() {
             messages.push(assistant_message(&reply));
-            return Ok(());
+            return Ok(used);
         }
 
         let calls: Vec<Value> = reply
@@ -1383,7 +1457,7 @@ fn run_turn(
 
         for call in &reply.calls {
             if cancel.cancelled() {
-                return Ok(());
+                return Ok(used);
             }
             let echo = call_line(call, read_only);
             // What is running, while it runs: the finished line appears below
@@ -1398,7 +1472,7 @@ fn run_turn(
                 "content": result,
             }));
             if cancel.cancelled() {
-                return Ok(());
+                return Ok(used);
             }
         }
     }
