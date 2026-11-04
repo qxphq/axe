@@ -641,7 +641,20 @@ const HELP: &str = "/model [id]    pick or switch model\n\
                     /new           start a new session\n\
                     /explore       toggle explore mode (read-only shell)\n\
                     !cmd           run a shell command; its output joins the context\n\
-                    /exit          quit\n";
+                    /help          list the commands and the config keys\n\
+                    /exit, /quit   quit\n";
+
+/// `/help`: the command list, then where the config is read from and the keys
+/// it takes. The path is resolved rather than written out, because
+/// `XDG_CONFIG_HOME` moves it.
+fn help_text() -> String {
+    format!(
+        "{HELP}\nconfig: {}\n\
+         keys: providers, model, explore_by_default, search, thinking, system, agents\n\
+         provider keys: base_url, api_key_env, models_url, session_header, thinking",
+        config::path().display()
+    )
+}
 
 impl Session {
     /// One line at a time from a terminal we own. Keys arrive on the channel, so
@@ -1584,7 +1597,7 @@ impl Session {
             Command::Empty => Cmd::Continue,
             Command::Exit => Cmd::Exit,
             Command::Help => {
-                screen.output(HELP);
+                screen.output(&help_text());
                 Cmd::Continue
             }
             Command::New => {
@@ -1678,7 +1691,7 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
         Command::Empty => Cmd::Continue,
         Command::Exit => Cmd::Exit,
         Command::Help => {
-            println!("{}", HELP.trim_end());
+            println!("{}", help_text());
             Cmd::Continue
         }
         Command::New => {
@@ -2714,6 +2727,16 @@ mod tests {
         let off = mode_note(false)["content"].as_str().unwrap().to_string();
         assert!(on.contains("write"));
         assert!(off.contains("fetch and web_search are unavailable"));
+    }
+
+    #[test]
+    fn help_lists_every_command_and_the_config() {
+        for name in COMMANDS {
+            assert!(HELP.contains(name), "{name} is missing from HELP");
+        }
+        let text = help_text();
+        assert!(text.contains(&*config::path().to_string_lossy()));
+        assert!(text.contains("explore_by_default"));
     }
 
     #[test]
