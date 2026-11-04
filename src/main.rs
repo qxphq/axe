@@ -40,6 +40,9 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let cfg = config::load()?;
+    // `web_search` holds its token rather than the config: read once, like the
+    // providers, and never re-read mid-session.
+    tools::set_brave_key(cfg.search.brave_key.clone());
     // Confinement is announced before anything runs, once, next to the
     // provider lines: weaker than promised must never be silent.
     if let Some(note) = sandbox::init() {
@@ -192,7 +195,7 @@ fn run() -> Result<(), String> {
 fn mode_note(read_only: bool) -> Value {
     let content = if read_only {
         "explore mode: on — write and edit are unavailable; bash runs read-only \
-         commands, writes only to a scratch directory, and nothing reaches the \
+         commands, writes only to a scratch directory, and no command reaches the \
          network."
     } else {
         "explore mode: off — all tools are available; bash cannot reach the network."
@@ -1608,6 +1611,7 @@ fn call_line(call: &api::ToolCall, read_only: bool) -> Vec<(Paint, String)> {
     let (glyph, paint) = match call.name.as_str() {
         "read" => ("◇", Paint::Cyan),
         "fetch" => ("↗", Paint::Cyan),
+        "web_search" => ("⌕", Paint::Cyan),
         "write" => ("✚", Paint::Yellow),
         "edit" => ("✎", Paint::Yellow),
         _ => ("✚", Paint::Yellow),
@@ -1619,7 +1623,7 @@ fn call_line(call: &api::ToolCall, read_only: bool) -> Vec<(Paint, String)> {
     }
 
     let mut parts = Vec::new();
-    for key in ["path", "file", "pattern", "url"] {
+    for key in ["path", "file", "pattern", "url", "query"] {
         if let Some(s) = v[key].as_str() {
             parts.push(summarize(s, 120));
         }

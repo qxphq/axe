@@ -1,7 +1,7 @@
 # nano
 
 Minimal coding agent harness in Rust. One binary, a line REPL, OpenAI-compatible
-providers, five tools. Roughly 6.8k LOC across nine files.
+providers, six tools. Roughly 6.8k LOC across nine files.
 
 ## Principles
 
@@ -30,12 +30,15 @@ providers, five tools. Roughly 6.8k LOC across nine files.
    volatile content last. Never inject timestamps, status, or cwd changes into the
    prefix: it invalidates provider prompt caching. When sessions arrive: append-only
    JSONL, replay on resume, compaction last.
-7. **Tools are dumb.** `read`, `write`, `edit`, `bash`, `fetch`. No `glob`, `grep`, or
-   `list`; `bash` + `rg`/`fd` covers them. `fetch` because explore mode's shell
-   allowlist has no `curl`, so that mode otherwise cannot read the web; it is refused
-   outside explore mode, where `bash` covers the same ground. Tool errors are results
+7. **Tools are dumb.** `read`, `write`, `edit`, `bash`, `fetch`, `web_search`. No
+   `glob`, `grep`, or `list`; `bash` + `rg`/`fd` covers them. `fetch` and
+   `web_search` because explore mode's shell allowlist has no `curl`, so that mode
+   otherwise cannot read the web; both are refused outside explore mode. Search
+   uses Brave when a token is configured and DuckDuckGo's HTML endpoint otherwise;
+   a Brave query that fails or returns nothing falls back. Tool errors are results
    for the model, not harness failures. Truncate output (30–50 KB), timeout `bash`
-   (120 s), cap `fetch` at 1 MiB off the wire and 50 000 characters to the model.
+   (120 s), cap `fetch` at 1 MiB off the wire and 50 000 characters to the model,
+   `web_search` at 1 MiB and 20 results.
 8. **No approval prompts.** Bash runs unprompted by explicit user decision. Do not
    add a permission layer without being asked.
 9. **Real cwd, relative paths.** `current_dir()` at startup, used for the prompt and
@@ -92,7 +95,8 @@ providers, five tools. Roughly 6.8k LOC across nine files.
 - `state.rs` — the per-directory state file: the cwd key, load, and an atomic
   write. Sessions join it later.
 - `tools.rs` — tool registry, JSON schemas, generated prompt, execution, and
-  `fetch`: the host guard, the HTML-to-text tokenizer, the sanitizer.
+  `fetch`/`web_search`: the host guard, the HTML-to-text tokenizer, the sanitizer,
+  and the Brave/DuckDuckGo result parsers.
 - `sandbox.rs` — the only `unsafe`: the seccomp filter and the Landlock ruleset on
   Linux, the `sandbox-exec` profiles on macOS, the exec allowlist, and the scratch
   directory explore mode may write to.
@@ -166,6 +170,18 @@ child, since the host guard refuses loopback: that variable is a **test knob, of
 by default, and a live bypass for anyone who sets it**. `--no-fetch-local` runs
 without it, which is how the refusal is checked. `show:x` streams the last tool
 result back, since the transcript shows only call lines.
+
+`web_search` has no fixture: it asks fixed public hosts. The fake provider can
+still call it, since `tool:` takes any name and arguments. That turn loops, so end
+it with `!Escape` and read the result back; the first line says which engine
+answered. The throwaway config binds `search.brave.api_key_env` to
+`BRAVE_SEARCH_API_KEY`, so unset means DuckDuckGo and a bogus value exercises the
+fallback:
+
+```sh
+./harness.py --wait 2 --scroll 400 'tool:web_search:{"query":"rust web framework"}' '!Escape' 'show:'
+BRAVE_SEARCH_API_KEY=bogus ./harness.py --wait 2 --scroll 400 'tool:web_search:{"query":"rust"}' '!Escape' 'show:'
+```
 
 A `tool:` turn keeps calling the same tool: the mock answers from the last user
 message, and a tool result is not one. Interrupt it with `!Escape`.

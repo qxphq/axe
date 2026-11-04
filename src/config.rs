@@ -38,12 +38,20 @@ impl ProviderConfig {
     }
 }
 
+pub struct Search {
+    /// Brave Search API token, resolved from `api_key` or `api_key_env`.
+    /// `None` sends queries to DuckDuckGo.
+    pub brave_key: Option<String>,
+}
+
 pub struct Config {
     pub providers: Vec<ProviderConfig>,
     pub model: Option<String>,
     /// Whether a session starts in explore mode (`read` and a read-only
     /// `bash`). On unless the config sets `"explore_by_default": false`.
     pub explore_by_default: bool,
+    /// Web search: Brave when a token resolves, DuckDuckGo otherwise.
+    pub search: Search,
     /// Model spec (`provider/id`) -> remembered thinking level.
     pub thinking: Vec<(String, String)>,
     pub system: Option<String>,
@@ -88,6 +96,11 @@ const EXAMPLE: &str = r#"{
   },
   "model": "local/qwen3.8-flash-next-chat",
   "explore_by_default": true,
+  "search": {
+    "brave": {
+      "api_key_env": "BRAVE_SEARCH_API_KEY"
+    }
+  },
   "thinking": {},
   "system": null,
   "agents": null
@@ -232,10 +245,18 @@ pub fn load() -> Result<Config, String> {
         return Err(format!("{}: no providers configured", p.display()));
     }
 
+    // An unset key is not an error: search falls back to DuckDuckGo. A literal
+    // `api_key` wins, the same order providers use.
+    let brave = &v["search"]["brave"];
+    let brave_key = text(brave, "api_key").or_else(|| {
+        text(brave, "api_key_env").and_then(|var| env::var(var).ok().filter(|s| !s.is_empty()))
+    });
+
     Ok(Config {
         providers,
         model: text(&v, "model"),
         explore_by_default: v["explore_by_default"].as_bool().unwrap_or(true),
+        search: Search { brave_key },
         thinking: v["thinking"]
             .as_object()
             .map(|map| {

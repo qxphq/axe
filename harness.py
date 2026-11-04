@@ -221,6 +221,9 @@ def write_config(root, port):
             {
                 "providers": {"mock": {"base_url": f"http://127.0.0.1:{port}/v1"}},
                 "model": "mock/mock-1",
+                # The env var selects Brave; without it search falls back to
+                # DuckDuckGo, which is also what the live tests use.
+                "search": {"brave": {"api_key_env": "BRAVE_SEARCH_API_KEY"}},
             },
             indent=2,
         )
