@@ -116,6 +116,9 @@ pub struct Screen {
     /// Markdown being collected. A block is laid out once it ends, not once
     /// per line: a table needs its whole header, a paragraph its last line.
     md: md::Stream,
+    /// Reasoning, collected the same way. Its own stream: a thought's last
+    /// paragraph must not run into the answer's first.
+    thought: md::Stream,
     /// A chooser above the prompt, when one is open.
     menu: Option<Menu>,
     restored: bool,
@@ -162,6 +165,7 @@ impl Screen {
             commands: Vec::new(),
             last: None,
             md: md::Stream::new(),
+            thought: md::Stream::new(),
             menu: None,
             restored: false,
         })
@@ -386,7 +390,7 @@ impl Screen {
     ///
     /// Blocks are separated by one blank line, so a message never sits against
     /// the tool call that followed it. Consecutive tool calls are one block:
-    /// they belong together, and so are the lines of one thought.
+    /// they belong together.
     pub fn insert(&mut self, lines: Vec<Line<'static>>, block: Block) {
         // Anything that is not model text ends the block being collected: a
         // paragraph must not straddle a tool call, a thought, or a turn.
@@ -398,6 +402,8 @@ impl Screen {
 
     /// End the collected markdown: what it rendered to joins the transcript.
     pub fn flush(&mut self) {
+        // Reasoning may be the last thing a round wrote.
+        self.end_thought();
         let mut lines = Vec::new();
         self.md.flush(self.cols(), &mut lines);
         if !lines.is_empty() {
@@ -413,11 +419,15 @@ impl Screen {
     }
 
     fn write(&mut self, lines: Vec<Line<'static>>, block: Block) {
+        // Whatever follows a thought ends it, and the thought goes first.
+        if block != Block::Thought {
+            self.end_thought();
+        }
         let mut lines = lines;
-        // A run of one kind is one block, except user lines, which are each
-        // their own, and markdown, which arrives one laid-out block at a time.
-        let continues =
-            matches!(block, Block::Tool | Block::Thought) && self.last == Some(block);
+        // Consecutive tool calls are one block: they belong together. A user
+        // line is its own, and markdown arrives one laid-out block at a time,
+        // so neither continues.
+        let continues = block == Block::Tool && self.last == Some(block);
         if !continues {
             lines.insert(0, Line::default());
         }
@@ -485,17 +495,38 @@ impl Screen {
         }
     }
 
-    /// Reasoning, dim: the model's notes, not its answer. Blank text is a
-    /// no-op, so a round without reasoning adds no gap.
+    /// Reasoning, dim: the model's notes, not its answer. Markdown like the
+    /// answer, and collected the same way: a block reaches the transcript when
+    /// it ends.
     pub fn thought(&mut self, text: &str) {
-        if text.is_empty() {
+        let width = self.cols();
+        for line in split(text) {
+            let mut lines = Vec::new();
+            self.thought.push(line, width, &mut lines);
+            self.notes(lines);
+        }
+    }
+
+    /// End the reasoning: its last line was unfinished while it streamed, so
+    /// the paragraph it belongs to is finished only now.
+    fn end_thought(&mut self) {
+        let mut lines = Vec::new();
+        self.thought.flush(self.cols(), &mut lines);
+        self.notes(lines);
+    }
+
+    /// Laid-out reasoning: the renderer's styles stay, dim goes on top, so
+    /// bold, code and links are still told apart inside a thought.
+    fn notes(&mut self, mut lines: Vec<Line<'static>>) {
+        if lines.is_empty() {
             return;
         }
-        let lines: Vec<Line<'static>> = split(text)
-            .into_iter()
-            .map(|line| Line::styled(line.to_string(), DIM))
-            .collect();
-        self.insert(lines, Block::Thought);
+        for line in &mut lines {
+            for span in &mut line.spans {
+                span.style = span.style.add_modifier(Modifier::DIM);
+            }
+        }
+        self.write(lines, Block::Thought);
     }
 
     /// A warning or an error: same as `output`, in red.

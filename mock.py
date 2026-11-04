@@ -15,7 +15,9 @@ The reply is chosen by the last user message:
   fetch:PAGE      one `fetch` call to FETCH_BASE/PAGE
   fetch:PAGE@START+CHARS   same, with the paging arguments
   show:           stream the last tool result back, so a test can read it
-  reason:...      reasoning deltas first, then the text after `|`
+  reason:...      reasoning deltas first, then the text after `|`; `\n` in
+                  the reasoning is a line break, since a typed turn cannot
+                  carry one
   empty:          no content at all, no calls
   plain:...       stream the rest verbatim (used for generated titles)
 
@@ -123,6 +125,8 @@ def plan(reply):
 
     if kind == "reason":
         text, _, answer = rest.partition("|")
+        # A typed turn cannot carry a line break: `\n` spells one.
+        text = text.replace("\\n", "\n")
         for piece in wrap(text, 6):
             out.append((0.0, frame({"reasoning_content": piece})))
         rest = answer
