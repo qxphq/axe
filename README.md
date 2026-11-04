@@ -216,12 +216,13 @@ Layer 2 applies in explore mode: writes outside a session scratch directory are
 denied, and only an allowlist of programs may be executed — `ls`, `cat`, `head`,
 `tail`, `grep`, `rg`, `fd`, `find`, `sort`, `wc`, `diff`, `du`, `df`, `file`,
 `jq`, `stat`, `tree`, `uname`, `uniq`, `id`, `ps`, `pwd`, `date`, `cut`, `tr`,
-`which`, `git`, and the shell itself. The loader is in that list because the
-kernel opens it for every dynamically linked binary, so `ld.so` can start a
-program that is not on the list, and an allowed program can load code with
-`LD_PRELOAD`. Loaded code runs in the same domain: it still cannot write
-outside the scratch directory or open an internet socket. It degrades with one
-line at startup on a kernel without Landlock.
+`which`, `git`, and the shell itself, plus the ELF interpreter each of those
+binaries names — the kernel opens it for every dynamically linked binary, and
+it is read from `PT_INTERP` rather than assumed, since a NixOS system keeps it
+in `/nix/store`. So `ld.so` can start a program that is not on the list, and an
+allowed program can load code with `LD_PRELOAD`. Loaded code runs in the same
+domain: it still cannot write outside the scratch directory or open an internet
+socket. It degrades with one line at startup on a kernel without Landlock.
 
 A refusal comes from the kernel, not from axe's argument parsing, and its
 message says so: a missing binary and a denied one read differently.
