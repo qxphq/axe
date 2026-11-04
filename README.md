@@ -208,8 +208,12 @@ Layer 2 applies in explore mode: writes outside a session scratch directory are
 denied, and only an allowlist of programs may be executed — `ls`, `cat`, `head`,
 `tail`, `grep`, `rg`, `fd`, `find`, `sort`, `wc`, `diff`, `du`, `df`, `file`,
 `jq`, `stat`, `tree`, `uname`, `uniq`, `id`, `ps`, `pwd`, `date`, `cut`, `tr`,
-`which`, `git`, and the shell itself. It degrades with one line at startup on a
-kernel without Landlock.
+`which`, `git`, and the shell itself. The loader is in that list because the
+kernel opens it for every dynamically linked binary, so `ld.so` can start a
+program that is not on the list, and an allowed program can load code with
+`LD_PRELOAD`. Loaded code runs in the same domain: it still cannot write
+outside the scratch directory or open an internet socket. It degrades with one
+line at startup on a kernel without Landlock.
 
 A refusal comes from the kernel, not from nano's argument parsing, and its
 message says so: a missing binary and a denied one read differently.
@@ -221,6 +225,8 @@ search tokens stay in the parent's memory.
 Known residuals, in both modes: `connect` over AF_UNIX, writes through an
 inherited file descriptor, metadata such as `chmod` outside the scratch
 directory, and `fetch`/`web_search`, which run in nano's own process by design.
+In explore mode, code loaded by an allowed program (`LD_PRELOAD`, the loader)
+runs too, inside the same write and network confinement.
 
 ## Trust and security
 
