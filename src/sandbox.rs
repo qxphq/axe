@@ -125,8 +125,8 @@ fn scratch_dir() -> Result<&'static Path, String> {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use std::ffi::CString;
-    use std::io;
+    use std::ffi::{CString, OsStr};
+    use std::io::{self, Read, Seek, SeekFrom};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
@@ -209,15 +209,55 @@ mod imp {
 
     /// The ELF interpreter is opened with `__FMODE_EXEC`, so Landlock demands
     /// `EXECUTE` on it too: without it every dynamically linked binary is
-    /// refused even when its own rule is there.
-    const LOADERS: &[&str] = &[
-        "/lib64/ld-linux-x86-64.so.2",
-        "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
-        "/lib/ld-linux-aarch64.so.1",
-        "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
-        "/lib/ld-musl-x86_64.so.1",
-        "/lib/ld-musl-aarch64.so.1",
-    ];
+    /// refused even when its own rule is there. It is read from each binary's
+    /// `PT_INTERP` rather than assumed: NixOS has no `/lib64/ld-linux-*.so.2`,
+    /// its interpreter lives under `/nix/store`.
+    pub(super) fn interpreter(binary: &Path) -> Option<PathBuf> {
+        let mut file = std::fs::File::open(binary).ok()?;
+        let mut header = [0u8; 64];
+        file.read_exact(&mut header).ok()?;
+        // ELF, 64-bit, little-endian: the only shape this platform can exec.
+        if &header[0..4] != b"\x7fELF" || header[4] != 2 || header[5] != 1 {
+            return None;
+        }
+        let phoff = le64(&header[32..40]);
+        let phentsize = le16(&header[54..56]) as usize;
+        let phnum = le16(&header[56..58]) as usize;
+        // A corrupt table would be a large allocation; real binaries are tiny.
+        if phnum == 0 || phentsize < 56 || phnum > 4096 {
+            return None;
+        }
+        let mut table = vec![0u8; phnum * phentsize];
+        file.seek(SeekFrom::Start(phoff)).ok()?;
+        file.read_exact(&mut table).ok()?;
+        for entry in table.chunks_exact(phentsize) {
+            if le32(&entry[0..4]) != 3 {
+                continue; // PT_INTERP
+            }
+            let offset = le64(&entry[8..16]);
+            let size = le64(&entry[32..40]).min(4096) as usize;
+            let mut name = vec![0u8; size];
+            file.seek(SeekFrom::Start(offset)).ok()?;
+            file.read_exact(&mut name).ok()?;
+            name.truncate(name.iter().position(|&b| b == 0).unwrap_or(name.len()));
+            return Some(PathBuf::from(OsStr::from_bytes(&name)));
+        }
+        None
+    }
+
+    fn le16(bytes: &[u8]) -> u16 {
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    }
+
+    fn le32(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    fn le64(bytes: &[u8]) -> u64 {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&bytes[..8]);
+        u64::from_le_bytes(raw)
+    }
 
     struct Ruleset(OwnedFd);
 
@@ -348,11 +388,12 @@ mod imp {
 
         let mut binaries: Vec<PathBuf> = COMMANDS.iter().filter_map(|name| resolve(name)).collect();
         binaries.push(shell.to_path_buf());
-        binaries.extend(
-            LOADERS
-                .iter()
-                .filter_map(|path| std::fs::canonicalize(path).ok()),
-        );
+        let loaders: Vec<PathBuf> = binaries
+            .iter()
+            .filter_map(|binary| interpreter(binary))
+            .filter_map(|loader| std::fs::canonicalize(loader).ok())
+            .collect();
+        binaries.extend(loaders);
         binaries.sort();
         binaries.dedup();
         for binary in &binaries {
@@ -636,5 +677,30 @@ mod tests {
         assert!(shell("true", false).is_ok());
         assert!(shell("true", true).is_ok());
         cleanup();
+    }
+
+    /// The loader is read from the binary, so a distro that keeps it anywhere
+    /// (NixOS: `/nix/store`) still execs; the old fixed path list did not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interpreter_is_read_from_pt_interp() {
+        let exe = std::env::current_exe().unwrap();
+        let loader = imp::interpreter(&exe).expect("a dynamically linked test binary");
+        assert!(loader.is_file(), "{}", loader.display());
+        let plain = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert_eq!(imp::interpreter(&plain), None);
+    }
+
+    /// End to end: an allowlisted command runs under the explore ruleset. A
+    /// loader left out of the ruleset fails this with `EACCES`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explore_mode_runs_an_allowed_command() {
+        let Ok(mut cmd) = shell("ls /dev/null", true) else {
+            return;
+        };
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "ls refused: {stderr}");
     }
 }
