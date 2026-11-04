@@ -58,9 +58,10 @@ pub fn fetch(args: &Value, cancel: &Cancel) -> String {
     // `request` puts `prefix` in front of the path it is given; the target is
     // already whole, so the endpoint contributes nothing to it.
     ep.prefix.clear();
-    // Tests only: nothing offline can reach the fixture server without it, and
-    // nothing stops a user from setting it.
-    let local = std::env::var("NANO_FETCH_ALLOW_LOCAL").is_ok_and(|v| v == "1");
+    // The harness needs loopback; a release build must not let an environment
+    // variable turn the SSRF guard off, so the knob exists only in debug.
+    let local =
+        cfg!(debug_assertions) && std::env::var("NANO_FETCH_ALLOW_LOCAL").is_ok_and(|v| v == "1");
     if !local {
         if let Err(e) = guard_host(&ep.host) {
             return format!("error: fetch: {e}");
