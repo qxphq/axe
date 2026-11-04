@@ -11,18 +11,19 @@
 
 use std::io::{self, IsTerminal, Stdout, Write};
 
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
+use ratatui::buffer::Cell;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::{cursor, execute, terminal};
-use ratatui::layout::{Alignment, Position, Rect};
+use ratatui::layout::{Alignment, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::md;
 
@@ -69,7 +70,7 @@ pub enum Action {
 }
 
 pub struct Screen {
-    term: Terminal<CrosstermBackend<Stdout>>,
+    term: Terminal<Tail<Stdout>>,
     /// Plain text: the editor owns the color.
     prompt: String,
     /// Color of the prompt glyph, switched by explore mode.
@@ -104,9 +105,20 @@ impl Screen {
     /// terminal cannot be put into raw mode.
     pub fn new(prompt: &str) -> io::Result<Screen> {
         // No alternate screen: the transcript is the user's scrollback.
-        let term = ratatui::try_init_with_options(TerminalOptions {
-            viewport: Viewport::Inline(CHROME + 1),
-        })?;
+        // `try_init_with_options` hard-codes its backend, so what it does is
+        // done here: restore the terminal if this panics, then raw mode.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            ratatui::restore();
+            hook(info);
+        }));
+        terminal::enable_raw_mode()?;
+        let term = Terminal::with_options(
+            Tail(CrosstermBackend::new(io::stdout())),
+            TerminalOptions {
+                viewport: Viewport::Inline(CHROME + 1),
+            },
+        )?;
         // Shift+Enter is only distinguishable from Enter under the kitty
         // keyboard protocol; bracketed paste keeps a pasted block one buffer
         // instead of one submission per line. A terminal that knows neither
@@ -301,6 +313,28 @@ impl Screen {
         let height = rows.len() as u16;
         let _ = self.term.insert_before(height, |buf| {
             Paragraph::new(rows).render(inset(buf.area, margin), buf);
+            // The backend prints every cell it is handed, blank ones included,
+            // so a row padded to the screen width would leave trailing spaces
+            // in scrollback for a later, narrower terminal to reflow into rows
+            // of white space. An empty symbol instead marks where the row's
+            // text ends: `Tail` draws up to it and erases the rest, which also
+            // wipes whatever the row held before.
+            let width = buf.area.width.max(1) as usize;
+            for row in buf.content.chunks_mut(width) {
+                // Past the last cell that is not blank, and past the columns a
+                // wide glyph covers: the mark goes after the character, never
+                // inside it.
+                let mut end = 0;
+                for (at, cell) in row.iter().enumerate() {
+                    if cell.symbol() != " " {
+                        end = at + cell.symbol().width().max(1);
+                    }
+                }
+                let end = end.min(row.len());
+                for cell in &mut row[end..] {
+                    cell.set_symbol("");
+                }
+            }
         });
         let _ = self.draw();
     }
@@ -477,7 +511,7 @@ impl Screen {
         let mut tries = 0;
         let term = loop {
             match Terminal::with_options(
-                CrosstermBackend::new(io::stdout()),
+                Tail(CrosstermBackend::new(io::stdout())),
                 TerminalOptions {
                     viewport: Viewport::Inline(height),
                 },
@@ -880,4 +914,107 @@ pub fn cooked_line(prompt: &str) -> Option<String> {
 /// True when the screen can own the terminal.
 pub fn is_interactive() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+/// The terminal, with one rule added: a cell whose symbol is empty ends its
+/// row, and the rest of that row is erased instead of being filled with spaces.
+///
+/// Scrollback must not carry padding: a terminal narrowed later reflows every
+/// printed cell, and a row of trailing spaces becomes a row of white space.
+/// Erasing rather than writing also wipes what the row held before, which
+/// `Terminal::insert_before` counts on — it never clears the rows it draws
+/// into, because its buffer is not sparse. Only `Screen::write` empties cells,
+/// and only in the dense buffer of a transcript insert; the live region is
+/// repainted by diff, where a row that ends early must keep its right half.
+struct Tail<W: Write>(CrosstermBackend<W>);
+
+impl<W: Write> Write for Tail<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Write::flush(&mut self.0)
+    }
+}
+
+impl<W: Write> Backend for Tail<W> {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        let cells: Vec<(u16, u16, &Cell)> = content.collect();
+        let mut at = 0;
+        while at < cells.len() {
+            // One row of the buffer: the whole of it for an insert, only the
+            // cells that changed for a repaint.
+            let y = cells[at].1;
+            let rows = cells[at..].iter().take_while(|cell| cell.1 == y).count();
+            let row = &cells[at..at + rows];
+            at += rows;
+            // The cell behind a wide glyph is not drawn: the backend counts
+            // one column per cell, so printing it would move the rest of the
+            // row one to the right of where the buffer says it is.
+            let mut drawn = Vec::with_capacity(row.len());
+            let mut covered = 0;
+            let mut erase = None;
+            for cell in row {
+                if cell.0 < covered {
+                    continue;
+                }
+                if cell.2.symbol().is_empty() {
+                    erase = Some(cell.0);
+                    break;
+                }
+                drawn.push(*cell);
+                covered = cell.0 + cell.2.symbol().width().max(1) as u16;
+            }
+            self.0.draw(drawn.into_iter())?;
+            if let Some(x) = erase {
+                self.0.set_cursor_position(Position::new(x, y))?;
+                self.0.clear_region(ClearType::UntilNewLine)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.0.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.0.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        self.0.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        self.0.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.0.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        self.0.clear_region(clear_type)
+    }
+
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        self.0.append_lines(n)
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        self.0.size()
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        self.0.window_size()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Backend::flush(&mut self.0)
+    }
 }
