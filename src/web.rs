@@ -132,14 +132,17 @@ fn page_text(text: &str, args: &Value) -> String {
     let chars = chars.clamp(1, FETCH_CHARS);
     let head: String = text.chars().skip(start - 1).take(chars).collect();
     let shown = head.chars().count();
-    if start - 1 + shown < total {
+    let body = if start - 1 + shown < total {
         let next = start + shown;
         format!(
             "{head}\n...[truncated after {shown} of {total} characters; use start {next} to continue]..."
         )
     } else {
         head
-    }
+    };
+    // The model is told where this text came from; the header is a label, not
+    // a guarantee, and the page stays byte-for-byte as extracted.
+    format!("source: web (untrusted)\n{body}")
 }
 
 /// One search hit, already plain text: `sanitize` has run on every field.
@@ -186,7 +189,7 @@ pub fn web_search(args: &Value, cancel: &Cancel) -> String {
 }
 
 fn results(source: &str, hits: Vec<Hit>, count: usize) -> String {
-    let mut out = format!("source: {source}\n");
+    let mut out = format!("source: {source} (untrusted)\n");
     for (i, hit) in hits.into_iter().take(count).enumerate() {
         out.push_str(&format!("{}. {}\n   {}\n", i + 1, hit.title, hit.url));
         if !hit.snippet.is_empty() {
@@ -877,7 +880,7 @@ mod tests {
     #[test]
     fn page_text_pages_and_names_next_start() {
         let page = page_text("abcdefghij", &json!({ "chars": 4 }));
-        assert!(page.starts_with("abcd"), "{page}");
+        assert!(page.starts_with("source: web (untrusted)\nabcd"), "{page}");
         assert!(page.contains("start 5"), "{page}");
     }
 
@@ -927,7 +930,7 @@ mod tests {
             }],
             1,
         );
-        assert!(out.starts_with("source: brave"));
+        assert!(out.starts_with("source: brave (untrusted)"));
         assert!(out.contains("T"));
         assert!(out.contains("https://e/"));
         assert!(out.contains("S"));
