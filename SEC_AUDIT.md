@@ -231,6 +231,11 @@ On a multi-user machine, any local user can read full conversations, tool output
 - Set modes on rename or use `OpenOptions` for the temp file.
 - Document that sessions are plaintext and unencrypted.
 
+**Status at HEAD.** State and session directories are `0700`; meta, log, state,
+gzip and first-run config files are `0600`. The log and temporary sidecars are
+tightened when an older file is opened. README states that sessions are
+plaintext.
+
 ### SEC-06 — HTTP request target and headers are injectable (P1)
 
 **Evidence**
@@ -251,6 +256,10 @@ A URL containing CR/LF can inject headers or a second request on the same connec
 - `Host: host:port` for non-default ports; bracket IPv6 if supported.
 - Add tests for `\r`, `\n`, space, `#`, query-only URLs, and non-default ports.
 
+**Status at HEAD.** `split_url` rejects ASCII controls and spaces; header names
+and values are validated before connecting; `Host` carries a non-default port.
+Tests cover controls, spaces, header tokens/values and the port.
+
 ### SEC-07 — `NANO_FETCH_ALLOW_LOCAL` is a live release bypass (P1)
 
 **Evidence**
@@ -266,6 +275,9 @@ It permits loopback, private ranges, and `169.254.169.254`, not just the test fi
 
 - Gate with `cfg!(debug_assertions)` or a test-only feature; the harness uses a debug build.
 - Or allow only `127.0.0.1`/`::1`, and only when the URL host is exactly that.
+
+**Status at HEAD.** Honored only under `cfg!(debug_assertions)`; a release build
+ignores it. The harness builds the debug binary.
 
 ### SEC-08 — DNS rebinding in the host guard (P2)
 
@@ -299,6 +311,10 @@ and `Host` still use the hostname, and provider connections are unchanged.
 - One `strip_control` helper for banner/stderr/piped ANSI; strip ESC and C0/C1.
 - In `prompt_layout`, replace control chars with a space (or refuse them) and count one cell.
 - Honor `NO_COLOR` if coloring is not required.
+
+**Status at HEAD.** One `strip_control` covers ANSI span output, the banner,
+`!cmd`, session and model lines, and stderr; `prompt_layout` draws a control as
+one cell. `NO_COLOR` was not adopted — it is a preference, not a security fix.
 
 ### SEC-10 — Literal `api_key` contradicts AGENTS (P2)
 
