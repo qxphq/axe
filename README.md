@@ -222,3 +222,47 @@ search tokens stay in the parent's memory.
 Known residuals, in both modes: `connect` over AF_UNIX, writes through an
 inherited file descriptor, metadata such as `chmod` outside the scratch
 directory, and `fetch`/`web_search`, which run in nano's own process by design.
+
+## Trust and security
+
+nano runs as you. The trust boundary is the operating-system user: the model
+can reach the files, the environment and the credentials you can reach. A
+working directory is not trusted just because it is yours — a cloned
+repository, its `AGENTS.md`, a file, a fetched page or a command's output is
+data about the task, not authority over it. Source labels record provenance;
+they are not enforcement.
+
+Normal mode runs code as you. `bash` is a full shell, `write` and `edit` change
+files, and no approval prompt stands in between — a deliberate trade-off. A
+cloned repository's instructions, a file, or text you paste in can talk the
+model into running something. Use normal mode only in directories you trust.
+`bash` cannot open an internet socket in either mode, and `fetch` and
+`web_search` are refused here, so a tool call cannot reach the network except
+through the model provider.
+
+Explore mode bounds integrity, not secrecy. The kernel denies writes outside
+the session scratch directory, direct execution outside the allowlist, and
+internet sockets; on a kernel without Landlock, the startup line says when that
+is weaker. Reads are not confined: `read` and `bash` can read any file you can,
+and `fetch` and `web_search` can send any of it to any host. `!cmd` is your own
+shell — it bypasses explore mode's write confinement, and it is still
+network-denied. When confidentiality matters, use a container, a VM, or a
+dedicated user.
+
+Prompt injection cannot be sanitized away. `fetch` and `web_search` results
+start with `source: ... (untrusted)`, a project's instructions are wrapped in
+`<project_instructions path="...">`, and the first rule says such content is
+data. The web sanitizer removes terminal controls and chat-template tokens,
+not persuasion: content that can address the model can still steer it. The
+kernel sandbox, the provider, and the environment you choose are the real
+boundary.
+Reading the transcript shows what happened; it is not a boundary either.
+
+What the model reads enters the conversation and goes to the provider with the
+next request. Treat the provider as inside the trust boundary, along with
+anyone who can read the session files: plaintext JSONL, `0600`, unencrypted.
+
+Provider and search tokens are read from the environment at startup and stay in
+memory. Command children do not inherit them, and `read` refuses `/proc`
+environment files. A literal `api_key` in the config puts the secret in the
+config file instead; `api_key_env` is the safer setup.
