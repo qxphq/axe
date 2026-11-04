@@ -72,7 +72,7 @@ invariants a change must not break.
 - `ui.rs` — the screen: prompt buffer and key mapping, the live region (chrome plus
   the wrapped prompt, resized by `fit`), the chooser, and `insert` for transcript
   lines (wrapped here, since a clipped line would be lost).
-- `md.rs` — markdown: blocks, inlines, tables, entities, URL checks, and the
+- `markdown.rs` — markdown: blocks, inlines, tables, entities, URL checks, and the
   renderer. `Stream` feeds it a line at a time and lays a block out when it ends.
 - `api.rs` — model listing, chat request, SSE parsing, tool-call accumulation.
 - `http.rs` — URL parsing, HTTP/1.1 over `TcpStream`/rustls, body decoding

@@ -4,7 +4,7 @@
 mod api;
 mod config;
 mod http;
-mod md;
+mod markdown;
 mod sandbox;
 mod sessions;
 mod state;
@@ -1834,7 +1834,7 @@ trait Sink {
 #[derive(Default)]
 struct PlainSink {
     out: TextSink,
-    md: md::Stream,
+    md: markdown::Stream,
     /// The line being written: the stream ends wherever the provider felt
     /// like it, and a line is only a line once its newline arrives.
     partial: String,
@@ -1854,7 +1854,7 @@ impl PlainSink {
         }
         self.wrote_block = true;
         for line in &lines {
-            buf.push_str(&md::ansi(line));
+            buf.push_str(&markdown::ansi(line));
             buf.push('\n');
         }
         let mut done = String::new();

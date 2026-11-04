@@ -27,7 +27,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::md;
+use crate::markdown;
 
 /// Rows the live region occupies besides the prompt itself: a blank gap, the
 /// queue, an empty row under the prompt, the status and selection row, and a
@@ -184,10 +184,10 @@ pub struct Screen {
     last: Option<Block>,
     /// Markdown being collected. A block is laid out once it ends, not once
     /// per line: a table needs its whole header, a paragraph its last line.
-    md: md::Stream,
+    md: markdown::Stream,
     /// Reasoning, collected the same way. Its own stream: a thought's last
     /// paragraph must not run into the answer's first.
-    thought: md::Stream,
+    thought: markdown::Stream,
     /// A chooser above the prompt, when one is open.
     menu: Option<Menu>,
     restored: bool,
@@ -244,8 +244,8 @@ impl Screen {
             killed: String::new(),
             commands: Vec::new(),
             last: None,
-            md: md::Stream::new(),
-            thought: md::Stream::new(),
+            md: markdown::Stream::new(),
+            thought: markdown::Stream::new(),
             menu: None,
             restored: false,
         })
@@ -265,8 +265,8 @@ impl Screen {
             killed: String::new(),
             commands: Vec::new(),
             last: None,
-            md: md::Stream::new(),
-            thought: md::Stream::new(),
+            md: markdown::Stream::new(),
+            thought: markdown::Stream::new(),
             menu: None,
             restored: false,
         }
@@ -481,7 +481,7 @@ impl Screen {
     }
 
     fn echo(&mut self, line: &str) {
-        let mut lines = md::document(line, self.cols().saturating_sub(2));
+        let mut lines = markdown::document(line, self.cols().saturating_sub(2));
         if lines.is_empty() {
             lines.push(Line::default());
         }

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::http::{self, Cancel};
-use crate::md;
+use crate::markdown;
 
 /// Caps on a fetched page: bytes off the wire, characters the model sees, and
 /// wall time spent reading the body.
@@ -375,7 +375,7 @@ fn hex(b: u8) -> Option<u8> {
 /// The href of a DuckDuckGo result, with its `//duckduckgo.com/l/?uddg=...`
 /// redirect unwrapped. Ads and other DuckDuckGo-hosted links are not results.
 fn url_of(href: &str) -> Option<String> {
-    let href = md::decode_entities(href);
+    let href = markdown::decode_entities(href);
     let href = href.trim();
     let full = match href.strip_prefix("//") {
         Some(rest) => format!("https://{rest}"),
@@ -727,7 +727,7 @@ fn extract_text(html: &str) -> String {
             out.push('\n');
         }
     }
-    collapse(&md::decode_entities(&out))
+    collapse(&markdown::decode_entities(&out))
 }
 
 /// Index of the `>` that closes the tag open at `i`, skipping over quoted
