@@ -63,9 +63,15 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// `<state>/nano/projects/<key>/state.json`. Sessions join it as siblings.
+/// The directory that belongs to one working directory: its state file and
+/// its sessions. Sessions are siblings of `state.json`, under `sessions/`.
+pub fn project(cwd: &Path) -> PathBuf {
+    root().join("projects").join(key(cwd))
+}
+
+/// `<state>/nano/projects/<key>/state.json`.
 fn file(cwd: &Path) -> PathBuf {
-    root().join("projects").join(key(cwd)).join("state.json")
+    project(cwd).join("state.json")
 }
 
 /// Best-effort: a missing file is silent, a malformed one is a warning and a

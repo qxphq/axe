@@ -65,8 +65,27 @@ pub enum Action {
     Submit,
     /// Shift+Tab: the caller swaps modes. Nothing is submitted.
     Explore,
+    /// A session chooser is open and the selection moved.
+    MenuStep(isize),
+    /// Enter on an empty line with a chooser open.
+    MenuAccept,
+    /// Esc with a chooser open.
+    MenuCancel,
     /// End of input.
     Eof,
+}
+
+/// A chooser above the prompt: startup's recent sessions, and `/sessions`.
+/// The rows are already formatted; only the marker and the style are added
+/// here. When it closes it can leave its rows in the transcript, so the list
+/// survives and no blank rows are left where it was.
+struct Menu {
+    header: String,
+    rows: Vec<String>,
+    selected: usize,
+    scroll: usize,
+    /// Typing starts a new session instead of searching: startup's behaviour.
+    collapse_on_type: bool,
 }
 
 pub struct Screen {
@@ -97,6 +116,8 @@ pub struct Screen {
     /// Markdown being collected. A block is laid out once it ends, not once
     /// per line: a table needs its whole header, a paragraph its last line.
     md: md::Stream,
+    /// A chooser above the prompt, when one is open.
+    menu: Option<Menu>,
     restored: bool,
 }
 
@@ -141,6 +162,7 @@ impl Screen {
             commands: Vec::new(),
             last: None,
             md: md::Stream::new(),
+            menu: None,
             restored: false,
         })
     }
@@ -179,6 +201,82 @@ impl Screen {
         self.commands = commands.to_vec();
     }
 
+    /// Open a chooser. Rows are plain text; the marker is drawn on the
+    /// selected one.
+    pub fn set_menu(&mut self, header: &str, rows: Vec<String>, collapse_on_type: bool) {
+        if rows.is_empty() {
+            self.menu = None;
+            return;
+        }
+        self.menu = Some(Menu {
+            header: header.to_string(),
+            rows,
+            selected: 0,
+            scroll: 0,
+            collapse_on_type,
+        });
+    }
+
+    /// Close the chooser, optionally leaving its rows in the transcript. They
+    /// are committed without the selection marker: the choice is over.
+    pub fn clear_menu(&mut self, commit: bool) {
+        let Some(menu) = self.menu.take() else { return };
+        // Shrink to the prompt first, so committed rows land above a live
+        // region of its normal height rather than over the chooser's rows.
+        let _ = self.draw();
+        if commit && !menu.rows.is_empty() {
+            let lines: Vec<Line<'static>> = menu
+                .rows
+                .into_iter()
+                .map(|row| Line::styled(row, DIM))
+                .collect();
+            self.write(lines, Block::Text);
+        }
+    }
+
+    pub fn menu_selected(&self) -> usize {
+        self.menu.as_ref().map(|menu| menu.selected).unwrap_or(0)
+    }
+
+    pub fn menu_move(&mut self, delta: isize) {
+        let Some(menu) = &mut self.menu else { return };
+        let last = menu.rows.len().saturating_sub(1);
+        menu.selected = menu
+            .selected
+            .saturating_add_signed(delta)
+            .min(last);
+    }
+
+    /// Visible entries: whatever the prompt does not need, but at least one.
+    /// Zero when the screen is too short to hold a chooser at all: drawing one
+    /// there would put the status row outside the terminal.
+    fn menu_visible(&self, rows_n: u16, screen_h: u16) -> usize {
+        let Some(menu) = &self.menu else { return 0 };
+        let base = CHROME as usize + rows_n as usize;
+        if (screen_h as usize) < base + 3 {
+            return 0;
+        }
+        let room = (screen_h as usize)
+            .saturating_sub(base + 3)
+            .max(1);
+        menu.rows.len().min(room)
+    }
+
+    /// Keep the selected row inside the visible window.
+    fn menu_follow(&mut self, visible: usize) {
+        let Some(menu) = &mut self.menu else { return };
+        if visible == 0 {
+            return;
+        }
+        if menu.selected < menu.scroll {
+            menu.scroll = menu.selected;
+        }
+        if menu.selected >= menu.scroll + visible {
+            menu.scroll = menu.selected + 1 - visible;
+        }
+        menu.scroll = menu.scroll.min(menu.rows.len().saturating_sub(visible));
+    }
+
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
@@ -195,6 +293,14 @@ impl Screen {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
+            // A chooser owns the arrows and Esc while it is open. Enter on an
+            // empty line accepts it; Enter on a search query submits as usual.
+            KeyCode::Up if self.menu.is_some() => return Action::MenuStep(-1),
+            KeyCode::Down if self.menu.is_some() => return Action::MenuStep(1),
+            KeyCode::Esc if self.menu.is_some() => return Action::MenuCancel,
+            KeyCode::Enter if self.menu.is_some() && self.buf.is_empty() => {
+                return Action::MenuAccept
+            }
             // A new line, not a submission. Shift needs the kitty protocol;
             // Alt is the ESC-prefixed form every terminal sends.
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT)
@@ -246,7 +352,20 @@ impl Screen {
     /// What was typed is markdown, laid out here because it is complete.
     pub fn commit(&mut self) -> String {
         let line = self.take();
-        let mut lines = md::document(&line, self.cols().saturating_sub(2));
+        self.echo(&line);
+        self.status.clear();
+        line
+    }
+
+    /// A user line from somewhere else: the resumed transcript. It is complete
+    /// already, so the same layout as a committed line, without a buffer.
+    pub fn echo_user(&mut self, line: &str) {
+        self.flush();
+        self.echo(line);
+    }
+
+    fn echo(&mut self, line: &str) {
+        let mut lines = md::document(line, self.cols().saturating_sub(2));
         if lines.is_empty() {
             lines.push(Line::default());
         }
@@ -259,8 +378,6 @@ impl Screen {
             })
             .collect();
         self.write(rows, Block::User);
-        self.status.clear();
-        line
     }
 
     /// Append lines to the transcript, above the live region. A line longer
@@ -423,7 +540,24 @@ impl Screen {
             prompt_layout(gutter, &self.buf, self.cursor, cols, max_rows);
         let visible = &rows[first..];
         let rows_n = visible.len() as u16;
-        self.fit(CHROME + rows_n)?;
+        // The chooser takes what the prompt leaves, never the last row: the
+        // transcript keeps a place to be read even with 15 sessions on screen.
+        let slots = self.menu_visible(rows_n, size.height);
+        self.menu_follow(slots);
+        let menu = self.menu.as_ref().filter(|_| slots > 0).map(|menu| {
+            let start = menu.scroll;
+            (
+                menu.header.clone(),
+                menu.rows[start..start + slots].to_vec(),
+                menu.selected,
+                menu.scroll,
+            )
+        });
+        let menu_h = menu
+            .as_ref()
+            .map(|(_, entries, _, _)| entries.len() as u16 + 2)
+            .unwrap_or(0);
+        self.fit(CHROME + rows_n + menu_h)?;
         // Every row carries the glyph, so a wrapped line reads as one prompt.
         let prompt_rows: Text<'static> = visible
             .iter()
@@ -451,11 +585,30 @@ impl Screen {
                 height: 1,
                 ..area
             };
-            let below = 2 + rows_n + 1;
+            let top = 2 + menu_h;
+            let below = top + rows_n + 1;
+            if let Some((header, entries, selected, scroll)) = &menu {
+                frame.render_widget(
+                    Paragraph::new(Line::styled(clip(header, cols), DIM)),
+                    row(2),
+                );
+                for (at, entry) in entries.iter().enumerate() {
+                    let on = *selected == scroll + at;
+                    let marker = if on { "▸ " } else { "  " };
+                    let text = clip(entry, cols.saturating_sub(2));
+                    frame.render_widget(
+                        Paragraph::new(Line::styled(
+                            format!("{marker}{text}"),
+                            if on { PROMPT_STYLE } else { DIM },
+                        )),
+                        row(3 + at as u16),
+                    );
+                }
+            }
             frame.render_widget(
                 Paragraph::new(prompt_rows),
                 Rect {
-                    y: area.y + 2,
+                    y: area.y + top,
                     height: rows_n,
                     ..area
                 },
@@ -477,7 +630,7 @@ impl Screen {
             frame.render_widget(Paragraph::new(Line::styled(label, DIM)), row(1));
             frame.set_cursor_position(Position::new(
                 area.x + gutter as u16 + ccol,
-                area.y + 2 + crow,
+                area.y + top + crow,
             ));
         })
         .map(|_| ())
@@ -557,6 +710,16 @@ impl Screen {
     }
 
     fn insert_char(&mut self, c: char) {
+        // Typing at startup is the choice: the session begins fresh and the
+        // chooser leaves its list behind.
+        if self
+            .menu
+            .as_ref()
+            .map(|menu| menu.collapse_on_type)
+            .unwrap_or(false)
+        {
+            self.clear_menu(true);
+        }
         let at = self.offset(self.cursor);
         self.buf.insert(at, c);
         self.cursor += 1;
@@ -569,6 +732,14 @@ impl Screen {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if text.is_empty() {
             return;
+        }
+        if self
+            .menu
+            .as_ref()
+            .map(|menu| menu.collapse_on_type)
+            .unwrap_or(false)
+        {
+            self.clear_menu(true);
         }
         let at = self.offset(self.cursor);
         self.buf.insert_str(at, &text);

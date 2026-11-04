@@ -1,19 +1,21 @@
 # nano
 
 Minimal coding agent harness in Rust. One binary, a line REPL, OpenAI-compatible
-providers, six tools. Roughly 6.8k LOC across nine files.
+providers, six tools. Roughly 8.5k LOC across ten files.
 
 ## Principles
 
 1. **Dependencies are debt.** Prefer `std`. A crate must be strictly necessary and
    widely maintained. Current: `serde_json`, `rustls`, `webpki-roots`, `ratatui`
-   (with its `crossterm` backend), `unicode-width`. `rustls` because crypto is never
-   hand-rolled; `ratatui` because terminal geometry is the same class of problem —
-   the hand-rolled strip renderer produced a new whitespace bug per fix.
+   (with its `crossterm` backend), `unicode-width`, `flate2` (pure-Rust
+   `rust_backend`). `rustls` because crypto is never hand-rolled; `ratatui` because
+   terminal geometry is the same class of problem — the hand-rolled strip renderer
+   produced a new whitespace bug per fix; `flate2` because old session bodies are
+   gzipped and a compression format is never hand-rolled either.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
-   panes, sessions, compaction, subagents, MCP, or permission layer until the REPL
-   is genuinely insufficient. One feature per change.
-3. **Small surface.** Nine modules. A new module needs a reason.
+   panes, compaction, subagents, MCP, or permission layer until the REPL is
+   genuinely insufficient. One feature per change.
+3. **Small surface.** Ten modules. A new module needs a reason.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` + SSE
    only. Never add per-provider code paths; express differences as config
    (`base_url`, `models_url`, `api_key_env`, `session_header`).
@@ -28,8 +30,8 @@ providers, six tools. Roughly 6.8k LOC across nine files.
    re-read mid-session.
 6. **Stable prefix, append-only history.** System prompt and tool schemas first,
    volatile content last. Never inject timestamps, status, or cwd changes into the
-   prefix: it invalidates provider prompt caching. When sessions arrive: append-only
-   JSONL, replay on resume, compaction last.
+   prefix: it invalidates provider prompt caching. Sessions are append-only JSONL,
+   replayed on resume; compaction stays last.
 7. **Tools are dumb.** `read`, `write`, `edit`, `bash`, `fetch`, `web_search`. No
    `glob`, `grep`, or `list`; `bash` + `rg`/`fd` covers them. `fetch` and
    `web_search` because explore mode's shell allowlist has no `curl`, so that mode
@@ -48,7 +50,7 @@ providers, six tools. Roughly 6.8k LOC across nine files.
     through `api_key_env`. Never commit keys, never read another app's auth store.
     Nano never writes it: what the user picked is per-directory state, in
     `~/.local/state/nano/projects/<escaped cwd>/state.json` (respects
-    `XDG_STATE_HOME`), a sibling of the session files to come. Its `model` is the
+    `XDG_STATE_HOME`), alongside that directory's sessions. Its `model` is the
     default for a directory that has no state, so the config stays the answer to
     "when I do not say otherwise".
 11. **Verify against reality.** Test locally against `mock.py` (chunked SSE,
@@ -59,7 +61,11 @@ providers, six tools. Roughly 6.8k LOC across nine files.
     per wrapped prompt line, an empty row, status) inside a `Viewport::Inline`. It is
     five rows of chrome plus the prompt, capped at half the screen: growing it pushes
     transcript lines into scrollback, shrinking leaves their rows blank until the
-    next output fills them. Everything above it is appended, never repainted.
+    next output fills them. A session chooser (`/sessions`, the startup picker) may
+    also own one header row plus its entries, up to the screen minus the prompt and
+    one margin row; when it closes without resuming, its rows are committed to
+    scrollback, so the list survives and no blank rows are left. Everything above it
+    is appended, never repainted.
 13. **One writer.** Only `ui::Screen` touches the terminal. An event may mutate state
     and ask for output; nothing else prints. A stray `print!` is a rendering bug.
 14. **The prompt is a block.** Every line of the prompt carries its glyph (the live
@@ -79,12 +85,13 @@ providers, six tools. Roughly 6.8k LOC across nine files.
 
 ## Architecture
 
-- `main.rs` — REPL, provider setup, model picker, agent loop (unbounded, ends on no
-  tool calls). Two producers (keys, a turn) feed one `mpsc` channel; the main thread
+- `main.rs` — REPL, provider setup, model picker, session lifecycle (startup
+  chooser, `/sessions`, `/new`, naming), agent loop (unbounded, ends on no tool
+  calls). Two producers (keys, a turn) feed one `mpsc` channel; the main thread
   applies events and draws once per batch.
 - `ui.rs` — the screen: prompt buffer and key mapping, the live region (chrome plus
-  the wrapped prompt, resized by `fit`), and `insert` for transcript lines (wrapped
-  here, since a clipped line would be lost).
+  the wrapped prompt, resized by `fit`), the session chooser, and `insert` for
+  transcript lines (wrapped here, since a clipped line would be lost).
 - `md.rs` — markdown: a port of `md.ts` (blocks, inlines, tables, entities, URL
   checks), plus the renderer that turns its AST into transcript lines. `Stream`
   feeds it a line at a time and lays a block out when it ends.
@@ -93,7 +100,9 @@ providers, six tools. Roughly 6.8k LOC across nine files.
   (`Content-Length`, chunked, EOF).
 - `config.rs` — load and validate the config; resolve the `agents` file.
 - `state.rs` — the per-directory state file: the cwd key, load, and an atomic
-  write. Sessions join it later.
+  write. Its project directory also holds the sessions.
+- `sessions.rs` — one meta sidecar and one append-only JSONL body per session;
+  listing, full-text search, gzip for old bodies, and the UTC stamp.
 - `tools.rs` — tool registry, JSON schemas, generated prompt, execution, and
   `fetch`/`web_search`: the host guard, the HTML-to-text tokenizer, the sanitizer,
   and the Brave/DuckDuckGo result parsers.
@@ -117,6 +126,14 @@ being streamed stays raw in the status row.
 - Style comes from `Paint` in `main.rs`, rendered either as cells or as ANSI when
   there is no screen to draw on.
 - Tool names and descriptions are part of the prompt. Change them deliberately.
+- Sessions live in the project state directory: `<id>.json` is a mutable sidecar
+  (title, summary, dates, count, archived), `<id>.jsonl` is the append-only body of
+  API messages. Bodies older than `sessions::KEEP` are gzipped to `<id>.jsonl.gz`;
+  the sidecar stays readable, so listing and search work without unpacking, and a
+  resumed session is unpacked back to plain. The system prompt and mode notes are
+  never logged: resume rebuilds them from the current instructions and mode. A
+  title and summary are generated once, after the first answer; failing that, the
+  first request stands in.
 - `!cmd` at the prompt is the user's own shell: it runs through `tools::execute`
   and its output joins the history as a `user` message, so the next turn sees it.
   No turn follows, explore mode's write confinement does not apply — the user typed
@@ -148,7 +165,8 @@ cannot.
 
 `harness.py` is the loop. It starts `mock.py` in-process, writes a throwaway
 config, runs the binary in a tmux pty of a fixed size, sends the keystrokes and
-prints the final screen. Nothing is shared between runs.
+prints the final screen. Nothing is shared between runs; `--work DIR` makes one
+directory (and its state) survive, which is how resume is tested.
 
 ```sh
 ./harness.py                              # one turn: text:ok
@@ -156,6 +174,8 @@ prints the final screen. Nothing is shared between runs.
 ./harness.py --size 40x12 "blank:hi"
 ./harness.py "!a b c" "!C-u" "text:why"   # raw tmux keys, no Enter
 ./harness.py --keep "text:ok"             # keep the temp workdir
+./harness.py --work /tmp/nano-s "text:first"
+./harness.py --work /tmp/nano-s "!Down" "!Enter"   # resume the older one
 ```
 
 Each positional argument is a turn: typed, then Enter. One starting with `!` is

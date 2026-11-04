@@ -3,6 +3,7 @@ mod config;
 mod http;
 mod md;
 mod sandbox;
+mod sessions;
 mod state;
 mod ui;
 mod tools;
@@ -72,7 +73,7 @@ fn run() -> Result<(), String> {
         .map(|f| format!("Using project instructions from {}", f.display()));
 
     let mut providers = Vec::new();
-    let session = session_id();
+    let sid = session_id();
 
     for pc in &cfg.providers {
         let ep = http::parse_url(&pc.base_url).map_err(|e| format!("{}: {e}", pc.name))?;
@@ -86,7 +87,7 @@ fn run() -> Result<(), String> {
 
         let mut headers = Vec::new();
         if let Some(name) = &pc.session_header {
-            headers.push((name.clone(), session.clone()));
+            headers.push((name.clone(), sid.clone()));
         }
 
         let (models_ep, models_path) = match &pc.models_url {
@@ -171,6 +172,19 @@ fn run() -> Result<(), String> {
         mode_note(read_only),
     ];
 
+    // The directory's sessions: archive the old bodies before the listing so
+    // the markers match what a chooser will resume.
+    let mut startup = Vec::new();
+    if let Some(dir) = &cwd {
+        sessions::archive_old(dir, sessions::KEEP);
+        startup = sessions::list(dir);
+        startup.truncate(15);
+    }
+    let spec = format!("{}/{}", providers[provider].name, model);
+    let store = cwd
+        .as_deref()
+        .map(|dir| Store::fresh(sessions::dir(dir), &sid, &spec));
+
     let session = Session {
         state,
         providers,
@@ -180,6 +194,10 @@ fn run() -> Result<(), String> {
         read_only,
         used: None,
         messages,
+        sid,
+        store,
+        startup,
+        picks: Vec::new(),
     };
 
     if ui::is_interactive() {
@@ -187,6 +205,89 @@ fn run() -> Result<(), String> {
     } else {
         session.run_piped()
     }
+}
+
+/// The first request and the latest answer, short enough to name from. Naming
+/// waits for an assistant message: a session that only ran `!cmd` gets the
+/// fallback.
+fn naming_excerpt(messages: &[Value]) -> Option<(String, String)> {
+    if !messages
+        .iter()
+        .any(|message| message["role"].as_str() == Some("assistant"))
+    {
+        return None;
+    }
+    let user = messages
+        .iter()
+        .filter(|message| message["role"].as_str() == Some("user"))
+        .filter_map(|message| message["content"].as_str())
+        .find(|text| !text.starts_with("explore mode:") && !text.starts_with('$'))?;
+    let assistant = messages
+        .iter()
+        .filter(|message| message["role"].as_str() == Some("assistant"))
+        .filter_map(|message| message["content"].as_str())
+        .filter(|text| !text.trim().is_empty())
+        .last()
+        .unwrap_or("");
+    Some((
+        sessions::collapse(user, 1500),
+        sessions::collapse(assistant, 1500),
+    ))
+}
+
+/// One small completion, without tools. The session header stays: providers
+/// that require it would refuse the request otherwise.
+fn title_request(provider: &Provider, model: &str, user: &str, assistant: &str) -> Option<String> {
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "You name conversations. Reply with exactly two lines:\n\
+                        TITLE: a descriptive title of three to six words\n\
+                        SUMMARY: one sentence describing the task, under 25 words\n\
+                        No quotes, no markdown, no extra lines."
+        }),
+        json!({
+            "role": "user",
+            "content": format!("User: {user}\nAssistant: {assistant}"),
+        }),
+    ];
+    let extra = json!({ "max_tokens": 200, "temperature": 0.3 });
+    let cancel = http::Cancel::new();
+    api::stream_chat(
+        &provider.ep,
+        provider.key.as_deref(),
+        &provider.headers,
+        model,
+        &messages,
+        &json!([]),
+        Some(&extra),
+        &cancel,
+        |_| {},
+        |_| {},
+    )
+    .ok()
+    .map(|reply| reply.text)
+}
+
+/// The two lines the naming prompt asks for. Anything else falls back.
+fn parse_naming(text: &str) -> Option<(String, String)> {
+    let mut title = None;
+    let mut summary = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.trim().split_once(':') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').trim();
+        if value.is_empty() {
+            continue;
+        }
+        if key.trim().eq_ignore_ascii_case("title") {
+            title = Some(value.to_string());
+        } else if key.trim().eq_ignore_ascii_case("summary") {
+            summary = Some(value.to_string());
+        }
+    }
+    title.map(|title| (title, summary.unwrap_or_default()))
 }
 
 /// The note that tells the model which mode it is in. A `user` message, the
@@ -219,7 +320,154 @@ struct Session {
     /// reports one: the fill is then estimated from the history.
     used: Option<u64>,
     messages: Vec<Value>,
+    /// The session id: also the provider's `session_header` value.
+    sid: String,
+    /// The append-only body and its sidecar, when there is a working directory
+    /// to keep them in.
+    store: Option<Store>,
+    /// The directory's recent sessions, newest first, for the startup chooser.
+    startup: Vec<sessions::Meta>,
+    /// The ids a piped `/sessions` listing numbered, for `/sessions N`.
+    picks: Vec<String>,
 }
+
+/// The session on disk. `meta` is loaded with the first message or on resume,
+/// so an idle launch leaves no file behind.
+struct Store {
+    dir: std::path::PathBuf,
+    id: String,
+    model: String,
+    log: Option<sessions::Log>,
+    meta: Option<sessions::Meta>,
+    naming_tried: bool,
+    warned: bool,
+}
+
+impl Store {
+    fn fresh(dir: std::path::PathBuf, id: &str, model: &str) -> Store {
+        Store {
+            dir,
+            id: id.to_string(),
+            model: model.to_string(),
+            log: None,
+            meta: None,
+            naming_tried: false,
+            warned: false,
+        }
+    }
+
+    fn resumed(dir: std::path::PathBuf, meta: sessions::Meta, model: &str) -> Result<Store, String> {
+        let log = sessions::Log::open(&dir, &meta.id)?;
+        Ok(Store {
+            dir,
+            id: meta.id.clone(),
+            model: model.to_string(),
+            log: Some(log),
+            meta: Some(meta),
+            naming_tried: false,
+            warned: false,
+        })
+    }
+
+    /// A write failure is reported once and the session goes on: a session log
+    /// must never fail a turn.
+    fn record(&mut self, message: &Value) {
+        if let Err(e) = self.try_record(message) {
+            if !self.warned {
+                self.warned = true;
+                eprintln!("nano: session: {e}");
+            }
+        }
+    }
+
+    fn try_record(&mut self, message: &Value) -> Result<(), String> {
+        if self.log.is_none() {
+            self.log = Some(sessions::Log::open(&self.dir, &self.id)?);
+        }
+        if self.meta.is_none() {
+            let mut meta = sessions::Meta::new(&self.id, &self.model);
+            if let Some(summary) = user_summary(message) {
+                meta.summary = summary;
+            }
+            self.meta = Some(meta);
+        }
+        let meta = self.meta.as_mut().expect("just created");
+        self.log.as_mut().expect("just opened").append(message)?;
+        meta.messages += 1;
+        meta.updated = sessions::now();
+        if meta.summary.is_empty() {
+            if let Some(summary) = user_summary(message) {
+                meta.summary = summary;
+            }
+        }
+        meta.save(&self.dir)
+    }
+
+    fn set_title(&mut self, title: &str, summary: &str) {
+        let Some(meta) = self.meta.as_mut() else { return };
+        meta.title = sessions::collapse(title, 60);
+        if !summary.trim().is_empty() {
+            meta.summary = sessions::collapse(summary, 240);
+        }
+        if let Err(e) = meta.save(&self.dir) {
+            eprintln!("nano: session meta: {e}");
+        }
+    }
+
+    /// A title no model gave: the first request stands in. Called when the
+    /// session ends without one.
+    fn finalize(&mut self, messages: &[Value]) {
+        let Some(meta) = self.meta.as_mut() else { return };
+        if meta.title.is_empty() {
+            let (title, summary) = sessions::fallback(messages);
+            if !title.is_empty() {
+                meta.title = title;
+                if meta.summary.is_empty() {
+                    meta.summary = summary;
+                }
+            }
+        }
+        if let Err(e) = meta.save(&self.dir) {
+            eprintln!("nano: session meta: {e}");
+        }
+    }
+}
+
+fn user_summary(message: &Value) -> Option<String> {
+    if message["role"].as_str() != Some("user") {
+        return None;
+    }
+    let text = message["content"].as_str()?;
+    if text.starts_with("explore mode:") {
+        return None;
+    }
+    Some(sessions::collapse(text, 240))
+}
+
+fn session_title(meta: &sessions::Meta) -> String {
+    if !meta.title.is_empty() {
+        meta.title.clone()
+    } else if !meta.summary.is_empty() {
+        sessions::collapse(&meta.summary, 60)
+    } else {
+        "(untitled)".to_string()
+    }
+}
+
+/// One listing row: date, title, size, and whether the body is still packed.
+fn session_row(meta: &sessions::Meta) -> String {
+    let mut row = format!(
+        "{}  {}  ·  {} msgs",
+        sessions::stamp(meta.updated),
+        session_title(meta),
+        meta.messages
+    );
+    if meta.archived {
+        row.push_str("  ·  zip");
+    }
+    row
+}
+
 
 /// What a submitted line asks for.
 enum Cmd {
@@ -238,6 +486,10 @@ enum Input {
     Line(String),
     /// Shift+Tab: explore mode, handled without touching the history.
     Explore,
+    /// Enter on a chooser: the selected row.
+    Menu(usize),
+    /// Esc on a chooser.
+    Cancel,
 }
 
 /// Slash commands, for Tab completion in the prompt. Only the name is
@@ -248,7 +500,9 @@ const COMMANDS: &[&str] = &[
     "/help",
     "/model",
     "/models",
+    "/new",
     "/quit",
+    "/sessions",
     "/thinking",
     "/thoughts",
 ];
@@ -262,6 +516,16 @@ impl Session {
         screen.set_explore(self.read_only);
         screen.set_commands(COMMANDS);
         screen.set_info(&self.info());
+        // The directory's recent sessions are a chooser, not a printout: the
+        // list can be walked with the arrows and vanishes when typing starts.
+        if !self.startup.is_empty() {
+            let rows = self.startup.iter().map(session_row).collect();
+            screen.set_menu(
+                "Resume a session (↑↓ · Enter), or type to start a new one",
+                rows,
+                true,
+            );
+        }
         let (tx, rx) = mpsc::channel();
         spawn_input(tx.clone());
 
@@ -276,6 +540,21 @@ impl Session {
                     Some(Input::Line(line)) => line,
                     Some(Input::Explore) => {
                         self.toggle_explore(&mut screen);
+                        continue;
+                    }
+                    Some(Input::Menu(index)) => {
+                        let Some(meta) = self.startup.get(index).cloned() else {
+                            continue;
+                        };
+                        screen.clear_menu(false);
+                        self.startup.clear();
+                        if let Err(e) = self.resume(&meta.id, Some(&mut screen)) {
+                            screen.error(&format!("nano: {e}\n"));
+                        }
+                        continue;
+                    }
+                    Some(Input::Cancel) => {
+                        self.startup.clear();
                         continue;
                     }
                     None => break,
@@ -310,10 +589,11 @@ impl Session {
                 Cmd::Turn(input) => {
                     let mut sink = PlainSink::default();
                     let cancel = http::Cancel::new();
-                    self.messages.push(json!({ "role": "user", "content": input }));
+                    self.record(json!({ "role": "user", "content": input }));
                     if let Err(e) = self.turn(&mut sink, &cancel) {
                         eprintln!("nano: {e}");
                     }
+                    self.name_session();
                 }
                 Cmd::Shell(command) => {
                     println!("{}", plain_text(&shell_line(&command, false)));
@@ -322,7 +602,338 @@ impl Session {
                 }
             }
         }
+        self.finalize_session();
         Ok(())
+    }
+
+    /// Persist a message and add it to the history. Mode notes stay out: the
+    /// mode is state, and resume writes the current one.
+    fn record(&mut self, message: Value) {
+        if let Some(store) = self.store.as_mut() {
+            store.record(&message);
+        }
+        self.messages.push(message);
+    }
+
+    fn spec(&self) -> String {
+        format!("{}/{}", self.providers[self.provider].name, self.model)
+    }
+
+    fn finalize_session(&mut self) {
+        if let Some(store) = self.store.as_mut() {
+            store.finalize(&self.messages);
+        }
+    }
+
+    /// The provider's affinity token follows the conversation. A resumed
+    /// session must keep its own, or the provider starts a cold one.
+    fn set_session_header(&mut self) {
+        let sid = self.sid.clone();
+        for provider in &mut self.providers {
+            let Some(name) = provider.cfg.session_header.clone() else {
+                continue;
+            };
+            let mut found = false;
+            for (key, value) in &mut provider.headers {
+                if *key == name {
+                    *value = sid.clone();
+                    found = true;
+                }
+            }
+            if !found {
+                provider.headers.push((name, sid.clone()));
+            }
+        }
+    }
+
+    /// Load a stored session into this one. The current system prompt stays:
+    /// instructions are current, history is history.
+    fn resume(&mut self, id: &str, screen: Option<&mut ui::Screen>) -> Result<String, String> {
+        let dir = self
+            .store
+            .as_ref()
+            .map(|store| store.dir.clone())
+            .ok_or_else(|| "no working directory to keep sessions in".to_string())?;
+        let mut meta = sessions::Meta::load(&dir, id)?;
+        let messages = sessions::load_messages(&dir, &mut meta)?;
+        // Selecting a session is activity: it moves to the top of the listing
+        // and is not re-archived on the next start. A read-only state directory
+        // must not make the history unreadable.
+        meta.updated = sessions::now();
+        if let Err(e) = meta.save(&dir) {
+            eprintln!("nano: session meta: {e}");
+        }
+        let title = session_title(&meta);
+        let model = self.spec();
+        let store = Store::resumed(dir, meta, &model)?;
+
+        let system = self.messages.first().cloned().unwrap_or_else(|| {
+            json!({ "role": "system", "content": tools::system_prompt() })
+        });
+        self.messages = vec![system, mode_note(self.read_only)];
+        self.messages.extend(messages);
+        self.sid = id.to_string();
+        self.store = Some(store);
+        self.used = None;
+        self.set_session_header();
+
+        if let Some(screen) = screen {
+            screen.output(&format!("Resumed: {title}\n"));
+            self.replay(screen);
+            screen.set_info(&self.info());
+        }
+        Ok(title)
+    }
+
+    /// Put the loaded conversation back on screen. Only the tail is drawn: the
+    /// model has all of it, and a long session must not bury the prompt in
+    /// scrollback. Tool calls carry their recorded outcome.
+    fn replay(&self, screen: &mut ui::Screen) {
+        let history = &self.messages[2..];
+        let mut results: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for message in history {
+            if message["role"].as_str() != Some("tool") {
+                continue;
+            }
+            if let (Some(id), Some(content)) = (
+                message["tool_call_id"].as_str(),
+                message["content"].as_str(),
+            ) {
+                results.insert(id, content);
+            }
+        }
+
+        let start = history.len().saturating_sub(100);
+        if start > 0 {
+            screen.output(&format!("… {start} earlier messages\n"));
+        }
+        for message in &history[start..] {
+            match message["role"].as_str() {
+                Some("user") => {
+                    if let Some(text) = message["content"].as_str() {
+                        screen.echo_user(text);
+                    }
+                }
+                Some("assistant") => {
+                    if self.state.thoughts {
+                        if let Some(text) = message["reasoning_content"].as_str() {
+                            screen.thought(text);
+                        }
+                    }
+                    if let Some(text) = message["content"].as_str() {
+                        if !text.trim().is_empty() {
+                            screen.text(text);
+                            screen.flush();
+                        }
+                    }
+                    let Some(calls) = message["tool_calls"].as_array() else {
+                        continue;
+                    };
+                    for call in calls {
+                        let call = api::ToolCall {
+                            id: call["id"].as_str().unwrap_or("").to_string(),
+                            name: call["function"]["name"].as_str().unwrap_or("").to_string(),
+                            arguments: call["function"]["arguments"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                        };
+                        let result = results.get(call.id.as_str()).copied().unwrap_or("");
+                        let mut spans = call_line(&call, self.read_only);
+                        spans.push((Paint::Plain, " ".to_string()));
+                        let (paint, glyph) = mark(result);
+                        spans.push((paint, glyph.to_string()));
+                        screen.insert(vec![line_of(&spans)], ui::Block::Tool);
+                        if failed(result) {
+                            screen.fail(&detail(result));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        screen.set_status("");
+    }
+
+    /// `/new`: finalize what is open, then start with a clean history. The id
+    /// and the provider token change together.
+    fn new_session(&mut self, screen: Option<&mut ui::Screen>) {
+        self.finalize_session();
+        let sid = session_id();
+        let model = self.spec();
+        let dir = self.store.as_ref().map(|store| store.dir.clone());
+        if let Some(dir) = dir {
+            self.store = Some(Store::fresh(dir, &sid, &model));
+        }
+        let system = self.messages.first().cloned().unwrap_or_else(|| {
+            json!({ "role": "system", "content": tools::system_prompt() })
+        });
+        self.messages = vec![system, mode_note(self.read_only)];
+        self.sid = sid;
+        self.used = None;
+        self.set_session_header();
+        if let Some(screen) = screen {
+            screen.clear_menu(false);
+            screen.output("New session\n");
+            screen.set_info(&self.info());
+        }
+    }
+
+    /// A generated title is attempted once, after the first answer exists.
+    fn may_name(&self) -> bool {
+        let Some(store) = &self.store else { return false };
+        let Some(meta) = &store.meta else { return false };
+        meta.title.is_empty() && !store.naming_tried && naming_excerpt(&self.messages).is_some()
+    }
+
+    fn name_session(&mut self) {
+        if !self.may_name() {
+            return;
+        }
+        let Some((user, assistant)) = naming_excerpt(&self.messages) else {
+            return;
+        };
+        if let Some(store) = self.store.as_mut() {
+            store.naming_tried = true;
+        }
+        let model = self.model.clone();
+        let provider = &self.providers[self.provider];
+        let named = title_request(provider, &model, &user, &assistant)
+            .as_deref()
+            .and_then(parse_naming);
+        let (title, summary) = named.unwrap_or_else(|| sessions::fallback(&self.messages));
+        if title.is_empty() {
+            return;
+        }
+        if let Some(store) = self.store.as_mut() {
+            store.set_title(&title, &summary);
+        }
+    }
+
+    /// `/sessions`: a chooser over this directory's sessions. Typing becomes a
+    /// search, Enter on an empty line resumes the selected row, Esc closes.
+    fn browse_sessions(&mut self, screen: &mut ui::Screen, rx: &Receiver<Event>, query: &str) {
+        if self.state.cwd.as_os_str().is_empty() {
+            screen.output("sessions need a working directory\n");
+            return;
+        }
+        let metas = sessions::list(&self.state.cwd);
+        if metas.is_empty() {
+            screen.output("No sessions in this directory.\n");
+            return;
+        }
+        let mut query = query.trim().to_string();
+        loop {
+            let found: Vec<(usize, String)> = if query.is_empty() {
+                (0..metas.len()).map(|index| (index, String::new())).collect()
+            } else {
+                sessions::search(&self.state.cwd, &metas, &query)
+                    .into_iter()
+                    .map(|hit| (hit.index, hit.snippet))
+                    .collect()
+            };
+            if found.is_empty() {
+                screen.output(&format!("No sessions match {query:?}\n"));
+                query.clear();
+                continue;
+            }
+            let mut ids = Vec::new();
+            let mut rows = Vec::new();
+            for (index, snippet) in &found {
+                let meta = &metas[*index];
+                ids.push(meta.id.clone());
+                let mut row = session_row(meta);
+                if !snippet.is_empty() {
+                    row.push_str("  ·  ");
+                    row.push_str(snippet);
+                }
+                rows.push(row);
+            }
+            let header = if query.is_empty() {
+                "Sessions (↑↓ · Enter; type to search; Esc to close)".to_string()
+            } else {
+                format!("Sessions matching {query:?} (↑↓ · Enter; type to refine; Esc)")
+            };
+            screen.set_menu(&header, rows, false);
+            match readline(screen, rx) {
+                Some(Input::Menu(index)) => {
+                    let Some(id) = ids.get(index).cloned() else {
+                        continue;
+                    };
+                    screen.clear_menu(false);
+                    match self.resume(&id, Some(screen)) {
+                        Ok(_) => return,
+                        Err(e) => {
+                            screen.error(&format!("nano: {e}\n"));
+                            return;
+                        }
+                    }
+                }
+                Some(Input::Cancel) | None => {
+                    screen.clear_menu(true);
+                    return;
+                }
+                Some(Input::Line(line)) => {
+                    query = line.trim().to_string();
+                }
+                Some(Input::Explore) => continue,
+            }
+        }
+    }
+
+    /// The no-tty form: a numbered list, and a number to resume. A search
+    /// replaces the list, so the numbers always refer to what was last shown.
+    fn list_piped(&mut self, arg: &str) {
+        if self.state.cwd.as_os_str().is_empty() {
+            eprintln!("nano: sessions need a working directory");
+            return;
+        }
+        if let Ok(number) = arg.parse::<usize>() {
+            let Some(id) = number
+                .checked_sub(1)
+                .and_then(|at| self.picks.get(at))
+                .cloned()
+            else {
+                eprintln!("nano: no session #{number}; run /sessions first");
+                return;
+            };
+            match self.resume(&id, None) {
+                Ok(title) => println!("Resumed: {title}"),
+                Err(e) => eprintln!("nano: {e}"),
+            }
+            return;
+        }
+
+        let all = sessions::list(&self.state.cwd);
+        if all.is_empty() {
+            println!("no sessions");
+            self.picks.clear();
+            return;
+        }
+        let selected: Vec<(sessions::Meta, String)> = if arg.trim().is_empty() {
+            all.into_iter()
+                .map(|meta| (meta, String::new()))
+                .collect()
+        } else {
+            sessions::search(&self.state.cwd, &all, arg)
+                .into_iter()
+                .map(|hit| (all[hit.index].clone(), hit.snippet))
+                .collect()
+        };
+        if selected.is_empty() {
+            println!("no sessions match {:?}", arg.trim());
+            self.picks.clear();
+            return;
+        }
+        self.picks = selected.iter().map(|(meta, _)| meta.id.clone()).collect();
+        for (at, (meta, snippet)) in selected.iter().enumerate() {
+            let mut row = session_row(meta);
+            if !snippet.is_empty() {
+                row.push_str("  ·  ");
+                row.push_str(snippet);
+            }
+            println!("{:>2}) {row}", at + 1);
+        }
     }
 
     /// The live region's last row: what this session is pointed at, how much of
@@ -400,7 +1011,7 @@ impl Session {
             &cancel,
             false,
         );
-        self.messages.push(json!({
+        self.record(json!({
             "role": "user",
             "content": format!("$ {command}\n{result}"),
         }));
@@ -415,7 +1026,7 @@ impl Session {
         rx: &Receiver<Event>,
         screen: &mut ui::Screen,
     ) -> Result<Option<String>, String> {
-        self.messages.push(json!({ "role": "user", "content": input }));
+        self.record(json!({ "role": "user", "content": input }));
 
         let cancel = http::Cancel::new();
         let mut queued: Option<String> = None;
@@ -434,6 +1045,7 @@ impl Session {
         // the scope ends.
         let mut used: Option<u64> = None;
         let messages = &mut self.messages;
+        let store = self.store.as_mut();
         let provider = &self.providers[self.provider];
         let model = self.model.clone();
         let thinking = self.thinking.clone();
@@ -454,6 +1066,7 @@ impl Session {
                     provider,
                     &model,
                     messages,
+                    store,
                     thinking.as_deref(),
                     read_only,
                     &mut sink,
@@ -502,6 +1115,10 @@ impl Session {
                             // The turn already captured its tool set; a mode
                             // switch takes effect on the next one.
                             ui::Action::Explore => {}
+                            // A chooser only exists while idle.
+                            ui::Action::MenuStep(_)
+                            | ui::Action::MenuAccept
+                            | ui::Action::MenuCancel => {}
                             ui::Action::None => dirty = true,
                         },
                         Event::Paste(text) => {
@@ -606,6 +1223,19 @@ impl Session {
         self.used = used;
         screen.set_info(&self.info());
 
+        // One small request names the session, once. It is made after the
+        // turn so the answer never waits for it.
+        let naming = self.may_name();
+        if naming {
+            screen.set_status("Naming…");
+            let _ = screen.draw();
+        }
+        self.name_session();
+        if naming {
+            screen.set_status("");
+            let _ = screen.draw();
+        }
+
         if !result {
             screen.error("nano: turn failed\n");
         }
@@ -620,6 +1250,7 @@ impl Session {
             provider,
             &model,
             &mut self.messages,
+            self.store.as_mut(),
             thinking.as_deref(),
             self.read_only,
             sink,
@@ -640,8 +1271,6 @@ impl Session {
         if input.is_empty() {
             return Cmd::Continue;
         }
-        let providers = &self.providers;
-        let (provider, model) = (self.provider, &self.model);
 
         match input {
             "/exit" | "/quit" => return Cmd::Exit,
@@ -651,19 +1280,31 @@ impl Session {
                      /models        list models\n\
                      /thinking [l]  show or set thinking level (off, low, medium, high)\n\
                      /thoughts      show or hide the model's reasoning\n\
+                     /sessions [q]  list, search and resume sessions\n\
+                     /new           start a new session\n\
                      /explore       toggle explore mode (read-only shell)\n\
                      !cmd           run a shell command; its output joins the context\n\
                      /exit          quit\n",
                 );
                 return Cmd::Continue;
             }
+            "/new" => {
+                self.new_session(Some(screen));
+                return Cmd::Continue;
+            }
+            "/sessions" => {
+                self.browse_sessions(screen, rx, "");
+                return Cmd::Continue;
+            }
             "/models" => {
-                let text = models(&providers);
+                let text = models(&self.providers);
                 screen.output(&text);
                 return Cmd::Continue;
             }
             "/model" => {
-                if let Some((pi, id)) = pick(providers, (provider, model), screen, rx) {
+                if let Some((pi, id)) =
+                    pick(&self.providers, (self.provider, &self.model), screen, rx)
+                {
                     self.provider = pi;
                     self.model = id;
                     // The count belonged to the old model's window.
@@ -671,7 +1312,7 @@ impl Session {
                     let text = self.info();
                     screen.set_info(&text);
                     screen.output(&format!("{text}\n"));
-                    let spec = format!("{}/{}", providers[self.provider].name, self.model);
+                    let spec = format!("{}/{}", self.providers[self.provider].name, self.model);
                     self.state.set_model(&spec);
                     self.state.save();
                 }
@@ -679,6 +1320,8 @@ impl Session {
             }
             _ => {}
         }
+
+        let providers = &self.providers;
 
         if input == "/thinking" || input.starts_with("/thinking ") {
             let rest = input.strip_prefix("/thinking").unwrap_or("").trim();
@@ -742,6 +1385,11 @@ impl Session {
             return Cmd::Continue;
         }
 
+        if let Some(rest) = input.strip_prefix("/sessions ") {
+            self.browse_sessions(screen, rx, rest);
+            return Cmd::Continue;
+        }
+
         if input.starts_with('/') {
             screen.error(&format!("unknown command: {input}\n"));
             return Cmd::Continue;
@@ -759,6 +1407,22 @@ impl Session {
 /// on stderr, no picker.
 fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
     let input = line.trim();
+    match input {
+        "/new" => {
+            session.new_session(None);
+            println!("New session");
+            return Cmd::Continue;
+        }
+        "/sessions" => {
+            session.list_piped("");
+            return Cmd::Continue;
+        }
+        _ => {}
+    }
+    if let Some(rest) = input.strip_prefix("/sessions ") {
+        session.list_piped(rest.trim());
+        return Cmd::Continue;
+    }
     let providers = &session.providers;
     match input {
         "/exit" | "/quit" => return Cmd::Exit,
@@ -768,6 +1432,8 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
                  /models        list models\n\
                  /thinking [l]  show or set thinking level (off, low, medium, high)\n\
                  /thoughts      show or hide the model's reasoning\n\
+                 /sessions [q]  list, search and resume sessions\n\
+                 /new           start a new session\n\
                  /explore       toggle explore mode (read-only shell)\n\
                  !cmd           run a shell command; its output joins the context\n\
                  /exit          quit"
@@ -920,11 +1586,23 @@ fn readline(screen: &mut ui::Screen, rx: &Receiver<Event>) -> Option<Input> {
     loop {
         match rx.recv() {
             Ok(Event::Key(key)) => match screen.apply_key(key) {
-                // Enter on an empty line commits nothing: a bare prompt in the
-                // transcript is noise, and an empty line is not input.
                 ui::Action::Submit if screen.is_empty() => {}
                 ui::Action::Submit => return Some(Input::Line(screen.commit())),
                 ui::Action::Explore => return Some(Input::Explore),
+                ui::Action::MenuStep(delta) => {
+                    screen.menu_move(delta);
+                    let _ = screen.draw();
+                }
+                ui::Action::MenuAccept => return Some(Input::Menu(screen.menu_selected())),
+                ui::Action::MenuCancel => {
+                    // The list stays in the transcript: a chooser that closes
+                    // must not leave blank rows where it was.
+                    screen.clear_menu(true);
+                    let _ = screen.draw();
+                    return Some(Input::Cancel);
+                }
+                // Enter on an empty line commits nothing: a bare prompt in the
+                // transcript is noise, and an empty line is not input.
                 ui::Action::Eof => return None,
                 ui::Action::None => {
                     let _ = screen.draw();
@@ -1393,6 +2071,8 @@ fn pick(
         match readline(screen, rx) {
             Some(Input::Line(line)) => break line,
             Some(Input::Explore) => continue,
+            // There is no chooser here; a menu key cannot arrive.
+            Some(Input::Menu(_)) | Some(Input::Cancel) => continue,
             None => break String::new(),
         }
     };
@@ -1425,6 +2105,7 @@ fn run_turn(
     provider: &Provider,
     model: &str,
     messages: &mut Vec<Value>,
+    mut store: Option<&mut Store>,
     thinking: Option<&str>,
     read_only: bool,
     sink: &mut dyn Sink,
@@ -1482,7 +2163,11 @@ fn run_turn(
         }
 
         if reply.calls.is_empty() {
-            messages.push(assistant_message(&reply));
+            let message = assistant_message(&reply);
+            if let Some(store) = store.as_deref_mut() {
+                store.record(&message);
+            }
+            messages.push(message);
             return Ok(used);
         }
 
@@ -1502,6 +2187,9 @@ fn run_turn(
             .collect();
         let mut message = assistant_message(&reply);
         message["tool_calls"] = json!(calls);
+        if let Some(store) = store.as_deref_mut() {
+            store.record(&message);
+        }
         messages.push(message);
 
         for call in &reply.calls {
@@ -1515,11 +2203,15 @@ fn run_turn(
             let result = tools::execute(&call.name, &call.arguments, cancel, read_only);
             let error = failed(&result).then(|| detail(&result));
             sink.echo(&echo, mark(&result), error.as_deref());
-            messages.push(json!({
+            let message = json!({
                 "role": "tool",
                 "tool_call_id": call.id,
                 "content": result,
-            }));
+            });
+            if let Some(store) = store.as_deref_mut() {
+                store.record(&message);
+            }
+            messages.push(message);
             if cancel.cancelled() {
                 return Ok(used);
             }

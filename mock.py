@@ -17,6 +17,11 @@ The reply is chosen by the last user message:
   show:           stream the last tool result back, so a test can read it
   reason:...      reasoning deltas first, then the text after `|`
   empty:          no content at all, no calls
+  plain:...       stream the rest verbatim (used for generated titles)
+
+A request whose system prompt starts with "You name conversations" is a title
+request: the mock answers `plain:TITLE: ...\nSUMMARY: ...` regardless of the
+last user message.
 
 Usage: mock.py [port]
 """
@@ -161,10 +166,18 @@ class Handler(BaseHTTPRequestHandler):
             if message.get("role") == "tool":
                 LAST_TOOL = message.get("content") or ""
         reply = "text:ok"
-        for message in reversed(request.get("messages", [])):
-            if message.get("role") == "user":
-                reply = message.get("content") or reply
+        system = ""
+        for message in request.get("messages", []):
+            if message.get("role") == "system":
+                system = message.get("content") or ""
                 break
+        if system.startswith("You name conversations"):
+            reply = "plain:TITLE: Mock session title\nSUMMARY: A mock conversation about session replay."
+        else:
+            for message in reversed(request.get("messages", [])):
+                if message.get("role") == "user":
+                    reply = message.get("content") or reply
+                    break
 
         # Chunked, like a real provider: the client must decode framing.
         self.send_response(200)

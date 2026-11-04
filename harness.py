@@ -265,6 +265,8 @@ def main():
     ap.add_argument("--ansi", action="store_true", help="keep colors")
     ap.add_argument("--keep", action="store_true",
                     help="keep the temp workdir")
+    ap.add_argument("--work", metavar="DIR",
+                    help="reuse DIR as cwd and state home (implies --keep)")
     ap.add_argument("--no-fetch-local", action="store_true",
                     help="do not allow fetch to reach the fixture server")
     args = ap.parse_args()
@@ -278,6 +280,11 @@ def main():
     size = parse_size(args.size)
 
     work = tempfile.mkdtemp(prefix="nano-harness-")
+    if args.work:
+        # A stable directory means a stable cwd key: sessions and state from a
+        # previous run are still there, which is what resume tests need.
+        work = str(Path(args.work).resolve())
+        Path(work).mkdir(parents=True, exist_ok=True)
     conf = Path(work) / "tmux.conf"
     conf.write_text(
         "set-option -g status off\n"
@@ -340,7 +347,7 @@ def main():
         pages.shutdown()
         pages.server_close()
         tmux.kill()
-        if args.keep:
+        if args.keep or args.work:
             print(f"harness: kept {work}", file=sys.stderr)
         else:
             shutil.rmtree(work, ignore_errors=True)
