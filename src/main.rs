@@ -134,9 +134,12 @@ fn run() -> Result<(), String> {
     }
     let mut system = tools::system_prompt();
     system.push_str(&instructions);
+    // The mode is history, not prompt: the config decides where a session
+    // starts, and the note below tells the model which side it is on.
+    let read_only = cfg.explore_by_default;
     let messages: Vec<Value> = vec![
         json!({ "role": "system", "content": system }),
-        mode_note(true),
+        mode_note(read_only),
     ];
 
     let session = Session {
@@ -146,7 +149,7 @@ fn run() -> Result<(), String> {
         model,
         thinking,
         thoughts: false,
-        read_only: true,
+        read_only,
         used: None,
         messages,
     };
@@ -180,8 +183,8 @@ struct Session {
     /// Show reasoning in the transcript (`/thoughts`). Off by default: the
     /// status row's "thinking…" is enough unless the user asks for more.
     thoughts: bool,
-    /// Explore mode: `read` and a read-only `bash` only (`/explore`). On until
-    /// the user leaves it; the history carries the note.
+    /// Explore mode: `read` and a read-only `bash` only (`/explore`). Starts
+    /// from `cfg.explore_by_default`; the history carries the note.
     read_only: bool,
     /// The last round's token count, from the provider. `None` until a turn
     /// reports one: the fill is then estimated from the history.
@@ -227,6 +230,7 @@ impl Session {
     fn run_interactive(mut self) -> Result<(), String> {
         let mut screen =
             ui::Screen::new("❯ ").map_err(|e| format!("cannot take the terminal: {e}"))?;
+        screen.set_explore(self.read_only);
         screen.set_commands(COMMANDS);
         screen.set_info(&self.info());
         let (tx, rx) = mpsc::channel();

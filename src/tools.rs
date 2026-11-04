@@ -99,11 +99,11 @@ pub fn system_prompt() -> String {
         .unwrap_or_else(|_| ".".to_string());
     let mut out = format!("Working directory: {cwd}\n\n");
     out.push_str(
-        "A session starts in explore mode: read the working directory and run read-only \
-         commands to understand it, answer, and propose changes. `write` and `edit` are \
-         unavailable, and `bash` runs read-only commands only. The user may leave the mode \
-         at any time; every change is announced in the conversation as `explore mode: on` \
-         or `explore mode: off`, and the latest note says which mode is in force.\n",
+        "Explore mode: read the working directory and run read-only commands to \
+         understand it, answer, and propose changes. `write` and `edit` are unavailable, \
+         and `bash` runs read-only commands only. The user may leave the mode at any \
+         time; every change is announced in the conversation as `explore mode: on` or \
+         `explore mode: off`, and the latest note says which mode is in force.\n",
     );
     out.push_str("\nBehavior:\n");
     for (i, rule) in BEHAVIOR.iter().enumerate() {

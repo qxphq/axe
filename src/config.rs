@@ -41,6 +41,9 @@ impl ProviderConfig {
 pub struct Config {
     pub providers: Vec<ProviderConfig>,
     pub model: Option<String>,
+    /// Whether a session starts in explore mode (`read` and a read-only
+    /// `bash`). On unless the config sets `"explore_by_default": false`.
+    pub explore_by_default: bool,
     /// Model spec (`provider/id`) -> remembered thinking level.
     pub thinking: Vec<(String, String)>,
     pub system: Option<String>,
@@ -84,6 +87,7 @@ const EXAMPLE: &str = r#"{
     }
   },
   "model": "local/qwen3.8-flash-next-chat",
+  "explore_by_default": true,
   "thinking": {},
   "system": null,
   "agents": null
@@ -283,6 +287,7 @@ pub fn load() -> Result<Config, String> {
     Ok(Config {
         providers,
         model: text(&v, "model"),
+        explore_by_default: v["explore_by_default"].as_bool().unwrap_or(true),
         thinking: v["thinking"]
             .as_object()
             .map(|map| {
