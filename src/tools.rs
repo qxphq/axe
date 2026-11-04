@@ -172,8 +172,8 @@ pub fn execute(name: &str, args: &str, cancel: &Cancel, read_only: bool) -> Stri
         "bash" => bash(&args, cancel, read_only),
         // Documentation, no I/O: the same answer in both modes.
         "about" => README_TEXT.to_string(),
-        // Not in the schema explore mode sends; a call is the model recalling
-        // a tool it no longer has, and the result says why.
+        // The catalogue is mode-independent, so a toggle leaves the cached
+        // prefix byte-identical; refusing here is what makes it a no-op.
         "write" | "edit" if read_only => format!("error: explore mode: {name} is not available"),
         "fetch" if read_only => fetch(&args, cancel),
         "fetch" => "error: explore mode: fetch is only available in explore mode".into(),
