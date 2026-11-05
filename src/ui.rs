@@ -123,14 +123,14 @@ enum Mode {
     Choosing,
 }
 
-/// Where the live frame's parts sit, in screen rows — the parts carry rows, not
-/// the width, which is the terminal's and comes off the sides in `draw`. A
-/// function of the terminal
-/// size and the mode and of nothing else — content that does not fit is
-/// scrolled or clipped inside its part. That is the invariant this type exists
-/// to hold: a frame whose height followed its content would have to grow into
-/// the transcript and, on the way back, leave rows behind that a terminal
-/// cannot take away.
+/// Where the live frame's parts sit, in screen rows. The parts carry rows, not
+/// the width, which is the terminal's and comes off the sides in `draw`.
+///
+/// A frame is a function of the terminal size and the mode and of nothing else:
+/// content that does not fit is scrolled or clipped inside its part. That is the
+/// invariant this type exists to hold — a frame whose height followed its
+/// content would have to grow into the transcript and, on the way back, leave
+/// rows behind that a terminal cannot take away.
 #[derive(Clone, Copy)]
 struct Frame {
     /// Candidates, or a chooser's header and its entries. Blank when unused.
@@ -1042,8 +1042,8 @@ impl Screen {
         });
         // The candidates take the list rows while nothing is being chosen, the
         // window following the selection so the one the next step takes is on
-        // screen. They sit under the prompt's text, and the bottom row of the
-        // list is the one next to the prompt.
+        // screen. They sit above the prompt, bottom row first, so the next
+        // candidate is always the one nearest what is being typed.
         let (hints, at) = match menu {
             Some(_) => (Vec::new(), 0),
             None => self.hints(),
@@ -1102,15 +1102,18 @@ impl Screen {
                     }
                     .intersection(screen)
                 };
-                let row = |r: Rect, offset: u16| Rect {
-                    y: r.y + offset,
-                    height: 1,
-                    ..part(r)
+                let line = |y: u16| {
+                    Rect {
+                        y,
+                        height: 1,
+                        ..side
+                    }
+                    .intersection(screen)
                 };
                 if let Some((header, entries, selected, scroll)) = &menu {
                     frame.render_widget(
                         Paragraph::new(Line::styled(clip(header, cols), DIM)),
-                        row(layout.list, 0),
+                        line(layout.list.y),
                     );
                     for (i, entry) in entries.iter().enumerate() {
                         let on = *selected == scroll + i;
@@ -1121,7 +1124,7 @@ impl Screen {
                                 format!("{marker}{text}"),
                                 if on { PROMPT_STYLE } else { DIM },
                             )),
-                            row(layout.list, 1 + i as u16),
+                            line(layout.list.y + 1 + i as u16),
                         );
                     }
                 }
@@ -1136,11 +1139,7 @@ impl Screen {
                             format!("{pad}{text}"),
                             if on { PROMPT_STYLE } else { DIM },
                         )),
-                        Rect {
-                            y: first_hint + i as u16,
-                            height: 1,
-                            ..part(layout.list)
-                        },
+                        line(first_hint + i as u16),
                     );
                 }
                 frame.render_widget(
@@ -1158,29 +1157,33 @@ impl Screen {
                 };
                 frame.render_widget(
                     Paragraph::new(Line::styled(label, DIM)),
-                    row(layout.queued, 0),
+                    line(layout.queued.y),
                 );
                 // One row for the question, whole: the info row is metadata
                 // and comes back when the question is answered.
                 match &self.alert {
                     Some(text) => frame.render_widget(
                         Paragraph::new(Line::styled(clip(text, cols), ALERT_STYLE)),
-                        row(layout.status, 0),
+                        line(layout.status.y),
                     ),
                     None => {
                         frame.render_widget(
                             Paragraph::new(Line::styled(status, DIM)),
-                            row(layout.status, 0),
+                            line(layout.status.y),
                         );
                         frame.render_widget(
                             Paragraph::new(Line::styled(info, DIM)).alignment(Alignment::Right),
-                            row(layout.status, 0),
+                            line(layout.status.y),
                         );
                     }
                 }
+                // A failed `settle` can leave the layout taller than the
+                // screen it was drawn into; the cursor is the one thing that
+                // cannot be clipped by a rect.
+                let row = (top + crow).min(screen.bottom().saturating_sub(1));
                 frame.set_cursor_position(Position::new(
                     screen.x + margin + gutter as u16 + ccol,
-                    top + crow,
+                    row,
                 ));
             })
             .map(|_| ());
