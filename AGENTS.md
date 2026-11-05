@@ -101,7 +101,8 @@ invariants a change must not break.
     and `--version`; `flake.nix` reads the same file. The `ship` skill bumps it
     per semver (pre-1.0: patch for a fix, minor for a capability, a breaking
     change bumps minor until `1.0.0`). No second copy, no generated file, no
-    tag.
+    version tag: the release is a single mutable `latest` tag whose assets are
+    clobbered on each push to `main`, and `install.sh` downloads from it.
 
 ## Architecture
 
