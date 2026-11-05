@@ -234,10 +234,12 @@ impl Screen {
                 return Err(e);
             }
         };
-        // Shift+Enter is only distinguishable from Enter under the kitty
-        // keyboard protocol; bracketed paste keeps a pasted block one buffer
-        // instead of one submission per line. A terminal that knows neither
-        // ignores both.
+        // Only disambiguation is asked for. Ascertaining Shift+Enter would
+        // mean reporting every key as an escape code, which takes shifted
+        // characters away from the terminal and makes this side guess a
+        // keyboard layout; a new line is typed as Alt+Enter or Ctrl+J instead.
+        // Bracketed paste keeps a pasted block one buffer, and a terminal that
+        // knows neither ignores both.
         let _ = execute!(
             io::stdout(),
             EnableBracketedPaste,
@@ -430,14 +432,12 @@ impl Screen {
             KeyCode::Enter if self.menu_active() && self.buf.is_empty() => {
                 return Action::MenuAccept
             }
-            // A new line, not a submission. Shift needs the kitty protocol;
-            // Alt is the ESC-prefixed form every terminal sends.
-            KeyCode::Enter
-                if key.modifiers.contains(KeyModifiers::SHIFT)
-                    || key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                self.insert_char('\n')
-            }
+            // A new line, not a submission: Alt is the ESC-prefixed form every
+            // terminal sends. Shift+Enter is deliberately not a binding: a
+            // terminal reports it as a bare Enter unless the kitty protocol
+            // says otherwise, and asking for that costs every shifted
+            // character its layout.
+            KeyCode::Enter if alt => self.insert_char('\n'),
             KeyCode::Enter => return Action::Submit,
             KeyCode::Backspace if alt || ctrl => self.kill_word_back(),
             KeyCode::Backspace => self.backspace(),
@@ -470,6 +470,9 @@ impl Screen {
             KeyCode::Char('y') if ctrl => self.yank(),
             KeyCode::Char('t') if ctrl => self.transpose_chars(),
             KeyCode::Char('t') if alt => self.transpose_words(),
+            // Ctrl+J is the newline byte, and what a terminal-side Shift+Enter
+            // mapping sends. One buffer character, not a submission.
+            KeyCode::Char('j') if ctrl => self.insert_char('\n'),
             KeyCode::Char(c) if !ctrl && !alt => self.insert_char(c),
             _ => {}
         }
@@ -1564,6 +1567,14 @@ mod tests {
             screen.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Action::Submit
         ));
+    }
+
+    #[test]
+    fn ctrl_j_starts_a_line() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.apply_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        screen.apply_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(screen.buf, "\na");
     }
 
     #[test]
