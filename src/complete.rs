@@ -70,7 +70,9 @@ fn list(token: &str, cwd: &Path, home: Option<&Path>) -> Vec<String> {
     let Ok(entries) = fs::read_dir(resolve(shown, cwd, home)) else {
         return Vec::new();
     };
-    let mut matches: Vec<(bool, String)> = Vec::new();
+    // The sort key is folded once per entry, not once per comparison: a
+    // directory of thousands is a prompt, and this runs on every Tab.
+    let mut matches: Vec<(bool, String, String)> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -80,21 +82,31 @@ fn list(token: &str, cwd: &Path, home: Option<&Path>) -> Vec<String> {
         if !name.starts_with(base) || (name.starts_with('.') && !base.starts_with('.')) {
             continue;
         }
-        let is_dir = fs::metadata(entry.path())
-            .map(|meta| meta.is_dir())
-            .unwrap_or(false);
-        matches.push((is_dir, name.to_string()));
+        matches.push((is_dir(&entry), name.to_lowercase(), name.to_string()));
     }
     matches.sort_by(|a, b| {
         b.0.cmp(&a.0)
-            .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
             .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
     });
     matches.truncate(LIMIT);
     matches
         .into_iter()
-        .map(|(is_dir, name)| format!("{shown}{name}{}", if is_dir { "/" } else { "" }))
+        .map(|(is_dir, _, name)| format!("{shown}{name}{}", if is_dir { "/" } else { "" }))
         .collect()
+}
+
+/// Whether the entry is a directory, following a symlink the way a `cd` would.
+/// `file_type` is what the directory listing already knows; `metadata` is one
+/// syscall per entry and only a link needs it.
+fn is_dir(entry: &fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(kind) if kind.is_symlink() => fs::metadata(entry.path())
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false),
+        Ok(kind) => kind.is_dir(),
+        Err(_) => false,
+    }
 }
 
 /// What `shown` names on disk. The written form keeps `~/` as typed; only the
@@ -193,6 +205,43 @@ mod tests {
         assert!(
             paths_in("", 0, &dir, None).is_empty(),
             "an empty line completes nothing"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn names_sort_case_insensitively_with_the_spelling_breaking_ties() {
+        let dir = std::env::temp_dir().join(format!("axe-test-sort-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("a_dir")).unwrap();
+        for name in ["b.txt", "B.txt", "A.txt", "c.txt"] {
+            fs::write(dir.join(name), "").unwrap();
+        }
+        // Directories first, then folded names, and `B` before `b` because that
+        // is the exact order — the folded key must not shuffle them.
+        assert_eq!(
+            paths_in("@", 1, &dir, None),
+            vec![
+                "a_dir/".to_string(),
+                "A.txt".to_string(),
+                "B.txt".to_string(),
+                "b.txt".to_string(),
+                "c.txt".to_string(),
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symlinked_directory_keeps_its_slash() {
+        let dir = std::env::temp_dir().join(format!("axe-test-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        assert_eq!(
+            paths_in("@", 1, &dir, None),
+            vec!["link/".to_string(), "real/".to_string()],
+            "a link to a directory is one"
         );
         let _ = fs::remove_dir_all(&dir);
     }
