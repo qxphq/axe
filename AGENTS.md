@@ -55,17 +55,19 @@ invariants a change must not break.
     session headers). No speculative fixes; reproduce first.
 12. **A scrolling REPL, not a TUI.** No alt-screen: the transcript is
     scrollback. The only owned region is an inline live frame at the bottom
-    (candidate list, queued row, wrapped prompt, status), and its height is a
-    function of the terminal size and the mode — `ui::Frame::layout`, idle or
-    choosing — and never of what it shows: the list, the chooser and a wrapped
-    prompt scroll inside the rows they were given. A terminal appends rows at
-    the bottom and cannot take them back, so a frame sized by content leaves
-    blank rows in the transcript every time it shrinks. A chooser may own a
-    header plus entries; when it closes without resuming, its rows are committed
-    to scrollback — except startup's chooser, whose list vanishes on the first
-    typed key: typing is the choice of a new session. Everything above is
-    appended, never repainted — except `/new`, which wipes the screen and its
-    scrollback: a session boundary.
+    (candidate list, queued row, wrapped prompt, a blank row, status, a blank
+    row), and its height is a function of the terminal size and the mode —
+    `ui::Frame::layout`, idle or choosing — and never of what it shows: the
+    list, the chooser and a wrapped prompt scroll inside the rows they were
+    given. Nothing is written against the bottom edge, and the status keeps a
+    blank row above it however many rows the prompt fills. A terminal appends
+    rows at the bottom and cannot take them back, so a frame sized by content
+    leaves blank rows in the transcript every time it shrinks. A chooser may own
+    a header plus entries; when it closes without resuming, its rows are
+    committed to scrollback — except startup's chooser, whose list vanishes on
+    the first typed key: typing is the choice of a new session. Everything
+    above is appended, never repainted — except `/new`, which wipes the screen
+    and its scrollback: a session boundary.
 13. **One writer, and it paints what is dirty.** While `ui::Screen` owns the
     terminal, only it draws. Every setter and transcript writer marks the screen
     dirty; `Screen::repaint()` paints only then, and the loops call it —
