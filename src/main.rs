@@ -1497,6 +1497,10 @@ impl Session {
         // Reasoning before the answer. Its last line is unfinished until the
         // answer starts or the round ends, so it is held until then.
         let mut thought = String::new();
+        // A mode switch pressed while the turn runs. Shift+Tab reached the live
+        // prompt and used to be dropped; it is held here instead, because the
+        // turn's tool set and history are fixed before it starts.
+        let mut switch = false;
 
         screen.set_status("Thinking…");
         let _ = screen.draw();
@@ -1578,9 +1582,11 @@ impl Session {
                                     dirty = true;
                                 }
                             }
-                            // The turn already captured its tool set; a mode
-                            // switch takes effect on the next one.
-                            ui::Action::Explore => {}
+                            // The turn already captured its tool set and its
+                            // history prefix; the switch is applied at the
+                            // boundary, below, so the note lands after the
+                            // answer it did not affect.
+                            ui::Action::Explore => switch = true,
                             // A chooser only exists while idle.
                             ui::Action::MenuStep(_)
                             | ui::Action::MenuAccept
@@ -1689,6 +1695,12 @@ impl Session {
         // not count) leaves the estimate in charge rather than a stale number.
         self.used = used;
         screen.set_info(&self.info());
+
+        // Held from the turn: applied now, so the note sits below the answer
+        // and above whatever the user types next.
+        if switch {
+            self.toggle_explore(screen);
+        }
 
         // One small request names the session, once, off the UI thread. The
         // prompt is live immediately; the result is applied at the next poll.
