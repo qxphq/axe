@@ -1130,11 +1130,10 @@ impl Session {
                         store.set_title(&title, &summary);
                     }
                 }
-                // The title is part of the selection row: repaint it now, so it
-                // appears when it lands rather than at the next key.
+                // The title is part of the selection row: marking it is
+                // enough, the idle tick repaints.
                 if let Some(screen) = screen.as_deref_mut() {
                     screen.set_info(&self.info());
-                    let _ = screen.draw();
                 }
                 self.flush_warnings(screen);
             }
@@ -1426,7 +1425,7 @@ impl Session {
     ) -> Option<String> {
         screen.insert(vec![line_of(&shell_line(command, false))], ui::Block::Tool);
         screen.set_status("Running…");
-        let _ = screen.draw();
+        screen.repaint();
         let cancel = http::Cancel::new();
         let args = json!({ "command": command }).to_string();
         let mut queued: Option<String> = None;
@@ -1437,7 +1436,7 @@ impl Session {
                     Ok(Event::Key(key)) if key.code == KeyCode::Esc => {
                         cancel.cancel();
                         screen.set_status("Interrupting…");
-                        let _ = screen.draw();
+                        screen.repaint();
                     }
                     Ok(Event::Key(key)) => match screen.apply_key(key) {
                         ui::Action::Submit if !screen.is_empty() && queued.is_none() => {
@@ -1448,15 +1447,16 @@ impl Session {
                             break;
                         }
                         _ => {
-                            let _ = screen.draw();
+                            screen.repaint();
                         }
                     },
                     Ok(Event::Paste(text)) => {
                         screen.insert_text(&text);
-                        let _ = screen.draw();
+                        screen.repaint();
                     }
                     Ok(Event::Resize) => {
-                        let _ = screen.draw();
+                        screen.invalidate();
+                        screen.repaint();
                     }
                     Ok(Event::Eof) => {
                         cancel.cancel();
@@ -1489,7 +1489,7 @@ impl Session {
         {result}"),
         }));
         screen.set_info(&self.info());
-        let _ = screen.draw();
+        screen.repaint();
         queued
     }
 
@@ -1541,7 +1541,7 @@ impl Session {
         let mut interrupted = false;
 
         screen.set_status("Thinking…");
-        let _ = screen.draw();
+        screen.repaint();
 
         // What the last round counted, handed back by the turn's thread. The
         // history is borrowed by that thread, so `self` is out of reach until
@@ -1713,7 +1713,12 @@ impl Session {
                                 screen.set_status(&text);
                             }
                         }
-                        Event::Resize => dirty = true,
+                        Event::Resize => {
+                            // The area under us changed: paint even if no
+                            // state did.
+                            screen.invalidate();
+                            dirty = true;
+                        }
                         Event::Done(Err(e)) => {
                             screen.error(&format!("axe: {e}\n"));
                             done = true;
@@ -1740,7 +1745,7 @@ impl Session {
                     }
                 }
                 if dirty {
-                    let _ = screen.draw();
+                    screen.repaint();
                 }
                 if done {
                     break;
@@ -2070,12 +2075,13 @@ fn readline(
     rx: &Receiver<Event>,
     idle: &mut dyn FnMut(&mut ui::Screen),
 ) -> Option<Input> {
-    let _ = screen.draw();
+    screen.repaint();
     loop {
         let event = match rx.recv_timeout(IDLE) {
             Ok(event) => event,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 idle(screen);
+                screen.repaint();
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return None,
@@ -2087,27 +2093,28 @@ fn readline(
                 ui::Action::Explore => return Some(Input::Explore),
                 ui::Action::MenuStep(delta) => {
                     screen.menu_move(delta);
-                    let _ = screen.draw();
+                    screen.repaint();
                 }
                 ui::Action::MenuAccept => return Some(Input::Menu(screen.menu_selected())),
                 ui::Action::MenuCancel => {
                     // The list stays in the transcript: a chooser that closes
                     // must not leave blank rows where it was.
                     screen.clear_menu(true);
-                    let _ = screen.draw();
+                    screen.repaint();
                     return Some(Input::Cancel);
                 }
                 ui::Action::Eof => return None,
                 ui::Action::None => {
-                    let _ = screen.draw();
+                    screen.repaint();
                 }
             },
             Event::Paste(text) => {
                 screen.insert_text(&text);
-                let _ = screen.draw();
+                screen.repaint();
             }
             Event::Resize => {
-                let _ = screen.draw();
+                screen.invalidate();
+                screen.repaint();
             }
             Event::Eof => return None,
             // A turn's events cannot arrive while idle; drop them if they do.

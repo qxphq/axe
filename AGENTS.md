@@ -61,9 +61,15 @@ invariants a change must not break.
     whose list vanishes on the first typed key: typing is the choice of a new
     session. Everything above is appended, never repainted — except `/new`,
     which wipes the screen and its scrollback: a session boundary.
-13. **One writer.** While `ui::Screen` owns the terminal, only it draws. Startup
-    banner and piped output run before/without a `Screen`; a stray `print!` while
-    it exists is a rendering bug.
+13. **One writer, and it paints what is dirty.** While `ui::Screen` owns the
+    terminal, only it draws. Every setter and transcript writer marks the screen
+    dirty; `Screen::repaint()` paints only then, and the loops call it —
+    `readline` on entry, on every key and on its idle tick, the turn and shell
+    loops once per drained batch; a resize invalidates first, so the area under
+    us is repainted even when no state changed. No caller draws for a state
+    change, so work that finishes off the UI thread cannot strand the row.
+    Startup banner and piped output run before/without a `Screen`; a stray
+    `print!` while it exists is a rendering bug.
 14. **The prompt is a block.** Every line carries its glyph (`❯ ` live, `█ `
     committed), so a wrapped line reads as one block.
 15. **`bash` is confined by the kernel, not by strings.** Explore mode denies
