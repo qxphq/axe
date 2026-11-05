@@ -2650,9 +2650,14 @@ fn run_turn(
         }
         messages.push(message);
 
+        // An interrupt can land before a call runs or between two of them.
+        // Every id the assistant message named still owes a result: a strict
+        // provider refuses the next request until each `tool_call_id` is
+        // answered, and the history is what a resumed session replays.
+        let mut answered = 0;
         for call in &reply.calls {
             if cancel.cancelled() {
-                return Ok(used);
+                break;
             }
             let echo = call_line(call, read_only);
             // What is running, while it runs: the finished line appears below
@@ -2661,20 +2666,43 @@ fn run_turn(
             let result = tools::execute(&call.name, &call.arguments, cancel, read_only);
             let error = failed(&result).then(|| detail(&result));
             sink.echo(&echo, mark(&result), error.as_deref());
-            let message = json!({
-                "role": "tool",
-                "tool_call_id": call.id,
-                "content": result,
-            });
+            let message = tool_message(&call.id, &result);
             if let Some(store) = store.as_deref_mut() {
                 store.record(&message);
             }
             messages.push(message);
-            if cancel.cancelled() {
-                return Ok(used);
+            answered += 1;
+        }
+        for message in unanswered(&reply.calls, answered) {
+            if let Some(store) = store.as_deref_mut() {
+                store.record(&message);
             }
+            messages.push(message);
+        }
+        if answered < reply.calls.len() {
+            return Ok(used);
         }
     }
+}
+
+/// A tool result as it goes back into the history.
+fn tool_message(id: &str, content: &str) -> Value {
+    json!({ "role": "tool", "tool_call_id": id, "content": content })
+}
+
+/// The calls of an interrupted round that never ran, as results. The provider
+/// wants one per `tool_call_id` before the next request, and a resumed session
+/// replays whatever the log holds, so a gap here outlives the turn.
+fn unanswered(calls: &[api::ToolCall], answered: usize) -> Vec<Value> {
+    calls[answered.min(calls.len())..]
+        .iter()
+        .map(|call| {
+            tool_message(
+                &call.id,
+                "error: interrupted by user (ESC); the call was not run",
+            )
+        })
+        .collect()
 }
 
 /// The assistant message as it goes back into the history. Thinking-mode
@@ -2864,6 +2892,32 @@ fn summarize(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_interrupted_round_answers_every_call_it_named() {
+        let calls = vec![
+            api::ToolCall {
+                id: "a".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+            api::ToolCall {
+                id: "b".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            },
+        ];
+        // A round that ran both owes nothing.
+        assert!(unanswered(&calls, 2).is_empty());
+        // One cut short answers the rest, so the next request is accepted.
+        let rest = unanswered(&calls, 1);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0]["role"], "tool");
+        assert_eq!(rest[0]["tool_call_id"], "b");
+        assert!(rest[0]["content"].as_str().unwrap().contains("interrupted"));
+        // A round interrupted before the first call still answers both.
+        assert_eq!(unanswered(&calls, 0).len(), 2);
+    }
 
     #[test]
     fn control_bytes_are_stripped_but_lines_survive() {
