@@ -20,7 +20,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::terminal;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -2007,11 +2007,104 @@ enum Event {
     Eof,
 }
 
+/// How long a held `[` waits for the rest of a cursor report: a terminal
+/// answers in one burst, a person does not type that fast.
+const REPORT_WINDOW: Duration = Duration::from_millis(50);
+
+/// A report is short (`[24;80R`); a longer run is typing that happens to look
+/// like one at its start.
+const REPORT_MAX: usize = 12;
+
+/// A cursor-position report whose escape was read as a key: ratatui's inline
+/// viewport asks the terminal where the cursor is (at startup, and on every
+/// resize), and the answer — `ESC [ row ; col R` — arrives on stdin. When it
+/// splits, the escape is a key press and the rest reads as typing. A run that
+/// starts with `[` and reads as `[0-9;]*R`, in one burst, is a report and is
+/// dropped; anything else is handed on unchanged.
+#[derive(Default)]
+struct CursorReport {
+    held: Vec<KeyEvent>,
+    started: Option<Instant>,
+}
+
+impl CursorReport {
+    /// The keys to forward. Empty while a report is being swallowed.
+    fn feed(&mut self, key: KeyEvent) -> Vec<KeyEvent> {
+        if self.held.is_empty() {
+            if plain(key, '[') {
+                self.hold(key);
+                return Vec::new();
+            }
+            return vec![key];
+        }
+        if self.expired() {
+            return self.flush(Some(key));
+        }
+        match key.code {
+            KeyCode::Char('R') if plain(key, 'R') => {
+                self.held.clear();
+                self.started = None;
+                Vec::new()
+            }
+            KeyCode::Char(c)
+                if plain(key, c)
+                    && (c.is_ascii_digit() || c == ';')
+                    && self.held.len() < REPORT_MAX =>
+            {
+                self.hold(key);
+                Vec::new()
+            }
+            _ => self.flush(Some(key)),
+        }
+    }
+
+    /// A held `[` that never became a report was typing: hand it over.
+    fn flush_expired(&mut self) -> Vec<KeyEvent> {
+        if self.expired() {
+            return self.flush(None);
+        }
+        Vec::new()
+    }
+
+    fn hold(&mut self, key: KeyEvent) {
+        if self.held.is_empty() {
+            self.started = Some(Instant::now());
+        }
+        self.held.push(key);
+    }
+
+    fn flush(&mut self, key: Option<KeyEvent>) -> Vec<KeyEvent> {
+        self.started = None;
+        let mut keys = std::mem::take(&mut self.held);
+        keys.extend(key);
+        keys
+    }
+
+    fn expired(&self) -> bool {
+        self.started.is_some_and(|at| at.elapsed() > REPORT_WINDOW)
+    }
+}
+
+/// Whether the key types `c` with no control or alt chord. Shift is not a
+/// chord: the report's `R` is uppercase, and a terminal reports it as shifted.
+fn plain(key: KeyEvent, c: char) -> bool {
+    key.code == KeyCode::Char(c)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
 /// The terminal's keys. Nothing else may read stdin.
 fn spawn_input(tx: Sender<Event>) {
     thread::spawn(move || {
         use ratatui::crossterm::event::{poll, read, Event as TermEvent};
+        let mut report = CursorReport::default();
         loop {
+            for key in report.flush_expired() {
+                if tx.send(Event::Key(key)).is_err() {
+                    return;
+                }
+            }
             // A zero timeout, not `read`: waiting for a key holds crossterm's
             // event-reader lock, and the screen needs it to ask the terminal
             // where the cursor is when the prompt wraps. A poll holds it for
@@ -2028,8 +2121,10 @@ fn spawn_input(tx: Sender<Event>) {
             match read() {
                 // Key releases (kitty protocol) are not new input.
                 Ok(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
-                    if tx.send(Event::Key(key)).is_err() {
-                        return;
+                    for key in report.feed(key) {
+                        if tx.send(Event::Key(key)).is_err() {
+                            return;
+                        }
                     }
                 }
                 Ok(TermEvent::Paste(text)) if !text.is_empty() => {
@@ -3038,6 +3133,44 @@ mod tests {
         let id = session_id();
         assert_eq!(id.len(), 32);
         assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    /// The keys a screen would receive for `text`, as characters.
+    fn report_through(report: &mut CursorReport, text: &str) -> String {
+        let mut out = String::new();
+        for c in text.chars() {
+            let modifiers = if c.is_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            for key in report.feed(KeyEvent::new(KeyCode::Char(c), modifiers)) {
+                if let KeyCode::Char(c) = key.code {
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_split_cursor_report_is_not_typing() {
+        let mut report = CursorReport::default();
+        // The escape was read as a key press; the rest is the report.
+        assert_eq!(report_through(&mut report, "[18;1R"), "");
+        // The next keys are typing again.
+        assert_eq!(report_through(&mut report, "hi"), "hi");
+    }
+
+    #[test]
+    fn typing_that_starts_like_a_report_is_kept() {
+        let mut report = CursorReport::default();
+        assert_eq!(report_through(&mut report, "[x"), "[x");
+        assert_eq!(report_through(&mut report, "[1]"), "[1]");
+        // A run that stops matching comes through whole, in order.
+        assert_eq!(report_through(&mut report, "[18;1x"), "[18;1x");
+        // Plain text never waits.
+        assert_eq!(report_through(&mut report, "hello"), "hello");
     }
 
     #[test]
