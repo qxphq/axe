@@ -282,8 +282,8 @@ pub fn run_turn(
             // once there is a result to put on it.
             sink.status(&plain_text(&echo));
             let result = tools::execute(&call.name, &call.arguments, turn.cancel, turn.mode);
-            let error = failed(&result).then(|| detail(&result));
-            sink.echo(&echo, mark(&result), error.as_deref());
+            let error = failed(&call.name, &result).then(|| detail(&result));
+            sink.echo(&echo, mark(&call.name, &result), error.as_deref());
             history.push(tool_message(&call.id, &result));
             answered += 1;
         }

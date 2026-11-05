@@ -1200,10 +1200,10 @@ impl Session {
                         let result = results.get(call.id.as_str()).copied().unwrap_or("");
                         let mut spans = call_line(&call, self.mode.explore());
                         spans.push((Paint::Plain, " ".to_string()));
-                        let (paint, glyph) = mark(result);
+                        let (paint, glyph) = mark(&call.name, result);
                         spans.push((paint, glyph.to_string()));
                         screen.insert(vec![line_of(&spans)], ui::Block::Tool);
-                        if failed(result) {
+                        if failed(&call.name, result) {
                             screen.fail(&detail(result));
                         }
                     }
@@ -2975,11 +2975,11 @@ mod tests {
         assert_eq!(scaled(1_000_000), "1.0M");
         assert_eq!(percent(1, 1000), "<1%");
         assert_eq!(percent(50, 100), "50%");
-        assert!(failed("exit: 1\nboom"));
-        assert!(!failed("exit: 0\nok"));
-        assert!(failed("error: nope"));
-        assert_eq!(mark("exit: 0\n").1, "✓");
-        assert_eq!(mark("exit: 1\n").1, "✗");
+        assert!(failed("bash", "exit: 1\nboom"));
+        assert!(!failed("bash", "exit: 0\nok"));
+        assert!(failed("tools", "error: nope"));
+        assert_eq!(mark("bash", "exit: 0\n").1, "✓");
+        assert_eq!(mark("bash", "exit: 1\n").1, "✗");
         assert_eq!(detail("exit: 1\nboom\nmore"), "boom…");
         assert_eq!(summarize("a\nb", 10), "a…");
     }

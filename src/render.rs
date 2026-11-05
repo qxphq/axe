@@ -144,18 +144,25 @@ pub(crate) fn call_line(call: &api::ToolCall, explore: bool) -> Vec<(Paint, Stri
 }
 
 /// A failed tool result is a result, not an error: tools report failures as
-/// text, either `error: ...` or a non-zero `exit: N`.
-pub(crate) fn failed(result: &str) -> bool {
+/// text, either `error: ...` or a non-zero `exit: N`. `read` is the one tool
+/// whose success is arbitrary file content, so a file whose first line begins
+/// `error:` must not read as its own failure: what identifies a `read` failure
+/// is the tool's name in it. Only a file that opens with exactly
+/// `error: read ...` is still misjudged, and no header could tell that apart
+/// without changing the content the model needs.
+pub(crate) fn failed(name: &str, result: &str) -> bool {
     if let Some(rest) = result.strip_prefix("exit: ") {
-        rest.lines().next().unwrap_or("").trim() != "0"
-    } else {
-        result.starts_with("error:")
+        return rest.lines().next().unwrap_or("").trim() != "0";
     }
+    if name == "read" {
+        return result.starts_with("error: read ") || result.starts_with("error: missing \"path\"");
+    }
+    result.starts_with("error:")
 }
 
 /// One glyph for the outcome.
-pub(crate) fn mark(result: &str) -> (Paint, &'static str) {
-    if failed(result) {
+pub(crate) fn mark(name: &str, result: &str) -> (Paint, &'static str) {
+    if failed(name, result) {
         (Paint::Red, "✗")
     } else {
         (Paint::Green, "✓")
@@ -180,4 +187,35 @@ pub(crate) fn summarize(text: &str, max: usize) -> String {
         out.push('…');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_read_of_content_that_looks_like_an_error_succeeded() {
+        // The file's own words, not the tool's: a log, a parser fixture.
+        assert!(!failed("read", "error: the box is empty"));
+        assert!(!failed("read", "error: missing semicolon at line 3"));
+        assert_eq!(mark("read", "error: nope").1, "✓");
+        // The tool's own failures still read as ones.
+        assert!(failed("read", "error: read src/x.rs: not a regular file"));
+        assert!(failed(
+            "read",
+            "error: read src/x.rs: offset 9 is past the end (3 lines)"
+        ));
+        assert!(failed("read", "error: missing \"path\""));
+        assert_eq!(mark("read", "error: read x: gone").1, "✗");
+    }
+
+    #[test]
+    fn every_other_tool_keeps_the_plain_rule() {
+        assert!(failed("edit", "error: edit a: text not found"));
+        assert!(!failed("about", "# axe"));
+        assert!(!failed("bash", "exit: 0\nok"));
+        assert!(failed("bash", "exit: 1\nboom"));
+        assert!(failed("bash", "exit: signal\n"));
+        assert_eq!(mark("write", "wrote 3 bytes to a").1, "✓");
+    }
 }
