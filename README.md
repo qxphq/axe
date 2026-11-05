@@ -195,9 +195,11 @@ turn follows — the model sees it the next time you ask something.
 | `/help` | list the commands, the config path and its keys |
 | `/exit`, `/quit` | quit |
 
-The area under the transcript has a fixed height for a given terminal size: the
-candidate list, a chooser and a wrapped prompt all scroll inside it, so nothing
-that appears and disappears can leave a gap in the transcript above.
+The area under the transcript is as tall as it has to be: the prompt's rows, a
+queued line, the candidates, and the status with its blank rows. An idle prompt
+sits directly under the last block. A chooser is the one part sized by the
+terminal — a window over the transcript, whose rows are committed when it
+closes.
 
 Recent sessions for the directory are offered at startup as a chooser: Up and
 Down move, Enter resumes, Esc closes it, and typing starts a new session and

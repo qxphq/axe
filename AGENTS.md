@@ -56,18 +56,20 @@ invariants a change must not break.
 12. **A scrolling REPL, not a TUI.** No alt-screen: the transcript is
     scrollback. The only owned region is an inline live frame at the bottom
     (candidate list, queued row, wrapped prompt, a blank row, status, a blank
-    row), and its height is a function of the terminal size and the mode —
-    `ui::Frame::layout`, idle or choosing — and never of what it shows: the
-    list, the chooser and a wrapped prompt scroll inside the rows they were
-    given. Nothing is written against the bottom edge, and the status keeps a
-    blank row above it however many rows the prompt fills. A terminal appends
-    rows at the bottom and cannot take them back, so a frame sized by content
-    leaves blank rows in the transcript every time it shrinks. A chooser may own
-    a header plus entries; when it closes without resuming, its rows are
-    committed to scrollback — except startup's chooser, whose list vanishes on
-    the first typed key: typing is the choice of a new session. Everything
-    above is appended, never repainted — except `/new`, which wipes the screen
-    and its scrollback: a session boundary.
+    row), and it is as tall as what it shows and no taller —
+    `ui::Frame::layout` takes the rows the prompt wrapped to (up to the three
+    it composes in), the queued line, and the candidates — so an idle prompt
+    sits under the last block instead of under rows kept for a list that is
+    not there. Nothing is written against the bottom edge, and the status keeps
+    a blank row above it however many rows the prompt fills. A chooser is the
+    one part the terminal sizes: a window over the transcript, a header plus
+    entries, and when it closes without resuming its rows are committed to
+    scrollback — except startup's chooser, whose list vanishes on the first
+    typed key: typing is the choice of a new session. A terminal appends rows
+    at the bottom and cannot take them back, so a frame that shrinks leaves
+    blank rows above it; `slack` counts them and the next block fills them
+    from the top. Everything above is appended, never repainted — except
+    `/new`, which wipes the screen and its scrollback: a session boundary.
 13. **One writer, and it paints what is dirty.** While `ui::Screen` owns the
     terminal, only it draws. Every setter and transcript writer marks the screen
     dirty; `Screen::repaint()` paints only then, and the loops call it —
@@ -110,8 +112,9 @@ invariants a change must not break.
   the prompt, not picked from a list), session lifecycle (startup chooser,
   `/sessions`, `/new`, naming), agent loop. Two producers (keys, a turn)
   feed one `mpsc` channel; the main thread applies events and draws once per batch.
-- `ui.rs` — the screen: the live frame (`Frame`, a layout from the terminal size
-  and the mode, put in place by `settle`), key mapping, completion, the chooser,
+- `ui.rs` — the screen: the live frame (`Frame`, a layout from what the frame
+  shows — the prompt's rows, the queued line, the candidates — and from the mode
+  for a chooser, put in place by `settle`), key mapping, completion, the chooser,
   `write` for transcript blocks (wrapped here, since a clipped line would be
   lost) and the `slack` it places them by. The info row is pieces (`Info`), each
   with its own ANSI color: the caller says what a piece is, the screen how it
