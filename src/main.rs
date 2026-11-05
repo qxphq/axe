@@ -713,7 +713,7 @@ fn safe_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-const HELP: &str = "/model [id]    list models, or pick or switch one\n\
+const HELP: &str = "/model [id]    list the models, or switch to one\n\
                     /thinking [l]  show or set thinking level (off, low, medium, high)\n\
                     /thoughts      show or hide the model's reasoning\n\
                     /sessions [q]  list, search and resume sessions\n\
@@ -1372,13 +1372,22 @@ impl Session {
         vec![system, mode_note(self.read_only)]
     }
 
-    /// The slash commands Tab completes, including `/skill:<name>` for every
-    /// loaded skill whose name can be typed as one word.
+    /// The lines Tab completes: the slash commands, including `/skill:<name>`
+    /// for every loaded skill whose name can be typed as one word, and the
+    /// first argument of `/model` and `/thinking`.
     fn commands(&self) -> Vec<String> {
         let mut commands: Vec<String> =
             COMMANDS.iter().map(|command| command.to_string()).collect();
         for skill in self.skills.iter().filter(|skill| safe_name(&skill.name)) {
             commands.push(format!("/skill:{}", skill.name));
+        }
+        for provider in &self.providers {
+            for model in &provider.models {
+                commands.push(format!("/model {}/{}", provider.name, model.id));
+            }
+        }
+        for level in level_names(&self.providers[self.provider].cfg) {
+            commands.push(format!("/thinking {level}"));
         }
         commands
     }
@@ -1755,8 +1764,8 @@ impl Session {
         .map(|_| ())
     }
 
-    /// Slash commands and selection changes. `screen` supplies a line from the
-    /// terminal for the model picker.
+    /// Slash commands and selection changes. The model list is printed: the
+    /// choice itself is completed in the prompt, like any other line.
     fn dispatch(&mut self, line: &str, screen: &mut ui::Screen, rx: &Receiver<Event>) -> Cmd {
         match parse_command(line) {
             Command::Empty => Cmd::Continue,
@@ -1770,19 +1779,15 @@ impl Session {
                 Cmd::Continue
             }
             Command::Model(None) => {
-                if let Some((pi, id)) =
-                    pick(&self.providers, (self.provider, &self.model), screen, rx)
-                {
-                    let text = self.set_model(pi, id);
-                    screen.set_info(&text);
-                    screen.output(&format!("{text}\n"));
-                }
+                screen.output(&models(&self.providers));
                 Cmd::Continue
             }
             Command::Model(Some(spec)) => {
                 match find(&self.providers, &spec) {
                     Some((pi, id)) => {
                         let text = self.set_model(pi, id);
+                        // The levels `/thinking` completes belong to a provider.
+                        screen.set_commands(self.commands());
                         screen.set_info(&text);
                         screen.output(&format!("{text}\n"));
                     }
@@ -2527,73 +2532,6 @@ fn resolve(providers: &[Provider], spec: Option<&str>) -> (usize, String) {
         eprintln!("axe: model {spec:?} not available, using default");
     }
     (0, providers[0].models[0].id.clone())
-}
-
-fn pick(
-    providers: &[Provider],
-    current: (usize, &str),
-    screen: &mut ui::Screen,
-    rx: &Receiver<Event>,
-) -> Option<(usize, String)> {
-    let mut items: Vec<(usize, String)> = Vec::new();
-    let mut text = String::new();
-    for (pi, p) in providers.iter().enumerate() {
-        for m in &p.models {
-            let mark = if pi == current.0 && m.id == current.1 {
-                "*"
-            } else {
-                " "
-            };
-            let ctx = match m.context {
-                Some(ctx) => format!("  ({ctx} ctx)"),
-                None => String::new(),
-            };
-            text.push_str(&format!(
-                "{mark}{:>2}) {}/{}{ctx}\n",
-                items.len() + 1,
-                p.name,
-                m.id
-            ));
-            items.push((pi, m.id.clone()));
-        }
-    }
-
-    screen.output(&text);
-    let saved = screen.prompt().to_string();
-    screen.set_prompt("model> ");
-    // A mode toggle is not a model choice: keep the picker open.
-    let choice = loop {
-        match readline(screen, rx, &mut |_| {}) {
-            Some(Input::Line(line)) => break line,
-            Some(Input::Explore) => continue,
-            // There is no chooser here; a menu key cannot arrive.
-            Some(Input::Menu(_)) | Some(Input::Cancel) => continue,
-            None => break String::new(),
-        }
-    };
-    screen.set_prompt(&saved);
-    let choice = choice.trim().to_string();
-    if choice.is_empty() {
-        return None;
-    }
-
-    if let Ok(n) = choice.parse::<usize>() {
-        return match items.get(n.wrapping_sub(1)) {
-            Some(hit) if n >= 1 => Some(hit.clone()),
-            _ => {
-                screen.error(&format!("no model #{n}\n"));
-                None
-            }
-        };
-    }
-
-    match find(providers, &choice) {
-        Some(hit) => Some(hit),
-        None => {
-            screen.error(&format!("unknown model: {choice}\n"));
-            None
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

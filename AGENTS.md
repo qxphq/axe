@@ -88,8 +88,9 @@ invariants a change must not break.
 
 ## Architecture
 
-- `main.rs` — REPL, provider setup, model picker, session lifecycle (startup
-  chooser, `/sessions`, `/new`, naming), agent loop. Two producers (keys, a turn)
+- `main.rs` — REPL, provider setup, model and thinking selection (completed in
+  the prompt, not picked from a list), session lifecycle (startup chooser,
+  `/sessions`, `/new`, naming), agent loop. Two producers (keys, a turn)
   feed one `mpsc` channel; the main thread applies events and draws once per batch.
 - `ui.rs` — the screen: prompt buffer and key mapping, the live region (chrome,
   the wrapped prompt, the command candidates under it, resized by `fit`), the

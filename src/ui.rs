@@ -191,7 +191,8 @@ pub struct Screen {
     info: String,
     /// The last killed text: one slot, enough for Ctrl-U ... Ctrl-Y.
     killed: String,
-    /// Slash commands Tab completes, in the caller's spelling.
+    /// The lines Tab completes, in the caller's spelling: a slash command on
+    /// its own, or one with its first argument filled in.
     commands: Vec<String>,
     /// The Tab cycle the buffer is part of, if any. Any edit ends it.
     cycle: Option<Cycle>,
@@ -299,14 +300,6 @@ impl Screen {
         }
     }
 
-    pub fn prompt(&self) -> &str {
-        &self.prompt
-    }
-
-    pub fn set_prompt(&mut self, prompt: &str) {
-        self.prompt = prompt.to_string();
-    }
-
     /// Explore mode colors the prompt; the transcript keeps its own palette.
     pub fn set_explore(&mut self, explore: bool) {
         self.prompt_style = if explore { EXPLORE_STYLE } else { PROMPT_STYLE };
@@ -328,7 +321,8 @@ impl Screen {
         self.info = text.to_string();
     }
 
-    /// The slash commands Tab completes.
+    /// The lines Tab completes: slash names, and names with their first
+    /// argument.
     pub fn set_commands(&mut self, commands: Vec<String>) {
         self.commands = commands;
     }
@@ -1008,13 +1002,12 @@ impl Screen {
         self.cursor += text.chars().count();
     }
 
-    /// Tab on a bare slash word: fill in a candidate, then step to the next
-    /// one on every further Tab, wrapping around. The set is captured on the
-    /// first step, so the walk covers every command the typed prefix matched,
-    /// not just those the completed buffer still matches. Backwards starts at
-    /// the last one, as a menu does. A lone candidate finishes with a space and
-    /// ends the cycle. Arguments are not the screen's business, so a line that
-    /// already has one is left alone.
+    /// Tab on a slash line: fill in a candidate, then step to the next one on
+    /// every further Tab, wrapping around. The set is captured on the first
+    /// step, so the walk covers every line the typed prefix matched, not just
+    /// those the completed buffer still matches. Backwards starts at the last
+    /// one, as a menu does. A lone candidate finishes with a space and ends the
+    /// cycle.
     fn cycle_step(&mut self, forward: bool) {
         if let Some(cycle) = &mut self.cycle {
             if cycle.matches.get(cycle.at) == Some(&self.buf) && !cycle.matches.is_empty() {
@@ -1045,17 +1038,30 @@ impl Screen {
         }
     }
 
-    /// The commands a bare slash word matches: the only text the prompt
-    /// completes, and the only place a hint is drawn.
+    /// The lines the buffer is a prefix of. Only a name is completed while only
+    /// a name is typed, so Tab on a bare slash word cannot land on a model; an
+    /// argument is completed while it is one word, so `/model dee` matches
+    /// `/model deepseek-chat`. A free-text argument takes no candidates, and a
+    /// second space ends the matching.
     fn candidates(&self) -> Vec<String> {
-        if !self.buf.starts_with('/') || self.buf.contains(char::is_whitespace) {
+        if !self.buf.starts_with('/') {
             return Vec::new();
         }
-        self.commands
-            .iter()
-            .filter(|c| c.starts_with(&self.buf))
-            .cloned()
-            .collect()
+        match self.buf.split_once(' ') {
+            None => self
+                .commands
+                .iter()
+                .filter(|c| !c.contains(' ') && c.starts_with(&self.buf))
+                .cloned()
+                .collect(),
+            Some((_, arg)) if !arg.contains(char::is_whitespace) => self
+                .commands
+                .iter()
+                .filter(|c| c.starts_with(&self.buf))
+                .cloned()
+                .collect(),
+            Some(_) => Vec::new(),
+        }
     }
 
     /// The candidates to list under the prompt and which one the next step
@@ -1643,8 +1649,6 @@ mod tests {
         screen.insert_text("hi");
         assert_eq!(screen.commit(), "hi");
         assert!(screen.is_empty());
-        screen.set_prompt("model> ");
-        assert_eq!(screen.prompt(), "model> ");
         screen.set_status("Thinking…");
         assert_eq!(screen.status(), "Thinking…");
         screen.set_commands(vec!["/help".into(), "/exit".into()]);
@@ -1685,11 +1689,48 @@ mod tests {
         screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(screen.buf, "/help ");
         assert!(screen.cycle.is_none());
-        // An argument is the user's: Tab leaves it alone.
+        // Free text after the first argument is the user's: Tab leaves it
+        // alone.
         screen.insert_text("/model");
         screen.insert_text(" a/b");
         screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(screen.buf, "/help /model a/b");
+    }
+
+    #[test]
+    fn tab_completes_the_first_argument() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_commands(vec![
+            "/model".into(),
+            "/model one/big".into(),
+            "/model two/small".into(),
+        ]);
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        // A bare name completes names alone: a model line is not a prefix it
+        // can land on.
+        screen.insert_text("/model");
+        screen.apply_key(tab);
+        assert_eq!(screen.buf, "/model ");
+        // Only then does the argument list itself.
+        assert_eq!(
+            screen.hints(),
+            (vec!["/model one/big".into(), "/model two/small".into()], 0)
+        );
+        screen.apply_key(tab);
+        assert_eq!(screen.buf, "/model one/big");
+        screen.apply_key(tab);
+        assert_eq!(screen.buf, "/model two/small");
+        // The typed argument narrows the set; one left finishes the line.
+        screen.take();
+        screen.insert_text("/model tw");
+        screen.apply_key(tab);
+        assert_eq!(screen.buf, "/model two/small ");
+        assert!(screen.cycle.is_none());
+        // A second word is free text: no candidates, no fill.
+        screen.take();
+        screen.insert_text("/model one/big now");
+        screen.apply_key(tab);
+        assert_eq!(screen.buf, "/model one/big now");
     }
 
     #[test]

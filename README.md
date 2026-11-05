@@ -150,14 +150,17 @@ a task matches.
 `❯ ` is the prompt. Enter submits, Ctrl+J or Alt+Enter starts a new line. Typing
 a slash word lists up to five matching commands under the prompt, the one the
 next step takes drawn bright; Tab and ↓ step forward, ↑ steps back, and the
-line always holds the command the step picked. A line starting with `!` is your
+line always holds the command the step picked. A command's first argument
+completes the same way: `/model ` lists the models, `/model dee` narrows them,
+and Enter applies the one the line holds. A model or a thinking level is
+therefore chosen in the prompt, like any other line. A line starting with `!` is your
 own shell: it runs through the same tool, its output joins the history as a
 user message, and no turn follows — the model sees it the next time you ask
 something.
 
 | command | what it does |
 | --- | --- |
-| `/model [id]` | list the provider's models, or pick or switch one; without a terminal it only lists |
+| `/model [id]` | list the models, or switch to one (Tab completes it); without a terminal it only lists |
 | `/thinking [level]` | show or set the thinking level |
 | `/thoughts` | show or hide the model's reasoning |
 | `/explore` | toggle explore mode (also Shift+Tab) |
@@ -177,7 +180,7 @@ and Enter on an empty line resumes the selection.
 | --- | --- |
 | Enter | submit |
 | Ctrl+J, Alt+Enter | new line |
-| Tab, ↑ ↓ | complete a command: step through its candidates, the list under the prompt |
+| Tab, ↑ ↓ | complete a command or its first argument: step through the candidates, listed under the prompt |
 | Shift+Tab | toggle explore mode |
 | ↑ ↓ | move in a chooser, or step the command candidates |
 | Esc | close a chooser, or cancel the running turn |
