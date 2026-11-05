@@ -1773,6 +1773,12 @@ fn wrap(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
 /// one starts with a blank line — which is exactly what a separator is. The
 /// last one only closes the final line, so it must not add an empty one.
 pub(crate) fn split(text: &str) -> Vec<&str> {
+    // No text is no line at all. Without this, `""` would be one empty line,
+    // which is a block boundary: a chunk that carries no newline would end the
+    // paragraph or the code fence it arrived in the middle of.
+    if text.is_empty() {
+        return Vec::new();
+    }
     let mut lines: Vec<&str> = text.split('\n').collect();
     if text.ends_with('\n') {
         lines.pop();
@@ -1919,6 +1925,8 @@ mod tests {
     fn split_drops_only_the_final_newline() {
         assert_eq!(split("a\nb\n"), vec!["a", "b"]);
         assert_eq!(split("a\n\nb"), vec!["a", "", "b"]);
+        // No text is no line, so nothing ends the block being collected.
+        assert_eq!(split(""), Vec::<&str>::new());
     }
 
     #[test]
@@ -2568,6 +2576,41 @@ mod tests {
         assert!(
             transcript.iter().any(|row| row == " line 0"),
             "{transcript:?}"
+        );
+    }
+
+    #[test]
+    fn a_thought_arriving_in_chunks_lays_out_like_a_whole_one() {
+        let text = "Let me check:\n\n```rust\nlet x = 1;\nlet y = 2;\n```\n\ndone\n";
+        // Resume hands the screen the whole thought at once.
+        let mut whole = Screen::test_screen(40, 24);
+        whole.thought(text);
+        whole.flush();
+        // A turn hands it one delta at a time, and only the finished lines: a
+        // delta with no newline leaves nothing to pass on.
+        let mut streamed = Screen::test_screen(40, 24);
+        let mut pending = String::new();
+        for delta in text.as_bytes().chunks(3) {
+            pending.push_str(std::str::from_utf8(delta).unwrap());
+            let finished = match pending.rfind('\n') {
+                Some(at) => pending.drain(..=at).collect::<String>(),
+                None => String::new(),
+            };
+            streamed.thought(&finished);
+        }
+        streamed.thought(&pending);
+        streamed.flush();
+        assert_eq!(streamed.transcript(), whole.transcript());
+        // The code is one block: no blank row inside it.
+        let rows = streamed.transcript();
+        assert!(
+            rows.windows(2)
+                .all(|pair| !(pair[0].is_empty() && pair[1].is_empty())),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("let y = 2;")),
+            "{rows:?}"
         );
     }
 
