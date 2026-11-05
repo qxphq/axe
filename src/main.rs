@@ -1593,7 +1593,6 @@ impl Session {
                     },
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
-                let mut dirty = false;
                 let mut done = false;
                 let Some(first) = first else {
                     continue;
@@ -1608,7 +1607,6 @@ impl Session {
                         // requests; the socket shutdown unblocks the one in
                         // flight.
                         Event::Key(key) if key.code == KeyCode::Esc => {
-                            dirty = true;
                             if armed {
                                 interrupted = true;
                                 cancel.cancel();
@@ -1623,7 +1621,6 @@ impl Session {
                             if armed {
                                 armed = false;
                                 screen.set_alert(None);
-                                dirty = true;
                             }
                             match screen.apply_key(key) {
                                 ui::Action::Eof => {
@@ -1637,7 +1634,6 @@ impl Session {
                                         // answer it arrived during.
                                         queued = Some(screen.take());
                                         screen.set_queued(queued.as_deref());
-                                        dirty = true;
                                     }
                                 }
                                 // The turn already captured its tool set and its
@@ -1649,17 +1645,13 @@ impl Session {
                                 ui::Action::MenuStep(_)
                                 | ui::Action::MenuAccept
                                 | ui::Action::MenuCancel => {}
-                                ui::Action::None => dirty = true,
+                                ui::Action::None => {}
                             }
                         }
-                        Event::Paste(text) => {
-                            screen.insert_text(&text);
-                            dirty = true;
-                        }
+                        Event::Paste(text) => screen.insert_text(&text),
                         // Model text, already spaced by the sink: everything up
                         // to the last newline is a finished line.
                         Event::Printed(text) => {
-                            dirty = true;
                             // The answer starting is the end of the thought: its
                             // unfinished last line goes out first.
                             let tail = std::mem::take(&mut thought);
@@ -1683,7 +1675,6 @@ impl Session {
                         }
                         // A tool call and its outcome, on one line.
                         Event::Echo(spans, error) => {
-                            dirty = true;
                             // A round that only reasoned and called a tool: its
                             // thought ends here, before the call it produced.
                             let tail = std::mem::take(&mut thought);
@@ -1699,7 +1690,6 @@ impl Session {
                         // Reasoning, dim: it precedes the answer and is not the
                         // answer, and it must not disturb the status row.
                         Event::Thought(text) => {
-                            dirty = true;
                             thought.push_str(&text);
                             let finished = match thought.rfind('\n') {
                                 Some(at) => thought.drain(..=at).collect::<String>(),
@@ -1709,16 +1699,12 @@ impl Session {
                         }
                         Event::Status(text) => {
                             if screen.status() != text {
-                                dirty = true;
                                 screen.set_status(&text);
                             }
                         }
-                        Event::Resize => {
-                            // The area under us changed: paint even if no
-                            // state did.
-                            screen.invalidate();
-                            dirty = true;
-                        }
+                        // The area under us changed: paint even if no state
+                        // did.
+                        Event::Resize => screen.invalidate(),
                         Event::Done(Err(e)) => {
                             screen.error(&format!("axe: {e}\n"));
                             done = true;
@@ -1744,9 +1730,9 @@ impl Session {
                         break;
                     }
                 }
-                if dirty {
-                    screen.repaint();
-                }
+                // One paint per batch: the setters above marked the screen,
+                // and a repaint with nothing marked is a no-op.
+                screen.repaint();
                 if done {
                     break;
                 }
