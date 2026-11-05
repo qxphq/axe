@@ -28,10 +28,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
-    # Serialised so two pushes cannot create or upload to `latest` at once.
-    concurrency:
-      group: release
-      cancel-in-progress: false
+    # No concurrency group: it is evaluated per matrix job, and GitHub keeps at
+    # most one pending job per group, so the four targets cancel each other.
+    # Parallel uploads are safe instead: asset names are per target and
+    # `--clobber` makes a repeat harmless.
     strategy:
       fail-fast: false
       matrix:
@@ -66,9 +66,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # The four jobs race to create the release; a loser reads the winner's.
           gh release view latest >/dev/null 2>&1 ||
             gh release create latest --latest --title latest \
-              --notes "Rolling build of $GITHUB_SHA: a push to main, not a tag. The version is Cargo.toml's."
+              --notes "Rolling build of $GITHUB_SHA: a push to main, not a tag. The version is Cargo.toml's." ||
+            gh release view latest >/dev/null
           gh release upload latest axe-*.tar.gz axe-*.tar.gz.sha256 --clobber
 
   interactive:
