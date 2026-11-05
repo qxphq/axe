@@ -216,7 +216,7 @@ def parse_size(raw):
 
 def write_config(root, port):
     cfg = Path(root) / "config" / "axe"
-    cfg.mkdir(parents=True)
+    cfg.mkdir(parents=True, exist_ok=True)
     (cfg / "config.json").write_text(
         json.dumps(
             {
