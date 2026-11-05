@@ -873,6 +873,7 @@ impl Session {
         let mut screen = ui::Screen::new().map_err(|e| format!("cannot take the terminal: {e}"))?;
         screen.set_commands(self.commands());
         screen.set_info(self.info());
+        screen.set_history(state::read_history(&self.state.cwd));
         // The directory's recent sessions are a chooser, not a printout: the
         // list can be walked with the arrows and vanishes when typing starts.
         if !self.startup.is_empty() {
@@ -903,7 +904,14 @@ impl Session {
                         self.poll_naming(Some(screen));
                     };
                     match readline(&mut screen, &rx, &mut idle) {
-                        Some(Input::Line(line)) => (line, false),
+                        Some(Input::Line(line)) => {
+                            // Remembered before it is dispatched, so a command
+                            // is a step like a request.
+                            if let Err(e) = state::append_history(&self.state.cwd, &line) {
+                                self.warn(format!("history: {e}"));
+                            }
+                            (line, false)
+                        }
                         Some(Input::Explore) => {
                             self.toggle_explore(&mut Console::Screen {
                                 screen: &mut screen,

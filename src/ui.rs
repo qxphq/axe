@@ -187,6 +187,19 @@ impl Selection {
     }
 }
 
+/// The prompt lines typed in this directory, and where the prompt is in them.
+/// One draft: what the line held before recalling started, given back on the
+/// way down or when a search is abandoned.
+#[derive(Default)]
+struct Recall {
+    history: Vec<String>,
+    draft: String,
+    /// The entry shown, counting back from the newest.
+    at: Option<usize>,
+    /// Reverse search while it is open: the query and its match.
+    search: Option<(String, Option<usize>)>,
+}
+
 /// What the live frame is for. A chooser is a different frame, not a taller
 /// one: the mode, never the content, decides the frame's shape.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -462,6 +475,8 @@ pub struct Screen {
     /// The candidates the line put under the prompt, if any: the arrows move
     /// its marker and Enter runs what they moved to.
     selection: Option<Selection>,
+    /// The lines typed here before, and where the prompt is in them.
+    recall: Recall,
     /// The last block written, for the blank line between blocks.
     last: Option<Block>,
     /// Rows between the end of the transcript and the top of the frame that are
@@ -534,6 +549,7 @@ impl Screen {
             info: Vec::new(),
             commands: Vec::new(),
             selection: None,
+            recall: Recall::default(),
             last: None,
             slack: 0,
             md: markdown::Stream::new(),
@@ -572,6 +588,7 @@ impl Screen {
             info: Vec::new(),
             commands: Vec::new(),
             selection: None,
+            recall: Recall::default(),
             last: None,
             slack: 0,
             md: markdown::Stream::new(),
@@ -661,6 +678,14 @@ impl Screen {
         self.dirty = true;
     }
 
+    /// The lines typed in this directory before, oldest first: Up and Down walk
+    /// them, Ctrl+R searches them.
+    pub fn set_history(&mut self, history: Vec<String>) {
+        self.recall.history = history;
+        self.recall.at = None;
+        self.recall.search = None;
+    }
+
     /// Open a chooser. Rows are plain text; the marker is drawn on the
     /// selected one.
     pub fn set_menu(&mut self, header: &str, rows: Vec<String>, collapse_on_type: bool) {
@@ -733,10 +758,14 @@ impl Screen {
         self.ed.buf.is_empty()
     }
 
-    /// The completed line, leaving the buffer empty.
+    /// The completed line, leaving the buffer empty. Whatever the prompt was
+    /// recalling ends here: the line is settled.
     pub fn take(&mut self) -> String {
         self.dirty = true;
         self.selection = None;
+        self.recall.at = None;
+        self.recall.search = None;
+        self.recall.draft.clear();
         self.ed.take()
     }
 
@@ -746,6 +775,14 @@ impl Screen {
         self.dirty = true;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // A reverse search owns the keys while it is open: they edit the query,
+        // not the line.
+        if self.recall.search.is_some() {
+            if let Some(action) = self.search_key(key) {
+                return action;
+            }
+            self.recall.search = None;
+        }
         match key.code {
             // A chooser owns the arrows and Esc while it is open. Enter on an
             // empty line accepts it; Enter on a search query submits as usual.
@@ -777,8 +814,8 @@ impl Screen {
             KeyCode::Home => self.ed.cursor = 0,
             KeyCode::End => self.ed.cursor = self.ed.len(),
             KeyCode::Tab => self.complete(),
-            KeyCode::Up => self.mark(-1),
-            KeyCode::Down => self.mark(1),
+            KeyCode::Up => self.arrow(true),
+            KeyCode::Down => self.arrow(false),
             KeyCode::BackTab => return Action::Explore,
             // A shell's Ctrl-C: drop what was typed, keep the prompt.
             KeyCode::Char('c') if ctrl => {
@@ -800,6 +837,7 @@ impl Screen {
             KeyCode::Char('y') if ctrl => self.ed.yank(),
             KeyCode::Char('t') if ctrl => self.ed.transpose_chars(),
             KeyCode::Char('t') if alt => self.ed.transpose_words(),
+            KeyCode::Char('r') if ctrl => self.start_search(),
             // Ctrl+J is the newline byte, and what a terminal-side Shift+Enter
             // mapping sends. One buffer character, not a submission.
             KeyCode::Char('j') if ctrl => self.insert_char('\n'),
@@ -816,6 +854,7 @@ impl Screen {
     /// What was typed is markdown, laid out here because it is complete.
     pub fn commit(&mut self) -> String {
         let line = self.take();
+        self.remember(&line);
         self.echo(&line);
         self.status.clear();
         self.alert = None;
@@ -1202,6 +1241,9 @@ impl Screen {
         let info = info_line(&self.info, cols / 2);
         let gap = usize::from(info.width() > 0);
         let status = clip(&self.status, cols.saturating_sub(info.width() + gap));
+        // A reverse search says what it is looking for where the ESC offer
+        // would be: it is a question, like the offer.
+        let alert = self.search_label().or_else(|| self.alert.clone());
 
         let frame = self
             .term
@@ -1292,7 +1334,7 @@ impl Screen {
                 );
                 // One row for the question, whole: the info row is metadata
                 // and comes back when the question is answered.
-                match &self.alert {
+                match &alert {
                     Some(text) => frame.render_widget(
                         Paragraph::new(Line::styled(clip(text, cols), CAUTION)),
                         line(layout.status.y),
@@ -1506,6 +1548,168 @@ impl Screen {
         }
     }
 
+    /// Keep the line for Up and Down. A blank, a leading space (the shell's
+    /// "do not remember this") and a repeat of the newest are not steps.
+    fn remember(&mut self, line: &str) {
+        if line.trim().is_empty() || line.starts_with(' ') {
+            return;
+        }
+        if self.recall.history.last().map(String::as_str) == Some(line) {
+            return;
+        }
+        self.recall.history.push(line.to_string());
+    }
+
+    /// An arrow over the candidates when the line put some under the prompt,
+    /// and over the history when it did not. The list wins: it is what the
+    /// next Enter would run.
+    fn arrow(&mut self, older: bool) {
+        if self.fresh() {
+            self.mark(if older { -1 } else { 1 });
+        } else {
+            self.recall_move(older);
+        }
+    }
+
+    /// Up and Down walk the history: the first step saves the line, the last
+    /// one down gives it back. Editing a recalled line does not rewrite the
+    /// entry, so stepping away and back shows it as it was.
+    fn recall_move(&mut self, older: bool) {
+        let len = self.recall.history.len();
+        if len == 0 {
+            return;
+        }
+        if older {
+            let at = match self.recall.at {
+                None => {
+                    self.recall.draft = std::mem::take(&mut self.ed.buf);
+                    0
+                }
+                Some(at) => (at + 1).min(len - 1),
+            };
+            self.recall.at = Some(at);
+            self.show_recall(at);
+        } else {
+            match self.recall.at {
+                None => {}
+                Some(0) => {
+                    self.recall.at = None;
+                    self.ed.buf = std::mem::take(&mut self.recall.draft);
+                    self.ed.cursor = self.ed.len();
+                }
+                Some(at) => {
+                    self.recall.at = Some(at - 1);
+                    self.show_recall(at - 1);
+                }
+            }
+        }
+    }
+
+    /// One entry on the line, cursor at its end.
+    fn show_recall(&mut self, at: usize) {
+        let index = self.recall.history.len() - 1 - at;
+        self.ed.buf = self.recall.history[index].clone();
+        self.ed.cursor = self.ed.len();
+    }
+
+    /// Ctrl+R: search the history backwards. The line previews the match; the
+    /// query rides on the row under the prompt, where the ESC offer goes.
+    fn start_search(&mut self) {
+        if self.recall.history.is_empty() || self.menu.is_some() {
+            return;
+        }
+        if self.recall.search.is_none() {
+            self.recall.draft = self.ed.buf.clone();
+        }
+        self.recall.at = None;
+        self.recall.search = Some((String::new(), None));
+    }
+
+    /// The keys a reverse search takes, or `None` when the key ends it and
+    /// belongs to the line.
+    fn search_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            // Enter accepts: the match stays on the line, unsubmitted.
+            KeyCode::Enter => {
+                self.recall.search = None;
+                Some(Action::None)
+            }
+            KeyCode::Esc => {
+                self.ed.buf = std::mem::take(&mut self.recall.draft);
+                self.ed.cursor = self.ed.len();
+                self.recall.search = None;
+                Some(Action::None)
+            }
+            KeyCode::Backspace => {
+                if let Some((query, _)) = &mut self.recall.search {
+                    query.pop();
+                }
+                self.search_refresh(false);
+                Some(Action::None)
+            }
+            KeyCode::Char('r') if ctrl => {
+                self.search_refresh(true);
+                Some(Action::None)
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                if let Some((query, _)) = &mut self.recall.search {
+                    query.push(c);
+                }
+                self.search_refresh(false);
+                Some(Action::None)
+            }
+            _ => None,
+        }
+    }
+
+    /// Look for the query from the newest (`older` false) or above the match
+    /// the search already found. An empty query gives the draft back.
+    fn search_refresh(&mut self, older: bool) {
+        let Some((query, at)) = self.recall.search.take() else {
+            return;
+        };
+        let mut at = at;
+        if query.is_empty() {
+            at = None;
+            self.ed.buf = self.recall.draft.clone();
+            self.ed.cursor = self.ed.len();
+        } else {
+            let needle = query.to_lowercase();
+            let end = if older {
+                at.unwrap_or(self.recall.history.len())
+            } else {
+                self.recall.history.len()
+            };
+            let found = self.recall.history[..end]
+                .iter()
+                .rposition(|line| line.to_lowercase().contains(&needle));
+            if let Some(index) = found {
+                at = Some(index);
+                self.ed.buf = self.recall.history[index].clone();
+                self.ed.cursor = self.ed.len();
+            }
+        }
+        self.recall.search = Some((query, at));
+    }
+
+    /// The search's row: the query, and which match of how many, newest first.
+    fn search_label(&self) -> Option<String> {
+        let (query, at) = self.recall.search.as_ref()?;
+        if query.is_empty() {
+            return Some("reverse-i-search: (type to search)".to_string());
+        }
+        Some(match at {
+            Some(index) => format!(
+                "reverse-i-search: {query} [{}/{}]",
+                self.recall.history.len() - index,
+                self.recall.history.len()
+            ),
+            None => format!("reverse-i-search: {query} (no match)"),
+        })
+    }
+
     /// Enter takes what the marker was moved to: a stepped line runs the marked
     /// candidate even though its text is still the prefix it was typed as.
     fn take_marked(&mut self) {
@@ -1553,6 +1757,11 @@ impl Screen {
     /// The candidates to list under the prompt and which row the marker is on:
     /// the stepped list, or what is typed now with the first row marked.
     fn hints(&self) -> (Vec<String>, usize) {
+        // A search previews on the line; a candidate list over it would move
+        // the arrows out of the search.
+        if self.recall.search.is_some() {
+            return (Vec::new(), 0);
+        }
         match &self.selection {
             Some(sel) if sel.belongs(&self.ed.buf) => (sel.matches.clone(), sel.at),
             _ => (self.candidates(), 0),
@@ -2149,6 +2358,112 @@ mod tests {
         // The question is whole, so the metadata it outranks is not drawn.
         assert!(!text.contains("p/m · default"), "{text}");
         assert!(!text.contains("Thinking…"), "{text}");
+    }
+
+    fn press(screen: &mut Screen, code: KeyCode, modifiers: KeyModifiers) -> Action {
+        screen.apply_key(KeyEvent::new(code, modifiers))
+    }
+
+    fn typed(screen: &mut Screen, text: &str) {
+        for c in text.chars() {
+            press(screen, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn history_walks_and_gives_the_draft_back() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_history(vec!["one".into(), "two".into(), "three".into()]);
+        typed(&mut screen, "draft");
+        press(&mut screen, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "three");
+        press(&mut screen, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "two");
+        press(&mut screen, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut screen, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "one", "the oldest is the last step");
+        press(&mut screen, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut screen, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "three");
+        press(&mut screen, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "draft", "down from the newest restores it");
+    }
+
+    #[test]
+    fn a_committed_line_is_remembered_once() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_history(vec!["old".into()]);
+        typed(&mut screen, "new");
+        press(&mut screen, KeyCode::Enter, KeyModifiers::NONE);
+        screen.commit();
+        assert_eq!(
+            screen.recall.history,
+            vec!["old".to_string(), "new".to_string()]
+        );
+        typed(&mut screen, "new");
+        press(&mut screen, KeyCode::Enter, KeyModifiers::NONE);
+        screen.commit();
+        assert_eq!(screen.recall.history.len(), 2, "a repeat is not a step");
+        typed(&mut screen, " hidden");
+        press(&mut screen, KeyCode::Enter, KeyModifiers::NONE);
+        screen.commit();
+        assert_eq!(screen.recall.history.len(), 2, "a leading space stays out");
+    }
+
+    #[test]
+    fn an_arrow_prefers_the_candidate_list_to_the_history() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_history(vec!["one".into()]);
+        screen.set_commands(vec!["/model a/b".into(), "/model a/c".into()]);
+        typed(&mut screen, "/model ");
+        press(&mut screen, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            screen.ed.buf, "/model ",
+            "the marked row moved, not the line"
+        );
+        assert_eq!(screen.selection.as_ref().unwrap().at, 1);
+        // No list: the same key walks the history.
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_history(vec!["one".into()]);
+        press(&mut screen, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "one");
+    }
+
+    #[test]
+    fn ctrl_r_finds_a_line_without_submitting_it() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_history(vec!["fix the parser".into(), "run tests".into()]);
+        typed(&mut screen, "draft");
+        press(&mut screen, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(screen.search_label().is_some());
+        typed(&mut screen, "FIX");
+        assert_eq!(screen.ed.buf, "fix the parser", "the match previews");
+        assert!(matches!(
+            screen.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert_eq!(screen.ed.buf, "fix the parser", "accepted, not submitted");
+        assert!(screen.search_label().is_none());
+
+        // Esc gives the draft back and leaves nothing else behind.
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_history(vec!["one".into()]);
+        typed(&mut screen, "mine");
+        press(&mut screen, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        typed(&mut screen, "one");
+        assert_eq!(screen.ed.buf, "one");
+        press(&mut screen, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "mine");
+        assert!(screen.search_label().is_none());
+
+        // Ctrl+R steps to an older match.
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_history(vec!["one thing".into(), "one more".into()]);
+        press(&mut screen, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        typed(&mut screen, "one");
+        assert_eq!(screen.ed.buf, "one more");
+        press(&mut screen, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(screen.ed.buf, "one thing");
     }
 
     #[test]

@@ -78,6 +78,100 @@ fn file(cwd: &Path) -> PathBuf {
     project(cwd).join("state.json")
 }
 
+/// Prompt lines remembered for this directory.
+pub const HISTORY: usize = 500;
+
+/// A history file over this size is cut back to its last `HISTORY` entries the
+/// next time it is read.
+const HISTORY_BYTES: u64 = 128 * 1024;
+
+/// `<state>/axe/projects/<key>/history.jsonl`: the prompt lines typed here, one
+/// JSON string per line so a pasted multi-line prompt survives a round trip.
+pub fn history(cwd: &Path) -> PathBuf {
+    project(cwd).join("history.jsonl")
+}
+
+/// The remembered prompt lines, oldest first. A file that cannot be read is an
+/// empty history: remembering prompts must never fail a start.
+pub fn read_history(cwd: &Path) -> Vec<String> {
+    if cwd.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    read_history_file(&history(cwd))
+}
+
+/// Remember one submitted line. Best effort at the call site: a prompt that
+/// cannot be remembered is not a failed prompt.
+pub fn append_history(cwd: &Path, line: &str) -> Result<(), String> {
+    if cwd.as_os_str().is_empty() {
+        return Ok(());
+    }
+    append_history_file(&history(cwd), line)
+}
+
+fn read_history_file(path: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut lines = parse_history(&text);
+    if lines.len() > HISTORY {
+        lines.drain(..lines.len() - HISTORY);
+    }
+    if text.len() as u64 > HISTORY_BYTES {
+        let _ = write_history_file(path, &lines);
+    }
+    lines
+}
+
+fn parse_history(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<String>(line).ok())
+        .filter(|line| !line.trim().is_empty())
+        .collect()
+}
+
+fn append_history_file(path: &Path, line: &str) -> Result<(), String> {
+    let line = line.trim_end();
+    // A leading space is the shell's "do not remember this", and a repeat of
+    // the line before it is not a new step.
+    if line.trim().is_empty() || line.starts_with(' ') {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        private_dir(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    if let Ok(text) = fs::read_to_string(path) {
+        if parse_history(&text).last().map(String::as_str) == Some(line) {
+            return Ok(());
+        }
+    }
+    let encoded = serde_json::to_string(line).map_err(|e| format!("encode history: {e}"))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    set_mode(path, 0o600).map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    file.write_all(format!("{encoded}\n").as_bytes())
+        .map_err(|e| format!("append history: {e}"))
+}
+
+/// Replace the file with `lines`, atomically: a crash leaves the old history,
+/// not half of a new one.
+fn write_history_file(path: &Path, lines: &[String]) -> io::Result<()> {
+    let tmp = path.with_extension("jsonl.tmp");
+    let mut text = String::new();
+    for line in lines {
+        if let Ok(encoded) = serde_json::to_string(line) {
+            text.push_str(&encoded);
+            text.push('\n');
+        }
+    }
+    write_private(&tmp, &text)?;
+    fs::rename(&tmp, path)
+}
+
 /// Create `dir` and the axe-owned directories above it, all `0700`: a
 /// directory's state and its sessions are private to the user.
 pub fn private_dir(dir: &Path) -> io::Result<()> {
@@ -230,6 +324,53 @@ mod tests {
     fn fnv_hash_is_stable() {
         assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
+    #[test]
+    fn history_appends_and_reads_back() {
+        let dir = std::env::temp_dir().join(format!("axe-test-history-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("history.jsonl");
+        append_history_file(&path, "first").unwrap();
+        append_history_file(&path, "second\nline").unwrap();
+        // A repeat of the newest, a leading space, and a blank are not steps.
+        append_history_file(&path, "second\nline").unwrap();
+        append_history_file(&path, " leading").unwrap();
+        append_history_file(&path, "   ").unwrap();
+        assert_eq!(
+            read_history_file(&path),
+            vec!["first".to_string(), "second\nline".to_string()]
+        );
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        // A line that is not a JSON string is skipped, not fatal.
+        fs::write(&path, "{\"a\"}\n\"kept\"\n").unwrap();
+        assert_eq!(read_history_file(&path), vec!["kept".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_is_capped_and_pruned() {
+        let dir = std::env::temp_dir().join(format!("axe-test-prune-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        let mut text = String::new();
+        for i in 0..20_000 {
+            text.push_str(&format!(
+                "\"entry {i} with some padding so the file is over the cap\"\n"
+            ));
+        }
+        fs::write(&path, &text).unwrap();
+        let lines = read_history_file(&path);
+        assert_eq!(lines.len(), HISTORY);
+        assert_eq!(
+            lines.last().unwrap(),
+            "entry 19999 with some padding so the file is over the cap"
+        );
+        // The read pruned the file it read.
+        assert!(fs::metadata(&path).unwrap().len() < HISTORY_BYTES);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

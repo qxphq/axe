@@ -140,7 +140,8 @@ invariants a change must not break.
 - `http.rs` — URL parsing, HTTP/1.1 over `TcpStream`/rustls, body decoding
   (`Content-Length`, chunked, EOF), line/body caps and timeouts.
 - `config.rs` — load and validate the config; resolve the `agents` file.
-- `state.rs` — per-directory state: the cwd key, load, and an atomic write.
+- `state.rs` — per-directory state: the cwd key, load, an atomic write, and the
+  prompt history file `Up` and Ctrl+R walk.
 - `sessions.rs` — meta sidecar and append-only JSONL body per session; listing,
   search, system gzip for old bodies, UTC stamp, and the compaction marker a
   body continues from.
@@ -192,7 +193,10 @@ invariants a change must not break.
   key stripped: the marker is a file record, never a request field. The system prompt and mode notes are never
   logged; resume rebuilds them. A title and summary are generated once, after the
   first answer; failing that, the first request stands in. The project directory
-  also holds `plan/`, the one writable path explore mode keeps across sessions.
+  also holds `plan/`, the one writable path explore mode keeps across sessions,
+  and `history.jsonl`, the prompt lines typed there: one JSON string per line,
+  the newest 500, the same `0600`. A blank, a leading space and a repeat of the
+  newest are not steps.
 - `!cmd` is the user's shell. It runs through `tools::execute`, its output joins
   the history as a `user` message, no turn follows, and explore-mode write
   confinement does not apply.

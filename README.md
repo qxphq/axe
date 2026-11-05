@@ -187,6 +187,15 @@ line. A line starting with `!` is your own shell: it runs through the same tool,
 its output joins the history as a user message, and no turn follows — the model
 sees it the next time you ask something.
 
+Every submitted line is remembered for the directory, across sessions, so ↑
+walks what was typed here before, newest first; ↓ comes back down and gives the
+line being typed back at the bottom. Ctrl+R searches instead: the query shows
+on the row under the prompt, the line previews the match, and Ctrl+R again steps
+to an older one. Enter accepts the match into the line without submitting it,
+and Esc puts back what was there before. A blank line, a line starting with a
+space (the shell's "do not remember this") and a repeat of the line before it
+are not remembered.
+
 | command | what it does |
 | --- | --- |
 | `/model [id]` | list the models, or switch to one (Tab completes it); without a terminal it only lists |
@@ -218,7 +227,7 @@ and Enter on an empty line resumes the selection.
 | Enter | submit |
 | Ctrl+J, Alt+Enter | new line |
 | Tab | complete a command or its first argument: put the marked candidate on the line |
-| ↑ ↓ | move the mark over the candidates above the prompt, or in a chooser; Enter runs the marked one |
+| ↑ ↓ | move the mark over the candidates above the prompt, walk the history when there is no list, or move in a chooser |
 | Shift+Tab | toggle explore mode |
 | Esc | close a chooser; twice to interrupt the running turn |
 | Ctrl+C | clear the prompt line |
@@ -226,6 +235,7 @@ and Enter on an empty line resumes the selection.
 | Ctrl+B / Ctrl+F, Alt+B / Alt+F | move by character, by word |
 | Ctrl+W, Alt+W, Alt+D | kill the word before, before, after |
 | Ctrl+U / Ctrl+K | kill to the start / to the end |
+| Ctrl+R | search the history backwards: the line previews the match, Enter accepts, Esc gives the line back |
 | Ctrl+Y / Ctrl+T / Alt+T | yank / transpose characters / transpose words |
 
 Turns run in the background: the prompt stays live while the model answers, and
@@ -293,6 +303,7 @@ directory with every byte outside `[A-Za-z0-9._-]` written as `%XX` — so
 | file | contents |
 | --- | --- |
 | `state.json` | model, thinking levels, thoughts toggle |
+| `history.jsonl` | prompt lines typed here, one JSON string per line; the newest 500 |
 | `plan/` | explore mode's writable directory: a plan that outlives the session |
 | `<id>.json` | a session's title, summary, dates and message count |
 | `<id>.jsonl` | the session body: one API message per line, append-only |
