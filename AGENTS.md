@@ -13,8 +13,8 @@ invariants a change must not break.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
    panes, compaction, subagents, MCP, or permission layer until the REPL is
    genuinely insufficient. One feature per change.
-3. **Small surface.** Twelve modules; a new module needs a separate concern, not
-   a line count.
+3. **Small surface.** Sixteen modules; a new module needs a separate concern,
+   not a line count.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` +
    SSE only. Express differences as config (`base_url`, `models_url`,
    `api_key_env`, `session_header`), never per-provider code paths.
@@ -111,11 +111,21 @@ invariants a change must not break.
   `/sessions`, `/new`, naming), agent loop. Two producers (keys, a turn)
   feed one `mpsc` channel; the main thread applies events and draws once per batch.
 - `ui.rs` — the screen: the live frame (`Frame`, a layout from the terminal size
-  and the mode, put in place by `settle`), prompt buffer and key mapping, the
-  chooser, `write` for transcript blocks (wrapped here, since a clipped line
-  would be lost) and the `slack` it places them by. The info row is pieces
-  (`Info`), each with its own ANSI color: the caller says what a piece is, the
-  screen how it looks.
+  and the mode, put in place by `settle`), key mapping, completion, the chooser,
+  `write` for transcript blocks (wrapped here, since a clipped line would be
+  lost) and the `slack` it places them by. The info row is pieces (`Info`), each
+  with its own ANSI color: the caller says what a piece is, the screen how it
+  looks. `Block` and `separated` are the one rule for the blank row between two
+  blocks, which both writers use.
+- `editor.rs` — the prompt's buffer and motions: a char cursor, the kill ring's
+  one slot, and the keys readline taught everyone. No screen, no menu, no turn.
+- `render.rs` — transcript text: `Paint`, and what a call, a command and a
+  reasoning line look like. The screen renders the same spans as cells.
+- `turn.rs` — the turn loop: one request per round, the queue a typed line joins
+  at a boundary, the two sinks, and `History` (the one place a message is both
+  appended to the request and written to the log).
+- `text.rs` — control bytes, the output cap, and the one place a `Style` becomes
+  ANSI.
 - `markdown.rs` — markdown: blocks, inlines, tables, entities, URL checks, and the
   renderer. `Stream` feeds it a line at a time and lays a block out when it ends.
 - `api.rs` — model listing, chat request, SSE parsing, tool-call accumulation.
@@ -125,7 +135,9 @@ invariants a change must not break.
 - `state.rs` — per-directory state: the cwd key, load, and an atomic write.
 - `sessions.rs` — meta sidecar and append-only JSONL body per session; listing,
   search, system gzip for old bodies, UTC stamp.
-- `tools.rs` — tool registry, schemas, generated prompt, local tools, `about`.
+- `tools.rs` — tool registry, schemas, generated prompt, local tools, `about`,
+  and `Mode`: the tool set a session runs with, and the note and denial that
+  announce it.
 - `web.rs` — `fetch`/`web_search`: host guard, HTML tokenizer, sanitizer,
   Brave/DuckDuckGo parsers, paging.
 - `skills.rs` — Agent Skills discovery, the frontmatter subset, the catalogue,

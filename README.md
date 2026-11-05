@@ -48,6 +48,11 @@ axe < prompts    # without a terminal: plain-text lines in, transcript out
 axe --version    # prints the version and exits; no config, no network
 ```
 
+Without a terminal the line comes from stdin and the transcript goes to stdout:
+the same commands, the same turns, one line at a time. Nothing that needs a
+screen exists there — `/sessions` prints a numbered list to resume from, and the
+startup chooser does not appear.
+
 The working directory is what the prompt shows, what `AGENTS.md` is looked up
 from, and the key under which the session is remembered.
 
@@ -240,7 +245,8 @@ for a key.
 
 Explore mode is a session setting, on by default (`explore_by_default`). When
 it is on: `write` and `edit` are unavailable, `bash` runs only a fixed
-allowlist of commands and writes only inside a scratch directory,
+allowlist of commands and writes only inside a scratch directory and the
+project's `plan/` directory,
 and `fetch` and `web_search` are the way to read the web. When it is off,
 `write`, `edit` and a full `bash` are back — `fetch` and `web_search` are
 refused. The network is confined in neither mode: a command connects where you
@@ -331,7 +337,7 @@ and programs whose side effect is a mode or a timestamp rather than a write
 off: they exec their own `/nix/store` and `/opt/homebrew` paths, which no list
 entry can cover. `ld.so` can start a program that is not on the list, and an
 allowed program can load code with `LD_PRELOAD`; loaded code runs in the same
-domain, and still cannot write outside the scratch directory. So `git ls-remote`
+domain, and still cannot write outside the two writable directories. So `git ls-remote`
 reaches an https remote in explore mode, while `git fetch` does not, because the
 repository is not writable there, and an `ssh` remote does not, because the
 transport execs `ssh`. It degrades with one line at startup on a kernel without

@@ -9,11 +9,9 @@
 //! until the block they belong to ends, because laying a block out needs all
 //! of it: a table its header, a paragraph its last line.
 
-use std::collections::HashMap;
-use std::io::{self, IsTerminal};
-
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::collections::HashMap;
 use unicode_width::UnicodeWidthChar;
 
 // --- Types ---
@@ -1627,51 +1625,21 @@ impl Stream {
 
 // --- Output for a stream that has no screen ---
 
+#[cfg(test)]
 fn plain(line: &Line) -> String {
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     text.trim_end().to_string()
 }
 
+/// A rendered line as ANSI, for the paths that have no screen. The codes are
+/// `text::ansi`'s: this module decides what is code and what is a link, the
+/// terminal's own names decide how that looks.
 pub fn ansi(line: &Line) -> String {
-    if !io::stdout().is_terminal() {
-        return plain(line);
-    }
     let mut out = String::new();
     for span in &line.spans {
-        // A span can quote a page or a command: terminal controls are removed
-        // here, before the style wraps it.
-        let content = crate::strip_control(&span.content);
-        let codes = ansi_codes(span.style);
-        if codes.is_empty() {
-            out.push_str(&content);
-        } else {
-            out.push_str(&format!("\x1b[{}m{}\x1b[0m", codes.join(";"), content));
-        }
+        out.push_str(&crate::text::ansi(&span.content, span.style));
     }
     out.trim_end().to_string()
-}
-
-fn ansi_codes(style: Style) -> Vec<&'static str> {
-    let mut codes = Vec::new();
-    match style.fg {
-        Some(Color::Cyan) => codes.push("36"),
-        Some(Color::Green) => codes.push("32"),
-        Some(Color::Yellow) => codes.push("33"),
-        Some(Color::Red) => codes.push("31"),
-        _ => {}
-    }
-    for (bit, code) in [
-        (Modifier::BOLD, "1"),
-        (Modifier::DIM, "2"),
-        (Modifier::ITALIC, "3"),
-        (Modifier::UNDERLINED, "4"),
-        (Modifier::CROSSED_OUT, "9"),
-    ] {
-        if style.add_modifier.contains(bit) {
-            codes.push(code);
-        }
-    }
-    codes
 }
 
 #[cfg(test)]

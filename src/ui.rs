@@ -24,7 +24,7 @@ use std::io::{self, IsTerminal, Stdout, Write};
 #[cfg(test)]
 use ratatui::backend::TestBackend;
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
-use ratatui::buffer::{Buffer, Cell};
+use ratatui::buffer::{Buffer as Cells, Cell};
 use ratatui::crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -37,6 +37,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame as TermFrame, Terminal, TerminalOptions, Viewport};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::editor::Buffer;
 use crate::markdown;
 
 /// Blank cells at each screen edge: nothing is written against the border.
@@ -101,6 +102,13 @@ impl Info {
             Info::Mode => CAUTION,
         }
     }
+}
+
+/// Whether `block` needs a blank row above it: everything but two tool calls in
+/// a row, which are one block. Both writers place it, so a transcript reads the
+/// same whether it has a screen or a pipe.
+pub fn separated(last: Option<Block>, block: Block) -> bool {
+    !(block == Block::Tool && last == Some(block))
 }
 
 /// The kind of the last transcript block. Everything but two tool calls in a
@@ -313,7 +321,7 @@ impl Term {
         }
     }
 
-    fn insert_before<F: FnOnce(&mut Buffer)>(&mut self, height: u16, draw: F) -> io::Result<()> {
+    fn insert_before<F: FnOnce(&mut Cells)>(&mut self, height: u16, draw: F) -> io::Result<()> {
         match self {
             Term::Real(term) => term.insert_before(height, draw),
             #[cfg(test)]
@@ -407,9 +415,8 @@ pub struct Screen {
     prompt: String,
     /// Color of the prompt glyph, switched by explore mode.
     prompt_style: Style,
-    buf: String,
-    /// Cursor position in `buf`, in chars.
-    cursor: usize,
+    /// The line being typed, its cursor and the last killed text.
+    ed: Buffer,
     /// Left half of the row under the prompt: thinking, or what is running.
     status: String,
     /// A question the user must answer, on the row under the prompt with the
@@ -424,8 +431,6 @@ pub struct Screen {
     /// pointed at. Set by the caller, which owns the model, the thinking level
     /// and the window, and colored here.
     info: Vec<(Info, String)>,
-    /// The last killed text: one slot, enough for Ctrl-U ... Ctrl-Y.
-    killed: String,
     /// The lines Tab completes, in the caller's spelling: a slash command on
     /// its own, or one with its first argument filled in.
     commands: Vec<String>,
@@ -499,13 +504,11 @@ impl Screen {
             term: Term::Real(term),
             prompt: prompt.to_string(),
             prompt_style: PROMPT_STYLE,
-            buf: String::new(),
-            cursor: 0,
+            ed: Buffer::default(),
             status: String::new(),
             alert: None,
             queued: None,
             info: Vec::new(),
-            killed: String::new(),
             commands: Vec::new(),
             selection: None,
             last: None,
@@ -539,13 +542,11 @@ impl Screen {
             term: Term::Test(term),
             prompt: "❯ ".to_string(),
             prompt_style: PROMPT_STYLE,
-            buf: String::new(),
-            cursor: 0,
+            ed: Buffer::default(),
             status: String::new(),
             alert: None,
             queued: None,
             info: Vec::new(),
-            killed: String::new(),
             commands: Vec::new(),
             selection: None,
             last: None,
@@ -564,7 +565,7 @@ impl Screen {
     }
 
     #[cfg(test)]
-    fn test_buffer(&self) -> &Buffer {
+    fn test_buffer(&self) -> &Cells {
         match &self.term {
             Term::Test(term) => term.backend().buffer(),
             Term::Real(_) => unreachable!(),
@@ -712,15 +713,14 @@ impl Screen {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.ed.buf.is_empty()
     }
 
     /// The completed line, leaving the buffer empty.
     pub fn take(&mut self) -> String {
         self.dirty = true;
-        self.cursor = 0;
         self.selection = None;
-        std::mem::take(&mut self.buf)
+        self.ed.take()
     }
 
     /// Fold one key into the buffer. Holds no interrupt semantics: ESC belongs
@@ -735,7 +735,7 @@ impl Screen {
             KeyCode::Up if self.menu_active() => return Action::MenuStep(-1),
             KeyCode::Down if self.menu_active() => return Action::MenuStep(1),
             KeyCode::Esc if self.menu.is_some() => return Action::MenuCancel,
-            KeyCode::Enter if self.menu_active() && self.buf.is_empty() => {
+            KeyCode::Enter if self.menu_active() && self.ed.buf.is_empty() => {
                 return Action::MenuAccept
             }
             // A new line, not a submission: Alt is the ESC-prefixed form every
@@ -750,39 +750,39 @@ impl Screen {
                 self.take_marked();
                 return Action::Submit;
             }
-            KeyCode::Backspace if alt || ctrl => self.kill_word_back(),
-            KeyCode::Backspace => self.backspace(),
-            KeyCode::Delete => self.delete(),
-            KeyCode::Left if alt || ctrl => self.word_back(),
-            KeyCode::Right if alt || ctrl => self.word_forward(),
-            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Right => self.cursor = (self.cursor + 1).min(self.len()),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.len(),
+            KeyCode::Backspace if alt || ctrl => self.ed.kill_word_back(),
+            KeyCode::Backspace => self.ed.backspace(),
+            KeyCode::Delete => self.ed.delete(),
+            KeyCode::Left if alt || ctrl => self.ed.word_back(),
+            KeyCode::Right if alt || ctrl => self.ed.word_forward(),
+            KeyCode::Left => self.ed.cursor = self.ed.cursor.saturating_sub(1),
+            KeyCode::Right => self.ed.cursor = (self.ed.cursor + 1).min(self.ed.len()),
+            KeyCode::Home => self.ed.cursor = 0,
+            KeyCode::End => self.ed.cursor = self.ed.len(),
             KeyCode::Tab => self.complete(),
             KeyCode::Up => self.mark(-1),
             KeyCode::Down => self.mark(1),
             KeyCode::BackTab => return Action::Explore,
             // A shell's Ctrl-C: drop what was typed, keep the prompt.
             KeyCode::Char('c') if ctrl => {
-                self.buf.clear();
-                self.cursor = 0;
+                self.ed.buf.clear();
+                self.ed.cursor = 0;
             }
-            KeyCode::Char('d') if ctrl && self.buf.is_empty() => return Action::Eof,
-            KeyCode::Char('d') if ctrl => self.delete(),
-            KeyCode::Char('a') if ctrl => self.cursor = 0,
-            KeyCode::Char('e') if ctrl => self.cursor = self.len(),
-            KeyCode::Char('b') if ctrl => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Char('f') if ctrl => self.cursor = (self.cursor + 1).min(self.len()),
-            KeyCode::Char('b') if alt => self.word_back(),
-            KeyCode::Char('f') if alt => self.word_forward(),
-            KeyCode::Char('w') if ctrl || alt => self.kill_word_back(),
-            KeyCode::Char('d') if alt => self.kill_word_forward(),
-            KeyCode::Char('u') if ctrl => self.kill_to_start(),
-            KeyCode::Char('k') if ctrl => self.kill_to_end(),
-            KeyCode::Char('y') if ctrl => self.yank(),
-            KeyCode::Char('t') if ctrl => self.transpose_chars(),
-            KeyCode::Char('t') if alt => self.transpose_words(),
+            KeyCode::Char('d') if ctrl && self.ed.buf.is_empty() => return Action::Eof,
+            KeyCode::Char('d') if ctrl => self.ed.delete(),
+            KeyCode::Char('a') if ctrl => self.ed.cursor = 0,
+            KeyCode::Char('e') if ctrl => self.ed.cursor = self.ed.len(),
+            KeyCode::Char('b') if ctrl => self.ed.cursor = self.ed.cursor.saturating_sub(1),
+            KeyCode::Char('f') if ctrl => self.ed.cursor = (self.ed.cursor + 1).min(self.ed.len()),
+            KeyCode::Char('b') if alt => self.ed.word_back(),
+            KeyCode::Char('f') if alt => self.ed.word_forward(),
+            KeyCode::Char('w') if ctrl || alt => self.ed.kill_word_back(),
+            KeyCode::Char('d') if alt => self.ed.kill_word_forward(),
+            KeyCode::Char('u') if ctrl => self.ed.kill_to_start(),
+            KeyCode::Char('k') if ctrl => self.ed.kill_to_end(),
+            KeyCode::Char('y') if ctrl => self.ed.yank(),
+            KeyCode::Char('t') if ctrl => self.ed.transpose_chars(),
+            KeyCode::Char('t') if alt => self.ed.transpose_words(),
             // Ctrl+J is the newline byte, and what a terminal-side Shift+Enter
             // mapping sends. One buffer character, not a submission.
             KeyCode::Char('j') if ctrl => self.insert_char('\n'),
@@ -886,7 +886,7 @@ impl Screen {
         // Consecutive tool calls are one block: they belong together. A user
         // line is its own, and markdown arrives one laid-out block at a time,
         // so neither continues.
-        let continues = block == Block::Tool && self.last == Some(block);
+        let continues = !separated(self.last, block);
         if !continues {
             lines.insert(0, Line::default());
         }
@@ -1081,8 +1081,8 @@ impl Screen {
         let layout = layout.at(self.term.area().y);
         let (rows, first, (crow, ccol)) = prompt_layout(
             gutter,
-            &self.buf,
-            self.cursor,
+            &self.ed.buf,
+            self.ed.cursor,
             cols,
             layout.prompt.height.max(1) as usize,
         );
@@ -1344,19 +1344,6 @@ impl Screen {
         ratatui::restore();
     }
 
-    fn len(&self) -> usize {
-        self.buf.chars().count()
-    }
-
-    /// Byte offset of a char index.
-    fn offset(&self, chars: usize) -> usize {
-        self.buf
-            .char_indices()
-            .nth(chars)
-            .map(|(byte, _)| byte)
-            .unwrap_or(self.buf.len())
-    }
-
     fn insert_char(&mut self, c: char) {
         // Typing at startup is the choice: the session begins fresh and the
         // chooser's list goes with it, rather than staying in scrollback.
@@ -1368,9 +1355,7 @@ impl Screen {
         {
             self.clear_menu(false);
         }
-        let at = self.offset(self.cursor);
-        self.buf.insert(at, c);
-        self.cursor += 1;
+        self.ed.insert_char(c);
     }
 
     /// Text from a paste, newlines and all: it joins the buffer as it is, so a
@@ -1390,26 +1375,21 @@ impl Screen {
         {
             self.clear_menu(false);
         }
-        let at = self.offset(self.cursor);
-        self.buf.insert_str(at, &text);
-        self.cursor += text.chars().count();
+        self.ed.insert_text(&text);
     }
 
-    /// The list under the prompt, taken from the line as it is now with the
-    /// first row marked, or the one a step already made. False when nothing
-    /// matches.
     fn fresh(&mut self) -> bool {
         if !self
             .selection
             .as_ref()
-            .is_some_and(|sel| sel.belongs(&self.buf))
+            .is_some_and(|sel| sel.belongs(&self.ed.buf))
         {
             let matches = self.candidates();
             self.selection = if matches.is_empty() {
                 None
             } else {
                 Some(Selection {
-                    typed: self.buf.clone(),
+                    typed: self.ed.buf.clone(),
                     matches,
                     at: 0,
                 })
@@ -1442,7 +1422,7 @@ impl Screen {
         }
         let Some(sel) = &self.selection else { return };
         let n = sel.matches.len();
-        let at = if sel.matches[sel.at] == self.buf {
+        let at = if sel.matches[sel.at] == self.ed.buf {
             (sel.at + 1) % n
         } else {
             sel.at
@@ -1452,28 +1432,32 @@ impl Screen {
         if lone {
             line.push(' ');
         }
-        self.buf = line;
-        self.cursor = self.len();
+        self.ed.buf = line;
+        self.ed.cursor = self.ed.len();
         if lone {
             self.selection = None;
         } else if let Some(sel) = &mut self.selection {
             sel.at = at;
-            sel.typed = self.buf.clone();
+            sel.typed = self.ed.buf.clone();
         }
     }
 
     /// Enter takes what the marker was moved to: a stepped line runs the marked
     /// candidate even though its text is still the prefix it was typed as.
     fn take_marked(&mut self) {
-        let Some(sel) = self.selection.as_ref().filter(|sel| sel.belongs(&self.buf)) else {
+        let Some(sel) = self
+            .selection
+            .as_ref()
+            .filter(|sel| sel.belongs(&self.ed.buf))
+        else {
             return;
         };
-        if sel.matches[sel.at] == self.buf {
+        if sel.matches[sel.at] == self.ed.buf {
             return;
         }
         let line = sel.matches[sel.at].clone();
-        self.buf = line;
-        self.cursor = self.len();
+        self.ed.buf = line;
+        self.ed.cursor = self.ed.len();
     }
 
     /// The lines the buffer is a prefix of. Only a name is completed while only
@@ -1482,20 +1466,20 @@ impl Screen {
     /// `/model deepseek-chat`. A free-text argument takes no candidates, and a
     /// second space ends the matching.
     fn candidates(&self) -> Vec<String> {
-        if !self.buf.starts_with('/') {
+        if !self.ed.buf.starts_with('/') {
             return Vec::new();
         }
-        match self.buf.split_once(' ') {
+        match self.ed.buf.split_once(' ') {
             None => self
                 .commands
                 .iter()
-                .filter(|c| !c.contains(' ') && c.starts_with(&self.buf))
+                .filter(|c| !c.contains(' ') && c.starts_with(&self.ed.buf))
                 .cloned()
                 .collect(),
             Some((_, arg)) if !arg.contains(char::is_whitespace) => self
                 .commands
                 .iter()
-                .filter(|c| c.starts_with(&self.buf))
+                .filter(|c| c.starts_with(&self.ed.buf))
                 .cloned()
                 .collect(),
             Some(_) => Vec::new(),
@@ -1506,179 +1490,9 @@ impl Screen {
     /// the stepped list, or what is typed now with the first row marked.
     fn hints(&self) -> (Vec<String>, usize) {
         match &self.selection {
-            Some(sel) if sel.belongs(&self.buf) => (sel.matches.clone(), sel.at),
+            Some(sel) if sel.belongs(&self.ed.buf) => (sel.matches.clone(), sel.at),
             _ => (self.candidates(), 0),
         }
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            let at = self.offset(self.cursor);
-            self.buf.remove(at);
-        }
-    }
-
-    fn delete(&mut self) {
-        if self.cursor < self.len() {
-            let at = self.offset(self.cursor);
-            self.buf.remove(at);
-        }
-    }
-
-    /// Replace chars `from..to` with `text`, leaving the cursor after it.
-    fn splice(&mut self, from: usize, to: usize, text: &str) {
-        let start = self.offset(from);
-        let end = self.offset(to);
-        self.buf.replace_range(start..end, text);
-        self.cursor = from + text.chars().count();
-    }
-
-    /// `nth` from the end, where 0 is the last char. Cuts on char boundaries.
-    fn at(&self, nth: usize) -> usize {
-        self.offset(self.len().saturating_sub(nth))
-    }
-
-    fn char_at(&self, i: usize) -> Option<char> {
-        self.buf.chars().nth(i)
-    }
-
-    /// Start of the word ending at or before the cursor: skip the whitespace
-    /// the cursor sits in (or just after), then the word before it.
-    fn word_start(&self) -> usize {
-        let mut i = self.cursor;
-        while i > 0 && self.char_at(i - 1).is_some_and(char::is_whitespace) {
-            i -= 1;
-        }
-        while i > 0 && self.char_at(i - 1).is_some_and(|c| !c.is_whitespace()) {
-            i -= 1;
-        }
-        i
-    }
-
-    /// End of the word starting at or after the cursor.
-    fn word_end(&self) -> usize {
-        let mut i = self.cursor;
-        while i < self.len() && self.char_at(i).is_some_and(char::is_whitespace) {
-            i += 1;
-        }
-        while i < self.len() && self.char_at(i).is_some_and(|c| !c.is_whitespace()) {
-            i += 1;
-        }
-        i
-    }
-
-    fn word_back(&mut self) {
-        self.cursor = self.word_start();
-    }
-
-    fn word_forward(&mut self) {
-        self.cursor = self.word_end();
-    }
-
-    fn kill_word_back(&mut self) {
-        let start = self.word_start();
-        if start < self.cursor {
-            self.killed = self.buf[self.offset(start)..self.offset(self.cursor)].to_string();
-            self.splice(start, self.cursor, "");
-        }
-    }
-
-    fn kill_word_forward(&mut self) {
-        let end = self.word_end();
-        if end > self.cursor {
-            self.killed = self.buf[self.offset(self.cursor)..self.offset(end)].to_string();
-            self.splice(self.cursor, end, "");
-        }
-    }
-
-    fn kill_to_start(&mut self) {
-        if self.cursor > 0 {
-            self.killed = self.buf[..self.offset(self.cursor)].to_string();
-            self.splice(0, self.cursor, "");
-        }
-    }
-
-    fn kill_to_end(&mut self) {
-        if self.cursor < self.len() {
-            self.killed = self.buf[self.offset(self.cursor)..].to_string();
-            self.splice(self.cursor, self.len(), "");
-        }
-    }
-
-    fn yank(&mut self) {
-        // Copied out first: `splice` takes `&mut self`.
-        let text = self.killed.clone();
-        if text.is_empty() {
-            return;
-        }
-        let at = self.cursor;
-        self.splice(at, at, &text);
-    }
-
-    /// Swap the two chars before the cursor, as readline does: at the end of
-    /// the line the cursor steps back one first.
-    fn transpose_chars(&mut self) {
-        let end = if self.cursor == self.len() {
-            self.at(0)
-        } else {
-            self.cursor
-        };
-        if end < 2 {
-            return;
-        }
-        let (a, b) = (end - 2, end - 1);
-        let (x, y) = (self.char_at(a).unwrap(), self.char_at(b).unwrap());
-        self.splice(a, b + 1, &format!("{y}{x}"));
-        // The cursor is a char index, so a multi-cell char is one step.
-        self.cursor = a + 2;
-    }
-
-    /// Swap the two words before the cursor.
-    fn transpose_words(&mut self) {
-        // Step back over trailing whitespace, then find the word before it.
-        let mut second_end = self.cursor;
-        while second_end > 0
-            && self
-                .char_at(second_end - 1)
-                .is_some_and(char::is_whitespace)
-        {
-            second_end -= 1;
-        }
-        let mut second_start = second_end;
-        while second_start > 0
-            && self
-                .char_at(second_start - 1)
-                .is_some_and(|c| !c.is_whitespace())
-        {
-            second_start -= 1;
-        }
-        if second_start == second_end {
-            return;
-        }
-        let mut first_end = second_start;
-        while first_end > 0 && self.char_at(first_end - 1).is_some_and(char::is_whitespace) {
-            first_end -= 1;
-        }
-        let mut first_start = first_end;
-        while first_start > 0
-            && self
-                .char_at(first_start - 1)
-                .is_some_and(|c| !c.is_whitespace())
-        {
-            first_start -= 1;
-        }
-        if first_start == first_end {
-            return;
-        }
-        let first = self.buf[self.offset(first_start)..self.offset(first_end)].to_string();
-        let between = self.buf[self.offset(first_end)..self.offset(second_start)].to_string();
-        let second = self.buf[self.offset(second_start)..self.offset(second_end)].to_string();
-        self.splice(
-            first_start,
-            second_end,
-            &format!("{second}{between}{first}"),
-        );
     }
 }
 
@@ -1808,7 +1622,7 @@ fn paint_above<B: Backend>(
     margin: u16,
 ) -> io::Result<()> {
     let width = width.max(1);
-    let mut buf = Buffer::empty(Rect::new(0, top, width, rows.len() as u16));
+    let mut buf = Cells::empty(Rect::new(0, top, width, rows.len() as u16));
     paint(&mut buf, rows, margin);
     let cells = buf.content.iter().enumerate().map(|(i, cell)| {
         (
@@ -1829,7 +1643,7 @@ fn paint_above<B: Backend>(
 /// later, narrower terminal to reflow into rows of white space. An empty symbol
 /// instead marks where the row's text ends: `Tail` draws up to it and erases the
 /// rest, which also wipes whatever the row held before.
-fn paint(buf: &mut Buffer, rows: Vec<Line<'static>>, margin: u16) {
+fn paint(buf: &mut Cells, rows: Vec<Line<'static>>, margin: u16) {
     let width = buf.area.width.max(1) as usize;
     Paragraph::new(rows).render(inset(buf.area, margin), buf);
     for row in buf.content.chunks_mut(width) {
@@ -2095,8 +1909,8 @@ mod tests {
     #[test]
     fn live_region_renders_prompt_status_info_and_queue() {
         let mut screen = Screen::test_screen(40, 10);
-        screen.buf = "hi".into();
-        screen.cursor = 2;
+        screen.ed.buf = "hi".into();
+        screen.ed.cursor = 2;
         screen.set_status("Thinking…");
         screen.set_info([
             (Info::Selection, "p/m".to_string()),
@@ -2206,10 +2020,10 @@ mod tests {
         for c in ['a', 'b', 'c'] {
             screen.apply_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
-        assert_eq!(screen.buf, "abc");
+        assert_eq!(screen.ed.buf, "abc");
         screen.apply_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         screen.apply_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(screen.buf, "ac");
+        assert_eq!(screen.ed.buf, "ac");
         assert!(matches!(
             screen.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Action::Submit
@@ -2221,7 +2035,7 @@ mod tests {
         let mut screen = Screen::test_screen(40, 10);
         screen.apply_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
         screen.apply_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert_eq!(screen.buf, "\na");
+        assert_eq!(screen.ed.buf, "\na");
     }
 
     #[test]
@@ -2255,7 +2069,7 @@ mod tests {
         screen.set_menu("Resume", vec!["one".into(), "two".into()], true);
         screen.insert_text("h");
         assert!(screen.menu.is_none());
-        assert_eq!(screen.buf, "h");
+        assert_eq!(screen.ed.buf, "h");
         // No block was written: the list is gone, not reprinted above the prompt.
         assert!(screen.last.is_none());
         // `/sessions` searches instead, so its chooser waits for the line.
@@ -2289,20 +2103,20 @@ mod tests {
         }
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
         screen.apply_key(tab);
-        assert_eq!(screen.buf, "/exit");
+        assert_eq!(screen.ed.buf, "/exit");
         screen.apply_key(tab);
-        assert_eq!(screen.buf, "/explore");
+        assert_eq!(screen.ed.buf, "/explore");
         screen.apply_key(tab);
-        assert_eq!(screen.buf, "/exit");
+        assert_eq!(screen.ed.buf, "/exit");
         // An edit ends the list: the next Tab starts from the text again.
         screen.apply_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
-        assert_eq!(screen.buf, "/exitp");
+        assert_eq!(screen.ed.buf, "/exitp");
         screen.apply_key(tab);
-        assert_eq!(screen.buf, "/exitp");
+        assert_eq!(screen.ed.buf, "/exitp");
         screen.apply_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         // One candidate left: Tab finishes it and ends the list.
         screen.apply_key(tab);
-        assert_eq!(screen.buf, "/exit ");
+        assert_eq!(screen.ed.buf, "/exit ");
         assert!(screen.selection.is_none());
     }
 
@@ -2312,14 +2126,14 @@ mod tests {
         screen.set_commands(vec!["/help".into(), "/exit".into()]);
         screen.insert_text("/h");
         screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(screen.buf, "/help ");
+        assert_eq!(screen.ed.buf, "/help ");
         assert!(screen.selection.is_none());
         // Free text after the first argument is the user's: Tab leaves it
         // alone.
         screen.insert_text("/model");
         screen.insert_text(" a/b");
         screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(screen.buf, "/help /model a/b");
+        assert_eq!(screen.ed.buf, "/help /model a/b");
     }
 
     #[test]
@@ -2335,27 +2149,27 @@ mod tests {
         // can land on.
         screen.insert_text("/model");
         screen.apply_key(tab);
-        assert_eq!(screen.buf, "/model ");
+        assert_eq!(screen.ed.buf, "/model ");
         // Only then does the argument list itself.
         assert_eq!(
             screen.hints(),
             (vec!["/model one/big".into(), "/model two/small".into()], 0)
         );
         screen.apply_key(tab);
-        assert_eq!(screen.buf, "/model one/big");
+        assert_eq!(screen.ed.buf, "/model one/big");
         screen.apply_key(tab);
-        assert_eq!(screen.buf, "/model two/small");
+        assert_eq!(screen.ed.buf, "/model two/small");
         // The typed argument narrows the set; one left finishes the line.
         screen.take();
         screen.insert_text("/model tw");
         screen.apply_key(tab);
-        assert_eq!(screen.buf, "/model two/small ");
+        assert_eq!(screen.ed.buf, "/model two/small ");
         assert!(screen.selection.is_none());
         // A second word is free text: no candidates, no fill.
         screen.take();
         screen.insert_text("/model one/big now");
         screen.apply_key(tab);
-        assert_eq!(screen.buf, "/model one/big now");
+        assert_eq!(screen.ed.buf, "/model one/big now");
     }
 
     #[test]
@@ -2368,7 +2182,7 @@ mod tests {
         assert_eq!(screen.hints().1, 0);
         screen.apply_key(key(KeyCode::Down));
         assert_eq!(screen.hints().1, 1);
-        assert_eq!(screen.buf, "/sk");
+        assert_eq!(screen.ed.buf, "/sk");
         // Both ends wrap.
         screen.apply_key(key(KeyCode::Down));
         assert_eq!(screen.hints().1, 0);
@@ -2379,12 +2193,12 @@ mod tests {
         screen.apply_key(key(KeyCode::Down));
         assert_eq!(screen.hints().1, 1);
         screen.apply_key(key(KeyCode::Tab));
-        assert_eq!(screen.buf, "/skills");
+        assert_eq!(screen.ed.buf, "/skills");
         // Nothing to mark: the arrows leave the line alone.
         screen.take();
         screen.insert_text("hello");
         screen.apply_key(key(KeyCode::Up));
-        assert_eq!(screen.buf, "hello");
+        assert_eq!(screen.ed.buf, "hello");
     }
 
     #[test]
@@ -2399,14 +2213,14 @@ mod tests {
         // A marker that was moved makes the line the marked candidate.
         screen.insert_text("/sk");
         screen.apply_key(key(KeyCode::Down));
-        assert_eq!(screen.buf, "/sk");
+        assert_eq!(screen.ed.buf, "/sk");
         screen.apply_key(key(KeyCode::Enter));
         assert_eq!(screen.take(), "/skills");
         // An edit ends the list, so Enter is back to what is typed.
         screen.insert_text("/sk");
         screen.apply_key(key(KeyCode::Down));
         screen.apply_key(key(KeyCode::Char('i')));
-        assert_eq!(screen.buf, "/ski");
+        assert_eq!(screen.ed.buf, "/ski");
         screen.apply_key(key(KeyCode::Enter));
         assert_eq!(screen.take(), "/ski");
     }
@@ -2562,13 +2376,13 @@ mod tests {
         // After a step the whole set stays listed, with the buffer on the
         // second one.
         screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(screen.buf, "/skills");
+        assert_eq!(screen.ed.buf, "/skills");
         assert_eq!(
             screen.hints(),
             (vec!["/skills".into(), "/skill:ship".into()], 0)
         );
         screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(screen.buf, "/skill:ship");
+        assert_eq!(screen.ed.buf, "/skill:ship");
         assert_eq!(screen.hints().1, 1);
     }
 
@@ -2604,7 +2418,7 @@ mod tests {
         for _ in 0..7 {
             screen.apply_key(tab);
         }
-        assert_eq!(screen.buf, "/c7");
+        assert_eq!(screen.ed.buf, "/c7");
         screen.draw().unwrap();
         let text: Vec<String> = screen
             .test_buffer()

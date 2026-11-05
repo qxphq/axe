@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 use crate::http::Cancel;
 use crate::sandbox;
+use crate::text::truncate;
 
 struct Spec {
     name: &'static str,
@@ -48,7 +49,7 @@ const EDIT: Spec = Spec {
 const BASH: Spec = Spec {
     name: "bash",
     signature: "bash(command)",
-    description: "Use `read` for a file's lines and `rg`/`fd` to find files; bash is for what those cannot do — builds, tests, git, and pipelines. Runs in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds. The network is not confined, in any mode. In explore mode only a fixed allowlist runs (text and coreutils, checksums, file operations, search, git, curl, jq, interpreters, package managers, sh) and nothing outside a scratch directory is writable; a mutation the kernel would refuse comes back as a permission error.",
+    description: "Use `read` for a file's lines and `rg`/`fd` to find files; bash is for what those cannot do — builds, tests, git, and pipelines. Runs in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds. The network is not confined, in any mode. In explore mode only a fixed allowlist runs (text and coreutils, checksums, file operations, search, git, curl, jq, interpreters, package managers, sh) and nothing outside a scratch directory and the project's plan directory is writable; a mutation the kernel would refuse comes back as a permission error.",
     parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"Command passed to sh -c"}},"required":["command"]}"#,
 };
 
@@ -89,15 +90,71 @@ const WEB_SEARCH: Spec = Spec {
     parameters: r#"{"type":"object","properties":{"query":{"type":"string","description":"Search query"},"count":{"type":"integer","description":"Number of results, 1-20 (default 10)"}},"required":["query"]}"#,
 };
 
-/// Appended when the kernel, not the command, refused something: the model has
-/// to tell a sandbox denial from a missing binary or a bug, and to know which
-/// two places it may write and how the restriction is lifted.
-fn denial_note() -> String {
-    let plan = match sandbox::plan() {
-        Some(dir) => format!("; writes go to $TMPDIR and {} only", dir.display()),
-        None => "; writes go to $TMPDIR only".to_string(),
-    };
-    format!("explore mode: only the allowlist runs{plan} — `/explore off` for anything else\n")
+/// The session's tool set. Explore mode takes `write` and `edit` away and
+/// confines `bash` to the allowlist and two directories; normal mode gives
+/// them back and takes `fetch` and `web_search` away.
+///
+/// The sentences that tell the model this live next to `execute`'s match,
+/// because they describe the same policy: the writable places are named here
+/// once, and the note, the denial and the prompt's static paragraph all mean
+/// the same thing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    Normal,
+    Explore,
+}
+
+impl Mode {
+    pub fn explore(self) -> bool {
+        self == Mode::Explore
+    }
+
+    /// `/explore` and Shift+Tab.
+    pub fn flip(self) -> Mode {
+        match self {
+            Mode::Normal => Mode::Explore,
+            Mode::Explore => Mode::Normal,
+        }
+    }
+
+    /// Where a confined `bash` may write: `$TMPDIR` inside the call, and the
+    /// project's plan directory, which is the one that outlives the session.
+    fn writable(plan: Option<&Path>) -> String {
+        match plan {
+            Some(dir) => format!(
+                "a scratch directory ($TMPDIR) and to {} for a plan",
+                dir.display()
+            ),
+            None => "a scratch directory ($TMPDIR)".to_string(),
+        }
+    }
+
+    /// The note that goes into the history when the mode is set. The mode is
+    /// history, never the cached prefix, so a toggle rewrites nothing above it.
+    pub fn note(self, plan: Option<&Path>) -> String {
+        match self {
+            Mode::Explore => format!(
+                "explore mode: on — write and edit are unavailable; bash runs allowlisted \
+                 commands and writes only to {}, and the network is not confined. If the user \
+                 asks for changes, do not attempt them: say `/explore off` and they can switch.",
+                Self::writable(plan)
+            ),
+            Mode::Normal => "explore mode: off — write, edit and a full bash are available; \
+                             fetch and web_search are unavailable."
+                .to_string(),
+        }
+    }
+
+    /// Appended when the kernel, not the command, refused something: the model
+    /// has to tell a sandbox denial from a missing binary or a bug, and to know
+    /// which places it may write and how the restriction is lifted.
+    fn denial(self, plan: Option<&Path>) -> String {
+        format!(
+            "explore mode: only the allowlist runs; writes go to {} — `/explore off` for \
+             anything else\n",
+            Self::writable(plan)
+        )
+    }
 }
 
 const SPECS: &[Spec] = &[READ, WRITE, EDIT, BASH, ABOUT, FETCH, WEB_SEARCH];
@@ -152,7 +209,8 @@ pub fn system_prompt() -> String {
          is in force. In explore mode, read the working directory, read the web \
          through `fetch` and `web_search`, and run commands to understand it, answer, \
          and propose changes: `write` and `edit` are unavailable, `bash` runs only \
-         a fixed allowlist and writes only to a scratch directory. Outside explore \
+         a fixed allowlist and writes only to a scratch directory and the project's \
+         plan directory. Outside explore \
          mode, `write`, `edit` and a full `bash` are available, and `fetch` and \
          `web_search` are unavailable.\n",
     );
@@ -167,22 +225,24 @@ pub fn system_prompt() -> String {
     out
 }
 
-pub fn execute(name: &str, args: &str, cancel: &Cancel, read_only: bool) -> String {
+pub fn execute(name: &str, args: &str, cancel: &Cancel, mode: Mode) -> String {
     let args: Value = match serde_json::from_str(args) {
         Ok(v) => v,
         Err(e) => return format!("error: invalid arguments: {e}"),
     };
     match name {
         "read" => read(&args),
-        "bash" => bash(&args, cancel, read_only),
+        "bash" => bash(&args, cancel, mode),
         // Documentation, no I/O: the same answer in both modes.
         "about" => README_TEXT.to_string(),
         // The catalogue is mode-independent, so a toggle leaves the cached
         // prefix byte-identical; refusing here is what makes it a no-op.
-        "write" | "edit" if read_only => format!("error: explore mode: {name} is not available"),
-        "fetch" if read_only => crate::web::fetch(&args, cancel),
+        "write" | "edit" if mode.explore() => {
+            format!("error: explore mode: {name} is not available")
+        }
+        "fetch" if mode.explore() => crate::web::fetch(&args, cancel),
         "fetch" => "error: explore mode: fetch is only available in explore mode".into(),
-        "web_search" if read_only => crate::web::web_search(&args, cancel),
+        "web_search" if mode.explore() => crate::web::web_search(&args, cancel),
         "web_search" => "error: explore mode: web_search is only available in explore mode".into(),
         "write" => write(&args),
         "edit" => edit(&args),
@@ -333,7 +393,7 @@ fn edit(args: &Value) -> String {
     }
 }
 
-fn bash(args: &Value, cancel: &Cancel, read_only: bool) -> String {
+fn bash(args: &Value, cancel: &Cancel, mode: Mode) -> String {
     let Some(command) = args["command"].as_str() else {
         return "error: missing \"command\"".into();
     };
@@ -352,7 +412,7 @@ fn bash(args: &Value, cancel: &Cancel, read_only: bool) -> String {
 
     // The program and its argv come from `sandbox`: the platform decides how a
     // command is confined, and this function never names a shell.
-    let mut cmd = match sandbox::shell(command, read_only) {
+    let mut cmd = match sandbox::shell(command, mode.explore()) {
         Ok(cmd) => cmd,
         Err(e) => return format!("error: {e}"),
     };
@@ -447,8 +507,8 @@ fn bash(args: &Value, cancel: &Cancel, read_only: bool) -> String {
     } else if interrupted {
         out.push_str("interrupted by user (ESC); the command was killed\n");
     }
-    if read_only && denied(&stderr) {
-        out.push_str(&denial_note());
+    if mode.explore() && denied(&stderr) {
+        out.push_str(&mode.denial(sandbox::plan()));
     }
     truncate(out, 30_000)
 }
@@ -517,23 +577,6 @@ fn plural(n: usize) -> &'static str {
     } else {
         "s"
     }
-}
-
-pub(crate) fn truncate(text: String, max: usize) -> String {
-    let total = text.chars().count();
-    if total <= max {
-        return text;
-    }
-    let marker = "\n...[truncated]...\n";
-    let room = max.saturating_sub(marker.chars().count());
-    if room == 0 {
-        return text.chars().take(max).collect();
-    }
-    let head_len = room * 2 / 3;
-    let tail_len = room - head_len;
-    let head: String = text.chars().take(head_len).collect();
-    let tail: String = text.chars().skip(total - tail_len).collect();
-    format!("{head}{marker}{tail}")
 }
 
 #[cfg(test)]
@@ -607,8 +650,8 @@ mod tests {
     #[test]
     fn about_returns_readme_and_unknown_tool_errors() {
         let cancel = Cancel::new();
-        assert!(execute("about", "{}", &cancel, false).starts_with("# axe"));
-        assert!(execute("nope", "{}", &cancel, false).starts_with("error: unknown tool"));
+        assert!(execute("about", "{}", &cancel, Mode::Normal).starts_with("# axe"));
+        assert!(execute("nope", "{}", &cancel, Mode::Normal).starts_with("error: unknown tool"));
     }
 
     #[test]
@@ -617,7 +660,7 @@ mod tests {
             "bash",
             &json!({ "command": "printf hi" }).to_string(),
             &Cancel::new(),
-            false,
+            Mode::Normal,
         );
         assert!(result.contains("exit: 0"), "{result}");
         assert!(result.contains("hi"), "{result}");
@@ -629,7 +672,7 @@ mod tests {
             "fetch",
             &json!({ "url": "http://localhost/" }).to_string(),
             &Cancel::new(),
-            true,
+            Mode::Explore,
         );
         assert!(result.contains("refused host"), "{result}");
     }
@@ -637,22 +680,25 @@ mod tests {
     #[test]
     fn explore_refuses_mutating_tools_and_missing_args() {
         let cancel = Cancel::new();
-        assert!(execute("write", "{}", &cancel, true).contains("explore mode"));
-        assert!(execute("edit", "{}", &cancel, true).contains("explore mode"));
-        assert!(execute("fetch", "{}", &cancel, false).contains("explore mode"));
-        assert!(execute("read", "{}", &cancel, false).contains("missing \"path\""));
+        assert!(execute("write", "{}", &cancel, Mode::Explore).contains("explore mode"));
+        assert!(execute("edit", "{}", &cancel, Mode::Explore).contains("explore mode"));
+        assert!(execute("fetch", "{}", &cancel, Mode::Normal).contains("explore mode"));
+        assert!(execute("read", "{}", &cancel, Mode::Normal).contains("missing \"path\""));
         let path = temp("missing-args").to_string_lossy().to_string();
         assert!(execute(
             "write",
             &json!({ "path": path }).to_string(),
             &cancel,
-            false
+            Mode::Normal
         )
         .contains("missing \"content\""));
-        assert!(
-            execute("edit", &json!({ "path": path }).to_string(), &cancel, false)
-                .contains("missing \"old\"")
-        );
+        assert!(execute(
+            "edit",
+            &json!({ "path": path }).to_string(),
+            &cancel,
+            Mode::Normal
+        )
+        .contains("missing \"old\""));
     }
 
     #[test]
@@ -689,5 +735,35 @@ mod tests {
         assert!(denied("Permission denied"));
         assert!(denied("Operation not permitted"));
         assert!(!denied("not found"));
+    }
+
+    #[test]
+    fn one_policy_names_the_same_places_in_every_text() {
+        // The prompt, the mode note and the denial describe one policy, so a
+        // writable path added to one has to reach the others. The plan
+        // directory is the one that was left behind the first time.
+        let plan = Path::new("/state/projects/x/plan");
+        let on = Mode::Explore;
+        let note = on.note(Some(plan));
+        let refusal = on.denial(Some(plan));
+        for text in [&note, &refusal] {
+            assert!(text.contains("/state/projects/x/plan"), "{text}");
+            assert!(text.contains("scratch directory"), "{text}");
+        }
+        for text in [on.note(None), on.denial(None)] {
+            assert!(!text.contains("for a plan"), "{text}");
+        }
+        // The static paragraph and the tool description are in the cached
+        // prefix, so they name the directory without a path of their own.
+        for text in [&system_prompt(), BASH.description] {
+            assert!(text.contains("the project's plan directory"), "{text}");
+        }
+        // What each note says is unavailable is what `execute` refuses.
+        assert!(note.contains("write and edit are unavailable"));
+        assert!(Mode::Normal
+            .note(None)
+            .contains("fetch and web_search are unavailable"));
+        assert_eq!(Mode::Normal.flip(), Mode::Explore);
+        assert_eq!(Mode::Explore.flip(), Mode::Normal);
     }
 }

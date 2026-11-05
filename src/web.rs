@@ -200,7 +200,7 @@ fn results(source: &str, hits: Vec<Hit>, count: usize) -> String {
             out.push_str(&format!("   {}\n", hit.snippet));
         }
     }
-    crate::tools::truncate(out, 30_000)
+    crate::text::truncate(out, 30_000)
 }
 
 const BRAVE_SEARCH: &str = "https://api.search.brave.com/res/v1/web/search";

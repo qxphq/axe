@@ -1,6 +1,8 @@
 //! The OpenAI-compatible chat API: model listing, the chat request, SSE
 //! parsing, tool-call accumulation, and usage.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 
 use crate::http::{self, Cancel, Endpoint, Response};
@@ -39,7 +41,19 @@ pub fn list_models(
     api_key: Option<&str>,
     headers: &[(String, String)],
 ) -> Result<Vec<ModelInfo>, String> {
-    let mut res = http::request(ep, "GET", path, api_key, headers, None, None)?;
+    // A listing is startup: bounded, so one dead provider cannot hold the
+    // prompt off the screen for the five minutes a chat request is allowed.
+    let mut res = http::request_with_timeout(
+        ep,
+        "GET",
+        path,
+        api_key,
+        headers,
+        None,
+        None,
+        None,
+        Duration::from_secs(30),
+    )?;
     let body = res.read_all().map_err(|e| format!("read models: {e}"))?;
     if res.status != 200 {
         return Err(format!("models: HTTP {}: {}", res.status, body.trim()));

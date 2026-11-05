@@ -3,19 +3,22 @@
 
 mod api;
 mod config;
+mod editor;
 mod http;
 mod markdown;
+mod render;
 mod sandbox;
 mod sessions;
 mod skills;
 mod state;
+mod text;
 mod tools;
+mod turn;
 mod ui;
 mod web;
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::Read;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -24,9 +27,11 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::terminal;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
 use serde_json::{json, Value};
+
+use render::{call_line, detail, failed, line_of, mark, plain_text, shell_line, Paint};
+use text::{strip_control, terminal_text};
+use turn::{PlainSink, Queue, Sink, TextSink};
 
 #[derive(Clone)]
 struct Provider {
@@ -252,10 +257,14 @@ fn run() -> Result<(), String> {
     );
     // The mode is history, not prompt: the config decides where a session
     // starts, and the note below tells the model which side it is on.
-    let read_only = cfg.explore_by_default;
+    let mode = if cfg.explore_by_default {
+        tools::Mode::Explore
+    } else {
+        tools::Mode::Normal
+    };
     let messages: Vec<Value> = vec![
         json!({ "role": "system", "content": system }),
-        mode_note(read_only),
+        mode_note(mode),
     ];
 
     // The directory's sessions: archive the old bodies before the listing so
@@ -277,7 +286,7 @@ fn run() -> Result<(), String> {
         provider,
         model,
         thinking,
-        read_only,
+        mode,
         used: None,
         messages,
         sid,
@@ -380,27 +389,11 @@ fn parse_naming(text: &str) -> Option<(String, String)> {
 
 /// The note that tells the model which mode it is in. A `user` message, the
 /// same role `!cmd` output joins as; the mode is history, so the prompt above
-/// it never changes. Explore mode names the one writable place that survives
-/// the session and the way out: a model that cannot change files should hand
-/// the decision back, not apologize.
-fn mode_note(read_only: bool) -> Value {
-    let content = if read_only {
-        let plan = match sandbox::plan() {
-            Some(dir) => format!(" and to {} for a plan", dir.display()),
-            None => String::new(),
-        };
-        format!(
-            "explore mode: on — write and edit are unavailable; bash runs \
-             allowlisted commands, writes only to a scratch directory{plan}, and \
-             the network is not confined. If the user asks for changes, do not \
-             attempt them: say `/explore off` and they can switch."
-        )
-    } else {
-        "explore mode: off — write, edit and a full bash are available; fetch and web_search \
-         are unavailable."
-            .to_string()
-    };
-    json!({ "role": "user", "content": content })
+/// it never changes. The words are `Mode`'s: explore mode names where it may
+/// write and the way out, so a model that cannot change files hands the
+/// decision back instead of apologizing.
+fn mode_note(mode: tools::Mode) -> Value {
+    json!({ "role": "user", "content": mode.note(sandbox::plan()) })
 }
 
 /// Everything the REPL mutates between turns: the model selection and history.
@@ -412,9 +405,10 @@ struct Session {
     provider: usize,
     model: String,
     thinking: Option<String>,
-    /// Explore mode: `read` and a read-only `bash` only (`/explore`). Starts
-    /// from `cfg.explore_by_default`; the history carries the note.
-    read_only: bool,
+    /// Explore mode: `read`, the web tools and a confined `bash` only
+    /// (`/explore`). Starts from `cfg.explore_by_default`; the history carries
+    /// the note.
+    mode: tools::Mode,
     /// The last round's token count, from the provider. `None` until a turn
     /// reports one: the fill is then estimated from the history.
     used: Option<u64>,
@@ -434,6 +428,27 @@ struct Session {
     warning: Option<String>,
     /// The skills discovered at startup; the catalogue is in the prompt.
     skills: Vec<skills::Skill>,
+}
+
+/// What a turn appends to: the live history and, when this directory has one,
+/// the session's log. One `push`, so a message cannot reach the model without
+/// reaching the file, and a resumed session replays the same order.
+struct Live<'a> {
+    messages: &'a mut Vec<Value>,
+    store: Option<&'a mut Store>,
+}
+
+impl turn::History for Live<'_> {
+    fn push(&mut self, message: Value) {
+        if let Some(store) = self.store.as_deref_mut() {
+            store.record(&message);
+        }
+        self.messages.push(message);
+    }
+
+    fn messages(&self) -> &[Value] {
+        self.messages.as_slice()
+    }
 }
 
 /// The session on disk. `meta` is loaded with the first message or on resume,
@@ -745,7 +760,7 @@ impl Session {
     fn run_interactive(mut self) -> Result<(), String> {
         let mut screen =
             ui::Screen::new("❯ ").map_err(|e| format!("cannot take the terminal: {e}"))?;
-        screen.set_explore(self.read_only);
+        screen.set_explore(self.mode.explore());
         screen.set_commands(self.commands());
         screen.set_info(self.info());
         // The directory's recent sessions are a chooser, not a printout: the
@@ -780,7 +795,10 @@ impl Session {
                     match readline(&mut screen, &rx, &mut idle) {
                         Some(Input::Line(line)) => (line, false),
                         Some(Input::Explore) => {
-                            self.toggle_explore(&mut screen);
+                            self.toggle_explore(&mut Console::Screen {
+                                screen: &mut screen,
+                                rx: &rx,
+                            });
                             continue;
                         }
                         Some(Input::Menu(index)) => {
@@ -806,7 +824,13 @@ impl Session {
             if was_queued {
                 screen.echo_user(&line);
             }
-            match self.dispatch(&line, &mut screen, &rx) {
+            match self.dispatch(
+                &line,
+                &mut Console::Screen {
+                    screen: &mut screen,
+                    rx: &rx,
+                },
+            ) {
                 Cmd::Exit => break,
                 Cmd::Continue => {}
                 Cmd::Turn(input) => {
@@ -829,7 +853,7 @@ impl Session {
         while let Some(line) = ui::cooked_line("❯ ") {
             let cmd = match line.trim() {
                 "" => Cmd::Continue,
-                _ => dispatch_piped(&mut self, &line),
+                _ => self.dispatch(&line, &mut Console::Stdout),
             };
             match cmd {
                 Cmd::Exit => break,
@@ -844,12 +868,13 @@ impl Session {
                     self.name_session();
                 }
                 Cmd::Shell(command) => {
-                    println!(
-                        "{}",
-                        terminal_text(&plain_text(&shell_line(&command, false)))
-                    );
+                    // The user's own shell, and the same glyph the screen
+                    // draws: `!cmd` is never confined, so the line is the
+                    // unconfined color.
+                    let mut console = Console::Stdout;
+                    console.output(&format!("{}\n", plain_text(&shell_line(&command, false))));
                     let result = self.run_shell(&command);
-                    print!("{}", terminal_text(&result));
+                    console.output(&result);
                 }
             }
             self.flush_warnings(None);
@@ -1043,7 +1068,7 @@ impl Session {
                                 .to_string(),
                         };
                         let result = results.get(call.id.as_str()).copied().unwrap_or("");
-                        let mut spans = call_line(&call, self.read_only);
+                        let mut spans = call_line(&call, self.mode.explore());
                         spans.push((Paint::Plain, " ".to_string()));
                         let (paint, glyph) = mark(result);
                         spans.push((paint, glyph.to_string()));
@@ -1310,7 +1335,7 @@ impl Session {
         parts.push((ui::Info::Level, level(&self.thinking)));
         let (fill, fullness) = self.fill();
         parts.push((ui::Info::Fill(fullness), fill));
-        if self.read_only {
+        if self.mode.explore() {
             parts.push((ui::Info::Mode, "read-only".to_string()));
         }
         parts
@@ -1353,23 +1378,23 @@ impl Session {
         models.iter().find(|m| m.id == self.model)?.context
     }
 
-    /// Enter or leave explore mode. The prompt and the tool catalogue are
-    /// fixed, so the mode is announced in the history: the model reads the
-    /// note, and nothing before it is rewritten.
-    fn set_read_only(&mut self, read_only: bool) {
-        self.read_only = read_only;
-        self.messages.push(mode_note(read_only));
+    /// Set the mode. The prompt and the tool catalogue are fixed, so the mode
+    /// is announced in the history: the model reads the note, and nothing
+    /// before it is rewritten.
+    fn set_mode(&mut self, mode: tools::Mode) {
+        self.mode = mode;
+        self.messages.push(mode_note(mode));
     }
 
     /// `/explore` and Shift+Tab share one path, so the prompt color, the
     /// selection row and the transcript never disagree about the mode.
-    fn toggle_explore(&mut self, screen: &mut ui::Screen) {
-        self.set_read_only(!self.read_only);
-        screen.set_explore(self.read_only);
-        screen.set_info(self.info());
-        screen.output(&format!(
+    fn toggle_explore(&mut self, console: &mut Console) {
+        self.set_mode(self.mode.flip());
+        console.explore(self.mode.explore());
+        console.info(self.info());
+        console.output(&format!(
             "Explore: {}\n",
-            if self.read_only { "on" } else { "off" }
+            if self.mode.explore() { "on" } else { "off" }
         ));
     }
 
@@ -1381,7 +1406,7 @@ impl Session {
             .first()
             .cloned()
             .unwrap_or_else(|| json!({ "role": "system", "content": tools::system_prompt() }));
-        vec![system, mode_note(self.read_only)]
+        vec![system, mode_note(self.mode)]
     }
 
     /// The lines Tab completes: the slash commands, including `/skill:<name>`
@@ -1443,7 +1468,10 @@ impl Session {
         let args = json!({ "command": command }).to_string();
         let mut queued: Option<String> = None;
         let result = thread::scope(|scope| {
-            let handle = scope.spawn(|| tools::execute("bash", &args, &cancel, false));
+            // `!cmd` is the user's own shell: explore mode does not confine
+            // it, so the mode here is only about which tool set is offered.
+            let handle =
+                scope.spawn(|| tools::execute("bash", &args, &cancel, tools::Mode::Normal));
             loop {
                 match rx.recv_timeout(Duration::from_millis(50)) {
                     Ok(Event::Key(key)) if key.code == KeyCode::Esc => {
@@ -1514,7 +1542,7 @@ impl Session {
             "bash",
             &json!({ "command": command }).to_string(),
             &cancel,
-            false,
+            tools::Mode::Normal,
         );
         self.record(json!({
             "role": "user",
@@ -1565,13 +1593,15 @@ impl Session {
         // history is borrowed by that thread, so `self` is out of reach until
         // the scope ends.
         let mut used: Option<u64> = None;
-        let messages = &mut self.messages;
-        let store = self.store.as_mut();
+        let mut live = Live {
+            messages: &mut self.messages,
+            store: self.store.as_mut(),
+        };
         let provider = &self.providers[self.provider];
         let model = self.model.clone();
-        let thinking = self.thinking.clone();
+        let extra = provider.cfg.thinking_body(self.thinking.as_deref());
         let thoughts = self.state.thoughts;
-        let read_only = self.read_only;
+        let mode = self.mode;
         let turn_tx = tx.clone();
         let turn_cancel = &cancel;
 
@@ -1583,17 +1613,17 @@ impl Session {
                     thoughts,
                     thought: None,
                 };
-                let result = run_turn(
-                    provider,
-                    &model,
-                    messages,
-                    store,
-                    thinking.as_deref(),
-                    read_only,
-                    Some(&turn_queue),
-                    &mut sink,
-                    turn_cancel,
-                );
+                let turn = turn::Turn {
+                    ep: &provider.ep,
+                    key: provider.key.as_deref(),
+                    headers: &provider.headers,
+                    model: &model,
+                    extra: extra.as_ref(),
+                    mode,
+                    queue: Some(&turn_queue),
+                    cancel: turn_cancel,
+                };
+                let result = turn::run_turn(&turn, &mut live, &mut sink);
                 let _ = turn_tx.send(Event::Done(result));
             });
 
@@ -1794,7 +1824,10 @@ impl Session {
         // Held from the turn: applied now, so the note sits below the answer
         // and above whatever the user types next.
         if switch {
-            self.toggle_explore(screen);
+            self.toggle_explore(&mut Console::Screen {
+                screen: &mut *screen,
+                rx,
+            });
         }
 
         // One small request names the session, once, off the UI thread. The
@@ -1816,37 +1849,42 @@ impl Session {
     fn turn(&mut self, sink: &mut dyn Sink, cancel: &http::Cancel) -> Result<(), String> {
         let provider = &self.providers[self.provider];
         let model = self.model.clone();
-        let thinking = self.thinking.clone();
-        run_turn(
-            provider,
-            &model,
-            &mut self.messages,
-            self.store.as_mut(),
-            thinking.as_deref(),
-            self.read_only,
-            None,
-            sink,
+        let extra = provider.cfg.thinking_body(self.thinking.as_deref());
+        let turn = turn::Turn {
+            ep: &provider.ep,
+            key: provider.key.as_deref(),
+            headers: &provider.headers,
+            model: &model,
+            extra: extra.as_ref(),
+            mode: self.mode,
+            queue: None,
             cancel,
-        )
-        .map(|_| ())
+        };
+        let mut live = Live {
+            messages: &mut self.messages,
+            store: self.store.as_mut(),
+        };
+        turn::run_turn(&turn, &mut live, sink).map(|_| ())
     }
 
-    /// Slash commands and selection changes. The model list is printed: the
-    /// choice itself is completed in the prompt, like any other line.
-    fn dispatch(&mut self, line: &str, screen: &mut ui::Screen, rx: &Receiver<Event>) -> Cmd {
+    /// Slash commands and selection changes. The console is the only thing a
+    /// command says anything to, so a terminal and a pipe run the same arms:
+    /// the difference is where the text lands, not what it says.
+    fn dispatch(&mut self, line: &str, console: &mut Console) -> Cmd {
         match parse_command(line) {
             Command::Empty => Cmd::Continue,
             Command::Exit => Cmd::Exit,
             Command::Help => {
-                screen.output(&help_text());
+                console.output(&help_text());
                 Cmd::Continue
             }
             Command::New => {
-                self.new_session(Some(screen));
+                self.new_session(console.screen());
+                console.output("New session\n");
                 Cmd::Continue
             }
             Command::Model(None) => {
-                screen.output(&models(&self.providers));
+                console.output(&models(&self.providers));
                 Cmd::Continue
             }
             Command::Model(Some(spec)) => {
@@ -1854,22 +1892,19 @@ impl Session {
                     Some((pi, id)) => {
                         let text = self.set_model(pi, id);
                         // The levels `/thinking` completes belong to a provider.
-                        screen.set_commands(self.commands());
-                        screen.output(&format!("{}\n", ui::info_text(&text)));
-                        screen.set_info(text);
+                        console.commands(self.commands());
+                        console.output(&format!("{}\n", ui::info_text(&text)));
+                        console.info(text);
                     }
-                    None => screen.error(&format!("unknown model: {spec}\n")),
+                    None => console.error(&format!("unknown model: {spec}")),
                 }
                 Cmd::Continue
             }
             Command::Thinking(rest) => {
                 let providers = &self.providers;
                 if rest.as_deref().unwrap_or("").is_empty() {
-                    // No blank row of its own: `Screen::write` puts one between
-                    // blocks, and a second here would be a gap the writer never
-                    // asked for.
-                    screen.output(&format!(
-                        "thinking: {}",
+                    console.output(&format!(
+                        "thinking: {}\n",
                         thinking_label(&providers[self.provider].cfg, &self.thinking)
                     ));
                     return Cmd::Continue;
@@ -1877,7 +1912,7 @@ impl Session {
                 match set_thinking(&providers[self.provider].cfg, rest.as_deref().unwrap_or("")) {
                     Ok(level) => {
                         self.thinking = Some(level.clone());
-                        screen.set_info(self.info());
+                        console.info(self.info());
                         let spec = format!("{}/{}", providers[self.provider].name, self.model);
                         self.state.set_thinking(&spec, level.as_str());
                         let save_error = self.state.save().err();
@@ -1885,9 +1920,9 @@ impl Session {
                         if let Some(e) = save_error {
                             self.warn(format!("state: {e}"));
                         }
-                        screen.output(&format!("thinking: {label}"));
+                        console.output(&format!("thinking: {label}\n"));
                     }
-                    Err(e) => screen.error(&format!("axe: {e}\n")),
+                    Err(e) => console.error(&e),
                 }
                 Cmd::Continue
             }
@@ -1896,22 +1931,22 @@ impl Session {
                 if let Err(e) = self.state.save() {
                     self.warn(format!("state: {e}"));
                 }
-                screen.output(&format!(
-                    "Thoughts: {}",
+                console.output(&format!(
+                    "Thoughts: {}\n",
                     if self.state.thoughts { "on" } else { "off" }
                 ));
                 Cmd::Continue
             }
             Command::Explore => {
-                self.toggle_explore(screen);
+                self.toggle_explore(console);
                 Cmd::Continue
             }
             Command::Sessions(query) => {
-                self.browse_sessions(screen, rx, query.as_deref().unwrap_or(""));
+                self.sessions(query.as_deref().unwrap_or(""), console);
                 Cmd::Continue
             }
             Command::Skills => {
-                screen.output(&self.skill_listing());
+                console.output(&self.skill_listing());
                 Cmd::Continue
             }
             Command::Skill(name, request) => {
@@ -1919,122 +1954,92 @@ impl Session {
                     Some(skill) => match skills::invocation(skill, &request) {
                         Ok(text) => Cmd::Turn(text),
                         Err(e) => {
-                            screen.error(&format!("axe: {e}\n"));
+                            console.error(&e);
                             Cmd::Continue
                         }
                     },
                     None => {
-                        screen.error(&format!("unknown skill: {name} (see /skills)\n"));
+                        console.error(&format!("unknown skill: {name} (see /skills)"));
                         Cmd::Continue
                     }
                 }
             }
             Command::Unknown(input) => {
-                screen.error(&format!("unknown command: {input}\n"));
+                console.error(&format!("unknown command: {input}"));
                 Cmd::Continue
             }
             Command::Shell(command) => Cmd::Shell(command),
             Command::Turn(input) => Cmd::Turn(input),
         }
     }
+
+    /// `/sessions`: the chooser when there is a screen, a numbered list when
+    /// there is not.
+    fn sessions(&mut self, query: &str, console: &mut Console) {
+        match console {
+            Console::Screen { screen, rx } => self.browse_sessions(screen, rx, query),
+            Console::Stdout => self.list_piped(query),
+        }
+    }
 }
 
-/// The same dispatch for a terminal that is not ours: commands only, warnings
-/// on stderr, no picker.
-fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
-    match parse_command(line) {
-        Command::Empty => Cmd::Continue,
-        Command::Exit => Cmd::Exit,
-        Command::Help => {
-            println!("{}", help_text());
-            Cmd::Continue
-        }
-        Command::New => {
-            session.new_session(None);
-            println!("New session");
-            Cmd::Continue
-        }
-        Command::Model(None) => {
-            // No picker without a terminal: the listing is the whole answer.
-            println!("{}", terminal_text(models(&session.providers).trim_end()));
-            Cmd::Continue
-        }
-        Command::Model(Some(spec)) => {
-            match find(&session.providers, &spec) {
-                Some((pi, id)) => println!(
-                    "{}",
-                    terminal_text(&ui::info_text(&session.set_model(pi, id)))
-                ),
-                None => eprintln!("axe: unknown model: {}", strip_control(&spec)),
-            }
-            Cmd::Continue
-        }
-        Command::Thinking(rest) => {
-            let providers = &session.providers;
-            if rest.as_deref().unwrap_or("").is_empty() {
-                println!(
-                    "thinking: {}",
-                    terminal_text(&thinking_label(
-                        &providers[session.provider].cfg,
-                        &session.thinking
-                    ))
-                );
-                return Cmd::Continue;
-            }
-            match set_thinking(
-                &providers[session.provider].cfg,
-                rest.as_deref().unwrap_or(""),
-            ) {
-                Ok(level) => {
-                    session.thinking = Some(level.clone());
-                    let spec = format!("{}/{}", providers[session.provider].name, session.model);
-                    session.state.set_thinking(&spec, level.as_str());
-                    if let Err(e) = session.state.save() {
-                        eprintln!("axe: {}", strip_control(&e));
-                    }
-                }
-                Err(e) => eprintln!("axe: {}", strip_control(&e)),
-            }
-            Cmd::Continue
-        }
-        Command::Thoughts => {
-            eprintln!("axe: /thoughts needs a terminal");
-            Cmd::Continue
-        }
-        Command::Explore => {
-            session.set_read_only(!session.read_only);
-            println!("Explore: {}", if session.read_only { "on" } else { "off" });
-            Cmd::Continue
-        }
-        Command::Sessions(query) => {
-            session.list_piped(query.as_deref().unwrap_or(""));
-            Cmd::Continue
-        }
-        Command::Skills => {
-            print!("{}", terminal_text(&session.skill_listing()));
-            Cmd::Continue
-        }
-        Command::Skill(name, request) => {
-            match session.skills.iter().find(|skill| skill.name == name) {
-                Some(skill) => match skills::invocation(skill, &request) {
-                    Ok(text) => Cmd::Turn(text),
-                    Err(e) => {
-                        eprintln!("axe: {}", strip_control(&e));
-                        Cmd::Continue
-                    }
-                },
-                None => {
-                    eprintln!("axe: unknown skill: {}", strip_control(&name));
-                    Cmd::Continue
+/// Where a command's output goes. The screen writes it into the transcript;
+/// without a terminal, stdout gets the same text. Only a chooser needs the
+/// screen itself, so the console hands it out and the other arms never ask.
+enum Console<'a> {
+    Screen {
+        screen: &'a mut ui::Screen,
+        rx: &'a Receiver<Event>,
+    },
+    Stdout,
+}
+
+impl Console<'_> {
+    fn output(&mut self, text: &str) {
+        match self {
+            Console::Screen { screen, .. } => screen.output(text),
+            Console::Stdout => {
+                print!("{}", terminal_text(text));
+                if !text.ends_with('\n') {
+                    println!();
                 }
             }
         }
-        Command::Unknown(input) => {
-            eprintln!("axe: unknown command: {}", strip_control(&input));
-            Cmd::Continue
+    }
+
+    /// A failure, with the `axe:` the user reads and the model never sees.
+    fn error(&mut self, text: &str) {
+        let text = strip_control(text);
+        match self {
+            Console::Screen { screen, .. } => screen.error(&format!("axe: {text}\n")),
+            Console::Stdout => eprintln!("axe: {text}"),
         }
-        Command::Shell(command) => Cmd::Shell(command),
-        Command::Turn(input) => Cmd::Turn(input),
+    }
+
+    fn screen(&mut self) -> Option<&mut ui::Screen> {
+        match self {
+            Console::Screen { screen, .. } => Some(screen),
+            Console::Stdout => None,
+        }
+    }
+
+    /// The selection row: a screen has one, a pipe does not.
+    fn info(&mut self, parts: Vec<(ui::Info, String)>) {
+        if let Some(screen) = self.screen() {
+            screen.set_info(parts);
+        }
+    }
+
+    fn commands(&mut self, commands: Vec<String>) {
+        if let Some(screen) = self.screen() {
+            screen.set_commands(commands);
+        }
+    }
+
+    fn explore(&mut self, on: bool) {
+        if let Some(screen) = self.screen() {
+            screen.set_explore(on);
+        }
     }
 }
 
@@ -2258,113 +2263,6 @@ fn readline(
     }
 }
 
-/// Where a turn's output goes: straight to stdout when piped, onto the channel
-/// when a prompt is on screen.
-trait Sink {
-    /// Streamed model text. `TextSink` owns the spacing: finished lines go out
-    /// permanently, the unfinished one is exposed as a tail.
-    fn text(&mut self, text: &str);
-    /// Streamed reasoning. Shown or not is the sink's business; when it is
-    /// hidden, one line with its duration stands in for it.
-    fn reasoning(&mut self, text: &str);
-    /// A transient label for the live region: "Thinking…", a running command.
-    fn status(&mut self, text: &str);
-    /// One tool call, finished: the call and its outcome on one line, and the
-    /// failure's own words beneath it.
-    fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str), error: Option<&str>);
-    /// A line typed during the turn, which the turn has just appended to the
-    /// history. Piped output has no queue, and nothing to say.
-    fn user(&mut self, _line: &str) {}
-    /// A round's text is over; close its last line if it wrote one.
-    fn end_round(&mut self);
-}
-
-#[derive(Default)]
-struct PlainSink {
-    out: TextSink,
-    md: markdown::Stream,
-    /// The line being written: the stream ends wherever the provider felt
-    /// like it, and a line is only a line once its newline arrives.
-    partial: String,
-    /// Whether a block has already been written: the renderer decides where
-    /// blocks end, so the blank line between them is put here.
-    wrote_block: bool,
-}
-
-impl PlainSink {
-    fn write(&mut self, lines: Vec<Line<'static>>) {
-        if lines.is_empty() {
-            return;
-        }
-        let mut buf = String::new();
-        if self.wrote_block {
-            buf.push('\n');
-        }
-        self.wrote_block = true;
-        for line in &lines {
-            buf.push_str(&markdown::ansi(line));
-            buf.push('\n');
-        }
-        let mut done = String::new();
-        self.out.push(&buf, &mut done);
-        print!("{done}");
-        io::stdout().flush().ok();
-    }
-
-    fn flush(&mut self) {
-        let mut lines = Vec::new();
-        let rest = std::mem::take(&mut self.partial);
-        if !rest.is_empty() {
-            self.md.push(&rest, 0, &mut lines);
-        }
-        self.md.flush(0, &mut lines);
-        self.write(lines);
-    }
-}
-
-impl Sink for PlainSink {
-    fn text(&mut self, text: &str) {
-        self.partial.push_str(text);
-        let Some(last) = self.partial.rfind('\n') else {
-            return;
-        };
-        let finished: String = self.partial.drain(..=last).collect();
-        for line in ui::split(&finished) {
-            let mut lines = Vec::new();
-            self.md.push(line, 0, &mut lines);
-            self.write(lines);
-        }
-    }
-
-    fn status(&mut self, _text: &str) {}
-
-    fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str), error: Option<&str>) {
-        self.flush();
-        let mut line = String::new();
-        for (paint, text) in call {
-            line.push_str(&paint.ansi(text));
-        }
-        line.push(' ');
-        line.push_str(&mark.0.ansi(mark.1));
-        println!("{line}");
-        if let Some(error) = error {
-            println!("    {}", Paint::Red.ansi(error));
-        }
-        io::stdout().flush().ok();
-    }
-
-    fn end_round(&mut self) {
-        self.flush();
-        self.out.commit();
-        if std::mem::take(&mut self.out.wrote) {
-            println!();
-        }
-        self.wrote_block = false;
-    }
-
-    fn reasoning(&mut self, _text: &str) {}
-}
-
 struct ChannelSink {
     tx: Sender<Event>,
     out: TextSink,
@@ -2424,7 +2322,7 @@ impl Sink for ChannelSink {
     fn end_round(&mut self) {
         self.end_thought();
         self.out.commit();
-        if std::mem::take(&mut self.out.wrote) {
+        if self.out.take_wrote() {
             // The reply ended without a final newline, so the line it left
             // unfinished becomes permanent here.
             self.send(Event::Printed("\n".to_string()));
@@ -2449,90 +2347,6 @@ impl Sink for ChannelSink {
             self.send(Event::Status("Thinking…".to_string()));
         }
     }
-}
-
-/// Drop control characters a terminal would execute. Newlines and tabs stay:
-/// this is line output, not a raw terminal stream.
-fn strip_control(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .collect()
-}
-
-/// Text bound for stdout: stripped only when a terminal would interpret it,
-/// so redirected output stays byte-exact.
-fn terminal_text(text: &str) -> String {
-    if io::stdout().is_terminal() {
-        strip_control(text)
-    } else {
-        text.to_string()
-    }
-}
-
-/// A style this binary uses for transcript text. Two renderers read it: the
-/// screen's cells, and ANSI escapes when there is no screen.
-#[derive(Clone, Copy)]
-enum Paint {
-    Plain,
-    Dim,
-    Cyan,
-    Yellow,
-    Green,
-    Red,
-}
-
-impl Paint {
-    fn style(self) -> Style {
-        match self {
-            Paint::Plain => Style::new(),
-            Paint::Dim => Style::new().add_modifier(Modifier::DIM),
-            Paint::Cyan => Style::new().fg(Color::Cyan),
-            Paint::Yellow => Style::new().fg(Color::Yellow),
-            Paint::Green => Style::new().fg(Color::Green),
-            Paint::Red => Style::new().fg(Color::Red),
-        }
-    }
-
-    /// ANSI colors only when stdout is a terminal, so redirected output stays
-    /// plain. A terminal also gets its control bytes stripped: content can come
-    /// from a fetched page or a command, and ESC is never part of the style.
-    fn ansi(self, text: &str) -> String {
-        if !io::stdout().is_terminal() {
-            return text.to_string();
-        }
-        let text = strip_control(text);
-        let code = match self {
-            Paint::Plain => return text,
-            Paint::Dim => "2",
-            Paint::Cyan => "36",
-            Paint::Yellow => "33",
-            Paint::Green => "32",
-            Paint::Red => "31",
-        };
-        format!("\x1b[{code}m{text}\x1b[0m")
-    }
-
-    fn span(self, text: String) -> Span<'static> {
-        Span::styled(text, self.style())
-    }
-}
-
-fn line_of(spans: &[(Paint, String)]) -> Line<'static> {
-    Line::from(
-        spans
-            .iter()
-            .map(|(paint, text)| paint.span(text.clone()))
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn plain_text(spans: &[(Paint, String)]) -> String {
-    spans
-        .iter()
-        .map(|(_, text)| text.as_str())
-        .collect::<String>()
-        .trim()
-        .to_string()
 }
 
 fn thinking_label(provider: &config::ProviderConfig, level: &Option<String>) -> String {
@@ -2734,403 +2548,16 @@ fn resolve(providers: &[Provider], spec: Option<&str>) -> (usize, String) {
     (0, providers[0].models[0].id.clone())
 }
 
-/// Lines typed during a turn, waiting for the boundary that lets them join it.
-/// One slot: while a line is pending the prompt refuses a second one.
-type Queue = Arc<Mutex<VecDeque<String>>>;
-
-/// What a turn's queue holds now, oldest first. Empty without a queue, and
-/// empty rather than a failed turn when the lock is poisoned.
-fn take_queue(queue: Option<&Queue>) -> Vec<String> {
-    let Some(queue) = queue else {
-        return Vec::new();
-    };
-    match queue.lock() {
-        Ok(mut lines) => lines.drain(..).collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_turn(
-    provider: &Provider,
-    model: &str,
-    messages: &mut Vec<Value>,
-    mut store: Option<&mut Store>,
-    thinking: Option<&str>,
-    read_only: bool,
-    queue: Option<&Queue>,
-    sink: &mut dyn Sink,
-    cancel: &http::Cancel,
-) -> Result<Option<u64>, String> {
-    let tools = tools::definitions();
-    // The last round's own count. It measures the whole request, so it is the
-    // fill; `None` when no round reported one.
-    let mut used = None;
-
-    loop {
-        // An interrupt ends the turn here too: no further round is started.
-        // The user message stays without a reply, which is what happened.
-        if cancel.cancelled() {
-            return Ok(used);
-        }
-        // A line typed during the turn joins it here, at the only boundary
-        // there is: every tool result the last reply named has been answered,
-        // and this request does not exist yet, so the model reads it before
-        // answering instead of after the turn. A round already streaming cannot
-        // see it, and a reply that ends the turn has no round to reach.
-        for line in take_queue(queue) {
-            let message = json!({ "role": "user", "content": line });
-            if let Some(store) = store.as_deref_mut() {
-                store.record(&message);
-            }
-            messages.push(message);
-            sink.user(&line);
-        }
-        let extra = provider.cfg.thinking_body(thinking);
-        // Both callbacks borrow the sink, so it is shared rather than captured
-        // twice. The borrow ends with the block, so the turn can still report
-        // through it after the stream is over.
-        let result = {
-            let sink = RefCell::new(&mut *sink);
-            api::stream_chat(
-                &provider.ep,
-                provider.key.as_deref(),
-                &provider.headers,
-                model,
-                messages,
-                tools,
-                extra.as_ref(),
-                cancel,
-                |text| sink.borrow_mut().text(text),
-                |text| sink.borrow_mut().reasoning(text),
-            )
-        };
-        let reply = match result {
-            Ok(reply) => reply,
-            // Closing the socket under a read is how the interrupt unblocks
-            // it; the error is the interruption, not a failure. What arrived
-            // is still printed, but the turn is over.
-            Err(_) if cancel.cancelled() => {
-                sink.end_round();
-                return Ok(used);
-            }
-            Err(e) => return Err(e),
-        };
-        if let Some(count) = &reply.usage {
-            used = Some(count.prompt + count.completion);
-        }
-        sink.end_round();
-        // A shut-down read can also end the stream without an error. A cut
-        // reply is not an assistant message, and its calls never run.
-        if cancel.cancelled() {
-            return Ok(used);
-        }
-
-        if reply.calls.is_empty() {
-            let message = assistant_message(&reply);
-            if let Some(store) = store.as_deref_mut() {
-                store.record(&message);
-            }
-            messages.push(message);
-            return Ok(used);
-        }
-
-        let calls: Vec<Value> = reply
-            .calls
-            .iter()
-            .map(|call| {
-                json!({
-                    "id": call.id,
-                    "type": "function",
-                    "function": {
-                        "name": call.name,
-                        "arguments": call.arguments,
-                    }
-                })
-            })
-            .collect();
-        let mut message = assistant_message(&reply);
-        message["tool_calls"] = json!(calls);
-        if let Some(store) = store.as_deref_mut() {
-            store.record(&message);
-        }
-        messages.push(message);
-
-        // An interrupt can land before a call runs or between two of them.
-        // Every id the assistant message named still owes a result: a strict
-        // provider refuses the next request until each `tool_call_id` is
-        // answered, and the history is what a resumed session replays.
-        let mut answered = 0;
-        for call in &reply.calls {
-            if cancel.cancelled() {
-                break;
-            }
-            let echo = call_line(call, read_only);
-            // What is running, while it runs: the finished line appears below
-            // once there is a result to put on it.
-            sink.status(&plain_text(&echo));
-            let result = tools::execute(&call.name, &call.arguments, cancel, read_only);
-            let error = failed(&result).then(|| detail(&result));
-            sink.echo(&echo, mark(&result), error.as_deref());
-            let message = tool_message(&call.id, &result);
-            if let Some(store) = store.as_deref_mut() {
-                store.record(&message);
-            }
-            messages.push(message);
-            answered += 1;
-        }
-        for message in unanswered(&reply.calls, answered) {
-            if let Some(store) = store.as_deref_mut() {
-                store.record(&message);
-            }
-            messages.push(message);
-        }
-        if answered < reply.calls.len() {
-            return Ok(used);
-        }
-    }
-}
-
-/// A tool result as it goes back into the history.
-fn tool_message(id: &str, content: &str) -> Value {
-    json!({ "role": "tool", "tool_call_id": id, "content": content })
-}
-
-/// The calls of an interrupted round that never ran, as results. The provider
-/// wants one per `tool_call_id` before the next request, and a resumed session
-/// replays whatever the log holds, so a gap here outlives the turn.
-fn unanswered(calls: &[api::ToolCall], answered: usize) -> Vec<Value> {
-    calls[answered.min(calls.len())..]
-        .iter()
-        .map(|call| {
-            tool_message(
-                &call.id,
-                "error: interrupted by user (ESC); the call was not run",
-            )
-        })
-        .collect()
-}
-
-/// The assistant message as it goes back into the history. Thinking-mode
-/// providers (DeepSeek with `tools`, and the servers that share the extension)
-/// reject the next request unless the reasoning they streamed is returned.
-fn assistant_message(reply: &api::Reply) -> Value {
-    let mut message = json!({ "role": "assistant", "content": reply.text });
-    if !reply.reasoning.is_empty() {
-        message["reasoning_content"] = json!(reply.reasoning);
-    }
-    message
-}
-
-/// Streams model text to stdout, holding back newlines at the edges. Providers
-/// pad `content` differently (leading or trailing blank lines); the harness
-/// owns spacing, so those would otherwise widen the gap between blocks by an
-/// amount that varies per reply.
-#[derive(Default)]
-struct TextSink {
-    started: bool,
-    /// Blank lines to emit before the next text: a provider pads `content`
-    /// differently, and the gap is only real once the next line starts.
-    pending: usize,
-    wrote: bool,
-}
-
-impl TextSink {
-    /// Feed streamed text and append whatever may be printed now.
-    ///
-    /// Text is emitted as it arrives: holding a line until its newline would
-    /// mean nothing appears until the line ends.
-    fn push(&mut self, text: &str, out: &mut String) {
-        for ch in text.chars() {
-            if ch == '\n' {
-                if self.started {
-                    self.pending += 1;
-                }
-                continue;
-            }
-            if !self.started {
-                self.started = true;
-                // Piped output has no screen to put the blank row between two
-                // blocks, so the reply carries its own. Emitted here, not per
-                // round: a round with no text must not widen the gap between
-                // two tool calls. `Screen::write` inserts its own separator and
-                // reads this one as the empty line it is.
-                out.push('\n');
-            }
-            for _ in 0..self.pending {
-                out.push('\n');
-            }
-            self.pending = 0;
-            self.wrote = true;
-            out.push(ch);
-        }
-    }
-
-    /// End the reply: blank lines held back at its tail are dropped, since the
-    /// harness owns the spacing between blocks.
-    fn commit(&mut self) {
-        self.pending = 0;
-    }
-}
-
-// A shell command, the user's (`!cmd`) or the model's, on one line: the glyph
-// says what runs, and the command follows it, since `bash` has no call syntax.
-fn shell_line(command: &str, read_only: bool) -> Vec<(Paint, String)> {
-    // Cyan for a command that cannot change the tree: dim is the thought's
-    // color, and the two must not read alike.
-    let paint = if read_only {
-        Paint::Cyan
-    } else {
-        Paint::Yellow
-    };
-    vec![
-        (Paint::Plain, "  ".to_string()),
-        (paint, "▷".to_string()),
-        (Paint::Plain, " ".to_string()),
-        (paint, summarize(command, 120)),
-    ]
-}
-
-// Echo tool calls compactly: show the arguments that identify the target, never
-// the raw JSON (heredoc scripts and long content are unreadable in a line).
-// A glyph per tool says what it does at a glance. The palette has one rule:
-// anything that can change the tree is yellow, anything that cannot is cyan
-// (dim is the thought's color, so a read-only call must not use it).
-fn call_line(call: &api::ToolCall, read_only: bool) -> Vec<(Paint, String)> {
-    let v: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-    let (glyph, paint) = match call.name.as_str() {
-        "read" => ("◇", Paint::Cyan),
-        "fetch" => ("↗", Paint::Cyan),
-        "web_search" => ("⌕", Paint::Cyan),
-        "about" => ("ℹ", Paint::Cyan),
-        "write" => ("✚", Paint::Yellow),
-        "edit" => ("✎", Paint::Yellow),
-        _ => ("✚", Paint::Yellow),
-    };
-
-    if call.name == "bash" {
-        let command = v["command"].as_str().unwrap_or("bash");
-        return shell_line(command, read_only);
-    }
-
-    let mut parts = Vec::new();
-    for key in ["path", "file", "pattern", "url", "query"] {
-        if let Some(s) = v[key].as_str() {
-            parts.push(summarize(s, 120));
-        }
-    }
-    // A partial read is only reproducible with its window, so echo it. `fetch`
-    // pages with start/chars; `read` with offset/limit.
-    let num = |key: &str| v[key].as_u64().map(|n| n.to_string());
-    let (offset, limit) = (
-        num("offset").or_else(|| num("start")),
-        num("limit").or_else(|| num("chars")),
-    );
-    if offset.is_some() || limit.is_some() {
-        let start = offset.unwrap_or_else(|| "1".into());
-        parts.push(match limit {
-            Some(l) => format!("{start}+{l}"),
-            None => format!("{start}+"),
-        });
-    }
-    // An edit's path says nothing about its size: old→new lines tells a tweak
-    // from a rewrite, the way read's window says which slice it took.
-    if call.name == "edit" {
-        if let (Some(old), Some(new)) = (v["old"].as_str(), v["new"].as_str()) {
-            parts.push(format!(
-                "{}→{} lines",
-                old.lines().count(),
-                new.lines().count()
-            ));
-        }
-    }
-
-    let mut spans = vec![
-        (Paint::Plain, "  ".to_string()),
-        (paint, glyph.to_string()),
-        (Paint::Plain, " ".to_string()),
-        (paint, call.name.clone()),
-    ];
-    if parts.is_empty() {
-        return spans;
-    }
-    spans.push((Paint::Plain, format!("({})", parts.join(" "))));
-    spans
-}
-
-/// A failed tool result is a result, not an error: tools report failures as
-/// text, either `error: ...` or a non-zero `exit: N`.
-fn failed(result: &str) -> bool {
-    if let Some(rest) = result.strip_prefix("exit: ") {
-        rest.lines().next().unwrap_or("").trim() != "0"
-    } else {
-        result.starts_with("error:")
-    }
-}
-
-/// One glyph for the outcome.
-fn mark(result: &str) -> (Paint, &'static str) {
-    if failed(result) {
-        (Paint::Red, "✗")
-    } else {
-        (Paint::Green, "✓")
-    }
-}
-
-/// What to say under a failed call: one line. The `exit: N` header is dropped,
-/// since the mark already reports the failure. The full result still reaches
-/// the model; a build log must not reach the transcript.
-fn detail(result: &str) -> String {
-    let body = match result.strip_prefix("exit: ") {
-        Some(rest) => rest.split_once('\n').map(|(_, body)| body).unwrap_or(""),
-        None => result,
-    };
-    summarize(body.trim_start_matches('\n'), 120)
-}
-
-fn summarize(text: &str, max: usize) -> String {
-    let line = text.lines().next().unwrap_or("");
-    let mut out: String = line.chars().take(max).collect();
-    if line.chars().count() > max || text.lines().count() > 1 {
-        out.push('…');
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::render::summarize;
 
     /// The info row as one line: the screen joins the pieces, and so does
     /// anything that asserts on them.
     fn info_text(session: &Session) -> String {
         ui::info_text(&session.info())
-    }
-
-    #[test]
-    fn an_interrupted_round_answers_every_call_it_named() {
-        let calls = vec![
-            api::ToolCall {
-                id: "a".into(),
-                name: "read".into(),
-                arguments: "{}".into(),
-            },
-            api::ToolCall {
-                id: "b".into(),
-                name: "bash".into(),
-                arguments: "{}".into(),
-            },
-        ];
-        // A round that ran both owes nothing.
-        assert!(unanswered(&calls, 2).is_empty());
-        // One cut short answers the rest, so the next request is accepted.
-        let rest = unanswered(&calls, 1);
-        assert_eq!(rest.len(), 1);
-        assert_eq!(rest[0]["role"], "tool");
-        assert_eq!(rest[0]["tool_call_id"], "b");
-        assert!(rest[0]["content"].as_str().unwrap().contains("interrupted"));
-        // A round interrupted before the first call still answers both.
-        assert_eq!(unanswered(&calls, 0).len(), 2);
     }
 
     #[test]
@@ -3213,12 +2640,20 @@ mod tests {
     }
 
     #[test]
-    fn mode_note_names_the_available_tools() {
-        let on = mode_note(true)["content"].as_str().unwrap().to_string();
-        let off = mode_note(false)["content"].as_str().unwrap().to_string();
-        assert!(on.contains("write"));
+    fn mode_note_is_the_mode_as_a_user_message() {
+        // The policy itself is `Mode`'s; this is the role it travels in.
+        let on = mode_note(tools::Mode::Explore);
+        let off = mode_note(tools::Mode::Normal);
+        assert_eq!(on["role"].as_str(), Some("user"));
+        let on = on["content"].as_str().unwrap().to_string();
+        let off = off["content"].as_str().unwrap().to_string();
+        assert_eq!(on, tools::Mode::Explore.note(sandbox::plan()));
+        assert_eq!(off, tools::Mode::Normal.note(sandbox::plan()));
         assert!(on.contains("/explore off"), "{on}");
-        assert!(off.contains("fetch and web_search are unavailable"));
+        assert!(
+            off.contains("fetch and web_search are unavailable"),
+            "{off}"
+        );
     }
 
     #[test]
@@ -3374,7 +2809,7 @@ mod tests {
             provider: 0,
             model: "m".into(),
             thinking: None,
-            read_only: true,
+            mode: tools::Mode::Explore,
             used: Some(10),
             messages: vec![json!({ "role": "system", "content": "s" })],
             sid: "abc".into(),
@@ -3429,17 +2864,6 @@ mod tests {
         assert_eq!(store.meta.as_ref().unwrap().title, "T");
         store.finalize(&[]);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn text_sink_normalizes_reply_spacing() {
-        let mut sink = TextSink::default();
-        let mut out = String::new();
-        sink.push("\n\nhello", &mut out);
-        sink.push(" world\n\n", &mut out);
-        sink.commit();
-        assert_eq!(out, "\nhello world");
-        assert!(sink.wrote);
     }
 
     #[test]
@@ -3512,7 +2936,7 @@ mod tests {
             provider: 0,
             model: "m".into(),
             thinking: None,
-            read_only: true,
+            mode: tools::Mode::Explore,
             used: None,
             messages: vec![json!({ "role": "system", "content": "s" })],
             sid: "abc".into(),
@@ -3540,7 +2964,7 @@ mod tests {
             provider: 0,
             model: "m".into(),
             thinking: None,
-            read_only: true,
+            mode: tools::Mode::Explore,
             used: None,
             messages: vec![json!({ "role": "system", "content": "s" })],
             sid: "abc".into(),
@@ -3554,8 +2978,8 @@ mod tests {
         assert!(info_text(&session).contains("p/m"));
         assert_eq!(session.context(), Some(100));
         assert!(session.fill().0.contains("100"));
-        session.set_read_only(false);
-        assert!(!session.read_only);
+        session.set_mode(tools::Mode::Normal);
+        assert!(!session.mode.explore());
         assert_eq!(session.messages.len(), 2);
         session.record(json!({ "role": "user", "content": "hi" }));
         assert_eq!(session.messages.len(), 3);
@@ -3572,7 +2996,7 @@ mod tests {
             provider: 0,
             model: "m".into(),
             thinking: None,
-            read_only: false,
+            mode: tools::Mode::Normal,
             used: None,
             messages: Vec::new(),
             sid: "abc".into(),
