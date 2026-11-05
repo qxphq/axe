@@ -142,11 +142,12 @@ a task matches.
 
 ## REPL
 
-`❯ ` is the prompt. Enter submits, Ctrl+J or Alt+Enter starts a new line, Tab completes
-a command and cycles through the candidates for what you typed; the rest of the
-first one is shown dim after the cursor. A line starting with `!` is your own
-shell: it runs through the same tool, its output joins the history as a user
-message, and no turn follows — the model sees it the next time you ask
+`❯ ` is the prompt. Enter submits, Ctrl+J or Alt+Enter starts a new line. Typing
+a slash word lists up to five matching commands under the prompt, the one the
+next step takes drawn bright; Tab and ↓ step forward, ↑ steps back, and the
+line always holds the command the step picked. A line starting with `!` is your
+own shell: it runs through the same tool, its output joins the history as a
+user message, and no turn follows — the model sees it the next time you ask
 something.
 
 | command | what it does |
@@ -171,9 +172,9 @@ the selection.
 | --- | --- |
 | Enter | submit |
 | Ctrl+J, Alt+Enter | new line |
-| Tab | complete a command, cycling through its candidates |
+| Tab, ↑ ↓ | complete a command: step through its candidates, the list under the prompt |
 | Shift+Tab | toggle explore mode |
-| ↑ ↓ | move in a chooser |
+| ↑ ↓ | move in a chooser, or step the command candidates |
 | Esc | close a chooser, or cancel the running turn |
 | Ctrl+C | clear the prompt line |
 | Ctrl+D / Ctrl+A / Ctrl+E | end input / start of line / end of line |
