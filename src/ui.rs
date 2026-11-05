@@ -214,6 +214,9 @@ pub struct Screen {
     /// A chooser above the prompt, when one is open.
     menu: Option<Menu>,
     restored: bool,
+    /// State changed since the last frame. The loops paint; the setters only
+    /// mark, so a change made while nobody is drawing cannot be lost.
+    dirty: bool,
 }
 
 impl Screen {
@@ -275,6 +278,7 @@ impl Screen {
             thought: markdown::Stream::new(),
             menu: None,
             restored: false,
+            dirty: true,
         })
     }
 
@@ -298,7 +302,13 @@ impl Screen {
             thought: markdown::Stream::new(),
             menu: None,
             restored: false,
+            dirty: true,
         }
+    }
+
+    #[cfg(test)]
+    fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     #[cfg(test)]
@@ -312,6 +322,7 @@ impl Screen {
     /// Explore mode colors the prompt; the transcript keeps its own palette.
     pub fn set_explore(&mut self, explore: bool) {
         self.prompt_style = if explore { EXPLORE_STYLE } else { PROMPT_STYLE };
+        self.dirty = true;
     }
 
     pub fn status(&self) -> &str {
@@ -320,6 +331,7 @@ impl Screen {
 
     pub fn set_status(&mut self, text: &str) {
         self.status = text.to_string();
+        self.dirty = true;
     }
 
     /// A question the user must answer. It owns the row under the prompt and
@@ -327,25 +339,30 @@ impl Screen {
     /// read is not an offer.
     pub fn set_alert(&mut self, text: Option<&str>) {
         self.alert = text.map(str::to_string);
+        self.dirty = true;
     }
 
     pub fn set_queued(&mut self, line: Option<&str>) {
         self.queued = line.map(str::to_string);
+        self.dirty = true;
     }
 
     pub fn set_info(&mut self, text: &str) {
         self.info = text.to_string();
+        self.dirty = true;
     }
 
     /// The lines Tab completes: slash names, and names with their first
     /// argument.
     pub fn set_commands(&mut self, commands: Vec<String>) {
         self.commands = commands;
+        self.dirty = true;
     }
 
     /// Open a chooser. Rows are plain text; the marker is drawn on the
     /// selected one.
     pub fn set_menu(&mut self, header: &str, rows: Vec<String>, collapse_on_type: bool) {
+        self.dirty = true;
         if rows.is_empty() {
             self.menu = None;
             return;
@@ -363,6 +380,7 @@ impl Screen {
     /// Close the chooser, optionally leaving its rows in the transcript. They
     /// are committed without the selection marker: the choice is over.
     pub fn clear_menu(&mut self, commit: bool) {
+        self.dirty = true;
         let Some(menu) = self.menu.take() else { return };
         // Shrink to the prompt first, so committed rows land above a live
         // region of its normal height rather than over the chooser's rows.
@@ -382,6 +400,7 @@ impl Screen {
     }
 
     pub fn menu_move(&mut self, delta: isize) {
+        self.dirty = true;
         let Some(menu) = &mut self.menu else { return };
         let last = menu.rows.len().saturating_sub(1);
         menu.selected = menu.selected.saturating_add_signed(delta).min(last);
@@ -427,6 +446,7 @@ impl Screen {
 
     /// The completed line, leaving the buffer empty.
     pub fn take(&mut self) -> String {
+        self.dirty = true;
         self.cursor = 0;
         self.cycle = None;
         std::mem::take(&mut self.buf)
@@ -435,6 +455,7 @@ impl Screen {
     /// Fold one key into the buffer. Holds no interrupt semantics: ESC belongs
     /// to the caller, which knows whether a turn is in flight.
     pub fn apply_key(&mut self, key: KeyEvent) -> Action {
+        self.dirty = true;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
@@ -574,6 +595,7 @@ impl Screen {
     }
 
     fn write(&mut self, lines: Vec<Line<'static>>, block: Block) {
+        self.dirty = true;
         // Whatever follows a thought ends it, and the thought goes first.
         if block != Block::Thought {
             self.end_thought();
@@ -716,6 +738,7 @@ impl Screen {
     /// it goes with it, scrollback included, and the live region starts blank.
     /// The one place the transcript is erased: a session is a boundary.
     pub fn reset(&mut self) {
+        self.dirty = true;
         // Collected markdown would otherwise join the new session's first
         // block; the transcript starts with no block to continue.
         self.md = markdown::Stream::new();
@@ -823,7 +846,8 @@ impl Screen {
         let info = clip(&self.info, cols);
         let status = clip(&self.status, cols.saturating_sub(info.chars().count() + 1));
 
-        self.term
+        let frame = self
+            .term
             .draw(|frame| {
                 let area = inset(frame.area(), margin);
                 let row = |offset: u16| Rect {
@@ -896,7 +920,24 @@ impl Screen {
                     area.y + top + crow,
                 ));
             })
-            .map(|_| ())
+            .map(|_| ());
+        if frame.is_ok() {
+            self.dirty = false;
+        }
+        frame
+    }
+
+    /// Paint only when something changed. This is what the loops call: a
+    /// setter marks the screen dirty, so no caller has to remember a draw.
+    pub fn repaint(&mut self) {
+        if self.dirty {
+            let _ = self.draw();
+        }
+    }
+
+    /// The terminal changed under us: the next repaint is not optional.
+    pub fn invalidate(&mut self) {
+        self.dirty = true;
     }
 
     /// Give the live region `height` rows. It keeps its bottom at the screen
@@ -1013,6 +1054,7 @@ impl Screen {
     /// pasted block is one submission, not one per line. A terminal may hand
     /// over CRLF; that is still one line break.
     pub fn insert_text(&mut self, text: &str) {
+        self.dirty = true;
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if text.is_empty() {
             return;
@@ -1579,6 +1621,29 @@ mod tests {
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert_eq!(text, vec!["hello ", "world"]);
+    }
+
+    #[test]
+    fn repaint_paints_only_what_changed() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.draw().unwrap();
+        // A frame is out: nothing is pending until a setter runs.
+        assert!(!screen.is_dirty());
+        screen.set_info("after");
+        assert!(screen.is_dirty());
+        screen.repaint();
+        assert!(!screen.is_dirty());
+        let text: String = screen
+            .test_buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("after"), "{text}");
+        // A transcript line goes to scrollback through `write`, which paints
+        // as it goes: nothing is left pending afterwards.
+        screen.output("plain text\n");
+        assert!(!screen.is_dirty());
     }
 
     #[test]
