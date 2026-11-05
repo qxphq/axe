@@ -185,6 +185,10 @@ the selection.
 Turns run in the background: the prompt stays live while the model answers, and
 a line typed meanwhile is queued.
 
+The dim row under the prompt is what the turn is doing on the left, and on the
+right the session's title (once it has one), the provider/model and thinking
+level, and how much of the context window the history fills.
+
 ## Modes
 
 Explore mode is a session setting, on by default (`explore_by_default`). When

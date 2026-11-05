@@ -1084,7 +1084,7 @@ impl Session {
 
     /// Apply a finished background title, if one is ready. A title is metadata;
     /// waiting for the next key is enough and never blocks the prompt.
-    fn poll_naming(&mut self, screen: Option<&mut ui::Screen>) {
+    fn poll_naming(&mut self, mut screen: Option<&mut ui::Screen>) {
         let Some(received) = self.naming.as_ref().map(|rx| rx.try_recv()) else {
             return;
         };
@@ -1095,6 +1095,11 @@ impl Session {
                     if let Some(store) = self.store.as_mut() {
                         store.set_title(&title, &summary);
                     }
+                }
+                // The title is part of the selection row, so the row is stale
+                // until the next key: repaint it here.
+                if let Some(screen) = screen.as_deref_mut() {
+                    screen.set_info(&self.info());
                 }
                 self.flush_warnings(screen);
             }
@@ -1257,11 +1262,25 @@ impl Session {
     /// the window it has filled, and the mode when that changes the tool set.
     fn info(&self) -> String {
         let base = selection(&self.providers, self.provider, &self.model, &self.thinking);
+        let base = match self.title() {
+            Some(title) => format!("{title}  ·  {base}"),
+            None => base,
+        };
         let mut text = format!("{base}  ·  {}", self.fill());
         if self.read_only {
             text.push_str("  ·  read-only");
         }
         text
+    }
+
+    /// The generated title, when the session has one. A fresh session has no
+    /// meta yet, and an unnamed one has nothing to show: no "(untitled)" here.
+    /// It rides in the right group, left of the model, so the transient status
+    /// keeps its own left half.
+    fn title(&self) -> Option<&str> {
+        let meta = self.store.as_ref()?.meta.as_ref()?;
+        let title = meta.title.trim();
+        (!title.is_empty()).then_some(title)
     }
 
     /// Used and total tokens, with the percentage between them. The provider's
@@ -3174,5 +3193,43 @@ mod tests {
         assert_eq!(session.messages.len(), 3);
         session.warn("careful".into());
         session.flush_warnings(None);
+    }
+
+    #[test]
+    fn session_info_carries_the_title_left_of_the_model() {
+        let meta = sessions::Meta::new("abc", "m");
+        let mut session = Session {
+            state: state::State::default(),
+            providers: vec![test_provider()],
+            provider: 0,
+            model: "m".into(),
+            thinking: None,
+            read_only: false,
+            used: None,
+            messages: Vec::new(),
+            sid: "abc".into(),
+            store: Some(Store {
+                dir: std::env::temp_dir(),
+                id: "abc".into(),
+                model: "m".into(),
+                log: None,
+                meta: Some(meta),
+                naming_tried: false,
+                warned: false,
+                warning: None,
+            }),
+            startup: Vec::new(),
+            picks: Vec::new(),
+            naming: None,
+            warning: None,
+            skills: Vec::new(),
+        };
+        // Untitled: the row starts with the model, as it always has.
+        assert!(session.info().starts_with("p/m"), "{}", session.info());
+        session.store.as_mut().unwrap().meta.as_mut().unwrap().title = "Fix the status row".into();
+        assert!(session.info().starts_with("Fix the status row  ·  p/m"));
+        // A title of spaces is no title.
+        session.store.as_mut().unwrap().meta.as_mut().unwrap().title = "  ".into();
+        assert!(session.info().starts_with("p/m"), "{}", session.info());
     }
 }
