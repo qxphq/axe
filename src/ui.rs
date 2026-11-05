@@ -104,13 +104,22 @@ struct Menu {
     collapse_on_type: bool,
 }
 
-/// A Tab cycle in flight: the candidates for what was typed before the first
-/// Tab, and which one the buffer holds now. The candidates are captured once,
-/// so a second Tab walks all of them even though the completed buffer no
-/// longer matches the others.
-struct Cycle {
+/// The candidates under the prompt and the row the marker is on. The marker
+/// moves without touching the line, so the list is captured once against the
+/// line it was taken from: `typed` holds that line, and an edit ends it. Being
+/// captured also means Tab walks every candidate the prefix matched, not just
+/// those the line it wrote last still matches.
+struct Selection {
+    typed: String,
     matches: Vec<String>,
     at: usize,
+}
+
+impl Selection {
+    /// The list belongs to the line it was taken from: an edit ends it.
+    fn belongs(&self, line: &str) -> bool {
+        self.typed == line
+    }
 }
 
 /// What the live frame is for. A chooser is a different frame, not a taller
@@ -368,8 +377,9 @@ pub struct Screen {
     /// The lines Tab completes, in the caller's spelling: a slash command on
     /// its own, or one with its first argument filled in.
     commands: Vec<String>,
-    /// The Tab cycle the buffer is part of, if any. Any edit ends it.
-    cycle: Option<Cycle>,
+    /// The candidates the line put under the prompt, if any: the arrows move
+    /// its marker and Enter runs what they moved to.
+    selection: Option<Selection>,
     /// The last block written, for the blank line between blocks.
     last: Option<Block>,
     /// Rows between the end of the transcript and the top of the frame that are
@@ -445,7 +455,7 @@ impl Screen {
             info: String::new(),
             killed: String::new(),
             commands: Vec::new(),
-            cycle: None,
+            selection: None,
             last: None,
             slack: 0,
             md: markdown::Stream::new(),
@@ -485,7 +495,7 @@ impl Screen {
             info: String::new(),
             killed: String::new(),
             commands: Vec::new(),
-            cycle: None,
+            selection: None,
             last: None,
             slack: 0,
             md: markdown::Stream::new(),
@@ -655,7 +665,7 @@ impl Screen {
     pub fn take(&mut self) -> String {
         self.dirty = true;
         self.cursor = 0;
-        self.cycle = None;
+        self.selection = None;
         std::mem::take(&mut self.buf)
     }
 
@@ -680,7 +690,12 @@ impl Screen {
             // says otherwise, and asking for that costs every shifted
             // character its layout.
             KeyCode::Enter if alt => self.insert_char('\n'),
-            KeyCode::Enter => return Action::Submit,
+            // Enter runs what the marker was moved to. A list nobody stepped
+            // through is a preview of Tab, so the line submits as typed.
+            KeyCode::Enter => {
+                self.take_marked();
+                return Action::Submit;
+            }
             KeyCode::Backspace if alt || ctrl => self.kill_word_back(),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Delete => self.delete(),
@@ -690,9 +705,9 @@ impl Screen {
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.len()),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.len(),
-            KeyCode::Tab => self.cycle_step(true),
-            KeyCode::Up => self.cycle_step(false),
-            KeyCode::Down => self.cycle_step(true),
+            KeyCode::Tab => self.complete(),
+            KeyCode::Up => self.mark(-1),
+            KeyCode::Down => self.mark(1),
             KeyCode::BackTab => return Action::Explore,
             // A shell's Ctrl-C: drop what was typed, keep the prompt.
             KeyCode::Char('c') if ctrl => {
@@ -719,15 +734,6 @@ impl Screen {
             KeyCode::Char('j') if ctrl => self.insert_char('\n'),
             KeyCode::Char(c) if !ctrl && !alt => self.insert_char(c),
             _ => {}
-        }
-        // A cycle holds only while the buffer still is the candidate it put
-        // there. Any edit ends it, so the next Tab starts from what is typed.
-        if self
-            .cycle
-            .as_ref()
-            .is_some_and(|c| c.matches.get(c.at) != Some(&self.buf))
-        {
-            self.cycle = None;
         }
         Action::None
     }
@@ -1073,8 +1079,8 @@ impl Screen {
             })
             .collect();
         // Under the prompt's text, not under its glyph: a suggestion reads as
-        // a continuation of what is being typed. The row the next step takes
-        // is the bright one.
+        // a continuation of what is being typed. The marked row is the bright
+        // one: Enter runs it, Tab puts it on the line.
         let pad = " ".repeat(gutter.min(cols.saturating_sub(1)));
         let queued = self.queued.clone();
         // The row is shared: the status says what the turn is doing, the info
@@ -1334,40 +1340,85 @@ impl Screen {
         self.cursor += text.chars().count();
     }
 
-    /// Tab on a slash line: fill in a candidate, then step to the next one on
-    /// every further Tab, wrapping around. The set is captured on the first
-    /// step, so the walk covers every line the typed prefix matched, not just
-    /// those the completed buffer still matches. Backwards starts at the last
-    /// one, as a menu does. A lone candidate finishes with a space and ends the
-    /// cycle.
-    fn cycle_step(&mut self, forward: bool) {
-        if let Some(cycle) = &mut self.cycle {
-            if cycle.matches.get(cycle.at) == Some(&self.buf) && !cycle.matches.is_empty() {
-                let n = cycle.matches.len();
-                cycle.at = if forward {
-                    (cycle.at + 1) % n
-                } else {
-                    (cycle.at + n - 1) % n
-                };
-                self.buf = cycle.matches[cycle.at].clone();
-                self.cursor = self.len();
-                return;
-            }
+    /// The list under the prompt, taken from the line as it is now with the
+    /// first row marked, or the one a step already made. False when nothing
+    /// matches.
+    fn fresh(&mut self) -> bool {
+        if !self
+            .selection
+            .as_ref()
+            .is_some_and(|sel| sel.belongs(&self.buf))
+        {
+            let matches = self.candidates();
+            self.selection = if matches.is_empty() {
+                None
+            } else {
+                Some(Selection {
+                    typed: self.buf.clone(),
+                    matches,
+                    at: 0,
+                })
+            };
         }
-        self.cycle = None;
-        let matches = self.candidates();
-        if matches.is_empty() {
+        self.selection.is_some()
+    }
+
+    /// An arrow: move the marker one row, wrapping at both ends. The line is
+    /// left exactly as typed — the marker is a choice, not a completion, so
+    /// picking one never rewrites what was typed.
+    fn mark(&mut self, delta: isize) {
+        if !self.fresh() {
             return;
         }
-        let at = if forward { 0 } else { matches.len() - 1 };
-        self.buf = matches[at].clone();
-        self.cursor = self.len();
-        if matches.len() == 1 {
-            self.buf.push(' ');
-            self.cursor = self.len();
-        } else {
-            self.cycle = Some(Cycle { matches, at });
+        if let Some(sel) = &mut self.selection {
+            let n = sel.matches.len() as isize;
+            sel.at = (sel.at as isize + delta).rem_euclid(n) as usize;
         }
+    }
+
+    /// Tab: put the marked candidate on the line. When the line already holds
+    /// it the marker steps on first, so Tab walks the list; the set was
+    /// captured when the list was taken, so the walk covers every line the
+    /// prefix matched. A lone candidate finishes with a space and ends the
+    /// list.
+    fn complete(&mut self) {
+        if !self.fresh() {
+            return;
+        }
+        let Some(sel) = &self.selection else { return };
+        let n = sel.matches.len();
+        let at = if sel.matches[sel.at] == self.buf {
+            (sel.at + 1) % n
+        } else {
+            sel.at
+        };
+        let lone = n == 1;
+        let mut line = sel.matches[at].clone();
+        if lone {
+            line.push(' ');
+        }
+        self.buf = line;
+        self.cursor = self.len();
+        if lone {
+            self.selection = None;
+        } else if let Some(sel) = &mut self.selection {
+            sel.at = at;
+            sel.typed = self.buf.clone();
+        }
+    }
+
+    /// Enter takes what the marker was moved to: a stepped line runs the marked
+    /// candidate even though its text is still the prefix it was typed as.
+    fn take_marked(&mut self) {
+        let Some(sel) = self.selection.as_ref().filter(|sel| sel.belongs(&self.buf)) else {
+            return;
+        };
+        if sel.matches[sel.at] == self.buf {
+            return;
+        }
+        let line = sel.matches[sel.at].clone();
+        self.buf = line;
+        self.cursor = self.len();
     }
 
     /// The lines the buffer is a prefix of. Only a name is completed while only
@@ -1396,14 +1447,11 @@ impl Screen {
         }
     }
 
-    /// The candidates to list under the prompt and which one the next step
-    /// takes: the set the running cycle captured, or what is typed, with the
-    /// first one waiting.
+    /// The candidates to list under the prompt and which row the marker is on:
+    /// the stepped list, or what is typed now with the first row marked.
     fn hints(&self) -> (Vec<String>, usize) {
-        match &self.cycle {
-            Some(cycle) if cycle.matches.get(cycle.at) == Some(&self.buf) => {
-                (cycle.matches.clone(), cycle.at)
-            }
+        match &self.selection {
+            Some(sel) if sel.belongs(&self.buf) => (sel.matches.clone(), sel.at),
             _ => (self.candidates(), 0),
         }
     }
@@ -2122,16 +2170,16 @@ mod tests {
         assert_eq!(screen.buf, "/explore");
         screen.apply_key(tab);
         assert_eq!(screen.buf, "/exit");
-        // An edit ends the cycle: the next Tab starts from the text again.
+        // An edit ends the list: the next Tab starts from the text again.
         screen.apply_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
         assert_eq!(screen.buf, "/exitp");
         screen.apply_key(tab);
         assert_eq!(screen.buf, "/exitp");
         screen.apply_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        // One candidate left: Tab finishes it and ends the cycle.
+        // One candidate left: Tab finishes it and ends the list.
         screen.apply_key(tab);
         assert_eq!(screen.buf, "/exit ");
-        assert!(screen.cycle.is_none());
+        assert!(screen.selection.is_none());
     }
 
     #[test]
@@ -2141,7 +2189,7 @@ mod tests {
         screen.insert_text("/h");
         screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(screen.buf, "/help ");
-        assert!(screen.cycle.is_none());
+        assert!(screen.selection.is_none());
         // Free text after the first argument is the user's: Tab leaves it
         // alone.
         screen.insert_text("/model");
@@ -2178,7 +2226,7 @@ mod tests {
         screen.insert_text("/model tw");
         screen.apply_key(tab);
         assert_eq!(screen.buf, "/model two/small ");
-        assert!(screen.cycle.is_none());
+        assert!(screen.selection.is_none());
         // A second word is free text: no candidates, no fill.
         screen.take();
         screen.insert_text("/model one/big now");
@@ -2187,25 +2235,56 @@ mod tests {
     }
 
     #[test]
-    fn arrows_step_the_candidates_like_tab() {
+    fn arrows_move_the_marker_and_leave_the_line_alone() {
         let mut screen = Screen::test_screen(40, 10);
-        screen.set_commands(vec!["/exit".into(), "/explore".into(), "/help".into()]);
-        screen.insert_text("/e");
+        screen.set_commands(vec!["/skill:ship".into(), "/skills".into()]);
+        screen.insert_text("/sk");
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        // Backwards starts at the last candidate, forwards at the first.
-        screen.apply_key(key(KeyCode::Up));
-        assert_eq!(screen.buf, "/explore");
+        // The list starts on its first row, so the first press moves off it.
+        assert_eq!(screen.hints().1, 0);
         screen.apply_key(key(KeyCode::Down));
-        assert_eq!(screen.buf, "/exit");
+        assert_eq!(screen.hints().1, 1);
+        assert_eq!(screen.buf, "/sk");
+        // Both ends wrap.
         screen.apply_key(key(KeyCode::Down));
-        assert_eq!(screen.buf, "/explore");
+        assert_eq!(screen.hints().1, 0);
         screen.apply_key(key(KeyCode::Up));
-        assert_eq!(screen.buf, "/exit");
-        // Nothing to complete: the arrows leave the line alone.
+        assert_eq!(screen.hints().1, 1);
+        // Up and down agree on where they landed, and Tab takes it.
+        screen.apply_key(key(KeyCode::Up));
+        screen.apply_key(key(KeyCode::Down));
+        assert_eq!(screen.hints().1, 1);
+        screen.apply_key(key(KeyCode::Tab));
+        assert_eq!(screen.buf, "/skills");
+        // Nothing to mark: the arrows leave the line alone.
         screen.take();
         screen.insert_text("hello");
         screen.apply_key(key(KeyCode::Up));
         assert_eq!(screen.buf, "hello");
+    }
+
+    #[test]
+    fn enter_runs_the_marked_candidate() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_commands(vec!["/skill:ship".into(), "/skills".into()]);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        // A list nobody stepped through is a preview: Enter submits the text.
+        screen.insert_text("/sk");
+        screen.apply_key(key(KeyCode::Enter));
+        assert_eq!(screen.take(), "/sk");
+        // A marker that was moved makes the line the marked candidate.
+        screen.insert_text("/sk");
+        screen.apply_key(key(KeyCode::Down));
+        assert_eq!(screen.buf, "/sk");
+        screen.apply_key(key(KeyCode::Enter));
+        assert_eq!(screen.take(), "/skills");
+        // An edit ends the list, so Enter is back to what is typed.
+        screen.insert_text("/sk");
+        screen.apply_key(key(KeyCode::Down));
+        screen.apply_key(key(KeyCode::Char('i')));
+        assert_eq!(screen.buf, "/ski");
+        screen.apply_key(key(KeyCode::Enter));
+        assert_eq!(screen.take(), "/ski");
     }
 
     /// The invariant: one blank row between two blocks, never two, and never a
@@ -2352,7 +2431,7 @@ mod tests {
             rows[layout.list.y as usize + 1].trim_end(),
             "   /skill:ship"
         );
-        // The one the next step takes is the bright one.
+        // The marked row is the bright one.
         let cell = |x: u16, y: u16| screen.test_buffer()[(x, y)].clone();
         assert_eq!(cell(3, layout.list.y).fg, Color::Cyan);
         assert_ne!(cell(3, layout.list.y + 1).fg, Color::Cyan);
