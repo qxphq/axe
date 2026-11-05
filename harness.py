@@ -220,7 +220,18 @@ def write_config(root, port):
     (cfg / "config.json").write_text(
         json.dumps(
             {
-                "providers": {"mock": {"base_url": f"http://127.0.0.1:{port}/v1"}},
+                "providers": {
+                    # Levels, so `/thinking` has a chooser to walk; the mock
+                    # reads the body and ignores the extra field.
+                    "mock": {
+                        "base_url": f"http://127.0.0.1:{port}/v1",
+                        "thinking": {
+                            "off": {},
+                            "low": {"reasoning_effort": "low"},
+                            "high": {"reasoning_effort": "high"},
+                        },
+                    }
+                },
                 "model": "mock/mock-1",
                 # The env var selects Brave; without it search falls back to
                 # DuckDuckGo, which is also what the live tests use.

@@ -114,9 +114,10 @@ invariants a change must not break.
 
 ## Architecture
 
-- `main.rs` — REPL, provider setup, model and thinking selection (completed in
-  the prompt, not picked from a list), session lifecycle (startup chooser,
-  `/sessions`, `/new`, naming), agent loop. Two producers (keys, a turn)
+- `main.rs` — REPL, provider setup, model and thinking selection (a chooser
+  that typing narrows; no argument completion, because Enter would take the
+  candidate), session lifecycle (startup chooser, `/sessions`, `/new`, naming),
+  agent loop. Two producers (keys, a turn)
   feed one `mpsc` channel; the main thread applies events and draws once per batch.
 - `prompt.rs` — the system prompt: the built-in rules, then the instructions and
   the skills catalogue, built once as the prefix every request shares.

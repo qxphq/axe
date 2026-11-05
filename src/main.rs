@@ -856,6 +856,27 @@ impl Session {
         self.info()
     }
 
+    /// Apply a model choice and say so: the info row, and the line the
+    /// transcript keeps.
+    fn choose_model(&mut self, provider: usize, id: String, console: &mut Console) {
+        let info = self.set_model(provider, id);
+        console.output(&format!("{}\n", ui::info_text(&info)));
+        console.info(info);
+    }
+
+    /// Apply a thinking level and remember it for this `provider/id`.
+    fn choose_level(&mut self, level: String, console: &mut Console) {
+        self.thinking = Some(level.clone());
+        console.info(self.info());
+        let spec = self.spec();
+        self.state.set_thinking(&spec, level.as_str());
+        if let Err(e) = self.state.save() {
+            self.warn(format!("state: {e}"));
+        }
+        let label = thinking_label(&self.providers[self.provider].cfg, &self.thinking);
+        console.output(&format!("thinking: {label}\n"));
+    }
+
     fn finalize_session(&mut self) {
         if let Some(store) = self.store.as_mut() {
             store.finalize(&self.messages);
@@ -1181,6 +1202,53 @@ impl Session {
         }
     }
 
+    /// `/model`: a chooser over every provider's models, opened on the one in
+    /// use. Typing narrows the list, Enter switches, Esc closes.
+    fn browse_models(&mut self, screen: &mut ui::Screen, rx: &Receiver<Event>, query: &str) {
+        let items: Vec<(String, String)> = self
+            .providers
+            .iter()
+            .flat_map(|provider| {
+                provider.models.iter().map(move |model| {
+                    let spec = format!("{}/{}", provider.name, model.id);
+                    let row = match model.context {
+                        Some(ctx) => format!("{spec}  ({ctx} ctx)"),
+                        None => spec.clone(),
+                    };
+                    (spec, row)
+                })
+            })
+            .collect();
+        let on = items.iter().position(|(spec, _)| *spec == self.spec());
+        let Some(index) = choose(screen, rx, "Models", &items, on, query) else {
+            return;
+        };
+        let Some((provider, id)) = find(&self.providers, &items[index].0) else {
+            return;
+        };
+        let mut console = Console::Screen { screen, rx };
+        self.choose_model(provider, id, &mut console);
+    }
+
+    /// `/thinking`: a chooser over the levels this provider configures. A
+    /// provider with one level has nothing to pick and never gets here.
+    fn browse_levels(&mut self, screen: &mut ui::Screen, rx: &Receiver<Event>, query: &str) {
+        let names = level_names(&self.providers[self.provider].cfg);
+        let items: Vec<(String, String)> = names
+            .iter()
+            .map(|name| (name.clone(), name.clone()))
+            .collect();
+        let on = names
+            .iter()
+            .position(|name| Some(name) == self.thinking.as_ref());
+        let Some(index) = choose(screen, rx, "Thinking levels", &items, on, query) else {
+            return;
+        };
+        let level = names[index].clone();
+        let mut console = Console::Screen { screen, rx };
+        self.choose_level(level, &mut console);
+    }
+
     /// The no-tty form: a numbered list, and a number to resume. A search
     /// replaces the list, so the numbers always refer to what was last shown.
     fn list_piped(&mut self, arg: &str) {
@@ -1325,22 +1393,15 @@ impl Session {
         vec![system, mode_note(self.mode)]
     }
 
-    /// The lines Tab completes: the slash commands, including `/skill:<name>`
-    /// for every loaded skill whose name can be typed as one word, and the
-    /// first argument of `/model` and `/thinking`.
+    /// The lines Tab completes: the slash commands, and `/skill:<name>` for
+    /// every loaded skill whose name can be typed as one word. No argument is
+    /// in the list: `/model` and `/thinking` take theirs from a chooser, and a
+    /// candidate would be taken by Enter before the command ran.
     fn commands(&self) -> Vec<String> {
         let mut commands: Vec<String> =
             COMMANDS.iter().map(|command| command.to_string()).collect();
         for skill in self.skills.iter().filter(|skill| safe_name(&skill.name)) {
             commands.push(format!("/skill:{}", skill.name));
-        }
-        for provider in &self.providers {
-            for model in &provider.models {
-                commands.push(format!("/model {}/{}", provider.name, model.id));
-            }
-        }
-        for level in level_names(&self.providers[self.provider].cfg) {
-            commands.push(format!("/thinking {level}"));
         }
         commands
     }
@@ -1845,44 +1906,40 @@ impl Session {
                 Cmd::Continue
             }
             Command::Model(None) => {
-                console.output(&models(&self.providers));
+                match console {
+                    Console::Screen { screen, rx } => self.browse_models(screen, rx, ""),
+                    Console::Stdout => console.output(&models(&self.providers)),
+                }
                 Cmd::Continue
             }
             Command::Model(Some(spec)) => {
                 match find(&self.providers, &spec) {
-                    Some((pi, id)) => {
-                        let text = self.set_model(pi, id);
-                        // The levels `/thinking` completes belong to a provider.
-                        console.commands(self.commands());
-                        console.output(&format!("{}\n", ui::info_text(&text)));
-                        console.info(text);
-                    }
-                    None => console.error(&format!("unknown model: {spec}")),
+                    Some((provider, id)) => self.choose_model(provider, id, console),
+                    // On a screen an argument that names no model is a search,
+                    // not a mistake: the chooser opens narrowed to it.
+                    None => match console {
+                        Console::Screen { screen, rx } => self.browse_models(screen, rx, &spec),
+                        Console::Stdout => console.error(&format!("unknown model: {spec}")),
+                    },
                 }
                 Cmd::Continue
             }
             Command::Thinking(rest) => {
-                let providers = &self.providers;
-                if rest.as_deref().unwrap_or("").is_empty() {
-                    console.output(&format!(
-                        "thinking: {}\n",
-                        thinking_label(&providers[self.provider].cfg, &self.thinking)
-                    ));
+                let input = rest.as_deref().unwrap_or("").trim().to_string();
+                let label = thinking_label(&self.providers[self.provider].cfg, &self.thinking);
+                let levels = level_names(&self.providers[self.provider].cfg);
+                if input.is_empty() {
+                    match console {
+                        // One level is not a choice: the line says which it is.
+                        Console::Screen { screen, rx } if levels.len() > 1 => {
+                            self.browse_levels(screen, rx, "")
+                        }
+                        _ => console.output(&format!("thinking: {label}\n")),
+                    }
                     return Cmd::Continue;
                 }
-                match set_thinking(&providers[self.provider].cfg, rest.as_deref().unwrap_or("")) {
-                    Ok(level) => {
-                        self.thinking = Some(level.clone());
-                        console.info(self.info());
-                        let spec = format!("{}/{}", providers[self.provider].name, self.model);
-                        self.state.set_thinking(&spec, level.as_str());
-                        let save_error = self.state.save().err();
-                        let label = thinking_label(&providers[self.provider].cfg, &self.thinking);
-                        if let Some(e) = save_error {
-                            self.warn(format!("state: {e}"));
-                        }
-                        console.output(&format!("thinking: {label}\n"));
-                    }
+                match set_thinking(&self.providers[self.provider].cfg, &input) {
+                    Ok(level) => self.choose_level(level, console),
                     Err(e) => console.error(&e),
                 }
                 Cmd::Continue
@@ -1996,12 +2053,6 @@ impl Console<'_> {
     fn explore(&mut self, on: bool) {
         if let Some(screen) = self.screen() {
             screen.set_explore(on);
-        }
-    }
-
-    fn commands(&mut self, commands: Vec<String>) {
-        if let Some(screen) = self.screen() {
-            screen.set_commands(commands);
         }
     }
 }
@@ -2276,6 +2327,64 @@ fn readline(
             Event::Eof => return None,
             // A turn's events cannot arrive while idle; drop them if they do.
             _ => {}
+        }
+    }
+}
+
+/// The items a query keeps: a case-insensitive substring of the spec, which is
+/// what typing matches, never the row with its context window.
+fn narrow(items: &[(String, String)], query: &str) -> Vec<usize> {
+    let query = query.to_lowercase();
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, (spec, _))| spec.to_lowercase().contains(&query))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Walk a chooser until Enter, Esc or the end of input: the arrows move, a
+/// typed line narrows the list, Enter takes a row. `items` are (spec, row) — a
+/// query matches the spec, the screen draws the row — and the answer is the
+/// index into `items` that Enter chose. `on` is where the marker starts, so the
+/// chooser opens on what the session already uses.
+fn choose(
+    screen: &mut ui::Screen,
+    rx: &Receiver<Event>,
+    title: &str,
+    items: &[(String, String)],
+    on: Option<usize>,
+    query: &str,
+) -> Option<usize> {
+    let mut query = query.trim().to_string();
+    loop {
+        let found = narrow(items, &query);
+        if found.is_empty() {
+            screen.output(&format!("No {title} match {query:?}\n"));
+            query.clear();
+            continue;
+        }
+        let rows: Vec<String> = found.iter().map(|index| items[*index].1.clone()).collect();
+        let header = if query.is_empty() {
+            format!("{title} (↑↓ · Enter; type to narrow; Esc)")
+        } else {
+            format!("{title} matching {query:?} (↑↓ · Enter; type to refine; Esc)")
+        };
+        screen.set_menu(&header, rows, false);
+        if let Some(at) = on.and_then(|index| found.iter().position(|hit| *hit == index)) {
+            screen.menu_select(at);
+        }
+        match readline(screen, rx, &mut |_| {}) {
+            Some(Input::Menu(at)) => {
+                screen.clear_menu(false);
+                return found.get(at).copied();
+            }
+            Some(Input::Cancel) | None => {
+                screen.clear_menu(true);
+                return None;
+            }
+            Some(Input::Line(line)) => query = line.trim().to_string(),
+            Some(Input::Explore) => continue,
         }
     }
 }
@@ -2569,6 +2678,28 @@ mod tests {
     /// anything that asserts on them.
     fn info_text(session: &Session) -> String {
         ui::info_text(&session.info())
+    }
+
+    #[test]
+    fn a_chooser_query_narrows_by_spec_not_by_row() {
+        let items = vec![
+            (
+                "deepseek/deepseek-chat".to_string(),
+                "deepseek/deepseek-chat  (128000 ctx)".to_string(),
+            ),
+            ("local/qwen3".to_string(), "local/qwen3".to_string()),
+            (
+                "opencode-go/big".to_string(),
+                "opencode-go/big  (200000 ctx)".to_string(),
+            ),
+        ];
+        assert_eq!(narrow(&items, ""), vec![0, 1, 2]);
+        assert_eq!(narrow(&items, "DEEP"), vec![0]);
+        assert_eq!(narrow(&items, "local"), vec![1]);
+        assert_eq!(narrow(&items, "go/"), vec![2]);
+        // The context window is drawn, not searched.
+        assert_eq!(narrow(&items, "ctx"), Vec::<usize>::new());
+        assert_eq!(narrow(&items, "open/code"), Vec::<usize>::new());
     }
 
     #[test]

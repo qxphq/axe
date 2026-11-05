@@ -102,7 +102,7 @@ A provider entry describes the differences between servers, never code paths:
 ```
 
 Thinking levels are named by the provider, not by axe: `off`, `low`, `medium`
-and `high` are only what `/thinking` suggests. A level the provider does not
+and `high` are only what `/thinking` offers. A level the provider does not
 define falls back to its default.
 
 ```json
@@ -181,12 +181,16 @@ commands in
 the rows above the prompt — as many as the terminal's height allows, up to four
 — the first one marked. ↓ and ↑ move the mark and leave the line as typed,
 wrapping at both ends; Enter runs the marked row and Tab puts it on the line, so
-a step never rewrites the prompt by itself. A command's first argument completes
-the same way: `/model ` lists the models, `/model dee` narrows them, and Enter
-applies the marked one. The rule does not depend on where the list came from: a
-path in a message lists what it could be, and Enter submits the completed line.
-A model or a thinking level is therefore chosen in the prompt, like any other
-line. A line starting with `!` is your own shell: it runs through the same tool,
+a step never rewrites the prompt by itself. The rule does not depend on where the
+list came from: a path in a message lists what it could be, and Enter submits the
+completed line. `/model` and `/thinking` are the exception: their argument is not
+completed, because Enter would take a candidate before the command ran. Bare,
+they open a chooser over what they pick from — every provider's models, or the
+levels this one configures — opened on the one in use, walked with the arrows,
+narrowed by typing, closed with Esc, and applied on Enter. `/model dee` is the
+same chooser, already narrowed, and `/model provider/id` sets one directly.
+
+ A line starting with `!` is your own shell: it runs through the same tool,
 its output joins the history as a user message, and no turn follows — the model
 sees it the next time you ask something.
 
@@ -213,8 +217,8 @@ the file.
 
 | command | what it does |
 | --- | --- |
-| `/model [id]` | list the models, or switch to one (Tab completes it); without a terminal it only lists |
-| `/thinking [level]` | show or set the thinking level |
+| `/model [id]` | switch to a model; bare, a chooser over every provider's models, narrowed by typing; without a terminal it only lists |
+| `/thinking [level]` | show or set the thinking level; bare, a chooser over the levels the provider configures |
 | `/thoughts` | show or hide the model's reasoning |
 | `/explore` | toggle explore mode (also Shift+Tab) |
 | `/new` | start a new session, naming the old one and clearing the screen |
@@ -244,7 +248,7 @@ and Enter on an empty line resumes the selection.
 | --- | --- |
 | Enter | submit the marked candidate when a list is under the prompt, else the line |
 | Ctrl+J, Alt+Enter | new line |
-| Tab | complete a command, its first argument, or a path token: put the marked candidate on the line without submitting it |
+| Tab | complete a command or a path token: put the marked candidate on the line without submitting it |
 | ↑ ↓ | move the mark over the candidates above the prompt, walk the history when there is no list, or move in a chooser |
 | Shift+Tab | toggle explore mode |
 | Esc | close a chooser; twice to interrupt the running turn |

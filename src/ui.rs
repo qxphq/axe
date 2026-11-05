@@ -155,7 +155,8 @@ pub enum Action {
     Eof,
 }
 
-/// A chooser above the prompt: startup's recent sessions, and `/sessions`.
+/// A chooser above the prompt: startup's recent sessions, `/sessions`, and the
+/// models and levels `/model` and `/thinking` pick from.
 /// The rows are already formatted; only the marker and the style are added
 /// here. When it closes it can leave its rows in the transcript, so the list
 /// survives and no blank rows are left where it was.
@@ -481,7 +482,8 @@ pub struct Screen {
     /// visible at the line being typed and not only in the info row.
     explore: bool,
     /// The lines Tab completes, in the caller's spelling: a slash command on
-    /// its own, or one with its first argument filled in.
+    /// its own, or one with its first argument filled in when the command has a
+    /// fixed set to fill it from.
     commands: Vec<String>,
     /// The candidates the arrows stepped through, if any: what the marker was
     /// moved to is what Enter runs. A list nobody stepped through has no
@@ -698,7 +700,7 @@ impl Screen {
         self.dirty = true;
     }
 
-    /// The lines Tab completes: slash names, and names with their first
+    /// The lines Tab completes: slash names, and the ones that carry a fixed
     /// argument.
     pub fn set_commands(&mut self, commands: Vec<String>) {
         self.commands = commands;
@@ -757,6 +759,14 @@ impl Screen {
 
     pub fn menu_selected(&self) -> usize {
         self.menu.as_ref().map(|menu| menu.selected).unwrap_or(0)
+    }
+
+    /// Open a chooser on the row the session already uses. The window follows
+    /// at the next draw, so an entry far down the list is visible.
+    pub fn menu_select(&mut self, index: usize) {
+        self.dirty = true;
+        let Some(menu) = &mut self.menu else { return };
+        menu.selected = index.min(menu.rows.len().saturating_sub(1));
     }
 
     pub fn menu_move(&mut self, delta: isize) {
@@ -2696,6 +2706,29 @@ mod tests {
             screen.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Action::MenuAccept
         ));
+    }
+
+    #[test]
+    fn a_chooser_opens_on_the_row_it_was_given() {
+        let mut screen = Screen::test_screen(40, 14);
+        let rows: Vec<String> = (0..40).map(|i| format!("row {i}")).collect();
+        screen.set_menu("Models", rows, false);
+        screen.menu_select(30);
+        assert_eq!(screen.menu_selected(), 30);
+        screen.draw().unwrap();
+        let text: String = screen
+            .test_buffer()
+            .content
+            .chunks(40)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<String>>()
+            .join("\n");
+        // The window followed the marker instead of showing the rows above it.
+        assert!(text.contains("row 30"), "{text}");
+        assert!(!text.contains("row 0 "), "{text}");
+        // Past the end it lands on the last row, where the arrows stop anyway.
+        screen.menu_select(400);
+        assert_eq!(screen.menu_selected(), 39);
     }
 
     #[test]
