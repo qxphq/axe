@@ -48,7 +48,7 @@ const EDIT: Spec = Spec {
 const BASH: Spec = Spec {
     name: "bash",
     signature: "bash(command)",
-    description: "Run a shell command in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds. The network is not confined, in any mode. In explore mode only a fixed allowlist runs (ls, cat, curl, head, tail, grep, rg, fd, find, sort, wc, diff, du, df, file, jq, stat, tree, uname, uniq, id, ps, pwd, date, cut, tr, which, git, sh) and nothing outside a scratch directory is writable.",
+    description: "Run a shell command in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds. The network is not confined, in any mode. In explore mode only a fixed allowlist runs (text and coreutils, checksums, file operations, search, git, curl, jq, interpreters, package managers, sh) and nothing outside a scratch directory is writable; a mutation the kernel would refuse comes back as a permission error.",
     parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"Command passed to sh -c"}},"required":["command"]}"#,
 };
 
@@ -92,7 +92,7 @@ const WEB_SEARCH: Spec = Spec {
 /// Appended when the kernel, not the command, refused something: the model has
 /// to tell a sandbox denial from a missing binary or a bug.
 const DENIED: &str =
-    "explore mode: only the read-only allowlist runs, and nothing outside $TMPDIR is writable\n";
+    "explore mode: only the allowlist runs, and nothing outside $TMPDIR is writable\n";
 
 const SPECS: &[Spec] = &[READ, WRITE, EDIT, BASH, ABOUT, FETCH, WEB_SEARCH];
 
@@ -144,11 +144,11 @@ pub fn system_prompt() -> String {
         "Modes: explore mode is a session setting, announced in the conversation as \
          `explore mode: on` or `explore mode: off`. The latest note says which mode \
          is in force. In explore mode, read the working directory, read the web \
-         through `fetch` and `web_search`, and run read-only commands to understand \
-         it, answer, and propose changes: `write` and `edit` are unavailable, `bash` \
-         runs only a fixed read-only allowlist and writes only to a scratch \
-         directory. Outside explore mode, `write`, `edit` and a full `bash` are \
-         available, and `fetch` and `web_search` are unavailable.\n",
+         through `fetch` and `web_search`, and run commands to understand it, answer, \
+         and propose changes: `write` and `edit` are unavailable, `bash` runs only \
+         a fixed allowlist and writes only to a scratch directory. Outside explore \
+         mode, `write`, `edit` and a full `bash` are available, and `fetch` and \
+         `web_search` are unavailable.\n",
     );
     out.push_str("\nBehavior:\n");
     for (i, rule) in BEHAVIOR.iter().enumerate() {

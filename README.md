@@ -189,7 +189,7 @@ a line typed meanwhile is queued.
 
 Explore mode is a session setting, on by default (`explore_by_default`). When
 it is on: `write` and `edit` are unavailable, `bash` runs only a fixed
-allowlist of read-only commands and writes only inside a scratch directory,
+allowlist of commands and writes only inside a scratch directory,
 and `fetch` and `web_search` are the way to read the web. When it is off,
 `write`, `edit` and a full `bash` are back — `fetch` and `web_search` are
 refused. The network is confined in neither mode: a command connects where you
@@ -253,18 +253,34 @@ confined, and normal mode keeps only `no_new_privs` and the scrubbed
 environment.
 
 In explore mode, writes outside a session scratch directory are denied, and only
-an allowlist of programs may be executed — `ls`, `cat`, `curl`, `head`, `tail`,
-`grep`, `rg`, `fd`, `find`, `sort`, `wc`, `diff`, `du`, `df`, `file`, `jq`,
-`stat`, `tree`, `uname`, `uniq`, `id`, `ps`, `pwd`, `date`, `cut`, `tr`, `which`,
-`git`, and the shell itself, plus the ELF interpreter each of those binaries
-names — the kernel opens it for every dynamically linked binary, and it is read
-from `PT_INTERP` rather than assumed, since a NixOS system keeps it in
-`/nix/store`. So `ld.so` can start a program that is not on the list, and an
-allowed program can load code with `LD_PRELOAD`. Loaded code runs in the same
-domain: it still cannot write outside the scratch directory. `curl -o` into the
-working directory fails for that reason; `$TMPDIR` inside a tool call is the
-scratch directory, and it is removed at exit. It degrades with one line at
-startup on a kernel without Landlock.
+an allowlist of programs may be executed: the common inspection and tooling set —
+text and coreutils (`sed`, `awk`, `xargs`, `tee`, `nl`, …), checksums, file
+operations (`cp`, `mv`, `rm`, `mkdir`), search (`grep`, `rg`, `fd`, `find`),
+`git`, `curl`, `jq`, interpreters (`python3`, `node`, `perl`, `ruby`) and package
+managers (`apt`, `npm`, `pip`, `cargo`, …) — plus the shell itself, plus the ELF
+interpreter each of those binaries names — the kernel opens it for every
+dynamically linked binary, and it is read from `PT_INTERP` rather than assumed,
+since a NixOS system keeps it in `/nix/store` — plus git's network transports
+(`git-remote-https` and its siblings), which `git` execs from its own libexec
+directory rather than from `PATH`. A name that is not installed is skipped, so
+the same list works on a thin system.
+
+The list is a convenience guard, not a boundary. The kernel is what contains a
+side effect: `npm install` and `apt install` are allowed to start and then fail
+on their writes, and `curl -o` into the working directory fails for the same
+reason; `$TMPDIR` inside a tool call is the scratch directory, and it is removed
+at exit. Three classes are left off on purpose: daemons that write through
+another process (`docker`, `systemctl`, `dbus-send`), setuid (`sudo`, `mount`),
+and programs whose side effect is a mode or a timestamp rather than a write
+(`chmod`, `touch`) — Landlock has no right for those. `nix` and `brew` are also
+off: they exec their own `/nix/store` and `/opt/homebrew` paths, which no list
+entry can cover. `ld.so` can start a program that is not on the list, and an
+allowed program can load code with `LD_PRELOAD`; loaded code runs in the same
+domain, and still cannot write outside the scratch directory. So `git ls-remote`
+reaches an https remote in explore mode, while `git fetch` does not, because the
+repository is not writable there, and an `ssh` remote does not, because the
+transport execs `ssh`. It degrades with one line at startup on a kernel without
+Landlock.
 
 The network is not confined, in either mode: a command connects where you
 connect, private ranges included. `io_uring_setup` is the only syscall denied,
