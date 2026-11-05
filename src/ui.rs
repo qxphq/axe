@@ -33,8 +33,9 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::{cursor, execute, terminal};
 use ratatui::layout::{Alignment, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block as Outline, Borders, Paragraph, Widget};
 use ratatui::{Frame as TermFrame, Terminal, TerminalOptions, Viewport};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -48,9 +49,17 @@ const PAD: u16 = 1;
 /// the conversation has to stay readable through it.
 const MIN_TRANSCRIPT: u16 = 3;
 
+/// The line the box is drawn around: a line above the text and a line below it,
+/// with a column of the same at each side. A filled block was a slab of color
+/// the width of the screen; an outline says where the prompt is and leaves the
+/// text on the theme's own background.
+const PROMPT_EDGE: u16 = 1;
+/// Blank cells of the box at the left and right of its text, so the text does
+/// not sit against the line.
+const PROMPT_PAD: usize = 1;
+/// The prompt's cyan, for the rows a list has marked and for what the session
+/// is talking to.
 const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan);
-/// Explore mode's prompt: the glyph says the tool set is read-only.
-const EXPLORE_STYLE: Style = Style::new().fg(Color::Yellow);
 /// Marker for an already committed line in the transcript.
 const MARK: &str = "█";
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
@@ -233,8 +242,9 @@ impl Frame {
     fn layout(height: u16, mode: Mode, shown: Shown) -> Frame {
         let height = height.max(1);
         // The prompt composes in up to three rows and scrolls inside them: one
-        // row is always there, because a prompt with no row is no prompt.
-        let prompt_rows = shown.prompt.clamp(1, 3);
+        // row is always there, because a prompt with no row is no prompt. The
+        // box around it takes a row above and a row below.
+        let prompt_rows = shown.prompt.clamp(1, 3) + 2 * PROMPT_EDGE;
         let queued_rows = u16::from(shown.queued);
         // Blank row, prompt, blank row, status row, blank row under it: the
         // frame carries them whether or not it has anything to say, so the
@@ -430,10 +440,6 @@ impl Term {
 
 pub struct Screen {
     term: Term,
-    /// Plain text: the editor owns the color.
-    prompt: String,
-    /// Color of the prompt glyph, switched by explore mode.
-    prompt_style: Style,
     /// The line being typed, its cursor and the last killed text.
     ed: Buffer,
     /// Left half of the row under the prompt: thinking, or what is running.
@@ -480,7 +486,7 @@ pub struct Screen {
 impl Screen {
     /// Take the terminal. Fails if there is no terminal to take, or if the
     /// terminal cannot be put into raw mode.
-    pub fn new(prompt: &str) -> io::Result<Screen> {
+    pub fn new() -> io::Result<Screen> {
         // No alternate screen: the transcript is the user's scrollback.
         // `try_init_with_options` hard-codes its backend, so what it does is
         // done here: restore the terminal if this panics, then raw mode.
@@ -521,8 +527,6 @@ impl Screen {
         );
         Ok(Screen {
             term: Term::Real(term),
-            prompt: prompt.to_string(),
-            prompt_style: PROMPT_STYLE,
             ed: Buffer::default(),
             status: String::new(),
             alert: None,
@@ -561,8 +565,6 @@ impl Screen {
         .unwrap();
         Screen {
             term: Term::Test(term),
-            prompt: "❯ ".to_string(),
-            prompt_style: PROMPT_STYLE,
             ed: Buffer::default(),
             status: String::new(),
             alert: None,
@@ -621,12 +623,6 @@ impl Screen {
         }
         rows.drain(..rows.iter().take_while(|row| row.is_empty()).count());
         rows
-    }
-
-    /// Explore mode colors the prompt; the transcript keeps its own palette.
-    pub fn set_explore(&mut self, explore: bool) {
-        self.prompt_style = if explore { EXPLORE_STYLE } else { PROMPT_STYLE };
-        self.dirty = true;
     }
 
     pub fn status(&self) -> &str {
@@ -813,9 +809,10 @@ impl Screen {
         Action::None
     }
 
-    /// Commit the line: echo it into the transcript and return it. The marker
-    /// is `█`, not the live prompt's `❯`: the line is settled, not editable.
-    /// Every row carries it, so a wrapped line reads as one block.
+    /// Commit the line: echo it into the transcript and return it. The line is
+    /// settled, not editable, so it carries a marker `█` where the live field
+    /// carries its background. Every row has it, so a wrapped line reads as one
+    /// block.
     /// What was typed is markdown, laid out here because it is complete.
     pub fn commit(&mut self) -> String {
         let line = self.take();
@@ -892,16 +889,14 @@ impl Screen {
         }
     }
 
-    /// The cells the prompt's glyph takes at the left of every row.
-    fn gutter(&self) -> usize {
-        self.prompt.chars().map(|c| c.width().unwrap_or(1)).sum()
-    }
-
-    /// The prompt laid out at this width: its rows, and the cursor as a row and
-    /// a column after the glyph. The frame is sized from the count, so a line
-    /// that wraps gets the rows it fills and gives them back when it is done.
-    fn prompt_rows(&self, gutter: usize, cols: usize) -> (Vec<String>, (u16, u16)) {
-        prompt_layout(gutter, &self.ed.buf, self.ed.cursor, cols)
+    /// The prompt laid out in a field `cols` wide: its rows, and the cursor as
+    /// a row and a column inside the field. The text keeps a cell of field on
+    /// each side, so a row never runs into the block's edge. The frame is sized
+    /// from the count, so a line that wraps gets the rows it fills and gives
+    /// them back when it is done.
+    fn prompt_rows(&self, cols: usize) -> (Vec<String>, (u16, u16)) {
+        let text = cols.saturating_sub(2 * (PROMPT_EDGE as usize + PROMPT_PAD));
+        prompt_layout(&self.ed.buf, self.ed.cursor, text.max(1))
     }
 
     /// The rows the frame has to show, with a prompt of `prompt` rows: what the
@@ -925,7 +920,7 @@ impl Screen {
     #[cfg(test)]
     fn frame(&mut self) -> Frame {
         let cols = self.cols();
-        let (rows, _) = self.prompt_rows(self.gutter(), cols);
+        let (rows, _) = self.prompt_rows(cols);
         let layout = Frame::layout(
             self.term.size().unwrap().height,
             self.mode(),
@@ -1126,8 +1121,6 @@ impl Screen {
 
     /// Repaint the live frame.
     pub fn draw(&mut self) -> io::Result<()> {
-        let prompt = self.prompt.clone();
-        let prompt_style = self.prompt_style;
         // A resize since the last frame changes the area under us; settle it
         // before reading the size. A failure only delays it to the next draw.
         let _ = self.term.autoresize();
@@ -1135,11 +1128,10 @@ impl Screen {
         let width = size.width;
         let margin = PAD.min(width.saturating_sub(1));
         let cols = (width as usize).saturating_sub(2 * margin as usize);
-        let gutter = self.gutter();
         let mode = self.mode();
         // The frame is as tall as what it shows, and the prompt's own rows are
         // part of that: a line that wraps asks for the row it fills.
-        let (rows, (crow, ccol)) = self.prompt_rows(gutter, cols);
+        let (rows, (crow, ccol)) = self.prompt_rows(cols);
         let layout = Frame::layout(size.height, mode, self.shown(rows.len()));
         self.settle(layout.height())?;
         // The frame is the live area the last write left us, not a rect derived
@@ -1147,10 +1139,13 @@ impl Screen {
         // reaches the bottom, and the parts follow it.
         let layout = layout.at(self.term.area().y);
         // The cursor is the frame's: a buffer longer than the rows it composes
-        // in scrolls to keep it, from the bottom of the box up.
-        let first = (crow as usize + 1).saturating_sub(layout.prompt.height.max(1) as usize);
+        // in scrolls to keep it, from the bottom of the box up. The rows it
+        // composes in are the box's less the line it is drawn with.
+        let edge = 2 * PROMPT_EDGE;
+        let text_rows = layout.prompt.height.saturating_sub(edge).max(1);
+        let first = (crow as usize + 1).saturating_sub(text_rows as usize);
         let visible = &rows[first.min(rows.len())..];
-        let top = layout.prompt_top(visible.len() as u16);
+        let top = layout.prompt_top(visible.len() as u16 + edge);
         // A chooser's rows are its header and its entries; the window follows
         // the selection so the one the next step takes is on screen. Zero
         // entries means the frame has no room for a chooser at all, and its
@@ -1186,20 +1181,17 @@ impl Screen {
         };
         let hints = &hints[start..];
         let hints = &hints[..hints.len().min(fit)];
-        // Every row carries the glyph, so a wrapped line reads as one prompt.
+        // One box around every row the line wraps to, so a wrapped line reads
+        // as one prompt with no glyph to carry from line to line. The padding
+        // keeps the text off the line.
+        let pad = " ".repeat(PROMPT_PAD.min(cols.saturating_sub(1)));
         let prompt_rows: Vec<Line<'static>> = visible
             .iter()
-            .map(|row| {
-                Line::from(vec![
-                    Span::styled(prompt.clone(), prompt_style),
-                    Span::raw(row.clone()),
-                ])
-            })
+            .map(|row| Line::raw(format!("{pad}{row}")))
             .collect();
-        // Under the prompt's text, not under its glyph: a suggestion reads as
-        // a continuation of what is being typed. The marked row is the bright
+        // Under the text, at its left edge: a suggestion reads as a
+        // continuation of what is being typed. The marked row is the bright
         // one: Enter runs it, Tab puts it on the line.
-        let pad = " ".repeat(gutter.min(cols.saturating_sub(1)));
         let queued = self.queued.clone();
         // The row is shared: the status says what the turn is doing, the info
         // what the session is pointed at. Both are clipped, and the info never
@@ -1263,20 +1255,29 @@ impl Screen {
                 let first_hint = layout.list.bottom() - hints.len() as u16;
                 for (i, hint) in hints.iter().enumerate() {
                     let on = start + i == at;
-                    let text = clip(hint, cols.saturating_sub(pad.len()));
                     frame.render_widget(
                         Paragraph::new(Line::styled(
-                            format!("{pad}{text}"),
+                            format!(
+                                "{}{pad}{}",
+                                " ".repeat(PROMPT_EDGE as usize),
+                                clip(hint, cols.saturating_sub(PROMPT_EDGE as usize + pad.len()))
+                            ),
                             if on { PROMPT_STYLE } else { DIM },
                         )),
                         line(first_hint + i as u16),
                     );
                 }
+                // The box is the prompt's cyan: the outline says where the
+                // line is, and the text stays on the theme's background.
+                let outline = Outline::default()
+                    .borders(Borders::ALL)
+                    .border_set(symbols::border::PLAIN)
+                    .border_style(PROMPT_STYLE);
                 frame.render_widget(
-                    Paragraph::new(prompt_rows),
+                    Paragraph::new(prompt_rows).block(outline),
                     Rect {
                         y: top,
-                        height: visible.len() as u16,
+                        height: visible.len() as u16 + edge,
                         ..part(layout.prompt)
                     },
                 );
@@ -1310,9 +1311,9 @@ impl Screen {
                 // A failed `settle` can leave the layout taller than the
                 // screen it was drawn into; the cursor is the one thing that
                 // cannot be clipped by a rect.
-                let row = (top + crow).min(screen.bottom().saturating_sub(1));
+                let row = (top + PROMPT_EDGE + crow).min(screen.bottom().saturating_sub(1));
                 frame.set_cursor_position(Position::new(
-                    screen.x + margin + gutter as u16 + ccol,
+                    screen.x + margin + PROMPT_EDGE + pad.len() as u16 + ccol,
                     row,
                 ));
             })
@@ -1565,21 +1566,14 @@ impl Drop for Screen {
     }
 }
 
-/// Lay the prompt buffer out at `width` cells, with `gutter` cells at the left
-/// of every row. Returns the rows (text after the gutter) and the cursor as
-/// (row, column after the gutter). A buffer that fills a row to its last cell
-/// puts the cursor on the next, empty one: the text broke there, so the cursor
-/// did too.
+/// Lay the prompt buffer out at `width` cells. Returns the rows and the cursor
+/// as (row, column). A buffer that fills a row to its last cell puts the cursor
+/// on the next, empty one: the text broke there, so the cursor did too.
 ///
 /// Every row is returned, not just the ones that fit: how tall the frame is
 /// follows the count, and the rows it cannot show are the ones it scrolls past.
-fn prompt_layout(
-    gutter: usize,
-    buf: &str,
-    cursor: usize,
-    width: usize,
-) -> (Vec<String>, (u16, u16)) {
-    let limit = width.saturating_sub(gutter).max(1);
+fn prompt_layout(buf: &str, cursor: usize, width: usize) -> (Vec<String>, (u16, u16)) {
+    let limit = width.max(1);
     let len = buf.chars().count();
     let mut rows: Vec<String> = vec![String::new()];
     let mut col = 0usize;
@@ -1589,7 +1583,7 @@ fn prompt_layout(
             at = (rows.len() - 1, col);
         }
         // A newline is a row break the user chose: the rest of the line goes
-        // on the next row, which starts under the same glyph.
+        // on the next row, which starts at the same column.
         if ch == '\n' {
             rows.push(String::new());
             col = 0;
@@ -1932,18 +1926,18 @@ mod tests {
 
     #[test]
     fn prompt_layout_wraps_and_tracks_cursor() {
-        let (rows, (row, col)) = prompt_layout(2, "ab\ncd", 5, 10);
+        let (rows, (row, col)) = prompt_layout("ab\ncd", 5, 10);
         assert_eq!(rows, vec!["ab", "cd"]);
         assert_eq!((row, col), (1, 2));
         // A row filled to its last cell breaks the cursor onto the next one.
-        let (rows, (row, col)) = prompt_layout(2, "abcdefgh", 8, 10);
+        let (rows, (row, col)) = prompt_layout("abcdefgh", 8, 8);
         assert_eq!(rows, vec!["abcdefgh", ""]);
         assert_eq!((row, col), (1, 0));
     }
 
     #[test]
     fn prompt_layout_draws_controls_as_one_cell() {
-        let (rows, (row, col)) = prompt_layout(2, "a\u{1}b", 3, 20);
+        let (rows, (row, col)) = prompt_layout("a\u{1}b", 3, 20);
         assert_eq!(rows, vec!["a b"]);
         assert_eq!((row, col), (0, 3));
     }
@@ -2000,7 +1994,19 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect();
         let text = text.join("\n");
-        assert!(text.contains("❯ hi"), "{text}");
+        assert!(text.contains("│ hi "), "{text}");
+        // The box around the line is the prompt's cyan, one cell in from the
+        // edge; the text inside it keeps the theme's own foreground and
+        // background, one cell in from the line.
+        let row = screen.frame().prompt.y + 1;
+        let cell = |x: u16| screen.test_buffer()[(x, row)].clone();
+        assert_eq!((cell(1).symbol(), cell(1).fg), ("│", Color::Cyan));
+        assert_eq!(cell(2).symbol(), " ");
+        assert_eq!(cell(3).symbol(), "h");
+        assert_eq!((cell(3).fg, cell(3).bg), (Color::Reset, Color::Reset));
+        assert_eq!(cell(38).symbol(), "│");
+        assert_eq!(cell(38).fg, Color::Cyan);
+        assert_eq!(cell(0).symbol(), " ");
         assert!(text.contains("Thinking…"), "{text}");
         assert!(text.contains("p/m  ·  default"), "{text}");
         assert!(text.contains("Queued: later"), "{text}");
@@ -2076,11 +2082,11 @@ mod tests {
                 .collect()
         };
         let mut screen = Screen::test_screen(40, 24);
-        // An idle prompt keeps one row above it and no more: the five it needs
-        // are that blank row, its own row, a blank, the status and the row
-        // under that.
+        // An idle prompt keeps one row above it and no more: the seven it
+        // needs are that blank row, the field with a row of padding on each
+        // side of the text, a blank, the status and the row under that.
         screen.draw().unwrap();
-        assert_eq!(screen.term.area().height, 5);
+        assert_eq!(screen.term.area().height, 7);
         screen.echo_user("a question");
         screen.output("an answer");
         screen.draw().unwrap();
@@ -2090,13 +2096,36 @@ mod tests {
         // the separation is the frame's, so no block ends with one.
         assert_eq!(text[frame.prompt.y as usize - 2].trim_end(), " an answer");
         assert_eq!(text[frame.prompt.y as usize - 1].trim_end(), "");
-        assert_eq!(text[frame.prompt.y as usize].trim_end(), " ❯");
+        // An empty line is still a box: a line at the top and the bottom, and
+        // the row it is typed on between them, all drawn in the prompt's cyan.
+        let top = frame.prompt.y as usize;
+        assert!(text[top].trim_end().starts_with(" ┌"), "{:?}", text[top]);
+        assert!(
+            text[top + 1].trim_end().starts_with(" │"),
+            "{:?}",
+            text[top + 1]
+        );
+        assert!(
+            text[top + 2].trim_end().starts_with(" └"),
+            "{:?}",
+            text[top + 2]
+        );
+        assert!(
+            !text[top + 1].chars().any(char::is_alphanumeric),
+            "an empty box has no text in it: {:?}",
+            text[top + 1]
+        );
+        for y in [frame.prompt.y, frame.prompt.y + 1, frame.prompt.y + 2] {
+            let cell = &screen.test_buffer()[(1, y)];
+            assert_eq!(cell.fg, Color::Cyan);
+            assert_eq!(cell.bg, Color::Reset);
+        }
         // A wrapped prompt grows into the frame's own top, and the rows it
         // asks for are the rows it uses; the blank row above it stays.
         screen.insert_text(&"word ".repeat(40));
         screen.draw().unwrap();
-        assert_eq!(screen.frame().prompt.height, 3);
-        assert_eq!(screen.term.area().height, 7);
+        assert_eq!(screen.frame().prompt.height, 5);
+        assert_eq!(screen.term.area().height, 9);
     }
 
     #[test]
@@ -2148,7 +2177,7 @@ mod tests {
 
     #[test]
     fn chooser_renders_and_takes_keys() {
-        let mut screen = Screen::test_screen(40, 12);
+        let mut screen = Screen::test_screen(40, 14);
         screen.set_menu("Header", vec!["one".into(), "two".into()], false);
         screen.draw().unwrap();
         let text: Vec<String> = screen
@@ -2426,25 +2455,25 @@ mod tests {
         }
         // An idle prompt is a blank row, its own row, a blank row, the status
         // and the row under that: nothing is kept for a list that is not there.
-        check(&mut screen, 5, height);
+        check(&mut screen, 7, height);
         // Candidates take rows while they are shown and give them back after.
         screen.set_commands(vec!["/one".into(), "/two".into(), "/three".into()]);
         screen.insert_text("/");
-        check(&mut screen, 7, height);
+        check(&mut screen, 9, height);
         screen.take();
-        check(&mut screen, 5, height);
+        check(&mut screen, 7, height);
         // A prompt that wraps asks for the rows it fills, up to the three it
         // composes in.
         screen.insert_text(&"word ".repeat(40));
-        check(&mut screen, 7, height);
+        check(&mut screen, 9, height);
         screen.take();
-        check(&mut screen, 5, height);
+        check(&mut screen, 7, height);
         // A chooser is a window over the transcript, so it is the one part the
         // terminal sizes.
         screen.set_menu("Header", vec!["one".into(), "two".into()], false);
-        check(&mut screen, 5 + (height / 3).clamp(2, 10), height);
+        check(&mut screen, 7 + (height / 3).clamp(2, 10), height);
         screen.clear_menu(false);
-        check(&mut screen, 5, height);
+        check(&mut screen, 7, height);
     }
 
     #[test]
@@ -2470,9 +2499,10 @@ mod tests {
         // One blank cell of margin, then the prompt at the bottom of its box,
         // then the list in the rows above it: a list that appears moves
         // nothing.
-        assert_eq!(
-            rows[layout.prompt.bottom() as usize - 1].trim_end(),
-            " ❯ /sk"
+        let typed = rows[layout.prompt.bottom() as usize - 2].trim_end();
+        assert!(
+            typed.starts_with(" │ /sk") && typed.ends_with('│'),
+            "{typed}"
         );
         assert_eq!(rows[layout.list.y as usize].trim_end(), "   /skills");
         assert_eq!(
@@ -2516,7 +2546,11 @@ mod tests {
         // One blank row, then the prompt: the row above it is the prompt's own
         // and the list does not take it back.
         assert_eq!(rows[layout.prompt.y as usize - 1].trim_end(), "");
-        assert_eq!(rows[layout.prompt.y as usize].trim_end(), " ❯ /c");
+        let typed = rows[layout.prompt.y as usize + 1].trim_end();
+        assert!(
+            typed.starts_with(" │ /c") && typed.ends_with('│'),
+            "{typed}"
+        );
     }
 
     #[test]
@@ -2538,9 +2572,9 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect();
         let text = text.join("\n");
-        assert!(text.contains("   /c7"), "{text}");
-        assert!(!text.contains("   /c1"), "{text}");
-        assert!(!text.contains("   /c2"), "{text}");
+        assert!(text.contains(" /c7"), "{text}");
+        assert!(!text.contains(" /c1"), "{text}");
+        assert!(!text.contains(" /c2"), "{text}");
     }
 
     #[test]

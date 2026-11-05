@@ -169,18 +169,23 @@ a task matches.
 
 ## REPL
 
-`❯ ` is the prompt. Enter submits, Ctrl+J or Alt+Enter starts a new line. Typing
-a slash word lists the matching commands in the rows above the prompt — as many
-as the terminal's height allows, up to four — the first one marked. ↓ and ↑ move
-the mark and leave the line as typed, wrapping at both ends; Enter runs the
-marked command, Tab puts it on the line, so stepping through the list never
-rewrites the prompt. A command's first argument completes the same way:
-`/model ` lists the models, `/model dee` narrows them, and Enter applies the
-marked one. Until the mark is moved the list is a preview: Enter there submits
-what is typed, and Tab takes the first row. A model or a thinking level is
-therefore chosen in the prompt, like any other line. A line starting with `!` is your own shell: it runs
-through the same tool, its output joins the history as a user message, and no
-turn follows — the model sees it the next time you ask something.
+The line you type sits in a box: an outline in the prompt's cyan, one row per
+line the text wraps to, with a cell of padding between the text and the line and
+no glyph in front of it. The outline is the only thing drawn — the text keeps
+the theme's own foreground and background — because a filled block that wide
+reads as a slab of color rather than as a prompt. Enter submits, Ctrl+J or
+Alt+Enter starts a new line. Typing a slash word lists the matching commands in
+the rows above the prompt — as many as the terminal's height allows, up to four
+— the first one marked. ↓ and ↑ move the mark and leave the line as typed,
+wrapping at both ends; Enter runs the marked command, Tab puts it on the line,
+so stepping through the list never rewrites the prompt. A command's first
+argument completes the same way: `/model ` lists the models, `/model dee`
+narrows them, and Enter applies the marked one. Until the mark is moved the list
+is a preview: Enter there submits what is typed, and Tab takes the first row. A
+model or a thinking level is therefore chosen in the prompt, like any other
+line. A line starting with `!` is your own shell: it runs through the same tool,
+its output joins the history as a user message, and no turn follows — the model
+sees it the next time you ask something.
 
 | command | what it does |
 | --- | --- |

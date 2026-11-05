@@ -322,11 +322,11 @@ def main():
         )
         tmux.start(size, work, command)
 
-        # Wait for the model line, or for the process to die with its error.
+        # Wait for the info row, or for the process to die with its error.
         start = time.monotonic()
         while time.monotonic() - start < 5:
             screen = tmux.capture(args.scroll, args.ansi)
-            if "❯" in screen or "model:" in screen or tmux.dead():
+            if "·" in screen or tmux.dead():
                 break
             time.sleep(0.05)
 
