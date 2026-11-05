@@ -29,10 +29,15 @@ there: a child that cannot be confined is not spawned. Windows is not supported.
 ```sh
 axe              # in the directory you want it to work on
 axe < prompts    # without a terminal: plain-text lines in, transcript out
+axe --version    # prints the version and exits; no config, no network
 ```
 
 The working directory is what the prompt shows, what `AGENTS.md` is looked up
 from, and the key under which the session is remembered.
+
+The version follows semver and is written in exactly one place, `Cargo.toml`:
+the banner and `--version` read it at compile time, and `flake.nix` reads the
+same file. The `ship` skill bumps it with the change.
 
 ## Config
 
