@@ -160,10 +160,10 @@ the first line says which engine answered. `BRAVE_SEARCH_API_KEY` selects Brave;
 unset means DuckDuckGo, and a bogus value exercises the fallback.
 
 Skills are checked with a `.agents/skills/<name>/SKILL.md` under `--work DIR`:
-`/skills` lists it, the first run in that directory asks for trust and a `y`
-loads the project catalogue, `/skill:name` runs the body. The sandbox is checked the same way: `tool:bash:{...}` takes JSON arguments and
-loops; end with `!Escape` and `show:`. Normal mode is a `!cmd` line, which does not
-loop. Examples:
+`/skills` lists it, the first run in that directory asks whether to trust it and
+the harness answers `y`, `/skill:name` runs the body. The sandbox is checked the
+same way: `tool:bash:{...}` takes JSON arguments and loops; end with `!Escape`
+and `show:`. Normal mode is a `!cmd` line, which does not loop. Examples:
 
 ```sh
 ./harness.py --scroll 400 'tool:bash:{"command":"head -n 1 tmux.conf"}' '!Escape' 'show:'
