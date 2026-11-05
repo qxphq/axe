@@ -294,9 +294,15 @@ impl Frame {
             height: 1,
             ..area
         };
+        // Clamped by the screen, never to nothing: a terminal too short for the
+        // frame it asks for draws the prompt's one row inside what it has rather
+        // than reserving none for it. Everything else the frame would carry —
+        // the list, the blank rows — is what gives way.
         let prompt = Rect {
             y: list_rows + queued_rows + 1,
-            height: prompt_rows.min(status.y.saturating_sub(list_rows + queued_rows + 1)),
+            height: prompt_rows
+                .min(status.y.saturating_sub(list_rows + queued_rows + 1))
+                .max(1),
             ..area
         };
         Frame {
@@ -1349,13 +1355,17 @@ impl Screen {
                     } else {
                         PROMPT_STYLE
                     });
+                // Clipped by the screen as well as by the part: a terminal too
+                // short for the box it asks for crops it instead of asking the
+                // buffer for a row it does not have.
                 frame.render_widget(
                     Paragraph::new(prompt_rows).block(outline),
                     Rect {
                         y: top,
                         height: visible.len() as u16 + edge,
                         ..part(layout.prompt)
-                    },
+                    }
+                    .intersection(screen),
                 );
                 let label = match &queued {
                     // One row: a queued message's own line breaks would be lost.
@@ -2981,6 +2991,26 @@ mod tests {
         check(&mut screen, 7 + (height / 3).clamp(2, 10), height);
         screen.clear_menu(false);
         check(&mut screen, 7, height);
+    }
+
+    #[test]
+    fn a_terminal_too_short_for_the_frame_still_has_a_prompt_row() {
+        // The frame asks for nine rows and a short terminal gives it fewer: the
+        // prompt keeps a row inside what there is, and the list and the blank
+        // rows are what give way. Drawing it used to reach past the buffer.
+        for height in 2u16..=6 {
+            let mut screen = Screen::test_screen(20, height);
+            screen.set_commands(vec!["/one".into()]);
+            screen.insert_text("/");
+            screen.draw().unwrap();
+            let frame = screen.frame();
+            let size = screen.term.size().unwrap();
+            assert!(frame.prompt.height >= 1, "height {height}");
+            assert!(
+                frame.prompt.y + frame.prompt.height <= size.height,
+                "height {height}: the prompt reaches past the screen"
+            );
+        }
     }
 
     #[test]
