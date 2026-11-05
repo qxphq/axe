@@ -37,6 +37,10 @@ const CHROME: u16 = 5;
 /// Blank cells at each screen edge: nothing is written against the border.
 const PAD: u16 = 1;
 
+/// Rows the candidate list under the prompt may take. The list is a hint, not
+/// a chooser: it never covers the transcript for long.
+const HINTS: usize = 5;
+
 const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan);
 /// Explore mode's prompt: the glyph says the tool set is read-only.
 const EXPLORE_STYLE: Style = Style::new().fg(Color::Rgb(255, 165, 0));
@@ -448,7 +452,9 @@ impl Screen {
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.len()),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.len(),
-            KeyCode::Tab => self.complete_command(),
+            KeyCode::Tab => self.cycle_step(true),
+            KeyCode::Up => self.cycle_step(false),
+            KeyCode::Down => self.cycle_step(true),
             KeyCode::BackTab => return Action::Explore,
             // A shell's Ctrl-C: drop what was typed, keep the prompt.
             KeyCode::Char('c') if ctrl => {
@@ -767,9 +773,25 @@ impl Screen {
             .as_ref()
             .map(|(_, entries, _, _)| entries.len() as u16 + 2)
             .unwrap_or(0);
-        self.fit(CHROME + rows_n + menu_h)?;
+        // The candidates go under the prompt, at most five of them, and the
+        // window follows the selection so the one the next step takes is on
+        // screen. The list lives inside the half screen the live region may
+        // take, so a short terminal gets fewer rows, or none.
+        let (hints, at) = self.hints();
+        let live = (size.height / 2).max(CHROME + 1);
+        let room = live.saturating_sub(CHROME + rows_n) as usize;
+        let shown = hints.len().min(HINTS).min(room);
+        let start = if shown == 0 {
+            0
+        } else {
+            at.saturating_sub(shown - 1).min(hints.len() - shown)
+        };
+        let hints = &hints[start..];
+        let hints = &hints[..hints.len().min(shown)];
+        let hints_h = hints.len() as u16;
+        self.fit(CHROME + rows_n + menu_h + hints_h)?;
         // Every row carries the glyph, so a wrapped line reads as one prompt.
-        let mut prompt_rows: Vec<Line<'static>> = visible
+        let prompt_rows: Vec<Line<'static>> = visible
             .iter()
             .map(|row| {
                 Line::from(vec![
@@ -778,16 +800,10 @@ impl Screen {
                 ])
             })
             .collect();
-        // The hint is dim text after the buffer, on the row the cursor sits on.
-        // It takes only the cells that row has left, so it never wraps: a
-        // suggestion is not a line the user wrote.
-        if let Some(last) = prompt_rows.last_mut() {
-            let used = gutter + visible.last().map(|row| row.width()).unwrap_or(0);
-            let hint = fit_cells(&self.ghost(), cols.saturating_sub(used));
-            if !hint.is_empty() {
-                last.spans.push(Span::styled(hint, DIM));
-            }
-        }
+        // Under the prompt's text, not under its glyph: a suggestion reads as
+        // a continuation of what is being typed. The row the next step takes
+        // is the bright one.
+        let pad = " ".repeat(gutter.min(cols.saturating_sub(1)));
         let queued = self.queued.clone();
         // The selection is the invariant half of the last row: it must not be
         // cut, so a long status is trimmed first. One blank cell keeps the two
@@ -804,7 +820,7 @@ impl Screen {
                     ..area
                 };
                 let top = 2 + menu_h;
-                let below = top + rows_n + 1;
+                let below = top + rows_n + hints_h + 1;
                 if let Some((header, entries, selected, scroll)) = &menu {
                     frame.render_widget(
                         Paragraph::new(Line::styled(clip(header, cols), DIM)),
@@ -831,6 +847,17 @@ impl Screen {
                         ..area
                     },
                 );
+                for (i, hint) in hints.iter().enumerate() {
+                    let on = start + i == at;
+                    let text = clip(hint, cols.saturating_sub(pad.len()));
+                    frame.render_widget(
+                        Paragraph::new(Line::styled(
+                            format!("{pad}{text}"),
+                            if on { PROMPT_STYLE } else { DIM },
+                        )),
+                        row(top + rows_n + i as u16),
+                    );
+                }
                 frame.render_widget(Paragraph::new(Line::styled(status, DIM)), row(below));
                 frame.render_widget(
                     Paragraph::new(Line::styled(info, DIM)).alignment(Alignment::Right),
@@ -981,16 +1008,22 @@ impl Screen {
         self.cursor += text.chars().count();
     }
 
-    /// Tab on a bare slash word: fill in the first candidate, then step to the
-    /// next one on every further Tab, wrapping around. The set is captured on
-    /// the first Tab, so the walk covers every command the typed prefix
-    /// matched, not just those the completed buffer still matches. A lone
-    /// candidate finishes with a space and ends the cycle. Arguments are not
-    /// the screen's business, so a line that already has one is left alone.
-    fn complete_command(&mut self) {
+    /// Tab on a bare slash word: fill in a candidate, then step to the next
+    /// one on every further Tab, wrapping around. The set is captured on the
+    /// first step, so the walk covers every command the typed prefix matched,
+    /// not just those the completed buffer still matches. Backwards starts at
+    /// the last one, as a menu does. A lone candidate finishes with a space and
+    /// ends the cycle. Arguments are not the screen's business, so a line that
+    /// already has one is left alone.
+    fn cycle_step(&mut self, forward: bool) {
         if let Some(cycle) = &mut self.cycle {
             if cycle.matches.get(cycle.at) == Some(&self.buf) && !cycle.matches.is_empty() {
-                cycle.at = (cycle.at + 1) % cycle.matches.len();
+                let n = cycle.matches.len();
+                cycle.at = if forward {
+                    (cycle.at + 1) % n
+                } else {
+                    (cycle.at + n - 1) % n
+                };
                 self.buf = cycle.matches[cycle.at].clone();
                 self.cursor = self.len();
                 return;
@@ -998,16 +1031,17 @@ impl Screen {
         }
         self.cycle = None;
         let matches = self.candidates();
-        let Some(first) = matches.first().cloned() else {
+        if matches.is_empty() {
             return;
-        };
-        self.buf = first;
+        }
+        let at = if forward { 0 } else { matches.len() - 1 };
+        self.buf = matches[at].clone();
         self.cursor = self.len();
         if matches.len() == 1 {
             self.buf.push(' ');
             self.cursor = self.len();
         } else {
-            self.cycle = Some(Cycle { matches, at: 0 });
+            self.cycle = Some(Cycle { matches, at });
         }
     }
 
@@ -1024,17 +1058,15 @@ impl Screen {
             .collect()
     }
 
-    /// The rest of the first candidate, dim after the buffer: the completion
-    /// the user can take with Tab. Nothing once the buffer is a whole command,
-    /// and nothing while the cursor is inside the line, where the hint would
-    /// read as text that is already there.
-    fn ghost(&self) -> String {
-        if self.cursor != self.len() {
-            return String::new();
-        }
-        match self.candidates().first() {
-            Some(first) => first.chars().skip(self.buf.chars().count()).collect(),
-            None => String::new(),
+    /// The candidates to list under the prompt and which one the next step
+    /// takes: the set the running cycle captured, or what is typed, with the
+    /// first one waiting.
+    fn hints(&self) -> (Vec<String>, usize) {
+        match &self.cycle {
+            Some(cycle) if cycle.matches.get(cycle.at) == Some(&self.buf) => {
+                (cycle.matches.clone(), cycle.at)
+            }
+            _ => (self.candidates(), 0),
         }
     }
 
@@ -1294,22 +1326,6 @@ fn clip(text: &str, width: usize) -> String {
         used += cells;
     }
     out.push('…');
-    out
-}
-
-/// The first `width` cells of `text`, without an ellipsis: a truncated hint is
-/// still a hint, and the marker would read as part of the command.
-fn fit_cells(text: &str, width: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let cells = ch.width().unwrap_or(1);
-        if used + cells > width {
-            break;
-        }
-        out.push(ch);
-        used += cells;
-    }
     out
 }
 
@@ -1662,27 +1678,97 @@ mod tests {
     }
 
     #[test]
-    fn ghost_is_the_rest_of_the_first_candidate() {
+    fn arrows_step_the_candidates_like_tab() {
         let mut screen = Screen::test_screen(40, 10);
-        screen.set_commands(vec!["/help".into(), "/exit".into()]);
-        assert_eq!(screen.ghost(), "");
-        screen.insert_text("/h");
-        assert_eq!(screen.ghost(), "elp");
-        // Inside the line the hint would read as text already there.
-        screen.apply_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-        assert_eq!(screen.ghost(), "");
-        screen.apply_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
-        screen.insert_text("e");
-        assert_eq!(screen.ghost(), "lp");
-        screen.insert_text("x");
-        assert_eq!(screen.ghost(), "");
+        screen.set_commands(vec!["/exit".into(), "/explore".into(), "/help".into()]);
+        screen.insert_text("/e");
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        // Backwards starts at the last candidate, forwards at the first.
+        screen.apply_key(key(KeyCode::Up));
+        assert_eq!(screen.buf, "/explore");
+        screen.apply_key(key(KeyCode::Down));
+        assert_eq!(screen.buf, "/exit");
+        screen.apply_key(key(KeyCode::Down));
+        assert_eq!(screen.buf, "/explore");
+        screen.apply_key(key(KeyCode::Up));
+        assert_eq!(screen.buf, "/exit");
+        // Nothing to complete: the arrows leave the line alone.
+        screen.take();
+        screen.insert_text("hello");
+        screen.apply_key(key(KeyCode::Up));
+        assert_eq!(screen.buf, "hello");
     }
 
     #[test]
-    fn live_region_draws_the_ghost_and_clips_it() {
-        let mut screen = Screen::test_screen(20, 10);
-        screen.set_commands(vec!["/thinking".into()]);
-        screen.insert_text("/th");
+    fn hints_are_listed_under_the_prompt() {
+        let mut screen = Screen::test_screen(20, 20);
+        screen.set_commands(vec![
+            "/skills".into(),
+            "/skill:ship".into(),
+            "/sessions".into(),
+        ]);
+        screen.insert_text("/sk");
+        let (hints, at) = screen.hints();
+        assert_eq!(hints, vec!["/skills", "/skill:ship"]);
+        assert_eq!(at, 0);
+        screen.draw().unwrap();
+        let rows: Vec<String> = screen
+            .test_buffer()
+            .content
+            .chunks(20)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        // One blank cell of margin, then the prompt, then the list under its
+        // text.
+        assert_eq!(rows[2].trim_end(), " ❯ /sk");
+        assert_eq!(rows[3].trim_end(), "   /skills");
+        assert_eq!(rows[4].trim_end(), "   /skill:ship");
+        // The one the next step takes is the bright one.
+        let cell = |x: u16, y: u16| screen.test_buffer()[(x, y)].clone();
+        assert_eq!(cell(3, 3).fg, Color::Cyan);
+        assert_ne!(cell(3, 4).fg, Color::Cyan);
+        // After a step the whole set stays listed, with the buffer on the
+        // second one.
+        screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(screen.buf, "/skills");
+        assert_eq!(
+            screen.hints(),
+            (vec!["/skills".into(), "/skill:ship".into()], 0)
+        );
+        screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(screen.buf, "/skill:ship");
+        assert_eq!(screen.hints().1, 1);
+    }
+
+    #[test]
+    fn short_terminal_lists_fewer_candidates() {
+        let mut screen = Screen::test_screen(20, 14);
+        screen.set_commands(vec!["/c1".into(), "/c2".into(), "/c3".into()]);
+        screen.insert_text("/c");
+        screen.draw().unwrap();
+        let rows: Vec<String> = screen
+            .test_buffer()
+            .content
+            .chunks(20)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        // Half the screen, less the chrome and the prompt, is one row: the
+        // live region stays inside its cap and the rest of the list is cut.
+        assert_eq!(rows[3].trim_end(), "   /c1");
+        assert_eq!(rows[4].trim_end(), "");
+    }
+
+    #[test]
+    fn hint_window_follows_the_selection() {
+        let mut screen = Screen::test_screen(20, 14);
+        let commands: Vec<String> = (1..=7).map(|i| format!("/c{i}")).collect();
+        screen.set_commands(commands);
+        screen.insert_text("/c");
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        for _ in 0..7 {
+            screen.apply_key(tab);
+        }
+        assert_eq!(screen.buf, "/c7");
         screen.draw().unwrap();
         let text: Vec<String> = screen
             .test_buffer()
@@ -1691,21 +1777,9 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect();
         let text = text.join("\n");
-        assert!(text.contains("❯ /thinking"), "{text}");
-        // Narrow terminal: the hint stops at the edge instead of wrapping.
-        let mut screen = Screen::test_screen(10, 10);
-        screen.set_commands(vec!["/thinking".into()]);
-        screen.insert_text("/th");
-        screen.draw().unwrap();
-        let text: Vec<String> = screen
-            .test_buffer()
-            .content
-            .chunks(10)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
-            .collect();
-        let text = text.join("\n");
-        assert!(text.contains("❯ /think"), "{text}");
-        assert!(!text.contains("ing"), "{text}");
+        assert!(text.contains("   /c7"), "{text}");
+        assert!(!text.contains("   /c1"), "{text}");
+        assert!(!text.contains("   /c2"), "{text}");
     }
 
     #[test]

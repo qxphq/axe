@@ -55,10 +55,11 @@ invariants a change must not break.
     session headers). No speculative fixes; reproduce first.
 12. **A scrolling REPL, not a TUI.** No alt-screen: the transcript is scrollback.
     The only owned region is an inline live area at the bottom (queued row,
-    wrapped prompt, status), capped at half the screen. A chooser may own a header
-    plus entries; when it closes without resuming, its rows are committed to
-    scrollback. Everything above is appended, never repainted — except `/new`,
-    which wipes the screen and its scrollback: a session boundary.
+    wrapped prompt, the candidate list under it, status), capped at half the
+    screen. A chooser may own a header plus entries; when it closes without
+    resuming, its rows are committed to scrollback. Everything above is
+    appended, never repainted — except `/new`, which wipes the screen and its
+    scrollback: a session boundary.
 13. **One writer.** While `ui::Screen` owns the terminal, only it draws. Startup
     banner and piped output run before/without a `Screen`; a stray `print!` while
     it exists is a rendering bug.
@@ -82,9 +83,10 @@ invariants a change must not break.
 - `main.rs` — REPL, provider setup, model picker, session lifecycle (startup
   chooser, `/sessions`, `/new`, naming), agent loop. Two producers (keys, a turn)
   feed one `mpsc` channel; the main thread applies events and draws once per batch.
-- `ui.rs` — the screen: prompt buffer and key mapping, the live region (chrome plus
-  the wrapped prompt, resized by `fit`), the chooser, and `insert` for transcript
-  lines (wrapped here, since a clipped line would be lost).
+- `ui.rs` — the screen: prompt buffer and key mapping, the live region (chrome,
+  the wrapped prompt, the command candidates under it, resized by `fit`), the
+  chooser, and `insert` for transcript lines (wrapped here, since a clipped line
+  would be lost).
 - `markdown.rs` — markdown: blocks, inlines, tables, entities, URL checks, and the
   renderer. `Stream` feeds it a line at a time and lays a block out when it ends.
 - `api.rs` — model listing, chat request, SSE parsing, tool-call accumulation.
