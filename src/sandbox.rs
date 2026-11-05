@@ -149,6 +149,10 @@ pub const COMMANDS: &[&str] = &[
 /// both sandboxes match real paths, removed at exit.
 static SCRATCH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+/// The second writable directory, and the one that outlives the session: the
+/// project's plan. Registered by `main` before the first command runs.
+static PLAN: OnceLock<Option<PathBuf>> = OnceLock::new();
+
 /// One line for the startup banner when confinement is weaker than promised.
 pub fn init() -> Option<String> {
     #[cfg(target_os = "linux")]
@@ -204,6 +208,19 @@ pub fn cleanup() {
     if let Some(Some(dir)) = SCRATCH.get() {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// Register the project's plan directory, which explore mode may write and
+/// never execute. Canonicalised for the same reason as the scratch directory;
+/// a path that cannot be resolved leaves the directory out of the ruleset
+/// rather than widening it.
+pub fn set_plan(path: &Path) {
+    let _ = PLAN.set(std::fs::canonicalize(path).ok());
+}
+
+/// The plan directory, when the run has a working directory to keep one in.
+pub fn plan() -> Option<&'static Path> {
+    PLAN.get().and_then(|dir| dir.as_deref())
 }
 
 /// First `name` on PATH, canonicalised: Landlock and SBPL both match the real
@@ -552,8 +569,12 @@ mod imp {
             Path::new("/dev/null"),
         )?;
         // Everything writable, nothing executable: a script written here must
-        // not become a program.
+        // not become a program. The plan directory takes the same rights for
+        // the same reason, and is the only writable path that survives exit.
         allow(&set, fs & !FS_EXECUTE, scratch_dir()?)?;
+        if let Some(plan) = super::plan() {
+            allow(&set, fs & !FS_EXECUTE, plan)?;
+        }
         Ok(set)
     }
 
@@ -730,6 +751,10 @@ mod imp {
             "(allow file-write* (subpath {}) (literal \"/dev/null\"))\n",
             quote(scratch_dir()?)
         ));
+        // The plan directory: writable across sessions, never executable.
+        if let Some(plan) = super::plan() {
+            profile.push_str(&format!("(allow file-write* (subpath {}))\n", quote(plan)));
+        }
         profile.push_str("(deny process-exec)\n(allow process-exec");
         let mut paths: Vec<PathBuf> = COMMANDS.iter().filter_map(|name| resolve(name)).collect();
         paths.extend(["sh", "bash"].iter().copied().filter_map(resolve));

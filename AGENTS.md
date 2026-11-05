@@ -66,7 +66,9 @@ invariants a change must not break.
 14. **The prompt is a block.** Every line carries its glyph (`❯ ` live, `█ `
     committed), so a wrapped line reads as one block.
 15. **`bash` is confined by the kernel, not by strings.** Explore mode denies
-    writes outside a scratch directory and exec outside a fixed allowlist
+    writes outside two directories — the session scratch, and the project's
+    `plan/` under the state tree, which survives exit so a plan outlives the
+    session; neither is executable — and exec outside a fixed allowlist
     (Landlock/Seatbelt, plus seccomp denying `io_uring_setup`, which Landlock
     cannot mediate); it degrades with one startup line. The allowlist is a
     convenience guard, not the containment: it carries the common inspection and
@@ -102,7 +104,8 @@ invariants a change must not break.
 - `skills.rs` — Agent Skills discovery, the frontmatter subset, the catalogue,
   and the body read on `/skill:` activation.
 - `sandbox.rs` — the only `unsafe`: seccomp, Landlock, Seatbelt, exec allowlist,
-  and the explore-mode scratch directory.
+  and the two directories explore mode may write: the session's scratch and the
+  project's plan.
 
 ## Conventions
 
@@ -125,7 +128,8 @@ invariants a change must not break.
   older than `sessions::KEEP` are gzipped. The sidecar stays readable, so listing
   and search work without unpacking. The system prompt and mode notes are never
   logged; resume rebuilds them. A title and summary are generated once, after the
-  first answer; failing that, the first request stands in.
+  first answer; failing that, the first request stands in. The project directory
+  also holds `plan/`, the one writable path explore mode keeps across sessions.
 - `!cmd` is the user's shell. It runs through `tools::execute`, its output joins
   the history as a `user` message, no turn follows, and explore-mode write
   confinement does not apply.
