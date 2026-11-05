@@ -148,9 +148,10 @@ a task matches.
 ## REPL
 
 `❯ ` is the prompt. Enter submits, Ctrl+J or Alt+Enter starts a new line. Typing
-a slash word lists up to five matching commands under the prompt, the one the
-next step takes drawn bright; Tab and ↓ step forward, ↑ steps back, and the
-line always holds the command the step picked. A command's first argument
+a slash word lists the matching commands in the rows above the prompt — as many
+as the terminal's height allows, up to four — the one the next step takes drawn
+bright; Tab and ↓ step forward, ↑ steps back, and the line always holds the
+command the step picked. A command's first argument
 completes the same way: `/model ` lists the models, `/model dee` narrows them,
 and Enter applies the one the line holds. A model or a thinking level is
 therefore chosen in the prompt, like any other line. A line starting with `!` is your
@@ -171,6 +172,10 @@ something.
 | `/help` | list the commands, the config path and its keys |
 | `/exit`, `/quit` | quit |
 
+The area under the transcript has a fixed height for a given terminal size: the
+candidate list, a chooser and a wrapped prompt all scroll inside it, so nothing
+that appears and disappears can leave a gap in the transcript above.
+
 Recent sessions for the directory are offered at startup as a chooser: Up and
 Down move, Enter resumes, Esc closes it, and typing starts a new session and
 takes the list with it. `/sessions` opens the same list, where typing filters it
@@ -180,7 +185,7 @@ and Enter on an empty line resumes the selection.
 | --- | --- |
 | Enter | submit |
 | Ctrl+J, Alt+Enter | new line |
-| Tab, ↑ ↓ | complete a command or its first argument: step through the candidates, listed under the prompt |
+| Tab, ↑ ↓ | complete a command or its first argument: step through the candidates, listed above the prompt |
 | Shift+Tab | toggle explore mode |
 | ↑ ↓ | move in a chooser, or step the command candidates |
 | Esc | close a chooser; twice to interrupt the running turn |
