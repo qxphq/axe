@@ -973,14 +973,14 @@ impl Screen {
 
     fn insert_char(&mut self, c: char) {
         // Typing at startup is the choice: the session begins fresh and the
-        // chooser leaves its list behind.
+        // chooser's list goes with it, rather than staying in scrollback.
         if self
             .menu
             .as_ref()
             .map(|menu| menu.collapse_on_type)
             .unwrap_or(false)
         {
-            self.clear_menu(true);
+            self.clear_menu(false);
         }
         let at = self.offset(self.cursor);
         self.buf.insert(at, c);
@@ -1001,7 +1001,7 @@ impl Screen {
             .map(|menu| menu.collapse_on_type)
             .unwrap_or(false)
         {
-            self.clear_menu(true);
+            self.clear_menu(false);
         }
         let at = self.offset(self.cursor);
         self.buf.insert_str(at, &text);
@@ -1616,6 +1616,21 @@ mod tests {
             screen.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Action::MenuAccept
         ));
+    }
+
+    #[test]
+    fn typing_at_startup_drops_the_chooser_without_a_trace() {
+        let mut screen = Screen::test_screen(40, 12);
+        screen.set_menu("Resume", vec!["one".into(), "two".into()], true);
+        screen.insert_text("h");
+        assert!(screen.menu.is_none());
+        assert_eq!(screen.buf, "h");
+        // No block was written: the list is gone, not reprinted above the prompt.
+        assert!(screen.last.is_none());
+        // `/sessions` searches instead, so its chooser waits for the line.
+        screen.set_menu("Sessions", vec!["one".into()], false);
+        screen.insert_text("x");
+        assert!(screen.menu.is_some());
     }
 
     #[test]

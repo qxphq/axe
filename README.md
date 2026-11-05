@@ -164,9 +164,9 @@ something.
 | `/exit`, `/quit` | quit |
 
 Recent sessions for the directory are offered at startup as a chooser: Up and
-Down move, Enter resumes, Esc closes it, and typing collapses it. `/sessions`
-opens the same list, where typing filters it and Enter on an empty line resumes
-the selection.
+Down move, Enter resumes, Esc closes it, and typing starts a new session and
+takes the list with it. `/sessions` opens the same list, where typing filters it
+and Enter on an empty line resumes the selection.
 
 | key | what it does |
 | --- | --- |
