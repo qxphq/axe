@@ -1,14 +1,17 @@
 //! Kernel-enforced confinement for `bash`.
 //!
-//! Two layers, both in the kernel, because a string is not a guard: the
-//! first-token check this replaces let `ls; rm -rf .`, `ls $(curl x)` and
-//! `git -c alias.p='!sh' p` through.
+//! One layer, in the kernel, because a string is not a guard: the first-token
+//! check this replaces let `ls; rm -rf .`, `ls $(curl x)` and
+//! `git -c alias.p='!sh' p` through. In explore mode it confines `bash` to a
+//! scratch directory and a fixed exec allowlist; it degrades with one startup
+//! line on a Linux kernel without Landlock, because there is nothing else to
+//! use there. Normal mode keeps only `no_new_privs` and the environment
+//! whitelist.
 //!
-//! Layer 1 denies the network to every child, in every mode. It is mandatory:
-//! where it cannot be installed the command does not run. Layer 2 confines
-//! explore mode to a scratch directory and a fixed exec allowlist; it degrades
-//! with one startup line on a Linux kernel without Landlock, because there is
-//! nothing else to use there.
+//! The network is not confined in either mode: a child reaches what the user
+//! reaches. `io_uring_setup` stays denied in explore mode because Landlock does
+//! not mediate io_uring, and allowing it would punch a hole in the write
+//! confinement.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,11 +19,12 @@ use std::sync::OnceLock;
 
 /// What explore mode may execute, by name; the platform code adds the shell.
 /// `git` is here whole: with writes denied a subcommand list decides nothing,
-/// and `git log` has to keep working.
+/// and `git log` has to keep working. `curl` writes nothing on its own, so a
+/// networked read is an explore-mode command like any other.
 pub const COMMANDS: &[&str] = &[
-    "cat", "cut", "date", "df", "diff", "du", "fd", "file", "find", "git", "grep", "head", "id",
-    "jq", "ls", "ps", "pwd", "rg", "sort", "stat", "tail", "tr", "tree", "uname", "uniq", "wc",
-    "which",
+    "cat", "curl", "cut", "date", "df", "diff", "du", "fd", "file", "find", "git", "grep", "head",
+    "id", "jq", "ls", "ps", "pwd", "rg", "sort", "stat", "tail", "tr", "tree", "uname", "uniq",
+    "wc", "which",
 ];
 
 /// The one writable directory in explore mode: `0700`, canonicalised because
@@ -136,15 +140,14 @@ mod imp {
 
     use super::{confine_env, resolve, scratch_dir, shell_path, COMMANDS};
 
-    /// `socket` number and `AUDIT_ARCH_*` value the filter pins. `None` on an
-    /// architecture this file has no numbers for: Layer 1 is mandatory, so no
-    /// command runs there.
+    /// The `AUDIT_ARCH_*` value the filter pins. `None` on an architecture this
+    /// file has no numbers for, where explore mode's `bash` cannot be confined.
     #[cfg(target_arch = "x86_64")]
-    const TARGET: Option<(u32, u32)> = Some((41, 0xc000_003e));
+    const TARGET: Option<u32> = Some(0xc000_003e);
     #[cfg(target_arch = "aarch64")]
-    const TARGET: Option<(u32, u32)> = Some((198, 0xc000_00b7));
+    const TARGET: Option<u32> = Some(0xc000_00b7);
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    const TARGET: Option<(u32, u32)> = None;
+    const TARGET: Option<u32> = None;
 
     // Classic BPF, from <linux/bpf_common.h>. The class is part of the code,
     // so `JEQ|K` is 0x15 and not 0x10.
@@ -156,15 +159,12 @@ mod imp {
     const RET_ERRNO: u32 = 0x0005_0000;
     const EPERM: u32 = 1;
 
-    /// Offsets into `struct seccomp_data`: nr, arch, args[0].
+    /// Offsets into `struct seccomp_data`: nr and arch.
     const NR: u32 = 0;
     const ARCH: u32 = 4;
-    const ARG0: u32 = 16;
 
     const IO_URING_SETUP: u32 = 425;
     const X32_BIT: u32 = 0x4000_0000;
-    /// Not in libc; CAP_NET_RAW-gated like `AF_PACKET`, and it sends frames.
-    const AF_XDP: u32 = 44;
 
     // libc exposes the syscall numbers for linux-gnu, but neither `prctl` nor
     // its constants, so both are declared here.
@@ -189,15 +189,12 @@ mod imp {
     const FS_MAKE_SYM: u64 = 1 << 12;
     const FS_REFER: u64 = 1 << 13;
     const FS_TRUNCATE: u64 = 1 << 14;
-    const NET_CONNECT_TCP: u64 = 1 << 0;
-    const NET_BIND_TCP: u64 = 1 << 1;
 
-    /// A pre-6.7 kernel knows only the first field; the size passed with it
-    /// says how much of the struct exists.
+    /// One field: `handled_access_net` stays zero, so the ruleset says nothing
+    /// about sockets and the network is not confined.
     #[repr(C)]
     struct RulesetAttr {
         handled_access_fs: u64,
-        handled_access_net: u64,
     }
 
     /// Packed, as the kernel declares it: 12 bytes, not 16.
@@ -263,21 +260,26 @@ mod imp {
 
     pub fn notice() -> Option<String> {
         if TARGET.is_none() {
-            return Some("bash is unavailable: no seccomp filter for this architecture".into());
+            return Some(
+                "explore mode: bash is unavailable: no seccomp filter for this architecture".into(),
+            );
         }
         abi().is_none().then(|| {
             "sandbox: Landlock is unavailable, so explore mode's bash is unconfined: any \
-             command runs and anything is writable (its network is still denied)"
+             command runs and anything is writable"
                 .to_string()
         })
     }
 
     pub fn shell(command: &str, read_only: bool) -> Result<Command, String> {
-        let Some((socket_nr, audit_arch)) = TARGET else {
-            return Err("sandbox: bash is unavailable on this architecture".into());
-        };
         let shell = shell_path()?;
-        // Built here, in the parent: no allocation after fork.
+        // Built here, in the parent: no allocation after fork. Both the filter
+        // and the ruleset belong to explore mode: outside it there is nothing
+        // for them to protect, and the arch pin would break a 32-bit binary.
+        let audit_arch = if read_only { TARGET } else { None };
+        if read_only && audit_arch.is_none() {
+            return Err("sandbox: bash is unavailable on this architecture".into());
+        }
         let rules = if read_only {
             ruleset(&shell)?.map(|set| set.0.as_raw_fd())
         } else {
@@ -292,7 +294,9 @@ mod imp {
         unsafe {
             cmd.pre_exec(move || {
                 no_new_privs()?;
-                seccomp(socket_nr, audit_arch)?;
+                if let Some(audit_arch) = audit_arch {
+                    seccomp(audit_arch)?;
+                }
                 if let Some(fd) = rules {
                     restrict(fd)?;
                 }
@@ -355,17 +359,9 @@ mod imp {
         }
         let attr = RulesetAttr {
             handled_access_fs: fs,
-            handled_access_net: if abi >= 4 {
-                NET_CONNECT_TCP | NET_BIND_TCP
-            } else {
-                0
-            },
         };
-        let size = if abi >= 4 {
-            std::mem::size_of::<RulesetAttr>()
-        } else {
-            8
-        };
+        // The 8-byte shape every ABI understands: no `handled_access_net`.
+        let size = std::mem::size_of::<RulesetAttr>();
         // SAFETY: `attr` is a valid `RulesetAttr` and `size` is the prefix
         // the running ABI understands; the kernel copies, never retains it.
         let fd = unsafe {
@@ -471,8 +467,8 @@ mod imp {
         Ok(())
     }
 
-    fn seccomp(socket_nr: u32, audit_arch: u32) -> io::Result<()> {
-        let filter = filter(socket_nr, audit_arch);
+    fn seccomp(audit_arch: u32) -> io::Result<()> {
+        let filter = filter(audit_arch);
         let prog = libc::sock_fprog {
             len: filter.len() as u16,
             filter: filter.as_ptr() as *mut libc::sock_filter,
@@ -509,28 +505,22 @@ mod imp {
         Ok(())
     }
 
-    /// The arch word is pinned first: a 32-bit binary would reach `socket`
-    /// through `socketcall`, with a number this filter lets through.
-    fn filter(socket_nr: u32, audit_arch: u32) -> [libc::sock_filter; 16] {
+    /// The arch word is pinned first: a 32-bit binary would reach the syscalls
+    /// below through a different number, and `x32` would slip past a filter
+    /// that reads the number alone. What is left to deny is `io_uring_setup`,
+    /// which can issue the file operations Landlock is supposed to mediate.
+    fn filter(audit_arch: u32) -> [libc::sock_filter; 8] {
         let insn = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
         let deny = RET_ERRNO | EPERM;
         [
-            insn(LD_ABS, 0, 0, ARCH),                  // 0  A = arch
-            insn(JEQ_K, 1, 0, audit_arch),             // 1  -> 3, else 2
-            insn(RET_K, 0, 0, deny),                   // 2  another ABI: deny all
-            insn(LD_ABS, 0, 0, NR),                    // 3  A = nr
-            insn(JGE_K, 9, 0, X32_BIT),                // 4  x32 -> 14
-            insn(JEQ_K, 8, 0, IO_URING_SETUP),         // 5  -> 14
-            insn(JEQ_K, 0, 8, socket_nr),              // 6  -> 7, else 15
-            insn(LD_ABS, 0, 0, ARG0),                  // 7  A = args[0]
-            insn(JEQ_K, 5, 0, libc::AF_INET as u32),   // 8  -> 14
-            insn(JEQ_K, 4, 0, libc::AF_INET6 as u32),  // 9  -> 14
-            insn(JEQ_K, 3, 0, libc::AF_PACKET as u32), // 10 -> 14
-            insn(JEQ_K, 2, 0, libc::AF_VSOCK as u32),  // 11 -> 14
-            insn(JEQ_K, 1, 0, AF_XDP),                 // 12 -> 14
-            insn(RET_K, 0, 0, RET_ALLOW),              // 13 another family
-            insn(RET_K, 0, 0, deny),                   // 14
-            insn(RET_K, 0, 0, RET_ALLOW),              // 15
+            insn(LD_ABS, 0, 0, ARCH),          // 0  A = arch
+            insn(JEQ_K, 1, 0, audit_arch),     // 1  -> 3, else 2
+            insn(RET_K, 0, 0, deny),           // 2  another ABI: deny all
+            insn(LD_ABS, 0, 0, NR),            // 3  A = nr
+            insn(JGE_K, 2, 0, X32_BIT),        // 4  x32 -> 7
+            insn(JEQ_K, 1, 0, IO_URING_SETUP), // 5  -> 7, else 6
+            insn(RET_K, 0, 0, RET_ALLOW),      // 6
+            insn(RET_K, 0, 0, deny),           // 7
         ]
     }
 }
@@ -573,7 +563,7 @@ mod imp {
         static EXPLORE: OnceLock<Result<String, String>> = OnceLock::new();
         if !read_only {
             return Ok(NORMAL
-                .get_or_init(|| "(version 1)\n(allow default)\n(deny network*)\n".to_string())
+                .get_or_init(|| "(version 1)\n(allow default)\n".to_string())
                 .as_str());
         }
         match EXPLORE.get_or_init(build) {
@@ -586,8 +576,7 @@ mod imp {
     /// canonical: `/var` is `/private/var` here, and a grant on the short form
     /// matches nothing.
     fn build() -> Result<String, String> {
-        let mut profile =
-            String::from("(version 1)\n(allow default)\n(deny network*)\n(deny file-write*)\n");
+        let mut profile = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
         profile.push_str(&format!(
             "(allow file-write* (subpath {}) (literal \"/dev/null\"))\n",
             quote(scratch_dir()?)

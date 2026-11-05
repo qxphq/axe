@@ -5,6 +5,9 @@
 - **Scope:** security and trust model only. Non-security findings are in `AUDIT.md`.
 - **Method:** static review in explore mode, then revised against pi (`references/pi`). No build/test run.
 - **Line numbers** are at this commit and will drift.
+- **Amendment:** error text quoting the pre-amendment rule has been restated. `bash`'s
+  network confinement was removed after this audit (see SEC-04); the findings below
+  record the rule that replaced it, not the one they were written against.
 
 ## Baseline: pi and the trust model
 
@@ -15,18 +18,18 @@ This audit uses pi as the capability baseline: no built-in permission system, no
 - `references/pi/packages/coding-agent/src/core/system-prompt.ts`: project context files are wrapped in `<project_instructions path="...">`, but they still load even when project trust is declined.
 - `references/pi/packages/coding-agent/src/core/tools/bash.ts`: output is capped and the full output is saved to a temp file; timeout/abort kills the process tree.
 
-Axe already does one thing pi does not: `bash` is kernel-confined for writes, direct exec, and internet sockets. That is an asset. It should not be turned into a read sandbox or a per-call approval layer; that would make the tool less useful for no real boundary gain.
+Axe already does one thing pi does not: `bash` is kernel-confined for writes and direct exec. That is an asset. It should not be turned into a read sandbox or a per-call approval layer; that would make the tool less useful for no real boundary gain.
 
 The revised stance is:
 
-- **Trust the model's capability.** Keep `read`, `bash`, `write`, `edit`, `fetch` and `web_search` useful. Do not add read confinement, per-call approvals, or blanket network bans in normal mode.
+- **Trust the model's capability.** Keep `read`, `bash`, `write`, `edit`, `fetch` and `web_search` useful. Do not add read confinement, per-call approvals, or network bans.
 - **Do not trust the provenance of content.** Treat project files, `AGENTS.md`, command output, fetched pages, search results, and session replay as untrusted data. Label them, keep them out of the system-prompt authority slot where practical, and state the instruction hierarchy.
 - **Do not pretend labels are enforcement.** A source that can address the model can still persuade it. The only enforcement is the kernel sandbox/container and the user's choice of environment. Pi accepts this; axe should document it instead of promising source trust as a boundary.
 - **Treat model-generated actions as untrusted until bounded.** That is pi's stance and it is compatible with trusting the model: the model is capable, but it is downstream of its sources.
 
 ## Verdict
 
-The security model is **overclaimed in the docs**. Under the pi baseline, read-everything, normal-mode code execution and no approvals are accepted capabilities. Explore mode is an integrity/network sandbox, not a confidentiality boundary. What is missing is **source trust**, not capability restriction.
+The security model is **overclaimed in the docs**. Under the pi baseline, read-everything, normal-mode code execution, network access and no approvals are accepted capabilities. Explore mode is an integrity sandbox, not a confidentiality or network boundary. What is missing is **source trust**, not capability restriction.
 
 Severity:
 
@@ -87,7 +90,7 @@ Rules to add:
 2. Wrap project instructions in a tagged block with its path (pi's `<project_instructions>` shape), and put them after the built-in system rules, not mixed into them.
 3. Prefix `fetch`/`web_search` results with a one-line provenance header (`source: web (untrusted)`); keep the content intact. Do not claim the header cannot be forged.
 4. Do not sanitize code/file content for the model; sanitize only terminal/control/template channels. The model needs exact code.
-5. Keep the explore-mode kernel sandbox and the "bash cannot reach the network" rule. Recommend a container/dedicated user for normal mode in untrusted repos, as pi does.
+5. Keep the explore-mode kernel sandbox for writes and exec. Recommend a container/dedicated user for normal mode in untrusted repos, as pi does.
 6. Scrub provider/Brave env vars and protect `/proc`; that is hardening, not capability restriction.
 7. Add a README/SECURITY trust section modeled on pi's: what is inside the boundary, what project trust would mean in axe, and why source labels are not enforcement.
 
@@ -137,7 +140,7 @@ whitelist closes inheritance.
 **Impact**
 
 - Explore mode: injected content can read everything and exfiltrate via `fetch`/`web_search`.
-- Normal mode: injected content can execute arbitrary code as the user. Only outbound sockets are denied.
+- Normal mode: injected content can execute arbitrary code as the user, and that code reaches the network.
 - A poisoned session stays poisoned; fetched tool results are logged and replayed on resume.
 
 **Fix / stance**
@@ -146,7 +149,7 @@ whitelist closes inheritance.
 - Add the behavior rule above.
 - Move project instructions out of the system authority slot: wrap them as `<project_instructions path="...">` in a lower-trust message, or gate them behind a project-trust decision. Pi labels them but still loads them; axe can at least stop mixing them into the built-in rules.
 - Add a provenance header to `fetch`/`web_search` results (`source: web (untrusted)`); keep the content intact. Do not claim the header cannot be forged.
-- Keep the kernel sandbox; it is the only real boundary. It protects integrity and shell network, not confidentiality.
+- Keep the kernel sandbox; it is the only real boundary. It protects integrity, not confidentiality or network access.
 - Do not add an approval layer unless asked; the user explicitly chose no approvals. Document the consequence instead.
 
 **Status at HEAD.** The first rule in `BEHAVIOR` states the instruction
@@ -169,27 +172,27 @@ recorded before this change still replay without a label.
 
 **Impact**
 
-"Read-only" is true for `write`/`edit`; `bash` is confined for writes, direct exec and internet sockets. It is not true for reads, local IPC, or code loading. Users will infer more safety than exists.
+"Read-only" is true for `write`/`edit`; `bash` is confined for writes and direct exec. It is not true for reads, local IPC, code loading, or the network. Users will infer more safety than exists.
 
 **Fix**
 
-- README/AGENTS: "Explore mode restricts writes, direct exec, and internet sockets. It does not restrict reads or confidentiality."
-- Do not add Landlock read rules under the pi baseline; if confidentiality matters, run in a container, VM, or dedicated user. Axe's explore sandbox is for integrity/network, not secrecy.
+- README/AGENTS: "Explore mode restricts writes and direct exec. It does not restrict reads, confidentiality, or network access."
+- Do not add Landlock read rules under the pi baseline; if confidentiality matters, run in a container, VM, or dedicated user. Axe's explore sandbox is for integrity, not secrecy or network.
 - Strip environment and protect `/proc` regardless.
 
 **Status at HEAD.** The README "Trust and security" section states that explore
 mode bounds integrity, not confidentiality, including the `!cmd` write bypass;
 the environment and `/proc` parts are in SEC-01. The loader path was reproduced:
 `LD_PRELOAD=/tmp/x.so cat /dev/null` ran the constructor (write outside the
-scratch directory `EACCES`, `socket` `EPERM`), and `ld.so /bin/echo` ran an
+scratch directory `EACCES`), and `ld.so /bin/echo` ran an
 unlisted program, while a direct `/usr/bin/env` was denied. The README now
-states both, and that loaded code stays in the same write/network domain.
+states both, and that loaded code stays in the same write confinement.
 
 ### SEC-04 — Normal mode is RCE by design; AGENTS.md is remote instructions (accepted baseline; docs)
 
 **Evidence**
 
-- `read_only=false` disables Landlock write/exec confinement (`src/sandbox.rs:196-220`). Seccomp still denies internet sockets.
+- `read_only=false` disables Landlock write/exec confinement and installs no seccomp filter (`src/sandbox.rs:196-220`). Neither mode confines the network.
 - `write`/`edit` run in the parent with full user rights (`src/tools.rs:219-270`).
 - No approval prompt; explicit AGENTS principle 8.
 - `config::find_agents` auto-loads the nearest `AGENTS.md`; the startup notice names it, but does not say it is untrusted instructions.
@@ -204,11 +207,11 @@ README "Trust and security" section:
 
 - "Normal mode runs commands as you. Only use it in directories you trust. A repository's `AGENTS.md` is instructions; do not run axe in an untrusted repository in normal mode."
 - "There are no approval prompts; that is a deliberate trade-off."
-- "Explore mode protects writes/exec/network from `bash`, not reads or exfiltration."
+- "Explore mode protects writes and exec from `bash`, not reads, exfiltration, or the network."
 
 **Status at HEAD.** The README "Trust and security" section carries the
-normal-mode warning, the no-approval trade-off, the network rule, and the
-`!cmd` write-confinement bypass.
+normal-mode warning, the no-approval trade-off, and the `!cmd`
+write-confinement bypass.
 
 ### SEC-05 — State and session files are world-readable (P1)
 
@@ -350,7 +353,7 @@ environment only.
 
 ### P2 — accepted baseline and residual
 
-- Document explore mode as integrity/network only; normal mode as RCE-by-design.
+- Document explore mode as integrity only; normal mode as RCE-by-design with the network open.
 - DNS rebinding; terminal injection; literal `api_key`.
 - Verify the loader/`LD_PRELOAD` code-loading path before changing the exec-allowlist claim.
 
@@ -375,11 +378,11 @@ environment only.
 - [x] Literal `api_key` rejected at config load; `api_key_env` is the only source.
 - [x] `// SAFETY:` comments on every `unsafe` block in `sandbox.rs`.
 - [x] README/SECURITY trust section.
-- [x] Repro for loader/`LD_PRELOAD`: code runs and `ld.so` starts unlisted programs, inside the same write/network confinement; direct unlisted exec is denied.
+- [x] Repro for loader/`LD_PRELOAD`: code runs and `ld.so` starts unlisted programs, inside the same write confinement; direct unlisted exec is denied.
 
 ## Verification notes
 
 - The Landlock loader/`LD_PRELOAD` path is reproduced (SEC-03): loaded code keeps
-  the write and network confinement; the README claim is narrowed accordingly.
+  the write confinement; the README claim is narrowed accordingly.
 - The env/secret paths are source-level findings; reproduce before fixing.
 - The review is static; no build/test was run in explore mode.

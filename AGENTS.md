@@ -33,8 +33,9 @@ invariants a change must not break.
 7. **Tools are dumb.** `read`, `write`, `edit`, `bash`, `about`, `fetch`,
    `web_search`. No `glob`, `grep`, or `list`; `bash` + `rg`/`fd` covers them.
    `about` returns the compiled-in `README.md`: documentation, not a code path.
-   `fetch`/`web_search` exist because explore mode's shell allowlist has no
-   `curl`; both are refused outside explore mode. Tool errors are results for the
+   `fetch`/`web_search` are HTTP(S) GET with the body reduced to text and
+   labelled untrusted; both are refused outside explore mode. `curl` is on
+   explore's allowlist because a command sends what `fetch` cannot. Tool errors are results for the
    model, not harness failures. Truncate output, timeout `bash`, cap `fetch` at
    1 MiB/50 000 chars and `web_search` at 1 MiB/20 results.
 8. **No approval prompts.** Bash runs unprompted by explicit user decision. Do not
@@ -62,12 +63,14 @@ invariants a change must not break.
     it exists is a rendering bug.
 14. **The prompt is a block.** Every line carries its glyph (`❯ ` live, `█ `
     committed), so a wrapped line reads as one block.
-15. **`bash` is confined by the kernel, not by strings.** No child reaches the
-    network: seccomp refuses internet-family `socket` on Linux, `(deny network*)`
-    on macOS. Explore mode also denies writes outside a scratch directory and exec
-    outside a fixed allowlist (Landlock/Seatbelt). Layer 1 is mandatory; Layer 2
-    degrades with one startup line. A leading-word check is never a substitute.
-    `!cmd` is subject to the network deny. Details and residuals: `SEC_AUDIT.md`.
+15. **`bash` is confined by the kernel, not by strings.** Explore mode denies
+    writes outside a scratch directory and exec outside a fixed allowlist
+    (Landlock/Seatbelt, plus seccomp denying `io_uring_setup`, which Landlock
+    cannot mediate); it degrades with one startup line. Normal mode keeps only
+    `no_new_privs` and the scrubbed environment. The network is confined in
+    neither mode: a child connects where the user connects, `!cmd` included. A
+    leading-word check is never a substitute. Details and residuals:
+    `SEC_AUDIT.md`.
 
 ## Architecture
 
@@ -117,8 +120,8 @@ invariants a change must not break.
   logged; resume rebuilds them. A title and summary are generated once, after the
   first answer; failing that, the first request stands in.
 - `!cmd` is the user's shell. It runs through `tools::execute`, its output joins
-  the history as a `user` message, no turn follows, explore-mode write confinement
-  does not apply, and the network deny does.
+  the history as a `user` message, no turn follows, and explore-mode write
+  confinement does not apply.
 - Commit messages: imperative, one feature per commit.
 
 ## Provider notes
@@ -165,8 +168,9 @@ and `show:`. Normal mode is a `!cmd` line, which does not loop. Examples:
 ```sh
 ./harness.py --scroll 400 'tool:bash:{"command":"head -n 1 tmux.conf"}' '!Escape' 'show:'
 ./harness.py --scroll 400 'tool:bash:{"command":"echo x > /tmp/p"}' '!Escape' 'show:'
-./harness.py --scroll 400 ' !python3 -c "import socket; socket.socket()"'
+./harness.py --scroll 400 'tool:bash:{"command":"python3 -c pass"}' '!Escape' 'show:'
 ```
 
-The leading space in the last line is load-bearing: the harness reads an argument
-starting with `!` as tmux keys, and the REPL trims it back to a `!cmd`.
+The first two deny on the kernel: an unwritable path, an exec outside the
+allowlist. A `!cmd` line is the escape hatch, and the harness reads an argument
+starting with `!` as tmux keys, so prefix it with a space: `' !make'`.

@@ -48,7 +48,7 @@ const EDIT: Spec = Spec {
 const BASH: Spec = Spec {
     name: "bash",
     signature: "bash(command)",
-    description: "Run a shell command in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds. No command reaches the network, in any mode. In explore mode only a fixed allowlist runs (ls, cat, head, tail, grep, rg, fd, find, sort, wc, diff, du, df, file, jq, stat, tree, uname, uniq, id, ps, pwd, date, cut, tr, which, git, sh), nothing outside a scratch directory is writable, and `fetch` and `web_search` are the way to the web.",
+    description: "Run a shell command in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds. The network is not confined, in any mode. In explore mode only a fixed allowlist runs (ls, cat, curl, head, tail, grep, rg, fd, find, sort, wc, diff, du, df, file, jq, stat, tree, uname, uniq, id, ps, pwd, date, cut, tr, which, git, sh) and nothing outside a scratch directory is writable.",
     parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"Command passed to sh -c"}},"required":["command"]}"#,
 };
 
@@ -91,7 +91,8 @@ const WEB_SEARCH: Spec = Spec {
 
 /// Appended when the kernel, not the command, refused something: the model has
 /// to tell a sandbox denial from a missing binary or a bug.
-const DENIED: &str = "explore mode: only the read-only allowlist runs, nothing outside $TMPDIR is writable, and no command reaches the network; use `fetch` and `web_search` for the web\n";
+const DENIED: &str =
+    "explore mode: only the read-only allowlist runs, and nothing outside $TMPDIR is writable\n";
 
 const SPECS: &[Spec] = &[READ, WRITE, EDIT, BASH, ABOUT, FETCH, WEB_SEARCH];
 
@@ -147,8 +148,7 @@ pub fn system_prompt() -> String {
          it, answer, and propose changes: `write` and `edit` are unavailable, `bash` \
          runs only a fixed read-only allowlist and writes only to a scratch \
          directory. Outside explore mode, `write`, `edit` and a full `bash` are \
-         available, and `fetch` and `web_search` are unavailable. No command reaches \
-         the network in either mode.\n",
+         available, and `fetch` and `web_search` are unavailable.\n",
     );
     out.push_str("\nBehavior:\n");
     for (i, rule) in BEHAVIOR.iter().enumerate() {

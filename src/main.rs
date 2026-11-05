@@ -365,11 +365,11 @@ fn parse_naming(text: &str) -> Option<(String, String)> {
 fn mode_note(read_only: bool) -> Value {
     let content = if read_only {
         "explore mode: on — write and edit are unavailable; bash runs read-only \
-         commands, writes only to a scratch directory, and no command reaches the \
-         network."
+         commands, writes only to a scratch directory, and the network is not \
+         confined."
     } else {
         "explore mode: off — write, edit and a full bash are available; fetch and web_search \
-         are unavailable; bash cannot reach the network."
+         are unavailable."
     };
     json!({ "role": "user", "content": content })
 }
