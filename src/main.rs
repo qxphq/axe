@@ -767,29 +767,36 @@ impl Session {
             self.poll_naming(Some(&mut screen));
             let (line, was_queued) = match pending.take() {
                 Some(line) => (line, true),
-                None => match readline(&mut screen, &rx) {
-                    Some(Input::Line(line)) => (line, false),
-                    Some(Input::Explore) => {
-                        self.toggle_explore(&mut screen);
-                        continue;
-                    }
-                    Some(Input::Menu(index)) => {
-                        let Some(meta) = self.startup.get(index).cloned() else {
+                None => {
+                    // The title request lands while this loop blocks on keys:
+                    // the idle tick applies it and repaints the row.
+                    let mut idle = |screen: &mut ui::Screen| {
+                        self.poll_naming(Some(screen));
+                    };
+                    match readline(&mut screen, &rx, &mut idle) {
+                        Some(Input::Line(line)) => (line, false),
+                        Some(Input::Explore) => {
+                            self.toggle_explore(&mut screen);
                             continue;
-                        };
-                        screen.clear_menu(false);
-                        self.startup.clear();
-                        if let Err(e) = self.resume(&meta.id, Some(&mut screen)) {
-                            screen.error(&format!("axe: {e}\n"));
                         }
-                        continue;
+                        Some(Input::Menu(index)) => {
+                            let Some(meta) = self.startup.get(index).cloned() else {
+                                continue;
+                            };
+                            screen.clear_menu(false);
+                            self.startup.clear();
+                            if let Err(e) = self.resume(&meta.id, Some(&mut screen)) {
+                                screen.error(&format!("axe: {e}\n"));
+                            }
+                            continue;
+                        }
+                        Some(Input::Cancel) => {
+                            self.startup.clear();
+                            continue;
+                        }
+                        None => break,
                     }
-                    Some(Input::Cancel) => {
-                        self.startup.clear();
-                        continue;
-                    }
-                    None => break,
-                },
+                }
             };
             // A committed line is echoed by `readline`; a queued one was not.
             if was_queued {
@@ -1123,10 +1130,11 @@ impl Session {
                         store.set_title(&title, &summary);
                     }
                 }
-                // The title is part of the selection row, so the row is stale
-                // until the next key: repaint it here.
+                // The title is part of the selection row: repaint it now, so it
+                // appears when it lands rather than at the next key.
                 if let Some(screen) = screen.as_deref_mut() {
                     screen.set_info(&self.info());
+                    let _ = screen.draw();
                 }
                 self.flush_warnings(screen);
             }
@@ -1206,7 +1214,7 @@ impl Session {
                 format!("Sessions matching {query:?} (↑↓ · Enter; type to refine; Esc)")
             };
             screen.set_menu(&header, rows, false);
-            match readline(screen, rx) {
+            match readline(screen, rx, &mut |_| {}) {
                 Some(Input::Menu(index)) => {
                     let Some(id) = ids.get(index).cloned() else {
                         continue;
@@ -1300,14 +1308,20 @@ impl Session {
         text
     }
 
-    /// The generated title, when the session has one. A fresh session has no
-    /// meta yet, and an unnamed one has nothing to show: no "(untitled)" here.
-    /// It rides in the right group, left of the model, so the transient status
-    /// keeps its own left half.
-    fn title(&self) -> Option<&str> {
-        let meta = self.store.as_ref()?.meta.as_ref()?;
-        let title = meta.title.trim();
-        (!title.is_empty()).then_some(title)
+    /// The name on the selection row: the generated title, or, until the model
+    /// has named the session, the first request — what `finalize` would write at
+    /// the end. It rides in the right group, left of the model, so the transient
+    /// status keeps its own left half.
+    fn title(&self) -> Option<String> {
+        if let Some(meta) = self.store.as_ref().and_then(|store| store.meta.as_ref()) {
+            let title = meta.title.trim();
+            if !title.is_empty() {
+                return Some(title.to_string());
+            }
+        }
+        // Live, not written: the sidecar keeps the generated title's place.
+        let (provisional, _) = sessions::fallback(&self.messages);
+        Some(provisional).filter(|title| !title.is_empty())
     }
 
     /// Used and total tokens, with the percentage between them. The provider's
@@ -1496,6 +1510,9 @@ impl Session {
         screen: &mut ui::Screen,
     ) -> Result<Option<String>, String> {
         self.record(json!({ "role": "user", "content": input }));
+        // The first request is the session's name until the model gives it one:
+        // show it now, not once the turn is over.
+        screen.set_info(&self.info());
 
         let cancel = http::Cancel::new();
         let mut queued: Option<String> = None;
@@ -2006,12 +2023,29 @@ fn spawn_input(tx: Sender<Event>) {
     });
 }
 
-/// Collect one line from the prompt. Keys are the only input while idle.
-fn readline(screen: &mut ui::Screen, rx: &Receiver<Event>) -> Option<Input> {
+/// How often the idle prompt looks for work that finished off the UI thread.
+const IDLE: Duration = Duration::from_millis(100);
+
+/// Collect one line from the prompt. Keys are the only input while idle;
+/// `idle` runs on every tick, so work that finishes on another thread — the
+/// session's title — lands without waiting for a key.
+fn readline(
+    screen: &mut ui::Screen,
+    rx: &Receiver<Event>,
+    idle: &mut dyn FnMut(&mut ui::Screen),
+) -> Option<Input> {
     let _ = screen.draw();
     loop {
-        match rx.recv() {
-            Ok(Event::Key(key)) => match screen.apply_key(key) {
+        let event = match rx.recv_timeout(IDLE) {
+            Ok(event) => event,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                idle(screen);
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        };
+        match event {
+            Event::Key(key) => match screen.apply_key(key) {
                 ui::Action::Submit if screen.is_empty() => {}
                 ui::Action::Submit => return Some(Input::Line(screen.commit())),
                 ui::Action::Explore => return Some(Input::Explore),
@@ -2032,16 +2066,16 @@ fn readline(screen: &mut ui::Screen, rx: &Receiver<Event>) -> Option<Input> {
                     let _ = screen.draw();
                 }
             },
-            Ok(Event::Paste(text)) => {
+            Event::Paste(text) => {
                 screen.insert_text(&text);
                 let _ = screen.draw();
             }
-            Ok(Event::Resize) => {
+            Event::Resize => {
                 let _ = screen.draw();
             }
-            Ok(Event::Eof) | Err(_) => return None,
+            Event::Eof => return None,
             // A turn's events cannot arrive while idle; drop them if they do.
-            Ok(_) => {}
+            _ => {}
         }
     }
 }
@@ -2529,7 +2563,7 @@ fn pick(
     screen.set_prompt("model> ");
     // A mode toggle is not a model choice: keep the picker open.
     let choice = loop {
-        match readline(screen, rx) {
+        match readline(screen, rx, &mut |_| {}) {
             Some(Input::Line(line)) => break line,
             Some(Input::Explore) => continue,
             // There is no chooser here; a menu key cannot arrive.
@@ -3290,12 +3324,29 @@ mod tests {
             warning: None,
             skills: Vec::new(),
         };
-        // Untitled: the row starts with the model, as it always has.
+        // Untitled and empty history: the row starts with the model.
         assert!(session.info().starts_with("p/m"), "{}", session.info());
+        // The first request stands in until the model names the session; a
+        // mode note or a shell line is not a request.
+        session.messages = vec![
+            json!({ "role": "user", "content": "explore mode: on" }),
+            json!({ "role": "user", "content": "$ !ls\nfile" }),
+            json!({ "role": "user", "content": "why is the row blank" }),
+        ];
+        assert!(
+            session.info().starts_with("why is the row blank  ·  p/m"),
+            "{}",
+            session.info()
+        );
+        // A generated title wins over the prompt.
         session.store.as_mut().unwrap().meta.as_mut().unwrap().title = "Fix the status row".into();
         assert!(session.info().starts_with("Fix the status row  ·  p/m"));
-        // A title of spaces is no title.
+        // A title of spaces is no title: the prompt is back.
         session.store.as_mut().unwrap().meta.as_mut().unwrap().title = "  ".into();
-        assert!(session.info().starts_with("p/m"), "{}", session.info());
+        assert!(
+            session.info().starts_with("why is the row blank"),
+            "{}",
+            session.info()
+        );
     }
 }
