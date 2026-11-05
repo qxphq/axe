@@ -22,7 +22,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::{cursor, execute, terminal};
 use ratatui::layout::{Alignment, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -91,6 +91,15 @@ struct Menu {
     visible: usize,
     /// Typing starts a new session instead of searching: startup's behaviour.
     collapse_on_type: bool,
+}
+
+/// A Tab cycle in flight: the candidates for what was typed before the first
+/// Tab, and which one the buffer holds now. The candidates are captured once,
+/// so a second Tab walks all of them even though the completed buffer no
+/// longer matches the others.
+struct Cycle {
+    matches: Vec<String>,
+    at: usize,
 }
 
 enum Term {
@@ -180,6 +189,8 @@ pub struct Screen {
     killed: String,
     /// Slash commands Tab completes, in the caller's spelling.
     commands: Vec<String>,
+    /// The Tab cycle the buffer is part of, if any. Any edit ends it.
+    cycle: Option<Cycle>,
     /// The last block written, for the blank line between blocks.
     last: Option<Block>,
     /// Markdown being collected. A block is laid out once it ends, not once
@@ -243,6 +254,7 @@ impl Screen {
             info: String::new(),
             killed: String::new(),
             commands: Vec::new(),
+            cycle: None,
             last: None,
             md: markdown::Stream::new(),
             thought: markdown::Stream::new(),
@@ -264,6 +276,7 @@ impl Screen {
             info: String::new(),
             killed: String::new(),
             commands: Vec::new(),
+            cycle: None,
             last: None,
             md: markdown::Stream::new(),
             thought: markdown::Stream::new(),
@@ -399,6 +412,7 @@ impl Screen {
     /// The completed line, leaving the buffer empty.
     pub fn take(&mut self) -> String {
         self.cursor = 0;
+        self.cycle = None;
         std::mem::take(&mut self.buf)
     }
 
@@ -458,6 +472,15 @@ impl Screen {
             KeyCode::Char('t') if alt => self.transpose_words(),
             KeyCode::Char(c) if !ctrl && !alt => self.insert_char(c),
             _ => {}
+        }
+        // A cycle holds only while the buffer still is the candidate it put
+        // there. Any edit ends it, so the next Tab starts from what is typed.
+        if self
+            .cycle
+            .as_ref()
+            .is_some_and(|c| c.matches.get(c.at) != Some(&self.buf))
+        {
+            self.cycle = None;
         }
         Action::None
     }
@@ -743,7 +766,7 @@ impl Screen {
             .unwrap_or(0);
         self.fit(CHROME + rows_n + menu_h)?;
         // Every row carries the glyph, so a wrapped line reads as one prompt.
-        let prompt_rows: Text<'static> = visible
+        let mut prompt_rows: Vec<Line<'static>> = visible
             .iter()
             .map(|row| {
                 Line::from(vec![
@@ -752,6 +775,16 @@ impl Screen {
                 ])
             })
             .collect();
+        // The hint is dim text after the buffer, on the row the cursor sits on.
+        // It takes only the cells that row has left, so it never wraps: a
+        // suggestion is not a line the user wrote.
+        if let Some(last) = prompt_rows.last_mut() {
+            let used = gutter + visible.last().map(|row| row.width()).unwrap_or(0);
+            let hint = fit_cells(&self.ghost(), cols.saturating_sub(used));
+            if !hint.is_empty() {
+                last.spans.push(Span::styled(hint, DIM));
+            }
+        }
         let queued = self.queued.clone();
         // The selection is the invariant half of the last row: it must not be
         // cut, so a long status is trimmed first. One blank cell keeps the two
@@ -945,40 +978,60 @@ impl Screen {
         self.cursor += text.chars().count();
     }
 
-    /// Tab on a bare slash word: extend it to the longest common prefix, and
-    /// finish it with a space when exactly one command matches. More than one
-    /// match also lists them, so a shared prefix like `/th` never leaves the
-    /// user guessing what was completed to. Arguments are not the screen's
-    /// business, so a line that already has one is left alone.
+    /// Tab on a bare slash word: fill in the first candidate, then step to the
+    /// next one on every further Tab, wrapping around. The set is captured on
+    /// the first Tab, so the walk covers every command the typed prefix
+    /// matched, not just those the completed buffer still matches. A lone
+    /// candidate finishes with a space and ends the cycle. Arguments are not
+    /// the screen's business, so a line that already has one is left alone.
     fn complete_command(&mut self) {
-        if !self.buf.starts_with('/') || self.buf.contains(char::is_whitespace) {
-            return;
+        if let Some(cycle) = &mut self.cycle {
+            if cycle.matches.get(cycle.at) == Some(&self.buf) && !cycle.matches.is_empty() {
+                cycle.at = (cycle.at + 1) % cycle.matches.len();
+                self.buf = cycle.matches[cycle.at].clone();
+                self.cursor = self.len();
+                return;
+            }
         }
-        let matches: Vec<&str> = self
-            .commands
-            .iter()
-            .map(String::as_str)
-            .filter(|c| c.starts_with(&self.buf))
-            .collect();
-        let Some(first) = matches.first() else {
+        self.cycle = None;
+        let matches = self.candidates();
+        let Some(first) = matches.first().cloned() else {
             return;
         };
-        let mut prefix = first.to_string();
-        for command in &matches[1..] {
-            let common = prefix
-                .bytes()
-                .zip(command.bytes())
-                .take_while(|(a, b)| a == b)
-                .count();
-            prefix.truncate(common);
-        }
-        if matches.len() == 1 {
-            prefix.push(' ');
-        }
-        self.buf = prefix;
+        self.buf = first;
         self.cursor = self.len();
-        if matches.len() > 1 {
-            self.insert(vec![Line::styled(matches.join("  "), DIM)], Block::Text);
+        if matches.len() == 1 {
+            self.buf.push(' ');
+            self.cursor = self.len();
+        } else {
+            self.cycle = Some(Cycle { matches, at: 0 });
+        }
+    }
+
+    /// The commands a bare slash word matches: the only text the prompt
+    /// completes, and the only place a hint is drawn.
+    fn candidates(&self) -> Vec<String> {
+        if !self.buf.starts_with('/') || self.buf.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        self.commands
+            .iter()
+            .filter(|c| c.starts_with(&self.buf))
+            .cloned()
+            .collect()
+    }
+
+    /// The rest of the first candidate, dim after the buffer: the completion
+    /// the user can take with Tab. Nothing once the buffer is a whole command,
+    /// and nothing while the cursor is inside the line, where the hint would
+    /// read as text that is already there.
+    fn ghost(&self) -> String {
+        if self.cursor != self.len() {
+            return String::new();
+        }
+        match self.candidates().first() {
+            Some(first) => first.chars().skip(self.buf.chars().count()).collect(),
+            None => String::new(),
         }
     }
 
@@ -1238,6 +1291,22 @@ fn clip(text: &str, width: usize) -> String {
         used += cells;
     }
     out.push('…');
+    out
+}
+
+/// The first `width` cells of `text`, without an ellipsis: a truncated hint is
+/// still a hint, and the marker would read as part of the command.
+fn fit_cells(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let cells = ch.width().unwrap_or(1);
+        if used + cells > width {
+            break;
+        }
+        out.push(ch);
+        used += cells;
+    }
     out
 }
 
@@ -1538,6 +1607,94 @@ mod tests {
         assert_eq!(screen.status(), "Thinking…");
         screen.set_commands(vec!["/help".into(), "/exit".into()]);
         assert_eq!(screen.commands, vec!["/help", "/exit"]);
+    }
+
+    #[test]
+    fn tab_cycles_the_candidates() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_commands(vec!["/exit".into(), "/explore".into(), "/help".into()]);
+        for c in ['/', 'e'] {
+            screen.apply_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        screen.apply_key(tab);
+        assert_eq!(screen.buf, "/exit");
+        screen.apply_key(tab);
+        assert_eq!(screen.buf, "/explore");
+        screen.apply_key(tab);
+        assert_eq!(screen.buf, "/exit");
+        // An edit ends the cycle: the next Tab starts from the text again.
+        screen.apply_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(screen.buf, "/exitp");
+        screen.apply_key(tab);
+        assert_eq!(screen.buf, "/exitp");
+        screen.apply_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        // One candidate left: Tab finishes it and ends the cycle.
+        screen.apply_key(tab);
+        assert_eq!(screen.buf, "/exit ");
+        assert!(screen.cycle.is_none());
+    }
+
+    #[test]
+    fn tab_finishes_a_lone_candidate_with_a_space() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_commands(vec!["/help".into(), "/exit".into()]);
+        screen.insert_text("/h");
+        screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(screen.buf, "/help ");
+        assert!(screen.cycle.is_none());
+        // An argument is the user's: Tab leaves it alone.
+        screen.insert_text("/model");
+        screen.insert_text(" a/b");
+        screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(screen.buf, "/help /model a/b");
+    }
+
+    #[test]
+    fn ghost_is_the_rest_of_the_first_candidate() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_commands(vec!["/help".into(), "/exit".into()]);
+        assert_eq!(screen.ghost(), "");
+        screen.insert_text("/h");
+        assert_eq!(screen.ghost(), "elp");
+        // Inside the line the hint would read as text already there.
+        screen.apply_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(screen.ghost(), "");
+        screen.apply_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        screen.insert_text("e");
+        assert_eq!(screen.ghost(), "lp");
+        screen.insert_text("x");
+        assert_eq!(screen.ghost(), "");
+    }
+
+    #[test]
+    fn live_region_draws_the_ghost_and_clips_it() {
+        let mut screen = Screen::test_screen(20, 10);
+        screen.set_commands(vec!["/thinking".into()]);
+        screen.insert_text("/th");
+        screen.draw().unwrap();
+        let text: Vec<String> = screen
+            .test_buffer()
+            .content
+            .chunks(20)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let text = text.join("\n");
+        assert!(text.contains("❯ /thinking"), "{text}");
+        // Narrow terminal: the hint stops at the edge instead of wrapping.
+        let mut screen = Screen::test_screen(10, 10);
+        screen.set_commands(vec!["/thinking".into()]);
+        screen.insert_text("/th");
+        screen.draw().unwrap();
+        let text: Vec<String> = screen
+            .test_buffer()
+            .content
+            .chunks(10)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let text = text.join("\n");
+        assert!(text.contains("❯ /think"), "{text}");
+        assert!(!text.contains("ing"), "{text}");
     }
 
     #[test]
