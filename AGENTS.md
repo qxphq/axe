@@ -53,14 +53,19 @@ invariants a change must not break.
     Config `model` is the default for a directory with no state.
 11. **Verify against reality.** Test against `mock.py` (chunked SSE, keep-alive,
     session headers). No speculative fixes; reproduce first.
-12. **A scrolling REPL, not a TUI.** No alt-screen: the transcript is scrollback.
-    The only owned region is an inline live area at the bottom (queued row,
-    wrapped prompt, the candidate list under it, status), capped at half the
-    screen. A chooser may own a header plus entries; when it closes without
-    resuming, its rows are committed to scrollback — except startup's chooser,
-    whose list vanishes on the first typed key: typing is the choice of a new
-    session. Everything above is appended, never repainted — except `/new`,
-    which wipes the screen and its scrollback: a session boundary.
+12. **A scrolling REPL, not a TUI.** No alt-screen: the transcript is
+    scrollback. The only owned region is an inline live frame at the bottom
+    (candidate list, queued row, wrapped prompt, status), and its height is a
+    function of the terminal size and the mode — `ui::Frame::layout`, idle or
+    choosing — and never of what it shows: the list, the chooser and a wrapped
+    prompt scroll inside the rows they were given. A terminal appends rows at
+    the bottom and cannot take them back, so a frame sized by content leaves
+    blank rows in the transcript every time it shrinks. A chooser may own a
+    header plus entries; when it closes without resuming, its rows are committed
+    to scrollback — except startup's chooser, whose list vanishes on the first
+    typed key: typing is the choice of a new session. Everything above is
+    appended, never repainted — except `/new`, which wipes the screen and its
+    scrollback: a session boundary.
 13. **One writer, and it paints what is dirty.** While `ui::Screen` owns the
     terminal, only it draws. Every setter and transcript writer marks the screen
     dirty; `Screen::repaint()` paints only then, and the loops call it —
@@ -69,7 +74,11 @@ invariants a change must not break.
     us is repainted even when no state changed. No caller draws for a state
     change, so work that finishes off the UI thread cannot strand the row.
     Startup banner and piped output run before/without a `Screen`; a stray
-    `print!` while it exists is a rendering bug.
+    `print!` while it exists is a rendering bug. Only `Screen::write` and
+    `Screen::settle` write rows above the frame, and a block goes where the
+    transcript *ends* — `slack` counts the blank rows a frame that changed left
+    above it, and `write` fills them from the top — so a block is always under
+    the block before it, never under a gap.
 14. **The prompt is a block.** Every line carries its glyph (`❯ ` live, `█ `
     committed), so a wrapped line reads as one block.
 15. **`bash` is confined by the kernel, not by strings.** Explore mode denies
@@ -98,10 +107,10 @@ invariants a change must not break.
   the prompt, not picked from a list), session lifecycle (startup chooser,
   `/sessions`, `/new`, naming), agent loop. Two producers (keys, a turn)
   feed one `mpsc` channel; the main thread applies events and draws once per batch.
-- `ui.rs` — the screen: prompt buffer and key mapping, the live region (chrome,
-  the wrapped prompt, the command candidates under it, resized by `fit`), the
-  chooser, and `insert` for transcript lines (wrapped here, since a clipped line
-  would be lost).
+- `ui.rs` — the screen: the live frame (`Frame`, a layout from the terminal size
+  and the mode, put in place by `settle`), prompt buffer and key mapping, the
+  chooser, `write` for transcript blocks (wrapped here, since a clipped line
+  would be lost) and the `slack` it places them by.
 - `markdown.rs` — markdown: blocks, inlines, tables, entities, URL checks, and the
   renderer. `Stream` feeds it a line at a time and lays a block out when it ends.
 - `api.rs` — model listing, chat request, SSE parsing, tool-call accumulation.
@@ -126,7 +135,9 @@ invariants a change must not break.
   No error crates.
 - Keep functions short; comment only non-obvious behavior.
 - Transcript output is complete lines. `Screen::text` collects markdown;
-  `Screen::output` writes the binary's own text one line per line.
+  `Screen::output` writes the binary's own text one line per line. A block never
+  begins or ends with a blank row: the one blank between two blocks is the
+  writer's, and consecutive tool calls are one block.
 - Markdown is the model's and the user's, never the binary's. Blocks are laid out
   when they end; the live row says what the turn is doing, not the unfinished line.
 - Style comes from `Paint` in `main.rs`, rendered as cells or ANSI.
