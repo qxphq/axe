@@ -183,7 +183,7 @@ and Enter on an empty line resumes the selection.
 | Tab, ↑ ↓ | complete a command or its first argument: step through the candidates, listed under the prompt |
 | Shift+Tab | toggle explore mode |
 | ↑ ↓ | move in a chooser, or step the command candidates |
-| Esc | close a chooser, or cancel the running turn |
+| Esc | close a chooser; twice to interrupt the running turn |
 | Ctrl+C | clear the prompt line |
 | Ctrl+D / Ctrl+A / Ctrl+E | end input / start of line / end of line |
 | Ctrl+B / Ctrl+F, Alt+B / Alt+F | move by character, by word |
@@ -192,7 +192,10 @@ and Enter on an empty line resumes the selection.
 | Ctrl+Y / Ctrl+T / Alt+T | yank / transpose characters / transpose words |
 
 Turns run in the background: the prompt stays live while the model answers, and
-a line typed meanwhile is queued.
+a line typed meanwhile is queued. Interrupting takes two presses: the first puts
+the offer on the row under the prompt, any other key withdraws it, and the
+second stops the turn — which then says so in the transcript, because a cut
+reply reads like a finished one.
 
 The dim row under the prompt is what the turn is doing on the left, and on the
 right the session's name, the provider/model and thinking level, and how much of

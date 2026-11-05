@@ -7,7 +7,8 @@
 //! only decides *what* the live region contains: a blank row that keeps the
 //! transcript off the prompt, the queued row, one prompt row per wrapped line,
 //! an empty row under them, and below that one row with the status on the left
-//! and the selection on the right.
+//! and the selection on the right — or, while a question is waiting for an
+//! answer, the question alone.
 
 use std::io::{self, IsTerminal, Stdout, Write};
 
@@ -48,6 +49,8 @@ const EXPLORE_STYLE: Style = Style::new().fg(Color::Rgb(255, 165, 0));
 const MARK: &str = "█";
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 const ERROR_STYLE: Style = Style::new().fg(Color::Red);
+/// A question waiting for an answer: the one row that outranks the info row.
+const ALERT_STYLE: Style = Style::new().fg(Color::Yellow);
 
 /// The kind of the last transcript block. Everything but two tool calls in a
 /// row is separated from what came before it by one blank line.
@@ -181,6 +184,10 @@ pub struct Screen {
     cursor: usize,
     /// Left half of the row under the prompt: thinking, or what is running.
     status: String,
+    /// A question the user must answer, on the row under the prompt with the
+    /// info row cleared: the status is metadata and can be cut, this cannot.
+    /// The ESC offer is the only one.
+    alert: Option<String>,
     /// The line submitted mid-turn, waiting for the boundary. Its own row,
     /// above the prompt: the queue grows where the user is about to type, and
     /// a queued line that scrolls away silently looks like the Enter was lost.
@@ -257,6 +264,7 @@ impl Screen {
             buf: String::new(),
             cursor: 0,
             status: String::new(),
+            alert: None,
             queued: None,
             info: String::new(),
             killed: String::new(),
@@ -279,6 +287,7 @@ impl Screen {
             buf: String::new(),
             cursor: 0,
             status: String::new(),
+            alert: None,
             queued: None,
             info: String::new(),
             killed: String::new(),
@@ -311,6 +320,13 @@ impl Screen {
 
     pub fn set_status(&mut self, text: &str) {
         self.status = text.to_string();
+    }
+
+    /// A question the user must answer. It owns the row under the prompt and
+    /// the info row steps aside for as long as it is up: an offer nobody can
+    /// read is not an offer.
+    pub fn set_alert(&mut self, text: Option<&str>) {
+        self.alert = text.map(str::to_string);
     }
 
     pub fn set_queued(&mut self, line: Option<&str>) {
@@ -496,6 +512,7 @@ impl Screen {
         let line = self.take();
         self.echo(&line);
         self.status.clear();
+        self.alert = None;
         line
     }
 
@@ -706,6 +723,7 @@ impl Screen {
         self.last = None;
         self.menu = None;
         self.status.clear();
+        self.alert = None;
         self.queued = None;
         #[cfg(test)]
         if matches!(self.term, Term::Test(_)) {
@@ -800,8 +818,8 @@ impl Screen {
         let pad = " ".repeat(gutter.min(cols.saturating_sub(1)));
         let queued = self.queued.clone();
         // The selection is the invariant half of the last row: it must not be
-        // cut, so a long status is trimmed first. One blank cell keeps the two
-        // apart.
+        // cut, so a long status is trimmed first. An alert is the exception:
+        // it is a question, so it takes the row and the info waits.
         let info = clip(&self.info, cols);
         let status = clip(&self.status, cols.saturating_sub(info.chars().count() + 1));
 
@@ -852,11 +870,21 @@ impl Screen {
                         row(top + rows_n + i as u16),
                     );
                 }
-                frame.render_widget(Paragraph::new(Line::styled(status, DIM)), row(below));
-                frame.render_widget(
-                    Paragraph::new(Line::styled(info, DIM)).alignment(Alignment::Right),
-                    row(below),
-                );
+                // One row for the question, whole: the info row is metadata
+                // and comes back when the question is answered.
+                match &self.alert {
+                    Some(text) => frame.render_widget(
+                        Paragraph::new(Line::styled(clip(text, cols), ALERT_STYLE)),
+                        row(below),
+                    ),
+                    None => {
+                        frame.render_widget(Paragraph::new(Line::styled(status, DIM)), row(below));
+                        frame.render_widget(
+                            Paragraph::new(Line::styled(info, DIM)).alignment(Alignment::Right),
+                            row(below),
+                        );
+                    }
+                }
                 let label = match &queued {
                     // One row: a queued message's own line breaks would be lost.
                     Some(line) => clip(&format!("Queued: {}", line.replace('\n', " ")), cols),
@@ -1573,6 +1601,26 @@ mod tests {
         assert!(text.contains("Thinking…"), "{text}");
         assert!(text.contains("p/m · default"), "{text}");
         assert!(text.contains("Queued: later"), "{text}");
+    }
+
+    #[test]
+    fn an_alert_takes_the_row_the_info_would_use() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_status("Thinking…");
+        screen.set_info("p/m · default");
+        screen.set_alert(Some("press ESC again to interrupt"));
+        screen.draw().unwrap();
+        let text: String = screen
+            .test_buffer()
+            .content
+            .chunks(40)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("press ESC again to interrupt"), "{text}");
+        // The question is whole, so the metadata it outranks is not drawn.
+        assert!(!text.contains("p/m · default"), "{text}");
+        assert!(!text.contains("Thinking…"), "{text}");
     }
 
     #[test]
