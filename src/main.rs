@@ -1535,6 +1535,10 @@ impl Session {
         // prompt and used to be dropped; it is held here instead, because the
         // turn's tool set and history are fixed before it starts.
         let mut switch = false;
+        // ESC asks first: one press offers the interrupt, the next one takes it.
+        let mut armed = false;
+        // Whether the turn was actually stopped, for the line that says so.
+        let mut interrupted = false;
 
         screen.set_status("Thinking…");
         let _ = screen.draw();
@@ -1597,36 +1601,57 @@ impl Session {
                 let mut next = Some(first);
                 while let Some(ev) = next.take().or_else(|| rx.try_recv().ok()) {
                     match ev {
-                        // ESC is the interrupt, and it means one thing: stop
-                        // the turn now. The flag ends it between requests; the
-                        // socket shutdown unblocks the one in flight.
-                        Event::Key(key) if key.code == KeyCode::Esc => cancel.cancel(),
-                        Event::Key(key) => match screen.apply_key(key) {
-                            ui::Action::Eof => {
+                        // ESC is the interrupt, and it takes two presses: the
+                        // first offers it and any other key withdraws the
+                        // offer, so a mistyped ESC cannot end a turn that was
+                        // nearly done. The flag ends the turn between
+                        // requests; the socket shutdown unblocks the one in
+                        // flight.
+                        Event::Key(key) if key.code == KeyCode::Esc => {
+                            dirty = true;
+                            if armed {
+                                interrupted = true;
                                 cancel.cancel();
-                                done = true;
+                                screen.set_alert(Some("Interrupting…"));
+                            } else {
+                                armed = true;
+                                screen.set_alert(Some("press ESC again to interrupt"));
                             }
-                            ui::Action::Submit => {
-                                if !screen.is_empty() && queued.is_none() {
-                                    // Queue without echoing: the line is
-                                    // dispatched at the boundary, below the
-                                    // answer it arrived during.
-                                    queued = Some(screen.take());
-                                    screen.set_queued(queued.as_deref());
-                                    dirty = true;
+                        }
+                        Event::Key(key) => {
+                            // A key other than ESC withdraws the offer.
+                            if armed {
+                                armed = false;
+                                screen.set_alert(None);
+                                dirty = true;
+                            }
+                            match screen.apply_key(key) {
+                                ui::Action::Eof => {
+                                    cancel.cancel();
+                                    done = true;
                                 }
+                                ui::Action::Submit => {
+                                    if !screen.is_empty() && queued.is_none() {
+                                        // Queue without echoing: the line is
+                                        // dispatched at the boundary, below the
+                                        // answer it arrived during.
+                                        queued = Some(screen.take());
+                                        screen.set_queued(queued.as_deref());
+                                        dirty = true;
+                                    }
+                                }
+                                // The turn already captured its tool set and its
+                                // history prefix; the switch is applied at the
+                                // boundary, below, so the note lands after the
+                                // answer it did not affect.
+                                ui::Action::Explore => switch = true,
+                                // A chooser only exists while idle.
+                                ui::Action::MenuStep(_)
+                                | ui::Action::MenuAccept
+                                | ui::Action::MenuCancel => {}
+                                ui::Action::None => dirty = true,
                             }
-                            // The turn already captured its tool set and its
-                            // history prefix; the switch is applied at the
-                            // boundary, below, so the note lands after the
-                            // answer it did not affect.
-                            ui::Action::Explore => switch = true,
-                            // A chooser only exists while idle.
-                            ui::Action::MenuStep(_)
-                            | ui::Action::MenuAccept
-                            | ui::Action::MenuCancel => {}
-                            ui::Action::None => dirty = true,
-                        },
+                        }
                         Event::Paste(text) => {
                             screen.insert_text(&text);
                             dirty = true;
@@ -1724,6 +1749,12 @@ impl Session {
             handle.join().is_ok()
         });
         screen.set_status("");
+        screen.set_alert(None);
+        // The transcript says the turn was stopped: an interrupted reply ends
+        // mid-sentence and looks like a finished one otherwise.
+        if interrupted {
+            screen.error("⏹ turn interrupted — the reply is partial\n");
+        }
         screen.set_queued(None);
         // A turn that reported nothing (interrupted, or a provider that does
         // not count) leaves the estimate in charge rather than a stale number.
