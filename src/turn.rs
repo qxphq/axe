@@ -199,6 +199,13 @@ pub fn run_turn(
             history.push(json!({ "role": "user", "content": line }));
             sink.user(&line);
         }
+        // The request is in flight and nothing may reach the sink for the whole
+        // round: a provider prefills a long history before it streams a byte,
+        // and the arguments of a tool call arrive as deltas the sinks never
+        // see. The row says what the turn is doing until a more specific state
+        // — the answer, a hidden thought, the command being run — replaces it.
+        sink.status("Thinking…");
+
         // Both callbacks borrow the sink, so it is shared rather than captured
         // twice. The borrow ends with the block, so the turn can still report
         // through it after the stream is over.
