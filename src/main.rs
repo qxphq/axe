@@ -2,6 +2,7 @@
 //! commands, the agent turn, and the transcript formatting.
 
 mod api;
+mod complete;
 mod config;
 mod editor;
 mod http;
@@ -874,6 +875,7 @@ impl Session {
         screen.set_commands(self.commands());
         screen.set_info(self.info());
         screen.set_history(state::read_history(&self.state.cwd));
+        screen.set_completer(complete::paths);
         // The directory's recent sessions are a chooser, not a printout: the
         // list can be walked with the arrows and vanishes when typing starts.
         if !self.startup.is_empty() {

@@ -196,6 +196,16 @@ and Esc puts back what was there before. A blank line, a line starting with a
 space (the shell's "do not remember this") and a repeat of the line before it
 are not remembered.
 
+Tab completes paths as well. A token that starts with `@`, `~`, `/` or `.`, or
+holds a `/`, lists the directory it names — relative to the working directory,
+absolute from `/`, `~` from home — with directories first and a trailing `/` on
+each, so Tab on a directory keeps the list open and a lone file ends it with a
+space. `@` is a trigger, not part of the path: `@READ` completes to
+`README.md`, and what the model reads is the path, not a sigil. A word that is
+none of those is prose, and Tab leaves it alone: a file in the working directory
+is reached with `@`, and a root path with `@` or its own slash, because `/model`
+is a command. A path with a space in it is not completed.
+
 | command | what it does |
 | --- | --- |
 | `/model [id]` | list the models, or switch to one (Tab completes it); without a terminal it only lists |
@@ -226,7 +236,7 @@ and Enter on an empty line resumes the selection.
 | --- | --- |
 | Enter | submit |
 | Ctrl+J, Alt+Enter | new line |
-| Tab | complete a command or its first argument: put the marked candidate on the line |
+| Tab | complete a command, its first argument, or a path token: put the marked candidate on the line |
 | ↑ ↓ | move the mark over the candidates above the prompt, walk the history when there is no list, or move in a chooser |
 | Shift+Tab | toggle explore mode |
 | Esc | close a chooser; twice to interrupt the running turn |

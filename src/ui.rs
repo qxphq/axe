@@ -477,6 +477,10 @@ pub struct Screen {
     selection: Option<Selection>,
     /// The lines typed here before, and where the prompt is in them.
     recall: Recall,
+    /// How a path token is completed, when the caller has a filesystem to
+    /// complete it against. `None` leaves prose alone, which is what a test
+    /// wants and what a screen without a working directory would need.
+    complete: Option<fn(&str, usize) -> Vec<String>>,
     /// The last block written, for the blank line between blocks.
     last: Option<Block>,
     /// Rows between the end of the transcript and the top of the frame that are
@@ -550,6 +554,7 @@ impl Screen {
             commands: Vec::new(),
             selection: None,
             recall: Recall::default(),
+            complete: None,
             last: None,
             slack: 0,
             md: markdown::Stream::new(),
@@ -589,6 +594,7 @@ impl Screen {
             commands: Vec::new(),
             selection: None,
             recall: Recall::default(),
+            complete: None,
             last: None,
             slack: 0,
             md: markdown::Stream::new(),
@@ -676,6 +682,12 @@ impl Screen {
     pub fn set_commands(&mut self, commands: Vec<String>) {
         self.commands = commands;
         self.dirty = true;
+    }
+
+    /// Where Tab looks for paths: the working directory, through the caller.
+    /// A plain function, so `ui` never touches the filesystem itself.
+    pub fn set_completer(&mut self, complete: fn(&str, usize) -> Vec<String>) {
+        self.complete = Some(complete);
     }
 
     /// The lines typed in this directory before, oldest first: Up and Down walk
@@ -1535,7 +1547,9 @@ impl Screen {
         };
         let lone = n == 1;
         let mut line = sel.matches[at].clone();
-        if lone {
+        // A directory keeps the list open — the next segment is what is being
+        // typed — and a file ends it.
+        if lone && !line.ends_with('/') {
             line.push(' ');
         }
         self.ed.buf = line;
@@ -1701,11 +1715,23 @@ impl Screen {
             return Some("reverse-i-search: (type to search)".to_string());
         }
         Some(match at {
-            Some(index) => format!(
-                "reverse-i-search: {query} [{}/{}]",
-                self.recall.history.len() - index,
-                self.recall.history.len()
-            ),
+            // Which match of how many, counting from the newest: the ordinal
+            // says how far back the search has stepped.
+            Some(index) => {
+                let needle = query.to_lowercase();
+                let hits = |lines: &[String]| {
+                    lines
+                        .iter()
+                        .filter(|line| line.to_lowercase().contains(&needle))
+                        .count()
+                };
+                let total = hits(&self.recall.history);
+                format!(
+                    "reverse-i-search: {query} [{}/{}]",
+                    hits(&self.recall.history[*index..]),
+                    total
+                )
+            }
             None => format!("reverse-i-search: {query} (no match)"),
         })
     }
@@ -1734,8 +1760,11 @@ impl Screen {
     /// `/model deepseek-chat`. A free-text argument takes no candidates, and a
     /// second space ends the matching.
     fn candidates(&self) -> Vec<String> {
-        if !self.ed.buf.starts_with('/') {
-            return Vec::new();
+        if !self.command_line() {
+            return match self.complete {
+                Some(complete) => complete(&self.ed.buf, self.ed.cursor),
+                None => Vec::new(),
+            };
         }
         match self.ed.buf.split_once(' ') {
             None => self
@@ -1752,6 +1781,17 @@ impl Screen {
                 .collect(),
             Some(_) => Vec::new(),
         }
+    }
+
+    /// Whether the line is a slash command rather than a path: it starts with
+    /// `/` and its first word holds no second one. `/tmp/x` is a path, and Tab
+    /// completes it as one.
+    fn command_line(&self) -> bool {
+        let Some(rest) = self.ed.buf.strip_prefix('/') else {
+            return false;
+        };
+        let word = rest.split_whitespace().next().unwrap_or("");
+        !word.contains('/')
     }
 
     /// The candidates to list under the prompt and which row the marker is on:
@@ -2368,6 +2408,50 @@ mod tests {
         for c in text.chars() {
             press(screen, KeyCode::Char(c), KeyModifiers::NONE);
         }
+    }
+
+    #[test]
+    fn tab_completes_a_path_and_a_directory_keeps_the_list_open() {
+        fn file(line: &str, _cursor: usize) -> Vec<String> {
+            vec![format!("{line}.rs")]
+        }
+        fn dir(line: &str, _cursor: usize) -> Vec<String> {
+            vec![format!("{line}/")]
+        }
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_completer(file);
+        typed(&mut screen, "src/ui");
+        press(&mut screen, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "src/ui.rs ");
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_completer(dir);
+        typed(&mut screen, "src/ui");
+        press(&mut screen, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(
+            screen.ed.buf, "src/ui/",
+            "a directory does not end the list"
+        );
+        // A screen without a completer leaves the line alone: the slash
+        // commands are all that Tab knows.
+        let mut screen = Screen::test_screen(40, 10);
+        typed(&mut screen, "src/ui");
+        press(&mut screen, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "src/ui");
+
+        // An absolute path is a path, not a slash command: a second `/` in the
+        // first word settles it.
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_completer(file);
+        typed(&mut screen, "/tmp/ax");
+        press(&mut screen, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "/tmp/ax.rs ");
+        // And a slash word is still a command, not a path from the root.
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_completer(file);
+        screen.set_commands(vec!["/model".into(), "/model a/b".into()]);
+        typed(&mut screen, "/mod");
+        press(&mut screen, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "/model ");
     }
 
     #[test]

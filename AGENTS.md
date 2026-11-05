@@ -13,7 +13,7 @@ invariants a change must not break.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
    panes, subagents, MCP, or permission layer until the REPL is genuinely
    insufficient. One feature per change.
-3. **Small surface.** Sixteen modules; a new module needs a separate concern,
+3. **Small surface.** Seventeen modules; a new module needs a separate concern,
    not a line count.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` +
    SSE only. Express differences as config (`base_url`, `models_url`,
@@ -127,6 +127,10 @@ invariants a change must not break.
   blocks, which both writers use.
 - `editor.rs` — the prompt's buffer and motions: a char cursor, the kill ring's
   one slot, and the keys readline taught everyone. No screen, no menu, no turn.
+- `complete.rs` — path completion: the token at the cursor, listed against the
+  working directory as whole lines. Directories carry a `/`, dotfiles wait to be
+  asked for, and `@` is a trigger the completion consumes. `ui` reaches it
+  through a function pointer, so the screen never touches the filesystem.
 - `render.rs` — transcript text: `Paint`, and what a call, a command and a
   reasoning line look like. The screen renders the same spans as cells.
 - `turn.rs` — the turn loop: one request per round, the queue a typed line joins
