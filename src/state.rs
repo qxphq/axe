@@ -3,7 +3,7 @@
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -140,10 +140,8 @@ fn append_history_file(path: &Path, line: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         private_dir(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
-    if let Ok(text) = fs::read_to_string(path) {
-        if parse_history(&text).last().map(String::as_str) == Some(line) {
-            return Ok(());
-        }
+    if newest_line(path).as_deref() == Some(line) {
+        return Ok(());
     }
     let encoded = serde_json::to_string(line).map_err(|e| format!("encode history: {e}"))?;
     let mut file = OpenOptions::new()
@@ -155,6 +153,37 @@ fn append_history_file(path: &Path, line: &str) -> Result<(), String> {
     set_mode(path, 0o600).map_err(|e| format!("chmod {}: {e}", path.display()))?;
     file.write_all(format!("{encoded}\n").as_bytes())
         .map_err(|e| format!("append history: {e}"))
+}
+
+/// Bytes of the history file's tail read to find its newest line. The check
+/// runs on every submitted prompt, so the whole file is read only when the
+/// window cannot answer.
+const TAIL: u64 = 8 * 1024;
+
+/// The newest entry the file holds, decoded. `None` when it cannot be read: a
+/// prompt that cannot be compared is appended, not lost.
+fn newest_line(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start)).ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.take(len - start).read_to_end(&mut bytes).ok()?;
+    // The window may begin inside a line, so its first line is not a line; the
+    // last one is, unless the newest entry is longer than the window, and then
+    // the whole file is the honest answer.
+    let text = String::from_utf8_lossy(&bytes);
+    let last = text.rsplit('\n').find(|line| !line.trim().is_empty())?;
+    match serde_json::from_str::<String>(last) {
+        Ok(line) => Some(line),
+        Err(_) if start > 0 => {
+            let all = fs::read_to_string(path).ok()?;
+            parse_history(&all).pop()
+        }
+        Err(_) => None,
+    }
 }
 
 /// Replace the file with `lines`, atomically: a crash leaves the old history,
@@ -346,6 +375,28 @@ mod tests {
         // A line that is not a JSON string is skipped, not fatal.
         fs::write(&path, "{\"a\"}\n\"kept\"\n").unwrap();
         assert_eq!(read_history_file(&path), vec!["kept".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_newest_line_is_read_from_the_tail() {
+        let dir = std::env::temp_dir().join(format!("axe-test-tail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        assert!(newest_line(&path).is_none(), "a missing file is no line");
+        for i in 0..2_000 {
+            append_history_file(&path, &format!("entry {i}")).unwrap();
+        }
+        assert_eq!(newest_line(&path).as_deref(), Some("entry 1999"));
+        // A newest entry larger than the window is read whole, not truncated
+        // into a suffix that would append a duplicate.
+        let long = "x".repeat(20_000);
+        append_history_file(&path, &long).unwrap();
+        assert_eq!(newest_line(&path).as_deref(), Some(long.as_str()));
+        // A damaged tail decodes to nothing rather than to a wrong line.
+        fs::write(&path, "\"kept\"\nnot json").unwrap();
+        assert!(newest_line(&path).is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
