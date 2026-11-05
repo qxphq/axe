@@ -370,15 +370,25 @@ fn parse_naming(text: &str) -> Option<(String, String)> {
 
 /// The note that tells the model which mode it is in. A `user` message, the
 /// same role `!cmd` output joins as; the mode is history, so the prompt above
-/// it never changes.
+/// it never changes. Explore mode names the one writable place that survives
+/// the session and the way out: a model that cannot change files should hand
+/// the decision back, not apologize.
 fn mode_note(read_only: bool) -> Value {
     let content = if read_only {
-        "explore mode: on — write and edit are unavailable; bash runs read-only \
-         commands, writes only to a scratch directory, and the network is not \
-         confined."
+        let plan = match sandbox::plan() {
+            Some(dir) => format!(" and to {} for a plan", dir.display()),
+            None => String::new(),
+        };
+        format!(
+            "explore mode: on — write and edit are unavailable; bash runs \
+             allowlisted commands, writes only to a scratch directory{plan}, and \
+             the network is not confined. If the user asks for changes, do not \
+             attempt them: say `/explore off` and they can switch."
+        )
     } else {
         "explore mode: off — write, edit and a full bash are available; fetch and web_search \
          are unavailable."
+            .to_string()
     };
     json!({ "role": "user", "content": content })
 }
@@ -2919,6 +2929,7 @@ mod tests {
         let on = mode_note(true)["content"].as_str().unwrap().to_string();
         let off = mode_note(false)["content"].as_str().unwrap().to_string();
         assert!(on.contains("write"));
+        assert!(on.contains("/explore off"), "{on}");
         assert!(off.contains("fetch and web_search are unavailable"));
     }
 
