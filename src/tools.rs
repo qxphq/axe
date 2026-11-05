@@ -90,9 +90,15 @@ const WEB_SEARCH: Spec = Spec {
 };
 
 /// Appended when the kernel, not the command, refused something: the model has
-/// to tell a sandbox denial from a missing binary or a bug.
-const DENIED: &str =
-    "explore mode: only the allowlist runs, and nothing outside $TMPDIR is writable\n";
+/// to tell a sandbox denial from a missing binary or a bug, and to know which
+/// two places it may write and how the restriction is lifted.
+fn denial_note() -> String {
+    let plan = match sandbox::plan() {
+        Some(dir) => format!("; writes go to $TMPDIR and {} only", dir.display()),
+        None => "; writes go to $TMPDIR only".to_string(),
+    };
+    format!("explore mode: only the allowlist runs{plan} — `/explore off` for anything else\n")
+}
 
 const SPECS: &[Spec] = &[READ, WRITE, EDIT, BASH, ABOUT, FETCH, WEB_SEARCH];
 
@@ -442,7 +448,7 @@ fn bash(args: &Value, cancel: &Cancel, read_only: bool) -> String {
         out.push_str("interrupted by user (ESC); the command was killed\n");
     }
     if read_only && denied(&stderr) {
-        out.push_str(DENIED);
+        out.push_str(&denial_note());
     }
     truncate(out, 30_000)
 }
