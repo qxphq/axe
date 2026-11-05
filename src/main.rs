@@ -1073,7 +1073,6 @@ impl Session {
         self.set_session_header();
         if let Some(screen) = screen {
             screen.reset();
-            screen.output("New session\n");
             screen.set_info(&self.info());
         }
     }
@@ -1744,7 +1743,7 @@ impl Session {
         // The transcript says the turn was stopped: an interrupted reply ends
         // mid-sentence and looks like a finished one otherwise.
         if interrupted {
-            screen.error("⏹ turn interrupted — the reply is partial\n");
+            screen.error("⏹ Turn interrupted — the reply is partial\n");
         }
         screen.set_queued(None);
         // A turn that reported nothing (interrupted, or a provider that does
