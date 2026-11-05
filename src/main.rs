@@ -37,6 +37,14 @@ struct Provider {
 }
 
 fn main() {
+    // Answered before anything else: no config, no network, no terminal.
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("axe {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let result = run();
     // The scratch directory is the one thing a session creates outside the
     // terminal; a static's `Drop` never runs, so this is the hook.
@@ -2412,6 +2420,10 @@ fn banner(notes: &[String]) {
     for line in logo {
         println!(" {}", Paint::Cyan.ansi(line));
     }
+    println!(
+        " {}",
+        Paint::Dim.ansi(&format!("axe {}", env!("CARGO_PKG_VERSION")))
+    );
     if !notes.is_empty() {
         println!();
         for note in notes {
