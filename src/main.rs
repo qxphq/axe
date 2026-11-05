@@ -119,6 +119,15 @@ fn run() -> Result<(), String> {
     // Skills are read once, like the instructions: the catalogue is part of
     // the stable prefix.
     let loaded_skills = skills::load(cwd.as_deref(), &cfg.skills);
+    // Explore mode's second writable directory, and the only one that outlives
+    // the session: scratch is removed at exit, so a plan needs its own place.
+    if let Some(dir) = &cwd {
+        let plan = state::project(dir).join("plan");
+        match state::private_dir(&plan) {
+            Ok(()) => sandbox::set_plan(&plan),
+            Err(e) => eprintln!("axe: plan directory: {e}"),
+        }
+    }
     for warning in &loaded_skills.warnings {
         eprintln!("axe: {}", strip_control(warning));
     }

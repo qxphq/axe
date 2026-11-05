@@ -231,6 +231,7 @@ directory with every byte outside `[A-Za-z0-9._-]` written as `%XX` — so
 | file | contents |
 | --- | --- |
 | `state.json` | model, thinking levels, thoughts toggle |
+| `plan/` | explore mode's writable directory: a plan that outlives the session |
 | `<id>.json` | a session's title, summary, dates and message count |
 | `<id>.jsonl` | the session body: one API message per line, append-only |
 | `<id>.jsonl.gz` | a body older than the 30 most recent, gzipped |
@@ -257,7 +258,7 @@ applies in explore mode and is about writes and execution; the network is not
 confined, and normal mode keeps only `no_new_privs` and the scrubbed
 environment.
 
-In explore mode, writes outside a session scratch directory are denied, and only
+In explore mode, writes outside two directories are denied, and only
 an allowlist of programs may be executed: the common inspection and tooling set —
 text and coreutils (`sed`, `awk`, `xargs`, `tee`, `nl`, …), checksums, file
 operations (`cp`, `mv`, `rm`, `mkdir`), search (`grep`, `rg`, `fd`, `find`),
@@ -273,8 +274,11 @@ the same list works on a thin system.
 The list is a convenience guard, not a boundary. The kernel is what contains a
 side effect: `npm install` and `apt install` are allowed to start and then fail
 on their writes, and `curl -o` into the working directory fails for the same
-reason; `$TMPDIR` inside a tool call is the scratch directory, and it is removed
-at exit. Three classes are left off on purpose: daemons that write through
+reason. The writable paths tell the whole story: the scratch directory
+(`$TMPDIR` inside a tool call, removed at exit) and the project's `plan/` under
+the state tree, which survives so a plan can outlive the session. Neither is
+executable — a script written there is a file, not a program. Three classes are
+left off on purpose: daemons that write through
 another process (`docker`, `systemctl`, `dbus-send`), setuid (`sudo`, `mount`),
 and programs whose side effect is a mode or a timestamp rather than a write
 (`chmod`, `touch`) — Landlock has no right for those. `nix` and `brew` are also
