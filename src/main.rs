@@ -2758,6 +2758,17 @@ fn call_line(call: &api::ToolCall, read_only: bool) -> Vec<(Paint, String)> {
             None => format!("{start}+"),
         });
     }
+    // An edit's path says nothing about its size: old→new lines tells a tweak
+    // from a rewrite, the way read's window says which slice it took.
+    if call.name == "edit" {
+        if let (Some(old), Some(new)) = (v["old"].as_str(), v["new"].as_str()) {
+            parts.push(format!(
+                "{}→{} lines",
+                old.lines().count(),
+                new.lines().count()
+            ));
+        }
+    }
 
     let mut spans = vec![
         (Paint::Plain, "  ".to_string()),
@@ -3099,6 +3110,17 @@ mod tests {
         assert!(text.contains("read"));
         assert!(text.contains("src/ui.rs"));
         assert!(text.contains("2+3"));
+        let edit = call_line(
+            &api::ToolCall {
+                id: "2".into(),
+                name: "edit".into(),
+                arguments: "{\"path\":\"src/ui.rs\",\"old\":\"a\\nb\",\"new\":\"c\"}".into(),
+            },
+            false,
+        );
+        let text = plain_text(&edit);
+        assert!(text.contains("src/ui.rs"));
+        assert!(text.contains("2→1 lines"));
         let shell = shell_line("echo hi", false);
         assert!(plain_text(&shell).contains("echo hi"));
     }
