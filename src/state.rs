@@ -23,6 +23,8 @@ pub struct State {
     pub thinking: Vec<(String, String)>,
     /// Show reasoning in the transcript (`/thoughts`).
     pub thoughts: bool,
+    /// Project skills are trusted (`/trust`).
+    pub trusted: bool,
 }
 
 /// `$XDG_STATE_HOME` or `$HOME/.local/state`, then `axe`.
@@ -150,6 +152,7 @@ pub fn load(cwd: &Path) -> State {
         })
         .unwrap_or_default();
     state.thoughts = v["thoughts"].as_bool().unwrap_or(false);
+    state.trusted = v["trusted"].as_bool().unwrap_or(false);
     state
 }
 
@@ -176,6 +179,7 @@ impl State {
             "model": self.model,
             "thinking": thinking,
             "thoughts": self.thoughts,
+            "trusted": self.trusted,
         });
         let text = serde_json::to_string_pretty(&value)
             .map(|text| format!("{text}\n"))

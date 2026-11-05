@@ -1,5 +1,5 @@
-//! The one config file: load, validate, resolve `agents`, and read provider
-//! keys and thinking levels.
+//! The one config file: load, validate, resolve `agents` and `skills`, and
+//! read provider keys and thinking levels.
 
 use std::env;
 use std::fs;
@@ -56,6 +56,9 @@ pub struct Config {
     pub thinking: Vec<(String, String)>,
     pub system: Option<String>,
     pub agents: Option<PathBuf>,
+    /// Extra skill directories or `SKILL.md` files, scanned after the
+    /// default user locations.
+    pub skills: Vec<PathBuf>,
 }
 
 pub fn path() -> PathBuf {
@@ -103,7 +106,8 @@ const EXAMPLE: &str = r#"{
   },
   "thinking": {},
   "system": null,
-  "agents": null
+  "agents": null,
+  "skills": []
 }"#;
 
 const AGENTS_LIMIT: usize = 48 * 1024;
@@ -151,9 +155,9 @@ pub fn find_agents(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Resolve the `agents` config key: `~` and `~/` are expanded, relative paths
-/// are relative to the directory holding the config file.
-fn agents_file(raw: &str) -> PathBuf {
+/// Resolve a config path: `~` and `~/` are expanded, relative paths are
+/// relative to the directory holding the config file.
+fn resolve_path(raw: &str) -> PathBuf {
     let home = || PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into()));
     if raw == "~" {
         return home();
@@ -236,6 +240,25 @@ pub fn load() -> Result<Config, String> {
     parse_value(&v).map_err(|e| format!("{}: {e}", p.display()))
 }
 
+fn parse_skills(v: &Value) -> Result<Vec<PathBuf>, String> {
+    match v.get("skills") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(entries)) => {
+            let mut paths = Vec::new();
+            for entry in entries {
+                let raw = entry
+                    .as_str()
+                    .ok_or_else(|| "\"skills\" must be an array of paths".to_string())?;
+                if !raw.is_empty() {
+                    paths.push(resolve_path(raw));
+                }
+            }
+            Ok(paths)
+        }
+        Some(_) => Err("\"skills\" must be an array of paths".into()),
+    }
+}
+
 fn parse_value(v: &Value) -> Result<Config, String> {
     let mut providers = Vec::new();
     if let Some(map) = v["providers"].as_object() {
@@ -292,7 +315,8 @@ fn parse_value(v: &Value) -> Result<Config, String> {
             })
             .unwrap_or_default(),
         system: text(v, "system"),
-        agents: text(v, "agents").map(|raw| agents_file(&raw)),
+        agents: text(v, "agents").map(|raw| resolve_path(&raw)),
+        skills: parse_skills(v)?,
     })
 }
 
@@ -311,6 +335,30 @@ mod tests {
             .providers
             .iter()
             .any(|p| p.session_header.as_deref() == Some("x-opencode-session")));
+    }
+
+    #[test]
+    fn skills_paths_parse_and_validate() {
+        let cfg = parse_value(&serde_json::json!({
+            "base_url": "http://p",
+            "skills": ["~/skills", "extra", ""]
+        }))
+        .unwrap();
+        assert_eq!(cfg.skills.len(), 2);
+        assert!(cfg.skills[0].ends_with("skills"));
+        assert!(cfg.skills[1].ends_with("extra"));
+        assert!(parse_value(&serde_json::json!({
+            "base_url": "http://p",
+            "skills": [1]
+        }))
+        .is_err());
+        assert!(parse_value(&serde_json::json!({
+            "base_url": "http://p",
+            "skills": "~/skills"
+        }))
+        .is_err());
+        let cfg = parse_value(&serde_json::json!({ "base_url": "http://p" })).unwrap();
+        assert!(cfg.skills.is_empty());
     }
 
     #[test]
