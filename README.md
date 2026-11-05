@@ -149,15 +149,16 @@ a task matches.
 
 `❯ ` is the prompt. Enter submits, Ctrl+J or Alt+Enter starts a new line. Typing
 a slash word lists the matching commands in the rows above the prompt — as many
-as the terminal's height allows, up to four — the one the next step takes drawn
-bright; Tab and ↓ step forward, ↑ steps back, and the line always holds the
-command the step picked. A command's first argument
-completes the same way: `/model ` lists the models, `/model dee` narrows them,
-and Enter applies the one the line holds. A model or a thinking level is
-therefore chosen in the prompt, like any other line. A line starting with `!` is your
-own shell: it runs through the same tool, its output joins the history as a
-user message, and no turn follows — the model sees it the next time you ask
-something.
+as the terminal's height allows, up to four — the first one marked. ↓ and ↑ move
+the mark and leave the line as typed, wrapping at both ends; Enter runs the
+marked command, Tab puts it on the line, so stepping through the list never
+rewrites the prompt. A command's first argument completes the same way:
+`/model ` lists the models, `/model dee` narrows them, and Enter applies the
+marked one. Until the mark is moved the list is a preview: Enter there submits
+what is typed, and Tab takes the first row. A model or a thinking level is
+therefore chosen in the prompt, like any other line. A line starting with `!` is your own shell: it runs
+through the same tool, its output joins the history as a user message, and no
+turn follows — the model sees it the next time you ask something.
 
 | command | what it does |
 | --- | --- |
@@ -185,9 +186,9 @@ and Enter on an empty line resumes the selection.
 | --- | --- |
 | Enter | submit |
 | Ctrl+J, Alt+Enter | new line |
-| Tab, ↑ ↓ | complete a command or its first argument: step through the candidates, listed above the prompt |
+| Tab | complete a command or its first argument: put the marked candidate on the line |
+| ↑ ↓ | move the mark over the candidates above the prompt, or in a chooser; Enter runs the marked one |
 | Shift+Tab | toggle explore mode |
-| ↑ ↓ | move in a chooser, or step the command candidates |
 | Esc | close a chooser; twice to interrupt the running turn |
 | Ctrl+C | clear the prompt line |
 | Ctrl+D / Ctrl+A / Ctrl+E | end input / start of line / end of line |
