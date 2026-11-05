@@ -13,6 +13,19 @@ your scrollback: axe never takes the screen.
 Axe starts in read-only mode by default; web search works there only.
 Axe does not re-implement or compete with the functionality of your other tools, shell, or Unix system.
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/qxphq/axe/main/install.sh | sh
+```
+
+That fetches a build of `main` from the rolling `latest` release, checks its
+sha256 and installs the binary into `~/.local/bin` (`AXE_INSTALL_DIR` overrides
+it). Assets exist for x86_64 and aarch64 Linux (glibc; on musl, including
+Alpine, the script says so and stops) and for Apple Silicon and Intel macOS.
+The release is rebuilt on every push to `main`, so its version is whatever
+`Cargo.toml` says at that commit — no tag marks it.
+
 ## Build
 
 ```sh
@@ -23,6 +36,9 @@ The binary is `target/release/axe`. It needs a current stable Rust toolchain
 (edition 2021) and a C toolchain for `ring`. Linux (x86_64 or aarch64) and macOS
 are supported. Other Unix-like targets compile, but `bash` is unavailable
 there: a child that cannot be confined is not spawned. Windows is not supported.
+
+`cargo install --git https://github.com/qxphq/axe --locked` builds the same
+binary from source, without the release pipeline.
 
 ## Run
 

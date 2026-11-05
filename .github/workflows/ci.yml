@@ -21,6 +21,56 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --release --locked
 
+  # A rolling release of main: install.sh downloads from it, nothing is tagged.
+  release:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    # Serialised so two pushes cannot create or upload to `latest` at once.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          # Cross-compiled: GitHub retired the Intel macOS runner.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: strip target/${{ matrix.target }}/release/axe || true
+      - name: Package
+        run: |
+          tar=axe-${{ matrix.target }}.tar.gz
+          cp target/${{ matrix.target }}/release/axe axe
+          tar -czf "$tar" axe
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$tar" > "$tar.sha256"
+          else
+            shasum -a 256 "$tar" > "$tar.sha256"
+          fi
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view latest >/dev/null 2>&1 ||
+            gh release create latest --latest --title latest \
+              --notes "Rolling build of $GITHUB_SHA: a push to main, not a tag. The version is Cargo.toml's."
+          gh release upload latest axe-*.tar.gz axe-*.tar.gz.sha256 --clobber
+
   interactive:
     runs-on: ubuntu-latest
     steps:
