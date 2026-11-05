@@ -298,7 +298,9 @@ would punch a hole in the write confinement. Normal mode installs no filter, so
 a 32-bit binary runs there.
 
 A refusal comes from the kernel, not from axe's argument parsing, and its
-message says so: a missing binary and a denied one read differently.
+message says so: a missing binary and a denied one read differently, and a
+denied write comes back with the two directories that would have been allowed
+and the toggle that lifts both.
 
 A command child inherits a minimal environment — `PATH`, `HOME`, `LANG`,
 `LC_ALL`, `TERM`, `TMPDIR`, `USER`, `SHELL` — not axe's own. Provider and
