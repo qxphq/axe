@@ -804,8 +804,9 @@ impl Screen {
         line
     }
 
-    /// A user line from somewhere else: the resumed transcript. It is complete
-    /// already, so the same layout as a committed line, without a buffer.
+    /// A user line from somewhere else: the resumed transcript, or one the turn
+    /// took mid-way. It is complete already, so the same layout as a committed
+    /// line, without a buffer.
     pub fn echo_user(&mut self, line: &str) {
         self.flush();
         self.echo(line);

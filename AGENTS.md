@@ -158,6 +158,12 @@ invariants a change must not break.
   startup, the body on demand. The catalogue is appended last in the system
   prompt, after the instructions, so the part above it stays byte-identical.
   Project roots stop at the repository root; without a `.git`, only cwd counts.
+- A line typed during a turn joins it at the next round boundary: the turn's
+  thread drains a one-slot queue there and appends it to the history, so the
+  model reads it while it works instead of after the last round. A round already
+  streaming cannot see it, and a command — `/model`, `/sessions`, `!cmd` — needs
+  the session and the screen, so it waits for the turn to end and is dispatched
+  by the REPL loop like any line typed while idle.
 - Sessions: `<id>.json` is the mutable sidecar; `<id>.jsonl` is append-only; bodies
   older than `sessions::KEEP` are gzipped. The sidecar stays readable, so listing
   and search work without unpacking. The system prompt and mode notes are never
@@ -219,3 +225,12 @@ and `show:`. Normal mode is a `!cmd` line, which does not loop. Examples:
 The first two deny on the kernel: an unwritable path, an exec outside the
 allowlist. A `!cmd` line is the escape hatch, and the harness reads an argument
 starting with `!` as tmux keys, so prefix it with a space: `' !make'`.
+
+The mid-turn queue is checked by queueing a line while a slow call runs, and
+letting the mock answer it: the second argument lands during the tool call, and
+the reply ends the turn instead of the `tool:` loop it would otherwise be
+(`!Space` arguments hold the harness open until the boundary passes).
+
+```sh
+./harness.py --wait 1 'tool:bash:{"command":"python3 -c \"import time;time.sleep(6)\""}' 'text:done' '!Space' '!Space' '!Space' '!Space' '!Space' '!Space' '!Space' '!Space' '!Space' --expect done
+```

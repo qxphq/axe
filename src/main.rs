@@ -14,9 +14,11 @@ mod ui;
 mod web;
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -759,9 +761,11 @@ impl Session {
         let (tx, rx) = mpsc::channel();
         spawn_input(tx.clone());
 
-        // A line submitted mid-turn waits here until the turn boundary, where it
-        // is dispatched exactly like a line typed while idle. That is why slash
-        // commands are handled in this loop and not only where they are parsed.
+        // A line submitted mid-turn arrives here when the turn could not take
+        // it: a command, which needs the session and the screen, or a request
+        // that missed every round boundary. It is dispatched exactly like a
+        // line typed while idle, which is why slash commands are handled in
+        // this loop and not only where they are parsed.
         let mut pending: Option<String> = None;
         loop {
             self.poll_naming(Some(&mut screen));
@@ -1534,6 +1538,11 @@ impl Session {
 
         let cancel = http::Cancel::new();
         let mut queued: Option<String> = None;
+        // A line typed while this turn runs, handed to the turn's own thread so
+        // that it joins the history at the next round boundary instead of after
+        // the last one. A command cannot go that way and waits for the end.
+        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
+        let turn_queue = queue.clone();
         // Streamed text up to the last newline is permanent; the rest is the
         // line still being written and lives in the status row.
         let mut partial = String::new();
@@ -1581,6 +1590,7 @@ impl Session {
                     store,
                     thinking.as_deref(),
                     read_only,
+                    Some(&turn_queue),
                     &mut sink,
                     turn_cancel,
                 );
@@ -1638,10 +1648,22 @@ impl Session {
                                 }
                                 ui::Action::Submit => {
                                     if !screen.is_empty() && queued.is_none() {
-                                        // Queue without echoing: the line is
-                                        // dispatched at the boundary, below the
-                                        // answer it arrived during.
-                                        queued = Some(screen.take());
+                                        // Queue without echoing here: the
+                                        // transcript shows the line where the
+                                        // model saw it, which is the round
+                                        // boundary the turn takes it at, or
+                                        // the turn's end for a command.
+                                        let line = screen.take();
+                                        // A plain request reaches the model
+                                        // between rounds; a command needs the
+                                        // session and the screen, so it stays
+                                        // for the boundary in the REPL loop.
+                                        if let Command::Turn(input) = parse_command(&line) {
+                                            if let Ok(mut lines) = queue.lock() {
+                                                lines.push_back(input);
+                                            }
+                                        }
+                                        queued = Some(line);
                                         screen.set_queued(queued.as_deref());
                                     }
                                 }
@@ -1658,6 +1680,14 @@ impl Session {
                             }
                         }
                         Event::Paste(text) => screen.insert_text(&text),
+                        // The turn took a queued line into its history: it is
+                        // no longer pending, and it belongs in the transcript
+                        // at the point the model saw it.
+                        Event::User(line) => {
+                            queued = None;
+                            screen.set_queued(None);
+                            screen.echo_user(&line);
+                        }
                         // Model text, already spaced by the sink: everything up
                         // to the last newline is a finished line.
                         Event::Printed(text) => {
@@ -1775,7 +1805,12 @@ impl Session {
         if !result {
             screen.error("axe: turn failed\n");
         }
-        Ok(queued)
+        // A request typed while the turn's last round was already in flight
+        // never reached a boundary: it is the next turn, like any other line
+        // that arrived too late for one. A command line never entered the
+        // queue, and there is only ever one line pending.
+        let leftover = queue.lock().ok().and_then(|mut lines| lines.pop_front());
+        Ok(leftover.or(queued))
     }
 
     fn turn(&mut self, sink: &mut dyn Sink, cancel: &http::Cancel) -> Result<(), String> {
@@ -1789,6 +1824,7 @@ impl Session {
             self.store.as_mut(),
             thinking.as_deref(),
             self.read_only,
+            None,
             sink,
             cancel,
         )
@@ -2016,6 +2052,9 @@ enum Event {
     Status(String),
     /// Streamed reasoning, before any answer text.
     Thought(String),
+    /// A line typed during the turn that the turn has just taken into its
+    /// history: the transcript shows it where the model saw it.
+    User(String),
     /// The terminal changed size; the live region must repaint.
     Resize,
     Done(Result<Option<u64>, String>),
@@ -2233,6 +2272,9 @@ trait Sink {
     /// One tool call, finished: the call and its outcome on one line, and the
     /// failure's own words beneath it.
     fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str), error: Option<&str>);
+    /// A line typed during the turn, which the turn has just appended to the
+    /// history. Piped output has no queue, and nothing to say.
+    fn user(&mut self, _line: &str) {}
     /// A round's text is over; close its last line if it wrote one.
     fn end_round(&mut self);
 }
@@ -2387,6 +2429,14 @@ impl Sink for ChannelSink {
             // unfinished becomes permanent here.
             self.send(Event::Printed("\n".to_string()));
         }
+    }
+
+    fn user(&mut self, line: &str) {
+        self.end_thought();
+        // The block above is finished: the blank line between the two is the
+        // writer's, not this sink's.
+        self.out.commit();
+        self.send(Event::User(line.to_string()));
     }
 
     fn reasoning(&mut self, text: &str) {
@@ -2684,6 +2734,22 @@ fn resolve(providers: &[Provider], spec: Option<&str>) -> (usize, String) {
     (0, providers[0].models[0].id.clone())
 }
 
+/// Lines typed during a turn, waiting for the boundary that lets them join it.
+/// One slot: while a line is pending the prompt refuses a second one.
+type Queue = Arc<Mutex<VecDeque<String>>>;
+
+/// What a turn's queue holds now, oldest first. Empty without a queue, and
+/// empty rather than a failed turn when the lock is poisoned.
+fn take_queue(queue: Option<&Queue>) -> Vec<String> {
+    let Some(queue) = queue else {
+        return Vec::new();
+    };
+    match queue.lock() {
+        Ok(mut lines) => lines.drain(..).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_turn(
     provider: &Provider,
@@ -2692,6 +2758,7 @@ fn run_turn(
     mut store: Option<&mut Store>,
     thinking: Option<&str>,
     read_only: bool,
+    queue: Option<&Queue>,
     sink: &mut dyn Sink,
     cancel: &http::Cancel,
 ) -> Result<Option<u64>, String> {
@@ -2705,6 +2772,19 @@ fn run_turn(
         // The user message stays without a reply, which is what happened.
         if cancel.cancelled() {
             return Ok(used);
+        }
+        // A line typed during the turn joins it here, at the only boundary
+        // there is: every tool result the last reply named has been answered,
+        // and this request does not exist yet, so the model reads it before
+        // answering instead of after the turn. A round already streaming cannot
+        // see it, and a reply that ends the turn has no round to reach.
+        for line in take_queue(queue) {
+            let message = json!({ "role": "user", "content": line });
+            if let Some(store) = store.as_deref_mut() {
+                store.record(&message);
+            }
+            messages.push(message);
+            sink.user(&line);
         }
         let extra = provider.cfg.thinking_body(thinking);
         // Both callbacks borrow the sink, so it is shared rather than captured

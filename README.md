@@ -214,7 +214,11 @@ and Enter on an empty line resumes the selection.
 | Ctrl+Y / Ctrl+T / Alt+T | yank / transpose characters / transpose words |
 
 Turns run in the background: the prompt stays live while the model answers, and
-a line typed meanwhile is queued. Interrupting takes two presses: the first puts
+a line typed meanwhile is queued. It joins the turn at the next round boundary —
+after the tool calls the last answer asked for have run, before the next request
+— so the model reads it while it is still working rather than after it is done.
+A command (`/model`, `/sessions`, `!cmd`) needs the prompt and the session, so it
+waits for the turn to end. Interrupting takes two presses: the first puts
 the offer on the row under the prompt, any other key withdraws it, and the
 second stops the turn — which then says so in the transcript, because a cut
 reply reads like a finished one.
