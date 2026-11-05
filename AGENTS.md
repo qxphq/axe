@@ -35,9 +35,10 @@ invariants a change must not break.
    `about` returns the compiled-in `README.md`: documentation, not a code path.
    `fetch`/`web_search` are HTTP(S) GET with the body reduced to text and
    labelled untrusted; both are refused outside explore mode. `curl` is on
-   explore's allowlist because a command sends what `fetch` cannot. Tool errors are results for the
-   model, not harness failures. Truncate output, timeout `bash`, cap `fetch` at
-   1 MiB/50 000 chars and `web_search` at 1 MiB/20 results.
+   explore's allowlist because a command sends what `fetch` cannot. Tool errors
+   are results for the model, not harness failures. Truncate output, timeout
+   `bash`, cap `fetch` at 1 MiB/50 000 chars and `web_search` at 1 MiB/20
+   results.
 8. **No approval prompts.** Bash runs unprompted by explicit user decision. Do not
    add a permission layer without being asked. A directory's `AGENTS.md` and its
    skills also load without a question: a trust prompt gates text the model could
@@ -66,11 +67,15 @@ invariants a change must not break.
 15. **`bash` is confined by the kernel, not by strings.** Explore mode denies
     writes outside a scratch directory and exec outside a fixed allowlist
     (Landlock/Seatbelt, plus seccomp denying `io_uring_setup`, which Landlock
-    cannot mediate); it degrades with one startup line. Normal mode keeps only
-    `no_new_privs` and the scrubbed environment. The network is confined in
-    neither mode: a child connects where the user connects, `!cmd` included. A
-    leading-word check is never a substitute. Details and residuals:
-    `SEC_AUDIT.md`.
+    cannot mediate); it degrades with one startup line. The allowlist is a
+    convenience guard, not the containment: it carries the common inspection and
+    tooling set, interpreters and package managers included, and leaves out
+    daemons that write through another process (`docker`, `systemctl`), setuid,
+    and mode/timestamp tools (`chmod`, `touch`), which Landlock cannot see.
+    Normal mode keeps only `no_new_privs` and the scrubbed environment. The
+    network is confined in neither mode: a child connects where the user
+    connects, `!cmd` included. A leading-word check is never a substitute.
+    Details and residuals: `SEC_AUDIT.md`.
 
 ## Architecture
 

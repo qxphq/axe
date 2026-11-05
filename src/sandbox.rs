@@ -18,13 +18,131 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 /// What explore mode may execute, by name; the platform code adds the shell.
-/// `git` is here whole: with writes denied a subcommand list decides nothing,
-/// and `git log` has to keep working. `curl` writes nothing on its own, so a
-/// networked read is an explore-mode command like any other.
+/// This is a convenience guard, not a boundary: Landlock confines the writes,
+/// so a name here can only fail against the kernel. `git` is here whole: with
+/// writes denied a subcommand list decides nothing, and `git log` has to keep
+/// working. `curl` writes nothing on its own, so a networked read is an
+/// explore-mode command like any other. Interpreters and package managers are
+/// included for the same reason: their mutation is a write, and writes are
+/// what the kernel denies. Excluded on purpose: daemons that write through
+/// another process (`docker`, `systemctl`, `dbus-send`), setuid
+/// (`sudo`, `mount`), programs whose side effect is a mode or a timestamp
+/// rather than a write (`chmod`, `touch`), and tools that exec their own
+/// `/nix/store` or `/opt/homebrew` paths (`nix`, `brew`). A name that is not
+/// installed is skipped.
 pub const COMMANDS: &[&str] = &[
-    "cat", "curl", "cut", "date", "df", "diff", "du", "fd", "file", "find", "git", "grep", "head",
-    "id", "jq", "ls", "ps", "pwd", "rg", "sort", "stat", "tail", "tr", "tree", "uname", "uniq",
-    "wc", "which",
+    "apk",
+    "apt",
+    "apt-cache",
+    "apt-get",
+    "awk",
+    "b2sum",
+    "base64",
+    "basename",
+    "bc",
+    "bun",
+    "bundle",
+    "cargo",
+    "cat",
+    "cksum",
+    "cmp",
+    "column",
+    "comm",
+    "composer",
+    "conda",
+    "cp",
+    "curl",
+    "cut",
+    "date",
+    "df",
+    "diff",
+    "dirname",
+    "dnf",
+    "dpkg",
+    "du",
+    "env",
+    "expand",
+    "expr",
+    "fd",
+    "file",
+    "find",
+    "fmt",
+    "fold",
+    "free",
+    "gem",
+    "git",
+    "go",
+    "grep",
+    "groups",
+    "head",
+    "hexdump",
+    "iconv",
+    "id",
+    "join",
+    "jq",
+    "ln",
+    "locate",
+    "ls",
+    "md5sum",
+    "mkdir",
+    "mvn",
+    "mv",
+    "nl",
+    "node",
+    "npm",
+    "nproc",
+    "numfmt",
+    "npx",
+    "od",
+    "pacman",
+    "paste",
+    "perl",
+    "pip",
+    "pip3",
+    "pnpm",
+    "poetry",
+    "pr",
+    "printenv",
+    "ps",
+    "pwd",
+    "python3",
+    "readlink",
+    "realpath",
+    "rg",
+    "rm",
+    "rmdir",
+    "rpm",
+    "ruby",
+    "rustup",
+    "seq",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "shuf",
+    "sort",
+    "split",
+    "stat",
+    "strings",
+    "tac",
+    "tail",
+    "tee",
+    "tput",
+    "tr",
+    "tree",
+    "tty",
+    "uname",
+    "unexpand",
+    "uniq",
+    "uptime",
+    "uv",
+    "wc",
+    "whereis",
+    "which",
+    "whoami",
+    "xargs",
+    "xxd",
+    "yarn",
+    "zypper",
 ];
 
 /// The one writable directory in explore mode: `0700`, canonicalised because
@@ -98,6 +216,36 @@ fn resolve(name: &str) -> Option<PathBuf> {
         .and_then(|candidate| std::fs::canonicalize(candidate).ok())
 }
 
+/// Git's network transports, which `PATH` does not list: `git` execs
+/// `git-remote-https` and its siblings from its own exec directory, so without
+/// an executable rule here an https remote is refused by the same ruleset that
+/// allows `git` itself. `git --exec-path` is the only honest way to the
+/// directory, and a host without git simply has nothing to add.
+fn git_remotes() -> Vec<PathBuf> {
+    let Some(git) = resolve("git") else {
+        return Vec::new();
+    };
+    let Ok(out) = Command::new(git).arg("--exec-path").output() else {
+        return Vec::new();
+    };
+    let Ok(text) = String::from_utf8(out.stdout) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(text.trim()) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("git-remote-"))
+        })
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .filter(|path| path.is_file())
+        .collect()
+}
+
 /// The shell as an absolute path: `Command::new("sh")` would leave the lookup
 /// to `execvp` in the child, after the sandbox is installed.
 fn shell_path() -> Result<PathBuf, String> {
@@ -138,7 +286,7 @@ mod imp {
     use std::process::Command;
     use std::sync::OnceLock;
 
-    use super::{confine_env, resolve, scratch_dir, shell_path, COMMANDS};
+    use super::{confine_env, git_remotes, resolve, scratch_dir, shell_path, COMMANDS};
 
     /// The `AUDIT_ARCH_*` value the filter pins. `None` on an architecture this
     /// file has no numbers for, where explore mode's `bash` cannot be confined.
@@ -384,6 +532,7 @@ mod imp {
 
         let mut binaries: Vec<PathBuf> = COMMANDS.iter().filter_map(|name| resolve(name)).collect();
         binaries.push(shell.to_path_buf());
+        binaries.extend(git_remotes());
         let loaders: Vec<PathBuf> = binaries
             .iter()
             .filter_map(|binary| interpreter(binary))
@@ -531,7 +680,7 @@ mod imp {
     use std::process::Command;
     use std::sync::OnceLock;
 
-    use super::{confine_env, resolve, scratch_dir, shell_path, COMMANDS};
+    use super::{confine_env, git_remotes, resolve, scratch_dir, shell_path, COMMANDS};
 
     const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -585,6 +734,7 @@ mod imp {
         let mut paths: Vec<PathBuf> = COMMANDS.iter().filter_map(|name| resolve(name)).collect();
         paths.extend(["sh", "bash"].iter().copied().filter_map(resolve));
         paths.extend(TRAMPOLINES.iter().copied().filter_map(xcrun));
+        paths.extend(git_remotes());
         paths.sort();
         paths.dedup();
         for path in &paths {
