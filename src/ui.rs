@@ -12,6 +12,12 @@
 //! inside the rows they were given. A terminal appends rows at the bottom and
 //! cannot take them back, so a frame that shrank would leave blank rows behind
 //! in the transcript, which is the one thing the transcript must never have.
+//!
+//! *A block goes where the transcript ends.* `Screen::slack` counts the blank
+//! rows a frame that did change left above it, and `write` fills them from the
+//! top: a block lands directly under the block before it whatever the frame is
+//! doing, and the rows left over sit above the prompt, where a blank row reads
+//! as space rather than as a separator between two messages.
 
 use std::io::{self, IsTerminal, Stdout, Write};
 
@@ -276,6 +282,40 @@ impl Term {
         }
     }
 
+    /// Draw dense rows at an absolute screen position above the viewport: the
+    /// rows a shrunk frame left blank. Nothing above the frame is in the
+    /// terminal's back buffer, so this goes through the backend directly, which
+    /// is what `insert_before` does with the block it is given.
+    fn paint_above(
+        &mut self,
+        top: u16,
+        rows: Vec<Line<'static>>,
+        width: u16,
+        margin: u16,
+    ) -> io::Result<()> {
+        let width = width.max(1);
+        let mut buf = Buffer::empty(Rect::new(0, top, width, rows.len() as u16));
+        paint(&mut buf, rows, margin);
+        let cells = buf.content.iter().enumerate().map(|(i, cell)| {
+            (
+                (i % width as usize) as u16,
+                top + (i / width as usize) as u16,
+                cell,
+            )
+        });
+        match self {
+            Term::Real(term) => {
+                term.backend_mut().draw(cells)?;
+                Backend::flush(term.backend_mut())
+            }
+            #[cfg(test)]
+            Term::Test(term) => {
+                term.backend_mut().draw(cells)?;
+                Backend::flush(term.backend_mut())
+            }
+        }
+    }
+
     /// The same terminal, in a viewport `height` rows tall starting at the
     /// cursor. The backend is carried over, so a test's scrollback survives the
     /// move: it is the session's history, not the terminal's.
@@ -346,6 +386,11 @@ pub struct Screen {
     cycle: Option<Cycle>,
     /// The last block written, for the blank line between blocks.
     last: Option<Block>,
+    /// Rows between the end of the transcript and the top of the frame that are
+    /// known to be blank. `settle` is the only writer, when the frame gives rows
+    /// back; `write` fills them from the top, so a block always lands under the
+    /// block before it. See the module note.
+    slack: u16,
     /// Markdown being collected. A block is laid out once it ends, not once
     /// per line: a table needs its whole header, a paragraph its last line.
     md: markdown::Stream,
@@ -416,6 +461,7 @@ impl Screen {
             commands: Vec::new(),
             cycle: None,
             last: None,
+            slack: 0,
             md: markdown::Stream::new(),
             thought: markdown::Stream::new(),
             menu: None,
@@ -455,6 +501,7 @@ impl Screen {
             commands: Vec::new(),
             cycle: None,
             last: None,
+            slack: 0,
             md: markdown::Stream::new(),
             thought: markdown::Stream::new(),
             menu: None,
@@ -768,6 +815,11 @@ impl Screen {
         width.saturating_sub(2 * margin).max(1)
     }
 
+    /// Put a block into the transcript. The only writer of rows above the
+    /// frame, together with `settle`: it is here that a block is placed where
+    /// the transcript *ends*, not where the frame begins, so the blank rows a
+    /// shrunk frame left behind end up below the block and never between it and
+    /// the one before.
     fn write(&mut self, lines: Vec<Line<'static>>, block: Block) {
         self.dirty = true;
         // Whatever follows a thought ends it, and the thought goes first.
@@ -795,37 +847,29 @@ impl Screen {
         let width = self.term.size().map(|s| s.width).unwrap_or(80).max(1) as usize;
         // Wrap and render inside the margin, so nothing lands on the edge.
         let margin = PAD.min(width.saturating_sub(1) as u16);
-        let width = width.saturating_sub(2 * margin as usize).max(1);
+        let cols = width.saturating_sub(2 * margin as usize).max(1);
         let rows: Vec<Line<'static>> = lines
             .into_iter()
-            .flat_map(|line| wrap(line, width))
+            .flat_map(|line| wrap(line, cols))
             .collect();
-        let height = rows.len() as u16;
-        let _ = self.term.insert_before(height, |buf| {
-            Paragraph::new(rows).render(inset(buf.area, margin), buf);
-            // The backend prints every cell it is handed, blank ones included,
-            // so a row padded to the screen width would leave trailing spaces
-            // in scrollback for a later, narrower terminal to reflow into rows
-            // of white space. An empty symbol instead marks where the row's
-            // text ends: `Tail` draws up to it and erases the rest, which also
-            // wipes whatever the row held before.
-            let width = buf.area.width.max(1) as usize;
-            for row in buf.content.chunks_mut(width) {
-                // Past the last cell that is not blank, and past the columns a
-                // wide glyph covers: the mark goes after the character, never
-                // inside it.
-                let mut end = 0;
-                for (at, cell) in row.iter().enumerate() {
-                    if cell.symbol() != " " {
-                        end = at + cell.symbol().width().max(1);
-                    }
-                }
-                let end = end.min(row.len());
-                for cell in &mut row[end..] {
-                    cell.set_symbol("");
-                }
-            }
-        });
+        let total = rows.len() as u16;
+        // The rows the frame gave up are blank and already above it: the top of
+        // the block goes there, and only what does not fit is inserted next to
+        // the frame. Either way the block starts at `frame.top - max(total,
+        // slack)`, which is exactly under the block before it.
+        let fill = self.slack.min(total);
+        let mut rows = rows;
+        let tail = rows.split_off(fill as usize);
+        if total > fill {
+            let _ = self
+                .term
+                .insert_before(total - fill, |buf| paint(buf, tail, margin));
+        }
+        if fill > 0 {
+            let top = self.term.area().top().saturating_sub(total.max(self.slack));
+            let _ = self.term.paint_above(top, rows, width as u16, margin);
+            self.slack -= fill;
+        }
         let _ = self.draw();
     }
 
@@ -927,6 +971,7 @@ impl Screen {
         self.md = markdown::Stream::new();
         self.thought = markdown::Stream::new();
         self.last = None;
+        self.slack = 0;
         self.menu = None;
         self.status.clear();
         self.alert = None;
@@ -1167,7 +1212,9 @@ impl Screen {
         }
     }
 
-    /// The terminal changed under us: the next repaint is not optional.
+    /// The terminal changed under us: the next repaint is not optional. What
+    /// `slack` counts is the rows the frame itself gave up, and a blank row
+    /// stays blank however the terminal rewraps the rows around it.
     pub fn invalidate(&mut self) {
         self.dirty = true;
     }
@@ -1186,10 +1233,13 @@ impl Screen {
         if height > area.height {
             self.term.insert_before(height - area.height, |_| {})?;
         } else {
-            // The rows the region gives up are above the new top, where the new
-            // terminal's clear cannot reach.
+            // The rows the frame gives up are above the new top, where the new
+            // terminal's clear cannot reach: they are blank now, and they are
+            // the transcript's, so `write` may fill them from the top.
             self.term.clear()?;
+            self.slack = self.slack.saturating_add(area.height - height);
         }
+        self.slack = self.slack.min(size.height.saturating_sub(height));
         // An inline area starts at the cursor row and this one's bottom is the
         // screen's, so the cursor goes where the new top has to be.
         let top = size.height - height;
@@ -1620,6 +1670,33 @@ fn inset(area: Rect, pad: u16) -> Rect {
 /// between two blocks is the writer's, not the caller's.
 fn blank(line: &Line<'static>) -> bool {
     line.spans.iter().all(|span| span.content.trim().is_empty())
+}
+
+/// Lay rows out in `buf` with `margin` cells at each side, then mark where each
+/// row's text ends.
+///
+/// The backend prints every cell it is handed, blank ones included, so a row
+/// padded to the screen width would leave trailing spaces in scrollback for a
+/// later, narrower terminal to reflow into rows of white space. An empty symbol
+/// instead marks where the row's text ends: `Tail` draws up to it and erases the
+/// rest, which also wipes whatever the row held before.
+fn paint(buf: &mut Buffer, rows: Vec<Line<'static>>, margin: u16) {
+    let width = buf.area.width.max(1) as usize;
+    Paragraph::new(rows).render(inset(buf.area, margin), buf);
+    for row in buf.content.chunks_mut(width) {
+        // Past the last cell that is not blank, and past the columns a wide
+        // glyph covers: the mark goes after the character, never inside it.
+        let mut end = 0;
+        for (at, cell) in row.iter().enumerate() {
+            if cell.symbol() != " " {
+                end = at + cell.symbol().width().max(1);
+            }
+        }
+        let end = end.min(row.len());
+        for cell in &mut row[end..] {
+            cell.set_symbol("");
+        }
+    }
 }
 
 /// One row of a buffer as text, without the padding to the screen width: a
@@ -2106,14 +2183,78 @@ mod tests {
         assert_eq!(screen.buf, "hello");
     }
 
+    /// The invariant: one blank row between two blocks, never two, and never a
+    /// blank row at either end of the transcript.
+    fn packed(screen: &mut Screen) {
+        let rows = screen.transcript();
+        let blank = |row: &String| row.trim().is_empty();
+        for pair in rows.windows(2) {
+            assert!(
+                !(blank(&pair[0]) && blank(&pair[1])),
+                "two blank rows in {rows:?}"
+            );
+        }
+        assert!(rows.first().is_some_and(|row| !blank(row)), "{rows:?}");
+        assert!(rows.last().is_some_and(|row| !blank(row)), "{rows:?}");
+    }
+
     #[test]
-    fn a_caller_does_not_add_the_blank_row_between_blocks() {
+    fn a_command_and_its_answer_are_one_blank_row_apart() {
         let mut screen = Screen::test_screen(40, 24);
-        // A command's output often ends with a blank line; the writer already
-        // put one above the block, so this is the one that would double it.
-        screen.output("first\n\n");
-        screen.output("second");
-        assert_eq!(screen.transcript(), [" first", "", " second"]);
+        screen.insert_text("/thinking");
+        screen.commit();
+        screen.output("thinking: high\n\n");
+        assert_eq!(
+            screen.transcript(),
+            [" █ /thinking", "", " thinking: high"],
+            "the frame's rows are below the transcript, not inside it"
+        );
+        packed(&mut screen);
+    }
+
+    #[test]
+    fn nothing_a_session_does_leaves_a_blank_row_in_the_transcript() {
+        let mut screen = Screen::test_screen(40, 24);
+        screen.set_commands(vec![
+            "/alpha".into(),
+            "/alpha one".into(),
+            "/alpha two".into(),
+            "/beta".into(),
+        ]);
+        let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        screen.insert_text("hello");
+        screen.commit();
+        packed(&mut screen);
+        screen.output("a reply\n\n");
+        packed(&mut screen);
+        // The candidate list comes and goes while a command is typed: the frame
+        // has the rows for it either way, so the transcript does not move.
+        for c in "/alpha".chars() {
+            screen.apply_key(key(c));
+            screen.repaint();
+            packed(&mut screen);
+        }
+        screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        screen.repaint();
+        packed(&mut screen);
+        screen.commit();
+        screen.output("another reply\n");
+        packed(&mut screen);
+        // A chooser is the other frame and gives its rows back; what it committed
+        // to the transcript lands under the block before it.
+        screen.set_menu("Sessions", vec!["one".into(), "two".into()], false);
+        screen.repaint();
+        packed(&mut screen);
+        screen.clear_menu(true);
+        packed(&mut screen);
+        packed(&mut screen);
+        // A resize reflows the terminal and moves the frame; nothing it moves
+        // may land between two blocks.
+        screen.invalidate();
+        screen.repaint();
+        packed(&mut screen);
+        screen.output("a third reply\n");
+        packed(&mut screen);
     }
 
     #[test]
