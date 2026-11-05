@@ -13,8 +13,8 @@ invariants a change must not break.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
    panes, compaction, subagents, MCP, or permission layer until the REPL is
    genuinely insufficient. One feature per change.
-3. **Small surface.** Eleven modules; a new module needs a separate concern, not a
-   line count.
+3. **Small surface.** Twelve modules; a new module needs a separate concern, not
+   a line count.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` +
    SSE only. Express differences as config (`base_url`, `models_url`,
    `api_key_env`, `session_header`), never per-provider code paths.
@@ -22,9 +22,10 @@ invariants a change must not break.
    list of rules that hold for every user, and the tools from the same registry as
    the `tools` array. Rules are policy: one line each, no workflow, nothing
    project- or provider-specific. Instructions are appended in order: `agents`
-   (config), the nearest `AGENTS.md` at or above cwd, then `system`. The project
-   file is wrapped in `<project_instructions path="...">` and the first rule
-   calls it data, not authority. Read once at startup; never re-read mid-session.
+   (config), the nearest `AGENTS.md` at or above cwd, then `system`, then the
+   skills catalogue. The project file is wrapped in
+   `<project_instructions path="...">` and the first rule calls it data, not
+   authority. Read once at startup; never re-read mid-session.
 6. **Stable prefix, append-only history.** System prompt and tool schemas first,
    volatile content last. Never inject timestamps, status, or cwd changes into the
    prefix: it invalidates provider prompt caching. Sessions are append-only JSONL,
@@ -86,6 +87,8 @@ invariants a change must not break.
 - `tools.rs` — tool registry, schemas, generated prompt, local tools, `about`.
 - `web.rs` — `fetch`/`web_search`: host guard, HTML tokenizer, sanitizer,
   Brave/DuckDuckGo parsers, paging.
+- `skills.rs` — Agent Skills discovery, the frontmatter subset, the catalogue,
+  and the body read on `/skill:` activation. Project skills are `/trust`-gated.
 - `sandbox.rs` — the only `unsafe`: seccomp, Landlock, Seatbelt, exec allowlist,
   and the explore-mode scratch directory.
 
@@ -102,6 +105,10 @@ invariants a change must not break.
 - Tool names and descriptions are part of the prompt. Change them deliberately.
 - `README.md` is the user-facing contract and the GitHub page. It ships through
   `about`, so keep it factual and in the same commit as the behavior it describes.
+- Skills: a directory with `SKILL.md` is the unit; only the frontmatter is read at
+  startup, the body on demand. The catalogue is appended last in the system
+  prompt; `/trust` appends a system message rather than rewriting the prefix.
+  Project roots stop at the repository root; without a `.git`, only cwd counts.
 - Sessions: `<id>.json` is the mutable sidecar; `<id>.jsonl` is append-only; bodies
   older than `sessions::KEEP` are gzipped. The sidecar stays readable, so listing
   and search work without unpacking. The system prompt and mode notes are never
@@ -148,7 +155,9 @@ calling the same tool, so end it with `!Escape` and read the result with `show:`
 the first line says which engine answered. `BRAVE_SEARCH_API_KEY` selects Brave;
 unset means DuckDuckGo, and a bogus value exercises the fallback.
 
-The sandbox is checked the same way: `tool:bash:{...}` takes JSON arguments and
+Skills are checked with a `.agents/skills/<name>/SKILL.md` under `--work DIR`:
+`/skills` lists it, `/trust` loads the project catalogue, `/skill:name` runs the
+body. The sandbox is checked the same way: `tool:bash:{...}` takes JSON arguments and
 loops; end with `!Escape` and `show:`. Normal mode is a `!cmd` line, which does not
 loop. Examples:
 

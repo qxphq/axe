@@ -179,7 +179,7 @@ pub struct Screen {
     /// The last killed text: one slot, enough for Ctrl-U ... Ctrl-Y.
     killed: String,
     /// Slash commands Tab completes, in the caller's spelling.
-    commands: Vec<&'static str>,
+    commands: Vec<String>,
     /// The last block written, for the blank line between blocks.
     last: Option<Block>,
     /// Markdown being collected. A block is laid out once it ends, not once
@@ -310,8 +310,8 @@ impl Screen {
     }
 
     /// The slash commands Tab completes.
-    pub fn set_commands(&mut self, commands: &[&'static str]) {
-        self.commands = commands.to_vec();
+    pub fn set_commands(&mut self, commands: Vec<String>) {
+        self.commands = commands;
     }
 
     /// Open a chooser. Rows are plain text; the marker is drawn on the
@@ -954,10 +954,10 @@ impl Screen {
         if !self.buf.starts_with('/') || self.buf.contains(char::is_whitespace) {
             return;
         }
-        let matches: Vec<&'static str> = self
+        let matches: Vec<&str> = self
             .commands
             .iter()
-            .copied()
+            .map(String::as_str)
             .filter(|c| c.starts_with(&self.buf))
             .collect();
         let Some(first) = matches.first() else {
@@ -1536,7 +1536,7 @@ mod tests {
         assert_eq!(screen.prompt(), "model> ");
         screen.set_status("Thinking…");
         assert_eq!(screen.status(), "Thinking…");
-        screen.set_commands(&["/help", "/exit"]);
+        screen.set_commands(vec!["/help".into(), "/exit".into()]);
         assert_eq!(screen.commands, vec!["/help", "/exit"]);
     }
 
