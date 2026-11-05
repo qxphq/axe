@@ -180,7 +180,8 @@ enum Mode {
 }
 
 /// Where the live frame's parts sit, in screen rows. The parts carry rows, not
-/// the width, which is the terminal's and comes off the sides in `draw`.
+/// the width, which is the terminal's and comes off the sides in `draw`, and
+/// nothing is written against the screen's bottom edge.
 ///
 /// A frame is a function of the terminal size and the mode and of nothing else:
 /// content that does not fit is scrolled or clipped inside its part. That is the
@@ -211,9 +212,10 @@ impl Frame {
         // inside the box rather than asking the terminal for a row it can never
         // give back.
         let prompt_rows = (height / 12).clamp(1, 3);
-        // The queued row, the prompt's rows, the status row: the frame has
-        // them whether or not there is anything to put in them.
-        let fixed = 1 + prompt_rows + 1;
+        // The queued row, the prompt's rows, the blank row under them, the
+        // status row, and the blank row under that: the frame has them whether
+        // or not there is anything to put in them.
+        let fixed = 1 + prompt_rows + 1 + 1 + 1;
         let room = height.saturating_sub(fixed + MIN_TRANSCRIPT);
         let list_rows = match mode {
             Mode::Idle => (height / 12).clamp(1, 4).min(room),
@@ -222,13 +224,16 @@ impl Frame {
         };
         let rows = (fixed + list_rows).min(height);
         let area = Rect::new(0, 0, 0, rows);
+        // The status sits one row above the bottom edge, so the row under it
+        // stays blank, and the prompt keeps a blank row between itself and the
+        // status however many of its own rows the text fills.
         let status = Rect {
-            y: rows.saturating_sub(1),
+            y: rows.saturating_sub(2),
             height: 1,
             ..area
         };
         let prompt = Rect {
-            y: status.y.saturating_sub(prompt_rows),
+            y: status.y.saturating_sub(1 + prompt_rows),
             height: prompt_rows.min(status.y.max(1)),
             ..area
         };
@@ -264,9 +269,9 @@ impl Frame {
         }
     }
 
-    /// The rows the frame takes.
+    /// The rows the frame takes: the status row and the blank row under it.
     fn height(&self) -> u16 {
-        self.status.y + self.status.height
+        self.status.y + self.status.height + 1
     }
 
     /// The row the cursor sits on inside the prompt, giving the text the bottom
