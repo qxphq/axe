@@ -8,6 +8,7 @@
 //! that is already a path — `~`, `/`, `.`, or anything with a `/` — completes
 //! the same way without it. Anything else is prose, and Tab leaves it alone.
 
+use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -84,16 +85,21 @@ fn list(token: &str, cwd: &Path, home: Option<&Path>) -> Vec<String> {
         }
         matches.push((is_dir(&entry), name.to_lowercase(), name.to_string()));
     }
-    matches.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2.cmp(&b.2))
-    });
+    matches.sort_by(order);
     matches.truncate(LIMIT);
     matches
         .into_iter()
         .map(|(is_dir, _, name)| format!("{shown}{name}{}", if is_dir { "/" } else { "" }))
         .collect()
+}
+
+/// The list's order: a directory before a file, then the folded name, then the
+/// exact spelling, which breaks a tie like `B.txt` and `b.txt` without letting
+/// the folded key shuffle it.
+fn order(a: &(bool, String, String), b: &(bool, String, String)) -> Ordering {
+    b.0.cmp(&a.0)
+        .then_with(|| a.1.cmp(&b.1))
+        .then_with(|| a.2.cmp(&b.2))
 }
 
 /// Whether the entry is a directory, following a symlink the way a `cd` would.
@@ -214,22 +220,35 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("axe-test-sort-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("a_dir")).unwrap();
-        for name in ["b.txt", "B.txt", "A.txt", "c.txt"] {
+        for name in ["b.txt", "A.txt", "c.txt"] {
             fs::write(dir.join(name), "").unwrap();
         }
-        // Directories first, then folded names, and `B` before `b` because that
-        // is the exact order — the folded key must not shuffle them.
+        // Directories first, then the folded name: `A` sorts before `b`.
         assert_eq!(
             paths_in("@", 1, &dir, None),
             vec![
                 "a_dir/".to_string(),
                 "A.txt".to_string(),
-                "B.txt".to_string(),
                 "b.txt".to_string(),
                 "c.txt".to_string(),
             ]
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The exact-spelling tiebreak on the order itself: a case-insensitive
+    /// volume cannot hold `B.txt` beside `b.txt`, so a fixture that does would
+    /// test the filesystem, not the sort.
+    #[test]
+    fn the_folded_key_breaks_a_tie_by_spelling() {
+        let mut entries = [
+            (false, "b.txt".to_string(), "b.txt".to_string()),
+            (false, "b.txt".to_string(), "B.txt".to_string()),
+            (true, "a_dir".to_string(), "a_dir".to_string()),
+        ];
+        entries.sort_by(order);
+        let names: Vec<&str> = entries.iter().map(|(_, _, name)| name.as_str()).collect();
+        assert_eq!(names, ["a_dir", "B.txt", "b.txt"]);
     }
 
     #[test]
