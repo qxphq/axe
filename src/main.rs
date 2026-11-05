@@ -7,11 +7,13 @@ mod config;
 mod editor;
 mod http;
 mod markdown;
+mod prompt;
 mod render;
 mod sandbox;
 mod sessions;
 mod skills;
 mod state;
+mod store;
 mod text;
 mod tools;
 mod turn;
@@ -20,7 +22,6 @@ mod web;
 
 use std::collections::VecDeque;
 use std::io::Read;
-use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -30,7 +31,9 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::terminal;
 use serde_json::{json, Value};
 
+use prompt::{mode_note, system_with_instructions};
 use render::{call_line, detail, failed, line_of, mark, plain_text, shell_line, Paint};
+use store::{history_bytes, weight, Live, Store, COMPACT_NOTE};
 use text::{strip_control, terminal_text};
 use turn::{PlainSink, Queue, Sink, TextSink};
 
@@ -61,48 +64,6 @@ fn main() {
         eprintln!("axe: {}", strip_control(&e));
         std::process::exit(1);
     }
-}
-
-/// The system prompt: built-in rules, then instructions. `global` and the
-/// config's `system` are the user's own text; the project's `AGENTS.md` comes
-/// from a repository and is wrapped in a tag that marks it as data.
-fn system_with_instructions(
-    global: Option<&str>,
-    project: Option<(&str, &Path)>,
-    extra: Option<&str>,
-    skills_section: Option<&str>,
-) -> String {
-    let mut instructions = String::new();
-    if let Some(text) = global {
-        instructions.push_str("\n\n# Instructions (global)\n\n");
-        instructions.push_str(text);
-    }
-    if let Some((text, path)) = project {
-        instructions.push_str(&format!(
-            "\n\n<project_instructions path=\"{}\">\n{text}\n</project_instructions>",
-            tag_path(&path.display().to_string())
-        ));
-    }
-    if let Some(text) = extra {
-        instructions.push_str("\n\n");
-        instructions.push_str(text);
-    }
-    // The skills catalogue is last: it is the most likely section to change
-    // and the prefix above it stays byte-identical.
-    if let Some(text) = skills_section {
-        instructions.push_str(text);
-    }
-    let mut system = tools::system_prompt();
-    system.push_str(&instructions);
-    system
-}
-
-/// A path inside the tag's attribute: a quote or a control byte would end or
-/// break the attribute, so both become an apostrophe.
-fn tag_path(path: &str) -> String {
-    path.chars()
-        .map(|c| if c == '"' || c.is_control() { '\'' } else { c })
-        .collect()
 }
 
 fn run() -> Result<(), String> {
@@ -345,10 +306,6 @@ context. Reply with the summary only, no preamble. Keep every path, command, ide
 message and decision exact. Sections: task, what has been done, files changed, commands run, \
 decisions and constraints, open questions, next step. Under 800 words.";
 
-/// What the summary message says before the summary. The session's own voice,
-/// not the user's: `user_summary` and `naming_excerpt` skip it.
-const COMPACT_NOTE: &str = "Earlier in this session, before it was compacted:";
-
 /// One tool-less completion for `/compact`. The summary is text, not a turn.
 fn compact_request(
     provider: &Provider,
@@ -481,15 +438,6 @@ fn parse_naming(text: &str) -> Option<(String, String)> {
     title.map(|title| (title, summary.unwrap_or_default()))
 }
 
-/// The note that tells the model which mode it is in. A `user` message, the
-/// same role `!cmd` output joins as; the mode is history, so the prompt above
-/// it never changes. The words are `Mode`'s: explore mode names where it may
-/// write and the way out, so a model that cannot change files hands the
-/// decision back instead of apologizing.
-fn mode_note(mode: tools::Mode) -> Value {
-    json!({ "role": "user", "content": mode.note(sandbox::plan()) })
-}
-
 /// Everything the REPL mutates between turns: the model selection and history.
 struct Session {
     /// What this directory remembers. Held rather than re-read so a `/model`,
@@ -525,177 +473,6 @@ struct Session {
     warning: Option<String>,
     /// The skills discovered at startup; the catalogue is in the prompt.
     skills: Vec<skills::Skill>,
-}
-
-/// What a turn appends to: the live history and, when this directory has one,
-/// the session's log. One `push`, so a message cannot reach the model without
-/// reaching the file, and a resumed session replays the same order.
-struct Live<'a> {
-    messages: &'a mut Vec<Value>,
-    bytes: &'a mut u64,
-    store: Option<&'a mut Store>,
-}
-
-impl turn::History for Live<'_> {
-    fn push(&mut self, message: Value) {
-        if let Some(store) = self.store.as_deref_mut() {
-            store.record(&message);
-        }
-        *self.bytes += weight(&message);
-        self.messages.push(message);
-    }
-
-    fn messages(&self) -> &[Value] {
-        self.messages.as_slice()
-    }
-}
-
-/// The session on disk. `meta` is loaded with the first message or on resume,
-/// so an idle launch leaves no file behind.
-struct Store {
-    dir: std::path::PathBuf,
-    id: String,
-    model: String,
-    log: Option<sessions::Log>,
-    meta: Option<sessions::Meta>,
-    naming_tried: bool,
-    warned: bool,
-    warning: Option<String>,
-}
-
-impl Store {
-    fn fresh(dir: std::path::PathBuf, id: &str, model: &str) -> Store {
-        Store {
-            dir,
-            id: id.to_string(),
-            model: model.to_string(),
-            log: None,
-            meta: None,
-            naming_tried: false,
-            warned: false,
-            warning: None,
-        }
-    }
-
-    fn resumed(
-        dir: std::path::PathBuf,
-        meta: sessions::Meta,
-        model: &str,
-    ) -> Result<Store, String> {
-        let log = sessions::Log::open(&dir, &meta.id)?;
-        Ok(Store {
-            dir,
-            id: meta.id.clone(),
-            model: model.to_string(),
-            log: Some(log),
-            meta: Some(meta),
-            naming_tried: false,
-            warned: false,
-            warning: None,
-        })
-    }
-
-    /// A write failure is reported once and the session goes on: a session log
-    /// must never fail a turn.
-    fn record(&mut self, message: &Value) {
-        if let Err(e) = self.try_record(message) {
-            if !self.warned {
-                self.warned = true;
-                self.warn(format!("session: {e}"));
-            }
-        }
-    }
-
-    fn warn(&mut self, text: String) {
-        if self.warning.is_none() {
-            self.warning = Some(text);
-        }
-    }
-
-    fn take_warning(&mut self) -> Option<String> {
-        self.warning.take()
-    }
-
-    fn try_record(&mut self, message: &Value) -> Result<(), String> {
-        if self.log.is_none() {
-            self.log = Some(sessions::Log::open(&self.dir, &self.id)?);
-        }
-        if self.meta.is_none() {
-            let mut meta = sessions::Meta::new(&self.id, &self.model);
-            if let Some(summary) = user_summary(message) {
-                meta.summary = summary;
-            }
-            self.meta = Some(meta);
-        }
-        let meta = self.meta.as_mut().expect("just created");
-        self.log.as_mut().expect("just opened").append(message)?;
-        meta.messages += 1;
-        meta.updated = sessions::now();
-        if meta.summary.is_empty() {
-            if let Some(summary) = user_summary(message) {
-                meta.summary = summary;
-            }
-        }
-        meta.save(&self.dir)
-    }
-
-    /// Record a compaction: the marked summary goes into the body, and the
-    /// session's message count starts over at it. What came before is still in
-    /// the file; it is no longer part of the session.
-    fn compacted(&mut self, message: &Value) {
-        self.record(message);
-        if let Some(meta) = self.meta.as_mut() {
-            meta.messages = 1;
-            if let Err(e) = meta.save(&self.dir) {
-                self.warn(format!("session meta: {e}"));
-            }
-        }
-    }
-
-    fn set_title(&mut self, title: &str, summary: &str) {
-        let Some(meta) = self.meta.as_mut() else {
-            return;
-        };
-        meta.title = sessions::collapse(title, 60);
-        if !summary.trim().is_empty() {
-            meta.summary = sessions::collapse(summary, 240);
-        }
-        if let Err(e) = meta.save(&self.dir) {
-            self.warn(format!("session meta: {e}"));
-        }
-    }
-
-    /// A title no model gave: the first request stands in. Called when the
-    /// session ends without one.
-    fn finalize(&mut self, messages: &[Value]) {
-        let Some(meta) = self.meta.as_mut() else {
-            return;
-        };
-        if meta.title.is_empty() {
-            let (title, summary) = sessions::fallback(messages);
-            if !title.is_empty() {
-                meta.title = title;
-                if meta.summary.is_empty() {
-                    meta.summary = summary;
-                }
-            }
-        }
-        if let Err(e) = meta.save(&self.dir) {
-            self.warn(format!("session meta: {e}"));
-        }
-    }
-}
-
-fn user_summary(message: &Value) -> Option<String> {
-    if message["role"].as_str() != Some("user") {
-        return None;
-    }
-    let text = message["content"].as_str()?;
-    if text.starts_with("explore mode:") || text.starts_with('$') || text.starts_with(COMPACT_NOTE)
-    {
-        return None;
-    }
-    Some(sessions::collapse(text, 240))
 }
 
 fn session_title(meta: &sessions::Meta) -> String {
@@ -2663,19 +2440,6 @@ fn fullness(used: u64, ctx: u64) -> u8 {
     (used.saturating_mul(100) / ctx.max(1)).min(100) as u8
 }
 
-/// How much of a history one message is, in the bytes the request carries. The
-/// fill is estimated from this sum, four bytes to a token: the usual rule of
-/// thumb for English, and off by tens of percent.
-fn weight(message: &Value) -> u64 {
-    message.to_string().len() as u64
-}
-
-/// The same sum over a whole history, for the points that replace it —
-/// startup, resume, `/new`, `/compact` — rather than append to it.
-fn history_bytes(messages: &[Value]) -> u64 {
-    messages.iter().map(weight).sum()
-}
-
 /// Token counts in three characters where possible: `812`, `34k`, `1.0M`.
 fn scaled(n: u64) -> String {
     match n {
@@ -2816,36 +2580,6 @@ mod tests {
     }
 
     #[test]
-    fn project_instructions_are_tagged_between_global_and_system() {
-        let system = system_with_instructions(
-            Some("global text"),
-            Some(("project text", Path::new("/repo/AGENTS.md"))),
-            Some("config text"),
-            None,
-        );
-        assert!(system.contains("# Instructions (global)\n\nglobal text"));
-        assert!(system.contains(
-            "<project_instructions path=\"/repo/AGENTS.md\">\nproject text\n</project_instructions>"
-        ));
-        assert!(
-            system.find("# Instructions (global)").unwrap()
-                < system.find("<project_instructions path=").unwrap()
-        );
-        assert!(
-            system.find("<project_instructions path=").unwrap()
-                < system.find("config text").unwrap()
-        );
-        assert_eq!(tag_path("a\"b\nc"), "a'b'c");
-    }
-
-    #[test]
-    fn the_skills_catalogue_is_appended_last() {
-        let system =
-            system_with_instructions(None, None, Some("config text"), Some("\n\n# Skills\n"));
-        assert!(system.find("config text").unwrap() < system.find("# Skills").unwrap());
-    }
-
-    #[test]
     fn parses_commands_once() {
         assert_eq!(parse_command("  "), Command::Empty);
         assert_eq!(parse_command("/model"), Command::Model(None));
@@ -2933,23 +2667,6 @@ mod tests {
         assert!(prompt.contains("newest"));
         // Short text is left alone.
         assert_eq!(cut("abc", 2, 2), "abc");
-    }
-
-    #[test]
-    fn mode_note_is_the_mode_as_a_user_message() {
-        // The policy itself is `Mode`'s; this is the role it travels in.
-        let on = mode_note(tools::Mode::Explore);
-        let off = mode_note(tools::Mode::Normal);
-        assert_eq!(on["role"].as_str(), Some("user"));
-        let on = on["content"].as_str().unwrap().to_string();
-        let off = off["content"].as_str().unwrap().to_string();
-        assert_eq!(on, tools::Mode::Explore.note(sandbox::plan()));
-        assert_eq!(off, tools::Mode::Normal.note(sandbox::plan()));
-        assert!(on.contains("/explore off"), "{on}");
-        assert!(
-            off.contains("fetch and web_search are unavailable"),
-            "{off}"
-        );
     }
 
     #[test]
@@ -3129,11 +2846,6 @@ mod tests {
 
     #[test]
     fn summaries_and_session_rows() {
-        assert_eq!(
-            user_summary(&json!({ "role": "user", "content": "do it" })),
-            Some("do it".into())
-        );
-        assert!(user_summary(&json!({ "role": "user", "content": "$ ls" })).is_none());
         let meta = sessions::Meta {
             id: "abc123".into(),
             created: 0,
@@ -3147,20 +2859,6 @@ mod tests {
         assert_eq!(session_title(&meta), "Title");
         assert!(session_row(&meta).contains("Title"));
         assert!(session_row(&meta).contains("zip"));
-    }
-
-    #[test]
-    fn store_records_and_finalizes() {
-        let dir = std::env::temp_dir().join(format!("axe-test-store-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut store = Store::fresh(dir.clone(), "abc123", "p/m");
-        store.record(&json!({ "role": "user", "content": "fix it" }));
-        assert!(store.take_warning().is_none());
-        assert_eq!(store.meta.as_ref().unwrap().messages, 1);
-        store.set_title("T", "S");
-        assert_eq!(store.meta.as_ref().unwrap().title, "T");
-        store.finalize(&[]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3345,16 +3043,11 @@ mod tests {
             messages: Vec::new(),
             bytes: 0,
             sid: "abc".into(),
-            store: Some(Store {
-                dir: std::env::temp_dir(),
-                id: "abc".into(),
-                model: "m".into(),
-                log: None,
-                meta: Some(meta),
-                naming_tried: false,
-                warned: false,
-                warning: None,
-            }),
+            store: {
+                let mut store = Store::fresh(std::env::temp_dir(), "abc", "m");
+                store.meta = Some(meta);
+                Some(store)
+            },
             startup: Vec::new(),
             picks: Vec::new(),
             naming: None,

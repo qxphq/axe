@@ -13,7 +13,7 @@ invariants a change must not break.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
    panes, subagents, MCP, or permission layer until the REPL is genuinely
    insufficient. One feature per change.
-3. **Small surface.** Seventeen modules; a new module needs a separate concern,
+3. **Small surface.** Nineteen modules; a new module needs a separate concern,
    not a line count.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` +
    SSE only. Express differences as config (`base_url`, `models_url`,
@@ -118,6 +118,11 @@ invariants a change must not break.
   the prompt, not picked from a list), session lifecycle (startup chooser,
   `/sessions`, `/new`, naming), agent loop. Two producers (keys, a turn)
   feed one `mpsc` channel; the main thread applies events and draws once per batch.
+- `prompt.rs` — the system prompt: the built-in rules, then the instructions and
+  the skills catalogue, built once as the prefix every request shares.
+- `store.rs` — the session on disk and the live history that feeds it: one
+  `push` appends to both, and the bytes the info row's fill is estimated from
+  are counted there.
 - `ui.rs` — the screen: the live frame (`Frame`, a layout from what the frame
   shows — the prompt's rows, the queued line, the candidates — and from the mode
   for a chooser, put in place by `settle`), key mapping, completion, the chooser,
