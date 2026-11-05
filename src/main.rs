@@ -237,10 +237,9 @@ fn run() -> Result<(), String> {
         startup = sessions::list(dir);
         startup.truncate(15);
     }
-    let spec = format!("{}/{}", providers[provider].name, model);
     let store = cwd
         .as_deref()
-        .map(|dir| Store::fresh(sessions::dir(dir), &sid, &spec));
+        .map(|dir| Store::fresh(sessions::dir(dir), &sid));
 
     let bytes = history_bytes(&messages);
     let session = Session {
@@ -903,8 +902,7 @@ impl Session {
             warnings.push(format!("session meta: {e}"));
         }
         let title = session_title(&meta);
-        let model = self.spec();
-        let store = Store::resumed(dir, meta, &model)?;
+        let store = Store::resumed(dir, meta)?;
 
         self.messages = self.base_messages();
         self.messages.extend(messages);
@@ -1005,10 +1003,9 @@ impl Session {
     fn new_session(&mut self, screen: Option<&mut ui::Screen>) {
         self.finalize_session();
         let sid = session_id();
-        let model = self.spec();
         let dir = self.store.as_ref().map(|store| store.dir.clone());
         if let Some(dir) = dir {
-            self.store = Some(Store::fresh(dir, &sid, &model));
+            self.store = Some(Store::fresh(dir, &sid));
         }
         self.messages = self.base_messages();
         self.bytes = history_bytes(&self.messages);
@@ -2852,7 +2849,6 @@ mod tests {
             updated: 0,
             title: "Title".into(),
             summary: String::new(),
-            model: "p/m".into(),
             messages: 3,
             archived: true,
         };
@@ -3031,7 +3027,7 @@ mod tests {
 
     #[test]
     fn session_info_carries_the_title_left_of_the_model() {
-        let meta = sessions::Meta::new("abc", "m");
+        let meta = sessions::Meta::new("abc");
         let mut session = Session {
             state: state::State::default(),
             providers: vec![test_provider()],
@@ -3044,7 +3040,7 @@ mod tests {
             bytes: 0,
             sid: "abc".into(),
             store: {
-                let mut store = Store::fresh(std::env::temp_dir(), "abc", "m");
+                let mut store = Store::fresh(std::env::temp_dir(), "abc");
                 store.meta = Some(meta);
                 Some(store)
             },

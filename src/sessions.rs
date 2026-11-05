@@ -33,7 +33,6 @@ pub struct Meta {
     pub updated: u64,
     pub title: String,
     pub summary: String,
-    pub model: String,
     pub messages: u64,
     pub archived: bool,
 }
@@ -68,7 +67,7 @@ pub fn now() -> u64 {
 }
 
 impl Meta {
-    pub fn new(id: &str, model: &str) -> Meta {
+    pub fn new(id: &str) -> Meta {
         let now = now();
         Meta {
             id: id.to_string(),
@@ -76,7 +75,6 @@ impl Meta {
             updated: now,
             title: String::new(),
             summary: String::new(),
-            model: model.to_string(),
             messages: 0,
             archived: false,
         }
@@ -101,7 +99,6 @@ impl Meta {
             updated: v["updated"].as_u64().unwrap_or(0),
             title: text("title"),
             summary: text("summary"),
-            model: text("model"),
             messages: v["messages"].as_u64().unwrap_or(0),
             archived: v["archived"].as_bool().unwrap_or(false),
         })
@@ -118,7 +115,6 @@ impl Meta {
             "updated": self.updated,
             "title": self.title,
             "summary": self.summary,
-            "model": self.model,
             "messages": self.messages,
             "archived": self.archived,
         });
@@ -562,7 +558,7 @@ mod tests {
     fn meta_and_log_roundtrip() {
         let dir = std::env::temp_dir().join(format!("axe-test-sessions-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut meta = Meta::new("abc123", "prov/model");
+        let mut meta = Meta::new("abc123");
         meta.title = "Title".into();
         meta.save(&dir).unwrap();
         let mut log = Log::open(&dir, "abc123").unwrap();
@@ -583,7 +579,7 @@ mod tests {
     fn a_compacted_body_starts_at_its_last_summary() {
         let dir = std::env::temp_dir().join(format!("axe-test-compact-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let meta = Meta::new("abc123", "p/m");
+        let meta = Meta::new("abc123");
         meta.save(&dir).unwrap();
         let mut log = Log::open(&dir, "abc123").unwrap();
         log.append(&json!({ "role": "user", "content": "one" }))
@@ -626,7 +622,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("axe-test-gzip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut meta = Meta::new("abc123", "p/m");
+        let mut meta = Meta::new("abc123");
         let plain = log_path(&dir, "abc123");
         let gz = gz_path(&dir, "abc123");
         std::fs::write(&plain, "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
@@ -645,7 +641,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("axe-test-damaged-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut meta = Meta::new("abc123", "p/m");
+        let mut meta = Meta::new("abc123");
         meta.save(&dir).unwrap();
         std::fs::write(
             log_path(&dir, "abc123"),

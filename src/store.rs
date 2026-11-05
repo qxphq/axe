@@ -41,7 +41,6 @@ impl turn::History for Live<'_> {
 pub(crate) struct Store {
     pub(crate) dir: std::path::PathBuf,
     id: String,
-    model: String,
     log: Option<sessions::Log>,
     pub(crate) meta: Option<sessions::Meta>,
     pub(crate) naming_tried: bool,
@@ -50,11 +49,10 @@ pub(crate) struct Store {
 }
 
 impl Store {
-    pub(crate) fn fresh(dir: std::path::PathBuf, id: &str, model: &str) -> Store {
+    pub(crate) fn fresh(dir: std::path::PathBuf, id: &str) -> Store {
         Store {
             dir,
             id: id.to_string(),
-            model: model.to_string(),
             log: None,
             meta: None,
             naming_tried: false,
@@ -63,16 +61,11 @@ impl Store {
         }
     }
 
-    pub(crate) fn resumed(
-        dir: std::path::PathBuf,
-        meta: sessions::Meta,
-        model: &str,
-    ) -> Result<Store, String> {
+    pub(crate) fn resumed(dir: std::path::PathBuf, meta: sessions::Meta) -> Result<Store, String> {
         let log = sessions::Log::open(&dir, &meta.id)?;
         Ok(Store {
             dir,
             id: meta.id.clone(),
-            model: model.to_string(),
             log: Some(log),
             meta: Some(meta),
             naming_tried: false,
@@ -107,7 +100,7 @@ impl Store {
             self.log = Some(sessions::Log::open(&self.dir, &self.id)?);
         }
         if self.meta.is_none() {
-            let mut meta = sessions::Meta::new(&self.id, &self.model);
+            let mut meta = sessions::Meta::new(&self.id);
             if let Some(summary) = user_summary(message) {
                 meta.summary = summary;
             }
@@ -207,7 +200,7 @@ mod tests {
     fn store_records_and_finalizes() {
         let dir = std::env::temp_dir().join(format!("axe-test-store-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut store = Store::fresh(dir.clone(), "abc123", "p/m");
+        let mut store = Store::fresh(dir.clone(), "abc123");
         store.record(&json!({ "role": "user", "content": "fix it" }));
         assert!(store.take_warning().is_none());
         assert_eq!(store.meta.as_ref().unwrap().messages, 1);
