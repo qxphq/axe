@@ -840,11 +840,15 @@ impl Screen {
         // is the bright one.
         let pad = " ".repeat(gutter.min(cols.saturating_sub(1)));
         let queued = self.queued.clone();
-        // The selection is the invariant half of the last row: it must not be
-        // cut, so a long status is trimmed first. An alert is the exception:
-        // it is a question, so it takes the row and the info waits.
-        let info = clip(&self.info, cols);
-        let status = clip(&self.status, cols.saturating_sub(info.chars().count() + 1));
+        // The row is shared: the status says what the turn is doing, the info
+        // what the session is pointed at. Both are clipped, and the info never
+        // takes more than half of it — a title long enough to fill the row used
+        // to squeeze the status to nothing, so a running turn looked idle. An
+        // alert is the exception: it is a question, so it takes the row and the
+        // info waits.
+        let info = clip(&self.info, cols / 2);
+        let gap = usize::from(!info.is_empty());
+        let status = clip(&self.status, cols.saturating_sub(info.width() + gap));
 
         let frame = self
             .term
@@ -1666,6 +1670,24 @@ mod tests {
         assert!(text.contains("Thinking…"), "{text}");
         assert!(text.contains("p/m · default"), "{text}");
         assert!(text.contains("Queued: later"), "{text}");
+    }
+
+    #[test]
+    fn a_long_info_does_not_squeeze_out_the_status() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_status("Responding…");
+        screen.set_info("a long session title · mock/mock-1 · default · 1125/8192");
+        screen.draw().unwrap();
+        let text: String = screen
+            .test_buffer()
+            .content
+            .chunks(40)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Responding…"), "{text}");
+        // The info keeps its half, clipped, rather than taking the row.
+        assert!(text.contains("a long session tit"), "{text}");
     }
 
     #[test]

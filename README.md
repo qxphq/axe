@@ -199,7 +199,8 @@ reply reads like a finished one.
 
 The dim row under the prompt is what the turn is doing on the left, and on the
 right the session's name, the provider/model and thinking level, and how much of
-the context window the history fills. The name is the first request until the
+the context window the history fills. The right half never takes more than half
+the row: a long title clips, it does not push out what the turn is doing. The name is the first request until the
 model names the session after the first answer; it appears as soon as the
 request is in the history, and the generated title replaces it without waiting
 for a key.
