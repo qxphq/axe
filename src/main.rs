@@ -1602,52 +1602,9 @@ impl Session {
             // it, so the mode here is only about which tool set is offered.
             let handle =
                 scope.spawn(|| tools::execute("bash", &args, &cancel, tools::Mode::Normal));
-            loop {
-                match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(Event::Key(key)) if key.code == KeyCode::Esc => {
-                        cancel.cancel();
-                        screen.set_status("Interrupting…");
-                        screen.repaint();
-                    }
-                    Ok(Event::Key(key)) => match screen.apply_key(key) {
-                        ui::Action::Submit if !screen.is_empty() && queued.is_none() => {
-                            queued = Some(screen.take());
-                        }
-                        ui::Action::Eof => {
-                            cancel.cancel();
-                            break;
-                        }
-                        _ => {
-                            screen.repaint();
-                        }
-                    },
-                    Ok(Event::Paste(text)) => {
-                        screen.insert_text(&text);
-                        screen.repaint();
-                    }
-                    Ok(Event::Resize) => {
-                        screen.invalidate();
-                        screen.repaint();
-                    }
-                    Ok(Event::Eof) => {
-                        cancel.cancel();
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if handle.is_finished() {
-                            break;
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        cancel.cancel();
-                        break;
-                    }
-                }
-            }
-            handle
-                .join()
-                .unwrap_or_else(|_| "error: shell thread panicked".into())
+            let (joined, line) = pump(screen, rx, &cancel, handle);
+            queued = line;
+            joined.unwrap_or_else(|| "error: shell thread panicked".into())
         });
         screen.set_status("");
         screen.output(&result);
@@ -1707,44 +1664,9 @@ impl Session {
                 let result = thread::scope(|scope| {
                     let handle =
                         scope.spawn(|| compact_request(provider, &model, &request, &cancel));
-                    loop {
-                        match rx.recv_timeout(Duration::from_millis(50)) {
-                            Ok(Event::Key(key)) if key.code == KeyCode::Esc => {
-                                cancel.cancel();
-                                screen.set_status("Interrupting…");
-                                screen.repaint();
-                            }
-                            Ok(Event::Key(key)) => {
-                                if let ui::Action::Submit = screen.apply_key(key) {
-                                    if !screen.is_empty() && queued.is_none() {
-                                        queued = Some(screen.take());
-                                    }
-                                }
-                                screen.repaint();
-                            }
-                            Ok(Event::Paste(text)) => {
-                                screen.insert_text(&text);
-                                screen.repaint();
-                            }
-                            Ok(Event::Resize) => {
-                                screen.invalidate();
-                                screen.repaint();
-                            }
-                            Ok(Event::Eof) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                                cancel.cancel();
-                                break;
-                            }
-                            Ok(_) => {}
-                            Err(mpsc::RecvTimeoutError::Timeout) => {
-                                if handle.is_finished() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    handle
-                        .join()
-                        .unwrap_or_else(|_| Err("compaction thread panicked".into()))
+                    let (joined, line) = pump(screen, rx, &cancel, handle);
+                    queued = line;
+                    joined.unwrap_or_else(|| Err("compaction thread panicked".into()))
                 });
                 screen.set_status("");
                 result
@@ -2458,6 +2380,60 @@ fn spawn_input(tx: Sender<Event>) {
 
 /// How often the idle prompt looks for work that finished off the UI thread.
 const IDLE: Duration = Duration::from_millis(100);
+
+/// Wait for work another thread is doing while the prompt stays live: keys are
+/// folded into the line, Esc asks the cancel for it, and the loop ends when the
+/// work is finished. What the thread joined to comes back with the one line
+/// typed while it ran — a panic is `None`, and the caller names it.
+///
+/// `!cmd` and `/compact` wait the same way, which is why this is one function:
+/// the two used to be one loop each, and only one of them took a line.
+fn pump<T>(
+    screen: &mut ui::Screen,
+    rx: &Receiver<Event>,
+    cancel: &http::Cancel,
+    handle: thread::ScopedJoinHandle<'_, T>,
+) -> (Option<T>, Option<String>) {
+    let mut queued: Option<String> = None;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(Event::Key(key)) if key.code == KeyCode::Esc => {
+                cancel.cancel();
+                screen.set_status("Interrupting…");
+                screen.repaint();
+            }
+            Ok(Event::Key(key)) => match screen.apply_key(key) {
+                ui::Action::Submit if !screen.is_empty() && queued.is_none() => {
+                    queued = Some(screen.take());
+                }
+                ui::Action::Eof => {
+                    cancel.cancel();
+                    break;
+                }
+                _ => {}
+            },
+            Ok(Event::Paste(text)) => screen.insert_text(&text),
+            Ok(Event::Resize) => screen.invalidate(),
+            Ok(Event::Eof) => {
+                cancel.cancel();
+                break;
+            }
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if handle.is_finished() {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                cancel.cancel();
+                break;
+            }
+        }
+        // A setter marked the screen; one paint per event.
+        screen.repaint();
+    }
+    (handle.join().ok(), queued)
+}
 
 /// Collect one line from the prompt. Keys are the only input while idle;
 /// `idle` runs on every tick, so work that finishes on another thread — the
