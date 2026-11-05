@@ -137,13 +137,15 @@ impl Mode {
         }
     }
 
-    /// Appended when the kernel, not the command, refused something: the model
-    /// has to tell a sandbox denial from a missing binary or a bug, and to know
-    /// which places it may write and how the restriction is lifted.
+    /// Appended when a command reported a refusal the kernel may have made: the
+    /// model has to tell a sandbox denial from a missing binary or a bug, and to
+    /// know which places it may write and how the restriction is lifted. It
+    /// cannot be sure — "Permission denied" is also what a file mode says — so
+    /// this states the rule and leaves the verdict open.
     fn denial(self, plan: Option<&Path>) -> String {
         format!(
-            "explore mode: only the allowlist runs; writes go to {} — `/explore off` for \
-             anything else\n",
+            "explore mode: no write outside {} and no exec outside the allowlist — \
+             `/explore off` for anything else\n",
             Self::writable(plan)
         )
     }
@@ -737,6 +739,10 @@ mod tests {
             assert!(text.contains("/state/projects/x/plan"), "{text}");
             assert!(text.contains("scratch directory"), "{text}");
         }
+        // The kernel and a file mode both say "Permission denied", so the note
+        // states the rule rather than claiming this command was denied by it.
+        assert!(refusal.contains("no write outside"), "{refusal}");
+        assert!(!refusal.contains("only the allowlist runs"), "{refusal}");
         for text in [on.note(None), on.denial(None)] {
             assert!(!text.contains("for a plan"), "{text}");
         }
