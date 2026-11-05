@@ -195,6 +195,18 @@ impl Log {
     }
 }
 
+/// The marker a compacted body carries. The message under it is the summary the
+/// session continues from, and the count says how many messages it replaced.
+/// The provider never sees either: the loader strips the key.
+pub const COMPACT: &str = "axe_compact";
+
+/// The summary as the body records it.
+pub fn compacted(content: &str, replaced: u64) -> Value {
+    let mut message = json!({ "role": "user", "content": content });
+    message[COMPACT] = json!({ "replaced": replaced });
+    message
+}
+
 /// Read a body, unpacking it first when it was archived. The plain file is
 /// left behind: resuming makes the session live again.
 pub fn load_messages(
@@ -221,6 +233,7 @@ pub fn load_messages(
 
     let file = File::open(&plain).map_err(|e| format!("open {}: {e}", plain.display()))?;
     let mut messages = Vec::new();
+    let mut marker = None;
     for line in BufReader::new(file).lines() {
         let line = match line {
             Ok(line) => line,
@@ -241,8 +254,24 @@ pub fn load_messages(
             }
         };
         match message["role"].as_str() {
-            Some("user" | "assistant" | "tool") => messages.push(message),
+            Some("user" | "assistant" | "tool") => {
+                if message.get(COMPACT).is_some() {
+                    marker = Some(messages.len());
+                }
+                messages.push(message);
+            }
             _ => continue,
+        }
+    }
+    // A compacted body continues from its last summary. What came before stays
+    // on disk — the body is append-only — and out of the request, so replay
+    // matches what the live session sent.
+    if let Some(at) = marker {
+        messages.drain(..at);
+        for message in &mut messages {
+            if let Some(object) = message.as_object_mut() {
+                object.remove(COMPACT);
+            }
         }
     }
     // A killed append can leave the sidecar count one behind; the body is the
@@ -547,6 +576,32 @@ mod tests {
         let messages = load_messages(&dir, &mut meta, &mut warnings).unwrap();
         assert_eq!(messages.len(), 2);
         assert!(warnings.is_empty(), "{warnings:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_compacted_body_starts_at_its_last_summary() {
+        let dir = std::env::temp_dir().join(format!("axe-test-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let meta = Meta::new("abc123", "p/m");
+        meta.save(&dir).unwrap();
+        let mut log = Log::open(&dir, "abc123").unwrap();
+        log.append(&json!({ "role": "user", "content": "one" }))
+            .unwrap();
+        log.append(&compacted("first summary", 1)).unwrap();
+        log.append(&json!({ "role": "user", "content": "two" }))
+            .unwrap();
+        log.append(&compacted("second summary", 2)).unwrap();
+        log.append(&json!({ "role": "assistant", "content": "three" }))
+            .unwrap();
+        let mut meta = Meta::load(&dir, "abc123").unwrap();
+        let mut warnings = Vec::new();
+        let messages = load_messages(&dir, &mut meta, &mut warnings).unwrap();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[0]["content"].as_str(), Some("second summary"));
+        assert!(messages[0].get(COMPACT).is_none(), "the marker is stripped");
+        assert_eq!(messages[1]["content"].as_str(), Some("three"));
+        assert_eq!(meta.messages, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

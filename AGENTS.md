@@ -11,8 +11,8 @@ invariants a change must not break.
    (crossterm backend), `unicode-width`, and `libc` on Linux. Crypto and terminal
    geometry are not hand-rolled; compression is the host's `gzip`, never a crate.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
-   panes, compaction, subagents, MCP, or permission layer until the REPL is
-   genuinely insufficient. One feature per change.
+   panes, subagents, MCP, or permission layer until the REPL is genuinely
+   insufficient. One feature per change.
 3. **Small surface.** Sixteen modules; a new module needs a separate concern,
    not a line count.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` +
@@ -29,7 +29,8 @@ invariants a change must not break.
 6. **Stable prefix, append-only history.** System prompt and tool schemas first,
    volatile content last. Never inject timestamps, status, or cwd changes into the
    prefix: it invalidates provider prompt caching. Sessions are append-only JSONL,
-   replayed on resume; compaction stays last.
+   replayed on resume; `/compact` appends a marked summary and the loader starts
+   from the last marker, so the bytes stay and the request shrinks.
 7. **Tools are dumb.** `read`, `write`, `edit`, `bash`, `about`, `fetch`,
    `web_search`. No `glob`, `grep`, or `list`; `bash` + `rg`/`fd` covers them.
    `about` returns the compiled-in `README.md`: documentation, not a code path.
@@ -141,7 +142,8 @@ invariants a change must not break.
 - `config.rs` — load and validate the config; resolve the `agents` file.
 - `state.rs` — per-directory state: the cwd key, load, and an atomic write.
 - `sessions.rs` — meta sidecar and append-only JSONL body per session; listing,
-  search, system gzip for old bodies, UTC stamp.
+  search, system gzip for old bodies, UTC stamp, and the compaction marker a
+  body continues from.
 - `tools.rs` — tool registry, schemas, generated prompt, local tools, `about`,
   and `Mode`: the tool set a session runs with, and the note and denial that
   announce it.
@@ -185,7 +187,9 @@ invariants a change must not break.
   by the REPL loop like any line typed while idle.
 - Sessions: `<id>.json` is the mutable sidecar; `<id>.jsonl` is append-only; bodies
   older than `sessions::KEEP` are gzipped. The sidecar stays readable, so listing
-  and search work without unpacking. The system prompt and mode notes are never
+  and search work without unpacking. A compacted body carries a marked summary
+  and the loader returns the messages from the last marker on, with the marker's
+  key stripped: the marker is a file record, never a request field. The system prompt and mode notes are never
   logged; resume rebuilds them. A title and summary are generated once, after the
   first answer; failing that, the first request stands in. The project directory
   also holds `plan/`, the one writable path explore mode keeps across sessions.

@@ -319,7 +319,11 @@ fn naming_excerpt(messages: &[Value]) -> Option<(String, String)> {
         .iter()
         .filter(|message| message["role"].as_str() == Some("user"))
         .filter_map(|message| message["content"].as_str())
-        .find(|text| !text.starts_with("explore mode:") && !text.starts_with('$'))?;
+        .find(|text| {
+            !text.starts_with("explore mode:")
+                && !text.starts_with('$')
+                && !text.starts_with(COMPACT_NOTE)
+        })?;
     let assistant = messages
         .iter()
         .filter(|message| message["role"].as_str() == Some("assistant"))
@@ -330,6 +334,93 @@ fn naming_excerpt(messages: &[Value]) -> Option<(String, String)> {
         sessions::collapse(user, 1500),
         sessions::collapse(assistant, 1500),
     ))
+}
+
+/// `/compact`'s instruction: the reply is the summary and nothing else.
+const COMPACT_PROMPT: &str = "You summarize a coding session so it can continue in a smaller \
+context. Reply with the summary only, no preamble. Keep every path, command, identifier, error \
+message and decision exact. Sections: task, what has been done, files changed, commands run, \
+decisions and constraints, open questions, next step. Under 800 words.";
+
+/// What the summary message says before the summary. The session's own voice,
+/// not the user's: `user_summary` and `naming_excerpt` skip it.
+const COMPACT_NOTE: &str = "Earlier in this session, before it was compacted:";
+
+/// One tool-less completion for `/compact`. The summary is text, not a turn.
+fn compact_request(
+    provider: &Provider,
+    model: &str,
+    messages: &[Value],
+    cancel: &http::Cancel,
+) -> Result<String, String> {
+    let extra = json!({ "max_tokens": 2000, "temperature": 0 });
+    api::stream_chat(
+        &provider.ep,
+        provider.key.as_deref(),
+        &provider.headers,
+        model,
+        messages,
+        &json!([]),
+        Some(&extra),
+        cancel,
+        |_| {},
+        |_| {},
+    )
+    .map(|reply| reply.text)
+}
+
+/// The conversation as one plain-text transcript for the summarizing request.
+/// API messages would carry `tool_calls` without the `tools` array that defines
+/// them, which a strict provider refuses; text cannot. The oldest messages go
+/// first when the transcript does not fit `budget`, and the newest always stays.
+fn compaction_prompt(messages: &[Value], budget: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for message in messages.iter().skip(2) {
+        let role = message["role"].as_str().unwrap_or("");
+        if let Some(text) = message["content"].as_str().filter(|text| !text.is_empty()) {
+            let (head, tail) = if role == "tool" {
+                (800, 200)
+            } else {
+                (2000, 500)
+            };
+            lines.push(format!("{role}: {}", cut(text, head, tail)));
+        }
+        if let Some(calls) = message["tool_calls"].as_array() {
+            for call in calls {
+                let name = call["function"]["name"].as_str().unwrap_or("");
+                let args = call["function"]["arguments"].as_str().unwrap_or("");
+                lines.push(format!("{role}: calls {name} {}", cut(args, 300, 100)));
+            }
+        }
+    }
+    let mut total: usize = lines.iter().map(|line| line.len() + 1).sum();
+    let mut dropped = 0;
+    while total > budget && lines.len() > 1 {
+        total -= lines[0].len() + 1;
+        lines.remove(0);
+        dropped += 1;
+    }
+    let mut out = String::new();
+    if dropped > 0 {
+        out.push_str(&format!("[{dropped} earlier messages omitted]\n"));
+    }
+    for line in &lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// `text` cut to `head` chars from the front and `tail` from the end, marked
+/// where it was cut.
+fn cut(text: &str, head: usize, tail: usize) -> String {
+    let count = text.chars().count();
+    if count <= head + tail + 1 {
+        return text.to_string();
+    }
+    let front: String = text.chars().take(head).collect();
+    let back: String = text.chars().skip(count - tail).collect();
+    format!("{front}…[cut]…{back}")
 }
 
 /// One small completion, without tools. The session header stays: providers
@@ -540,6 +631,19 @@ impl Store {
         meta.save(&self.dir)
     }
 
+    /// Record a compaction: the marked summary goes into the body, and the
+    /// session's message count starts over at it. What came before is still in
+    /// the file; it is no longer part of the session.
+    fn compacted(&mut self, message: &Value) {
+        self.record(message);
+        if let Some(meta) = self.meta.as_mut() {
+            meta.messages = 1;
+            if let Err(e) = meta.save(&self.dir) {
+                self.warn(format!("session meta: {e}"));
+            }
+        }
+    }
+
     fn set_title(&mut self, title: &str, summary: &str) {
         let Some(meta) = self.meta.as_mut() else {
             return;
@@ -579,7 +683,8 @@ fn user_summary(message: &Value) -> Option<String> {
         return None;
     }
     let text = message["content"].as_str()?;
-    if text.starts_with("explore mode:") || text.starts_with('$') {
+    if text.starts_with("explore mode:") || text.starts_with('$') || text.starts_with(COMPACT_NOTE)
+    {
         return None;
     }
     Some(sessions::collapse(text, 240))
@@ -616,6 +721,8 @@ enum Cmd {
     Continue,
     /// Send this to the model.
     Turn(String),
+    /// Replace the history with a summary of it, then carry on.
+    Compact,
     /// Run this locally (`!cmd`); the output joins the history without a turn.
     Shell(String),
 }
@@ -636,6 +743,8 @@ enum Command {
     Explore,
     /// A chooser in the interactive run, a numbered list when piped.
     Sessions(Option<String>),
+    /// Replace the history with a summary of itself.
+    Compact,
     Skills,
     /// `/skill:name request`: the body becomes the user turn.
     Skill(String, String),
@@ -653,6 +762,7 @@ fn parse_command(line: &str) -> Command {
         "/exit" | "/quit" => return Command::Exit,
         "/help" => return Command::Help,
         "/new" => return Command::New,
+        "/compact" => return Command::Compact,
         "/model" => return Command::Model(None),
         "/thinking" => return Command::Thinking(None),
         "/thoughts" => return Command::Thoughts,
@@ -710,6 +820,7 @@ enum Input {
 /// Slash commands, for Tab completion in the prompt. Only the name is
 /// completed; `/model` and `/thinking` take their argument as typed.
 const COMMANDS: &[&str] = &[
+    "/compact",
     "/exit",
     "/explore",
     "/help",
@@ -734,6 +845,7 @@ const HELP: &str = "/model [id]    list the models, or switch to one\n\
                     /thinking [l]  show or set thinking level (off, low, medium, high)\n\
                     /thoughts      show or hide the model's reasoning\n\
                     /sessions [q]  list, search and resume sessions\n\
+                    /compact       replace the history with a summary of itself\n\
                     /skills        list loaded skills (project, global, config)\n\
                     /skill:name [request]  load a skill's instructions and run a turn\n\
                     /new           start a new session\n\
@@ -837,6 +949,12 @@ impl Session {
                 Cmd::Shell(command) => {
                     pending = self.shell(&command, &mut screen, &rx);
                 }
+                Cmd::Compact => {
+                    pending = self.compact(&mut Console::Screen {
+                        screen: &mut screen,
+                        rx: &rx,
+                    });
+                }
             }
             self.flush_warnings(Some(&mut screen));
         }
@@ -873,6 +991,9 @@ impl Session {
                     console.output(&format!("{}\n", plain_text(&shell_line(&command, false))));
                     let result = self.run_shell(&command);
                     console.output(&result);
+                }
+                Cmd::Compact => {
+                    self.compact(&mut Console::Stdout);
                 }
             }
             self.flush_warnings(None);
@@ -1531,6 +1652,123 @@ impl Session {
         queued
     }
 
+    /// `/compact`: ask the model to summarize the session, then continue from
+    /// the summary. The body is not rewritten — the summary is appended as a
+    /// marked user message and the loader starts replay from it.
+    ///
+    /// A line submitted while the request runs comes back like `shell`'s: the
+    /// prompt stays live, and nothing typed is lost.
+    fn compact(&mut self, console: &mut Console) -> Option<String> {
+        if !self
+            .messages
+            .iter()
+            .skip(2)
+            .any(|message| message["role"].as_str() == Some("assistant"))
+        {
+            console.output("nothing to compact\n");
+            return None;
+        }
+        // Half the window, as characters: the request has to fit with room for
+        // the answer. 50 000 tokens is the most `/compact` will send.
+        let budget = self
+            .context()
+            .map(|window| {
+                usize::try_from(window)
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(2)
+            })
+            .unwrap_or(200_000)
+            .min(200_000);
+        let prompt = compaction_prompt(&self.messages, budget);
+        let request = vec![
+            json!({ "role": "system", "content": COMPACT_PROMPT }),
+            json!({ "role": "user", "content": prompt }),
+        ];
+        let cancel = http::Cancel::new();
+        let provider = &self.providers[self.provider];
+        let model = self.model.clone();
+        let mut queued = None;
+        let result = match console {
+            Console::Screen { screen, rx } => {
+                screen.set_status("Compacting…");
+                screen.repaint();
+                let result = thread::scope(|scope| {
+                    let handle =
+                        scope.spawn(|| compact_request(provider, &model, &request, &cancel));
+                    loop {
+                        match rx.recv_timeout(Duration::from_millis(50)) {
+                            Ok(Event::Key(key)) if key.code == KeyCode::Esc => {
+                                cancel.cancel();
+                                screen.set_status("Interrupting…");
+                                screen.repaint();
+                            }
+                            Ok(Event::Key(key)) => {
+                                if let ui::Action::Submit = screen.apply_key(key) {
+                                    if !screen.is_empty() && queued.is_none() {
+                                        queued = Some(screen.take());
+                                    }
+                                }
+                                screen.repaint();
+                            }
+                            Ok(Event::Paste(text)) => {
+                                screen.insert_text(&text);
+                                screen.repaint();
+                            }
+                            Ok(Event::Resize) => {
+                                screen.invalidate();
+                                screen.repaint();
+                            }
+                            Ok(Event::Eof) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                cancel.cancel();
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                if handle.is_finished() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("compaction thread panicked".into()))
+                });
+                screen.set_status("");
+                result
+            }
+            Console::Stdout => compact_request(provider, &model, &request, &cancel),
+        };
+
+        match result {
+            Ok(text) if !text.trim().is_empty() => {
+                let summary = text.trim().to_string();
+                let replaced = self.messages.len().saturating_sub(2) as u64;
+                let content = format!("{COMPACT_NOTE}\n\n{summary}");
+                self.messages = self.base_messages();
+                self.messages
+                    .push(json!({ "role": "user", "content": content }));
+                if let Some(store) = self.store.as_mut() {
+                    store.compacted(&sessions::compacted(&content, replaced));
+                }
+                // The stored count was the old request's; the next reply sets it
+                // again, and the estimate stands in until then.
+                self.used = None;
+                if let Some(screen) = console.screen() {
+                    screen.set_info(self.info());
+                }
+                console.output(&format!("compacted {replaced} messages into 1 summary\n"));
+            }
+            Ok(_) => console.error("compaction: the model returned nothing"),
+            Err(_) if cancel.cancelled() => console.output("Compaction cancelled\n"),
+            Err(e) => console.error(&e),
+        }
+        if let Some(screen) = console.screen() {
+            screen.repaint();
+        }
+        queued
+    }
+
     /// The command and its output as a user message. The `!` is the prompt's
     /// syntax, not the model's, so the message reads as a shell transcript.
     fn run_shell(&mut self, command: &str) -> String {
@@ -1942,6 +2180,7 @@ impl Session {
                 self.sessions(query.as_deref().unwrap_or(""), console);
                 Cmd::Continue
             }
+            Command::Compact => Cmd::Compact,
             Command::Skills => {
                 console.output(&self.skill_listing());
                 Cmd::Continue
@@ -2607,6 +2846,8 @@ mod tests {
             parse_command("/sessions q"),
             Command::Sessions(Some("q".into()))
         );
+        assert_eq!(parse_command("/compact"), Command::Compact);
+        assert!(COMMANDS.contains(&"/compact"));
         assert_eq!(parse_command("! ls"), Command::Shell("ls".into()));
         assert_eq!(parse_command("!"), Command::Empty);
         assert_eq!(parse_command("hello"), Command::Turn("hello".into()));
@@ -2632,6 +2873,50 @@ mod tests {
             Some(("Fix parser".into(), "The parser was fixed.".into()))
         );
         assert_eq!(parse_naming("nothing useful"), None);
+    }
+
+    #[test]
+    fn compaction_prompt_keeps_the_newest_and_counts_what_it_dropped() {
+        let messages = vec![
+            json!({ "role": "system", "content": "the prompt" }),
+            json!({ "role": "user", "content": "explore mode: on" }),
+            json!({ "role": "user", "content": "first" }),
+            json!({ "role": "assistant", "content": "second" }),
+            json!({ "role": "user", "content": "third" }),
+        ];
+        // Wide enough: everything the session said, and neither the system
+        // prompt nor the mode note.
+        let all = compaction_prompt(&messages, 10_000);
+        assert!(all.contains("user: first"));
+        assert!(all.contains("assistant: second"));
+        assert!(all.contains("user: third"));
+        assert!(!all.contains("the prompt"));
+        assert!(!all.contains("explore mode"));
+        // Tight enough for one message: the oldest goes first, the newest stays.
+        let one = compaction_prompt(&messages, 10);
+        assert!(one.contains("third"));
+        assert!(!one.contains("first"));
+        assert!(one.starts_with("["));
+        assert!(one.contains("earlier messages omitted"));
+        // Nothing to say is not a panic.
+        assert_eq!(compaction_prompt(&messages[..2], 10), "");
+    }
+
+    #[test]
+    fn a_tool_result_is_cut_before_it_is_summarized() {
+        let long = "x".repeat(5000);
+        let messages = vec![
+            json!({ "role": "system", "content": "s" }),
+            json!({ "role": "user", "content": "u" }),
+            json!({ "role": "tool", "content": long }),
+            json!({ "role": "user", "content": "newest" }),
+        ];
+        let prompt = compaction_prompt(&messages, 10_000);
+        assert!(prompt.contains("…[cut]…"));
+        assert!(prompt.len() < 1500);
+        assert!(prompt.contains("newest"));
+        // Short text is left alone.
+        assert_eq!(cut("abc", 2, 2), "abc");
     }
 
     #[test]

@@ -195,6 +195,7 @@ sees it the next time you ask something.
 | `/explore` | toggle explore mode (also Shift+Tab) |
 | `/new` | start a new session, naming the old one and clearing the screen |
 | `/sessions [query]` | browse or search this directory's sessions |
+| `/compact` | summarize the session and continue from the summary |
 | `/skills` | list loaded skills, where they came from, and what the model sees |
 | `/skill:name [request]` | load a skill's instructions and run a turn |
 | `/help` | list the commands, the config path and its keys |
@@ -310,6 +311,13 @@ answers from its title and summary. Resuming one unpacks it back to plain. The
 system prompt and mode notes are not logged; resume rebuilds them from the
 current instructions and mode. Titles and summaries are generated after the
 first answer, and fall back to the first request if that fails.
+
+`/compact` replaces the history with a summary of it. The body is not rewritten:
+the summary is appended as a marked message, and reading a body starts from the
+last marker, so replay matches what the live session sent. What came before the
+marker stays on disk and `/sessions` search still finds it. The summary keeps
+the system prompt and the current mode note; a session that has been compacted
+lists the messages the model still has, not the bytes in the file.
 
 ## Sandbox
 
