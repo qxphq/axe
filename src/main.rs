@@ -2060,7 +2060,10 @@ impl Session {
         // The transcript says the turn was stopped: an interrupted reply ends
         // mid-sentence and looks like a finished one otherwise.
         if interrupted {
-            screen.error("⏹ Turn interrupted — the reply is partial\n");
+            // No emoji-presentation glyph here: `unicode-width` calls those one
+            // cell while the terminal may draw two, and the space after it is
+            // the cost.
+            screen.error("Turn interrupted — the reply is partial\n");
         }
         screen.set_queued(None);
         // A turn that reported nothing (interrupted, or a provider that does
