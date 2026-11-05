@@ -2470,13 +2470,17 @@ fn banner(notes: &[String]) {
     } else {
         &["axe"]
     };
-    for line in logo {
-        println!(" {}", Paint::Cyan.ansi(line));
+    // The release rides the mark's second row; the one-word fallback has no
+    // second row, so it takes the one it has.
+    let version_row = (logo.len() - 1).min(1);
+    for (i, line) in logo.iter().enumerate() {
+        let mut out = Paint::Cyan.ansi(line);
+        if i == version_row {
+            out.push_str("   ");
+            out.push_str(&Paint::Dim.ansi(env!("CARGO_PKG_VERSION")));
+        }
+        println!(" {}", out);
     }
-    println!(
-        " {}",
-        Paint::Dim.ansi(&format!("axe {}", env!("CARGO_PKG_VERSION")))
-    );
     if !notes.is_empty() {
         println!();
         for note in notes {
