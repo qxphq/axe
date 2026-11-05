@@ -171,6 +171,43 @@ impl Term {
             Term::Test(term) => term.set_cursor_position(position),
         }
     }
+
+    /// The same terminal, in a viewport `height` rows tall starting at the
+    /// cursor. The backend is carried over, so a test's scrollback survives the
+    /// move: it is the session's history, not the terminal's.
+    fn reshape(&mut self, height: u16) -> io::Result<()> {
+        let options = || TerminalOptions {
+            viewport: Viewport::Inline(height),
+        };
+        let term = match self {
+            // Deriving the area asks the terminal where its cursor is, and
+            // crossterm answers only while it holds the event reader: the input
+            // thread takes it in short turns, so this can miss a few times
+            // before it lands.
+            Term::Real(_) => {
+                let mut tries = 0;
+                loop {
+                    match Terminal::with_options(
+                        Tail(CrosstermBackend::new(io::stdout())),
+                        options(),
+                    ) {
+                        Ok(term) => break Term::Real(term),
+                        Err(_) if tries < 50 => {
+                            tries += 1;
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            #[cfg(test)]
+            Term::Test(term) => {
+                Term::Test(Terminal::with_options(term.backend().clone(), options())?)
+            }
+        };
+        *self = term;
+        Ok(())
+    }
 }
 
 pub struct Screen {
@@ -282,10 +319,25 @@ impl Screen {
         })
     }
 
+    /// A screen shaped like a real one: an inline region at the bottom of the
+    /// terminal, the transcript above it, and a scrollback the backend keeps.
+    /// Everything `fit` does to a real terminal it does here too.
     #[cfg(test)]
     fn test_screen(width: u16, height: u16) -> Screen {
+        let rows = height.clamp(1, CHROME + 1);
+        let mut backend = TestBackend::new(width, height);
+        backend
+            .set_cursor_position(Position::new(0, height - rows))
+            .unwrap();
+        let term = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(rows),
+            },
+        )
+        .unwrap();
         Screen {
-            term: Term::Test(Terminal::new(TestBackend::new(width, height)).unwrap()),
+            term: Term::Test(term),
             prompt: "❯ ".to_string(),
             prompt_style: PROMPT_STYLE,
             buf: String::new(),
@@ -317,6 +369,35 @@ impl Screen {
             Term::Test(term) => term.backend().buffer(),
             Term::Real(_) => unreachable!(),
         }
+    }
+
+    /// Everything a terminal would have after this session: the rows that
+    /// scrolled off, then the rows above the live region, oldest first. Trailing
+    /// space and trailing blank rows are trimmed, since one blank row between
+    /// two blocks is the rule and trailing ones are nobody's business.
+    ///
+    /// This is what a test asserts on. What is still on screen is only the tail
+    /// of it.
+    #[cfg(test)]
+    fn transcript(&mut self) -> Vec<String> {
+        let top = self.term.area().top() as usize;
+        let Term::Test(term) = &self.term else {
+            unreachable!()
+        };
+        let buffer = term.backend().buffer();
+        let width = buffer.area.width.max(1) as usize;
+        let mut rows: Vec<String> = term
+            .backend()
+            .scrollback()
+            .content
+            .chunks(width)
+            .map(row_text)
+            .collect();
+        rows.extend(buffer.content.chunks(width).take(top).map(row_text));
+        while rows.last().is_some_and(|row| row.is_empty()) {
+            rows.pop();
+        }
+        rows
     }
 
     /// Explore mode colors the prompt; the transcript keeps its own palette.
@@ -949,10 +1030,6 @@ impl Screen {
     /// are pushed into scrollback first, which leaves blank rows for the new
     /// prompt lines.
     fn fit(&mut self, height: u16) -> io::Result<()> {
-        #[cfg(test)]
-        if matches!(self.term, Term::Test(_)) {
-            return Ok(());
-        }
         let size = self.term.size()?;
         let height = height.min(size.height).max(1);
         let area = self.term.area();
@@ -970,26 +1047,7 @@ impl Screen {
         // screen's, so the cursor goes where the new top has to be.
         let top = size.height - height;
         self.term.set_cursor_position(Position::new(0, top))?;
-        // That derivation asks the terminal where its cursor is, and crossterm
-        // answers only while it holds the event reader: the input thread takes
-        // it in short turns, so this can miss a few times before it lands.
-        let mut tries = 0;
-        let term = loop {
-            match Terminal::with_options(
-                Tail(CrosstermBackend::new(io::stdout())),
-                TerminalOptions {
-                    viewport: Viewport::Inline(height),
-                },
-            ) {
-                Ok(term) => break term,
-                Err(_) if tries < 50 => {
-                    tries += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-                Err(e) => return Err(e),
-            }
-        };
-        self.term = Term::Real(term);
+        self.term.reshape(height)?;
         // Blank the whole region and force a full repaint.
         self.term.clear()?;
         Ok(())
@@ -1416,6 +1474,18 @@ fn inset(area: Rect, pad: u16) -> Rect {
         width: area.width.saturating_sub(2 * pad),
         ..area
     }
+}
+
+/// One row of a buffer as text, without the padding to the screen width: a
+/// terminal keeps the text, not the cells that were never written.
+#[cfg(test)]
+fn row_text(cells: &[Cell]) -> String {
+    cells
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 /// Break a styled line into display rows of at most `width` cells. Styles are
@@ -1903,6 +1973,7 @@ mod tests {
         assert_eq!(hints, vec!["/skills", "/skill:ship"]);
         assert_eq!(at, 0);
         screen.draw().unwrap();
+        let top = screen.term.area().top() as usize;
         let rows: Vec<String> = screen
             .test_buffer()
             .content
@@ -1911,13 +1982,13 @@ mod tests {
             .collect();
         // One blank cell of margin, then the prompt, then the list under its
         // text.
-        assert_eq!(rows[2].trim_end(), " ❯ /sk");
-        assert_eq!(rows[3].trim_end(), "   /skills");
-        assert_eq!(rows[4].trim_end(), "   /skill:ship");
+        assert_eq!(rows[top + 2].trim_end(), " ❯ /sk");
+        assert_eq!(rows[top + 3].trim_end(), "   /skills");
+        assert_eq!(rows[top + 4].trim_end(), "   /skill:ship");
         // The one the next step takes is the bright one.
         let cell = |x: u16, y: u16| screen.test_buffer()[(x, y)].clone();
-        assert_eq!(cell(3, 3).fg, Color::Cyan);
-        assert_ne!(cell(3, 4).fg, Color::Cyan);
+        assert_eq!(cell(3, top as u16 + 3).fg, Color::Cyan);
+        assert_ne!(cell(3, top as u16 + 4).fg, Color::Cyan);
         // After a step the whole set stays listed, with the buffer on the
         // second one.
         screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -1937,6 +2008,7 @@ mod tests {
         screen.set_commands(vec!["/c1".into(), "/c2".into(), "/c3".into()]);
         screen.insert_text("/c");
         screen.draw().unwrap();
+        let top = screen.term.area().top() as usize;
         let rows: Vec<String> = screen
             .test_buffer()
             .content
@@ -1945,8 +2017,8 @@ mod tests {
             .collect();
         // Half the screen, less the chrome and the prompt, is one row: the
         // live region stays inside its cap and the rest of the list is cut.
-        assert_eq!(rows[3].trim_end(), "   /c1");
-        assert_eq!(rows[4].trim_end(), "");
+        assert_eq!(rows[top + 3].trim_end(), "   /c1");
+        assert_eq!(rows[top + 4].trim_end(), "");
     }
 
     #[test]
@@ -1990,6 +2062,22 @@ mod tests {
         // no block, so the new session's first text has no separator to skip.
         screen.flush();
         assert!(screen.last.is_none());
+    }
+
+    #[test]
+    fn the_transcript_is_everything_that_scrolled_off() {
+        let mut screen = Screen::test_screen(40, 10);
+        for i in 0..12 {
+            screen.output(&format!("line {i}\n"));
+        }
+        let transcript = screen.transcript();
+        // The screen holds ten rows minus the live region; the rest is history.
+        // A row keeps the one cell of margin it was written with.
+        assert_eq!(transcript.last().unwrap(), " line 11", "{transcript:?}");
+        assert!(
+            transcript.iter().any(|row| row == " line 0"),
+            "{transcript:?}"
+        );
     }
 
     #[test]
