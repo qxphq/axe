@@ -745,7 +745,7 @@ impl Session {
             ui::Screen::new("❯ ").map_err(|e| format!("cannot take the terminal: {e}"))?;
         screen.set_explore(self.read_only);
         screen.set_commands(self.commands());
-        screen.set_info(&self.info());
+        screen.set_info(self.info());
         // The directory's recent sessions are a chooser, not a printout: the
         // list can be walked with the arrows and vanishes when typing starts.
         if !self.startup.is_empty() {
@@ -892,7 +892,7 @@ impl Session {
     /// Switch model: reset the fill count, remember the level for the new
     /// `provider/id` (state first, then config), persist the selection, and
     /// return the new info row.
-    fn set_model(&mut self, provider: usize, id: String) -> String {
+    fn set_model(&mut self, provider: usize, id: String) -> Vec<(ui::Info, String)> {
         self.provider = provider;
         self.model = id;
         // The count belonged to the old model's window.
@@ -976,7 +976,7 @@ impl Session {
             }
             screen.output(&format!("Resumed: {title}\n"));
             self.replay(screen);
-            screen.set_info(&self.info());
+            screen.set_info(self.info());
         } else {
             for warning in warnings {
                 eprintln!("axe: {}", strip_control(&warning));
@@ -1073,7 +1073,7 @@ impl Session {
         self.set_session_header();
         if let Some(screen) = screen {
             screen.reset();
-            screen.set_info(&self.info());
+            screen.set_info(self.info());
         }
     }
 
@@ -1132,7 +1132,7 @@ impl Session {
                 // The title is part of the selection row: marking it is
                 // enough, the idle tick repaints.
                 if let Some(screen) = screen.as_deref_mut() {
-                    screen.set_info(&self.info());
+                    screen.set_info(self.info());
                 }
                 self.flush_warnings(screen);
             }
@@ -1293,17 +1293,23 @@ impl Session {
 
     /// The live region's last row: what this session is pointed at, how much of
     /// the window it has filled, and the mode when that changes the tool set.
-    fn info(&self) -> String {
-        let base = selection(&self.providers, self.provider, &self.model, &self.thinking);
-        let base = match self.title() {
-            Some(title) => format!("{title}  ·  {base}"),
-            None => base,
-        };
-        let mut text = format!("{base}  ·  {}", self.fill());
-        if self.read_only {
-            text.push_str("  ·  read-only");
+    /// One piece per thing, so the screen can color each on its own.
+    fn info(&self) -> Vec<(ui::Info, String)> {
+        let mut parts = Vec::new();
+        if let Some(title) = self.title() {
+            parts.push((ui::Info::Title, title));
         }
-        text
+        parts.push((
+            ui::Info::Selection,
+            place(&self.providers, self.provider, &self.model),
+        ));
+        parts.push((ui::Info::Level, level(&self.thinking)));
+        let (fill, fullness) = self.fill();
+        parts.push((ui::Info::Fill(fullness), fill));
+        if self.read_only {
+            parts.push((ui::Info::Mode, "read-only".to_string()));
+        }
+        parts
     }
 
     /// The name on the selection row: the generated title, or, until the model
@@ -1325,12 +1331,16 @@ impl Session {
     /// Used and total tokens, with the percentage between them. The provider's
     /// own count when the last turn reported one, a character estimate
     /// otherwise; no percentage when the model does not say how big its window
-    /// is.
-    fn fill(&self) -> String {
+    /// is. The second value is how full the window is, the gauge the info row
+    /// colors: without a count there is nothing to measure.
+    fn fill(&self) -> (String, Option<u8>) {
         let used = self.used.unwrap_or_else(|| estimate(&self.messages));
         match self.context() {
-            Some(ctx) => format!("{}/{} ({})", scaled(used), scaled(ctx), percent(used, ctx)),
-            None => scaled(used),
+            Some(ctx) => (
+                format!("{}/{} ({})", scaled(used), scaled(ctx), percent(used, ctx)),
+                Some(fullness(used, ctx)),
+            ),
+            None => (scaled(used), None),
         }
     }
 
@@ -1352,7 +1362,7 @@ impl Session {
     fn toggle_explore(&mut self, screen: &mut ui::Screen) {
         self.set_read_only(!self.read_only);
         screen.set_explore(self.read_only);
-        screen.set_info(&self.info());
+        screen.set_info(self.info());
         screen.output(&format!(
             "Explore: {}\n",
             if self.read_only { "on" } else { "off" }
@@ -1487,7 +1497,7 @@ impl Session {
             "content": format!("$ {command}
         {result}"),
         }));
-        screen.set_info(&self.info());
+        screen.set_info(self.info());
         screen.repaint();
         queued
     }
@@ -1520,7 +1530,7 @@ impl Session {
         self.record(json!({ "role": "user", "content": input }));
         // The first request is the session's name until the model gives it one:
         // show it now, not once the turn is over.
-        screen.set_info(&self.info());
+        screen.set_info(self.info());
 
         let cancel = http::Cancel::new();
         let mut queued: Option<String> = None;
@@ -1749,7 +1759,7 @@ impl Session {
         // A turn that reported nothing (interrupted, or a provider that does
         // not count) leaves the estimate in charge rather than a stale number.
         self.used = used;
-        screen.set_info(&self.info());
+        screen.set_info(self.info());
 
         // Held from the turn: applied now, so the note sits below the answer
         // and above whatever the user types next.
@@ -1809,8 +1819,8 @@ impl Session {
                         let text = self.set_model(pi, id);
                         // The levels `/thinking` completes belong to a provider.
                         screen.set_commands(self.commands());
-                        screen.set_info(&text);
-                        screen.output(&format!("{text}\n"));
+                        screen.output(&format!("{}\n", ui::info_text(&text)));
+                        screen.set_info(text);
                     }
                     None => screen.error(&format!("unknown model: {spec}\n")),
                 }
@@ -1831,7 +1841,7 @@ impl Session {
                 match set_thinking(&providers[self.provider].cfg, rest.as_deref().unwrap_or("")) {
                     Ok(level) => {
                         self.thinking = Some(level.clone());
-                        screen.set_info(&self.info());
+                        screen.set_info(self.info());
                         let spec = format!("{}/{}", providers[self.provider].name, self.model);
                         self.state.set_thinking(&spec, level.as_str());
                         let save_error = self.state.save().err();
@@ -1915,7 +1925,10 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
         }
         Command::Model(Some(spec)) => {
             match find(&session.providers, &spec) {
-                Some((pi, id)) => println!("{}", terminal_text(&session.set_model(pi, id))),
+                Some((pi, id)) => println!(
+                    "{}",
+                    terminal_text(&ui::info_text(&session.set_model(pi, id)))
+                ),
                 None => eprintln!("axe: unknown model: {}", strip_control(&spec)),
             }
             Cmd::Continue
@@ -2520,11 +2533,27 @@ fn selection(
     model: &str,
     thinking: &Option<String>,
 ) -> String {
-    let level = match thinking {
-        Some(level) => level.clone(),
-        None => "default".to_string(),
-    };
-    format!("{}/{}  ·  {}", providers[provider].name, model, level)
+    format!(
+        "{}{}{}",
+        place(providers, provider, model),
+        ui::SEP,
+        level(thinking)
+    )
+}
+
+/// `provider/model`, the pair that answers a turn.
+fn place(providers: &[Provider], provider: usize, model: &str) -> String {
+    format!("{}/{}", providers[provider].name, model)
+}
+
+fn level(thinking: &Option<String>) -> String {
+    thinking.clone().unwrap_or_else(|| "default".to_string())
+}
+
+/// The window as a whole percent, saturating: a count that overshoots the
+/// window is full, not 140%.
+fn fullness(used: u64, ctx: u64) -> u8 {
+    (used.saturating_mul(100) / ctx.max(1)).min(100) as u8
 }
 
 /// Four bytes per token, the usual rule of thumb for English. Only used when no
@@ -2992,6 +3021,12 @@ fn summarize(text: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// The info row as one line: the screen joins the pieces, and so does
+    /// anything that asserts on them.
+    fn info_text(session: &Session) -> String {
+        ui::info_text(&session.info())
+    }
+
     #[test]
     fn an_interrupted_round_answers_every_call_it_named() {
         let calls = vec![
@@ -3270,7 +3305,7 @@ mod tests {
             warning: None,
             skills: Vec::new(),
         };
-        let info = session.set_model(0, "m".into());
+        let info = ui::info_text(&session.set_model(0, "m".into()));
         assert!(info.contains("p/m"), "{info}");
         assert_eq!(session.used, None);
         assert_eq!(session.state.model.as_deref(), Some("p/m"));
@@ -3436,9 +3471,9 @@ mod tests {
             warning: None,
             skills: Vec::new(),
         };
-        assert!(session.info().contains("p/m"));
+        assert!(info_text(&session).contains("p/m"));
         assert_eq!(session.context(), Some(100));
-        assert!(session.fill().contains("100"));
+        assert!(session.fill().0.contains("100"));
         session.set_read_only(false);
         assert!(!session.read_only);
         assert_eq!(session.messages.len(), 2);
@@ -3478,7 +3513,11 @@ mod tests {
             skills: Vec::new(),
         };
         // Untitled and empty history: the row starts with the model.
-        assert!(session.info().starts_with("p/m"), "{}", session.info());
+        assert!(
+            info_text(&session).starts_with("p/m"),
+            "{}",
+            info_text(&session)
+        );
         // The first request stands in until the model names the session; a
         // mode note or a shell line is not a request.
         session.messages = vec![
@@ -3487,19 +3526,19 @@ mod tests {
             json!({ "role": "user", "content": "why is the row blank" }),
         ];
         assert!(
-            session.info().starts_with("why is the row blank  ·  p/m"),
+            info_text(&session).starts_with("why is the row blank  ·  p/m"),
             "{}",
-            session.info()
+            info_text(&session)
         );
         // A generated title wins over the prompt.
         session.store.as_mut().unwrap().meta.as_mut().unwrap().title = "Fix the status row".into();
-        assert!(session.info().starts_with("Fix the status row  ·  p/m"));
+        assert!(info_text(&session).starts_with("Fix the status row  ·  p/m"));
         // A title of spaces is no title: the prompt is back.
         session.store.as_mut().unwrap().meta.as_mut().unwrap().title = "  ".into();
         assert!(
-            session.info().starts_with("why is the row blank"),
+            info_text(&session).starts_with("why is the row blank"),
             "{}",
-            session.info()
+            info_text(&session)
         );
     }
 }

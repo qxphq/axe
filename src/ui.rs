@@ -48,13 +48,60 @@ const MIN_TRANSCRIPT: u16 = 3;
 
 const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan);
 /// Explore mode's prompt: the glyph says the tool set is read-only.
-const EXPLORE_STYLE: Style = Style::new().fg(Color::Rgb(255, 165, 0));
+const EXPLORE_STYLE: Style = Style::new().fg(Color::Yellow);
 /// Marker for an already committed line in the transcript.
 const MARK: &str = "█";
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 const ERROR_STYLE: Style = Style::new().fg(Color::Red);
-/// A question waiting for an answer: the one row that outranks the info row.
-const ALERT_STYLE: Style = Style::new().fg(Color::Yellow);
+/// A caution, never a failure: a question waiting for an answer, a tool set
+/// that cannot write, a window that is nearly full.
+const CAUTION: Style = Style::new().fg(Color::Yellow);
+
+/// The cells between two pieces of the info row.
+pub const SEP: &str = "  ·  ";
+
+/// The info row as one plain line, for the paths that have no screen to color.
+pub fn info_text(parts: &[(Info, String)]) -> String {
+    let texts: Vec<&str> = parts.iter().map(|(_, text)| text.as_str()).collect();
+    texts.join(SEP)
+}
+
+/// A piece of the info row. The caller says what a piece is, not how it looks:
+/// every color below is one of the terminal's own ANSI names, so the theme the
+/// user chose decides what it actually is.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Info {
+    /// The session's name. Prose, so it keeps the terminal's default color.
+    Title,
+    /// `provider/model`: the same cyan as the prompt, because it is the same
+    /// thing, what this session is talking to.
+    Selection,
+    /// The thinking level: a knob next to the selection, so it gets its own
+    /// color rather than sharing one.
+    Level,
+    /// The window, and how full it is when the provider counted one. The only
+    /// piece whose color means something: green, then yellow, then red.
+    Fill(Option<u8>),
+    /// A mode that takes tools away.
+    Mode,
+}
+
+impl Info {
+    fn style(self) -> Style {
+        match self {
+            Info::Title => Style::new(),
+            Info::Selection => PROMPT_STYLE,
+            Info::Level => Style::new().fg(Color::Magenta),
+            Info::Fill(None) => DIM,
+            Info::Fill(Some(full)) => match full {
+                ..70 => Style::new().fg(Color::Green),
+                70..90 => CAUTION,
+                _ => ERROR_STYLE,
+            },
+            Info::Mode => CAUTION,
+        }
+    }
+}
 
 /// The kind of the last transcript block. Everything but two tool calls in a
 /// row is separated from what came before it by one blank line.
@@ -369,9 +416,9 @@ pub struct Screen {
     /// a queued line that scrolls away silently looks like the Enter was lost.
     queued: Option<String>,
     /// Right half of the row under the prompt, permanent: what this session is
-    /// pointed at. Set by the caller, which owns the model and the thinking
-    /// level.
-    info: String,
+    /// pointed at. Set by the caller, which owns the model, the thinking level
+    /// and the window, and colored here.
+    info: Vec<(Info, String)>,
     /// The last killed text: one slot, enough for Ctrl-U ... Ctrl-Y.
     killed: String,
     /// The lines Tab completes, in the caller's spelling: a slash command on
@@ -452,7 +499,7 @@ impl Screen {
             status: String::new(),
             alert: None,
             queued: None,
-            info: String::new(),
+            info: Vec::new(),
             killed: String::new(),
             commands: Vec::new(),
             selection: None,
@@ -492,7 +539,7 @@ impl Screen {
             status: String::new(),
             alert: None,
             queued: None,
-            info: String::new(),
+            info: Vec::new(),
             killed: String::new(),
             commands: Vec::new(),
             selection: None,
@@ -577,8 +624,10 @@ impl Screen {
         self.dirty = true;
     }
 
-    pub fn set_info(&mut self, text: &str) {
-        self.info = text.to_string();
+    /// The info row, piece by piece. The separator and the colors are the
+    /// screen's; the caller only says what each piece is.
+    pub fn set_info(&mut self, parts: impl IntoIterator<Item = (Info, String)>) {
+        self.info = parts.into_iter().collect();
         self.dirty = true;
     }
 
@@ -1089,8 +1138,8 @@ impl Screen {
         // to squeeze the status to nothing, so a running turn looked idle. An
         // alert is the exception: it is a question, so it takes the row and the
         // info waits.
-        let info = clip(&self.info, cols / 2);
-        let gap = usize::from(!info.is_empty());
+        let info = info_line(&self.info, cols / 2);
+        let gap = usize::from(info.width() > 0);
         let status = clip(&self.status, cols.saturating_sub(info.width() + gap));
 
         let frame = self
@@ -1175,7 +1224,7 @@ impl Screen {
                 // and comes back when the question is answered.
                 match &self.alert {
                     Some(text) => frame.render_widget(
-                        Paragraph::new(Line::styled(clip(text, cols), ALERT_STYLE)),
+                        Paragraph::new(Line::styled(clip(text, cols), CAUTION)),
                         line(layout.status.y),
                     ),
                     None => {
@@ -1184,7 +1233,7 @@ impl Screen {
                             line(layout.status.y),
                         );
                         frame.render_widget(
-                            Paragraph::new(Line::styled(info, DIM)).alignment(Alignment::Right),
+                            Paragraph::new(info).alignment(Alignment::Right),
                             line(layout.status.y),
                         );
                     }
@@ -1683,6 +1732,27 @@ fn prompt_layout(
     (rows, first, ((at.0 - first) as u16, at.1 as u16))
 }
 
+/// The info row as styled pieces joined by `SEP`, cut to `width` cells: the
+/// piece that overruns ends with an ellipsis and the rest is dropped, so a
+/// narrow row loses its last piece rather than its colors.
+fn info_line(parts: &[(Info, String)], width: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for (kind, text) in parts {
+        if !spans.is_empty() {
+            if used + SEP.width() >= width {
+                break;
+            }
+            spans.push(Span::styled(SEP, DIM));
+            used += SEP.width();
+        }
+        let text = clip(text, width - used);
+        used += text.width();
+        spans.push(Span::styled(text, kind.style()));
+    }
+    Line::from(spans)
+}
+
 /// Fit text into `width` cells. The selection row is the only row whose length
 /// the user controls (`model` ids and thinking levels), so a narrow terminal
 /// gets an ellipsis instead of a word cut in half.
@@ -1999,7 +2069,7 @@ mod tests {
         screen.draw().unwrap();
         // A frame is out: nothing is pending until a setter runs.
         assert!(!screen.is_dirty());
-        screen.set_info("after");
+        screen.set_info([(Info::Selection, "after".to_string())]);
         assert!(screen.is_dirty());
         screen.repaint();
         assert!(!screen.is_dirty());
@@ -2022,7 +2092,10 @@ mod tests {
         screen.buf = "hi".into();
         screen.cursor = 2;
         screen.set_status("Thinking…");
-        screen.set_info("p/m · default");
+        screen.set_info([
+            (Info::Selection, "p/m".to_string()),
+            (Info::Level, "default".to_string()),
+        ]);
         screen.set_queued(Some("later"));
         screen.draw().unwrap();
         let text: Vec<String> = screen
@@ -2034,7 +2107,7 @@ mod tests {
         let text = text.join("\n");
         assert!(text.contains("❯ hi"), "{text}");
         assert!(text.contains("Thinking…"), "{text}");
-        assert!(text.contains("p/m · default"), "{text}");
+        assert!(text.contains("p/m  ·  default"), "{text}");
         assert!(text.contains("Queued: later"), "{text}");
     }
 
@@ -2042,7 +2115,12 @@ mod tests {
     fn a_long_info_does_not_squeeze_out_the_status() {
         let mut screen = Screen::test_screen(40, 10);
         screen.set_status("Responding…");
-        screen.set_info("a long session title · mock/mock-1 · default · 1125/8192");
+        screen.set_info([
+            (Info::Title, "a long session title".to_string()),
+            (Info::Selection, "mock/mock-1".to_string()),
+            (Info::Level, "default".to_string()),
+            (Info::Fill(Some(13)), "1125/8192 (13%)".to_string()),
+        ]);
         screen.draw().unwrap();
         let text: String = screen
             .test_buffer()
@@ -2057,10 +2135,50 @@ mod tests {
     }
 
     #[test]
+    fn every_info_piece_carries_its_own_color() {
+        let mut screen = Screen::test_screen(100, 12);
+        screen.set_info([
+            (Info::Title, "t".to_string()),
+            (Info::Selection, "p/m".to_string()),
+            (Info::Level, "high".to_string()),
+            (Info::Fill(Some(93)), "93%".to_string()),
+            (Info::Mode, "read-only".to_string()),
+        ]);
+        screen.draw().unwrap();
+        let layout =
+            Frame::layout(screen.term.size().unwrap().height, Mode::Idle).at(screen.term.area().y);
+        let cells: Vec<(String, Color)> = (0..100u16)
+            .map(|x| {
+                let cell = &screen.test_buffer()[(x, layout.status.y)];
+                (cell.symbol().to_string(), cell.fg)
+            })
+            .filter(|(symbol, _)| symbol != " ")
+            .collect();
+        // Each piece carries one color of its own: the name is the terminal's
+        // default, the selection is the prompt's cyan, the level magenta, a
+        // nearly full window red, a mode that cannot write yellow.
+        let color = |first: &str| {
+            let (_, fg) = cells
+                .iter()
+                .find(|(symbol, _)| symbol == first)
+                .unwrap_or_else(|| panic!("{first} is not on the row: {cells:?}"));
+            *fg
+        };
+        assert_eq!(color("t"), Color::Reset);
+        assert_eq!(color("p"), Color::Cyan);
+        assert_eq!(color("h"), Color::Magenta);
+        assert_eq!(color("9"), Color::Red);
+        assert_eq!(color("r"), Color::Yellow);
+    }
+
+    #[test]
     fn an_alert_takes_the_row_the_info_would_use() {
         let mut screen = Screen::test_screen(40, 10);
         screen.set_status("Thinking…");
-        screen.set_info("p/m · default");
+        screen.set_info([
+            (Info::Selection, "p/m".to_string()),
+            (Info::Level, "default".to_string()),
+        ]);
         screen.set_alert(Some("press ESC again to interrupt"));
         screen.draw().unwrap();
         let text: String = screen
