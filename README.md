@@ -126,14 +126,11 @@ and is not descended into. The first name wins, so a project skill replaces a
 global one with the same name. `.git`, `node_modules`, `target` and dot
 directories are skipped; at most 200 skills and 16 KB of catalogue are used.
 
-Project skills come from the repository, so they stay out of the prompt until
-that directory is trusted. The first interactive run in a directory that has
-project skills or its own `AGENTS.md` asks once, in one line above the splash:
-`Trust the code in /path? Its project skills join the prompt [y/N]`. The answer
-is written to the directory's state and never asked again; an empty answer, or
-a piped run, records nothing and the question returns next time. `/trust` is
-the way back from a `no`. Global and config skills always load.
-`/skills` lists what was found, where it came from, and what is withheld.
+Project skills come from the repository and load like any other; the startup
+notice says how many joined the prompt. There is no trust prompt and no gate:
+loading is what `AGENTS.md` and a skill are for, and a directory you would not
+trust is a directory you should not run a coding agent in.
+`/skills` lists what was found and where it came from.
 `/skill:name request` loads a skill explicitly and runs a turn; `/skill:name`
 completes with Tab. `allowed-tools` is parsed and shown but not enforced — axe
 has no approval layer to pre-approve against. `disable-model-invocation: true`
@@ -141,8 +138,7 @@ keeps a skill out of the model's catalogue while `/skill:name` still works.
 
 The catalogue is a section of the system prompt listing each visible skill's
 name, description and absolute `SKILL.md` path; the model reads the file when
-a task matches. `/trust` mid-session appends one system message with the new
-catalogue; the prefix already sent is never rewritten.
+a task matches.
 
 ## REPL
 
@@ -161,9 +157,8 @@ something.
 | `/explore` | toggle explore mode (also Shift+Tab) |
 | `/new` | start a new session, naming the old one and clearing the screen |
 | `/sessions [query]` | browse or search this directory's sessions |
-| `/skills` | list loaded skills and withheld project skills |
+| `/skills` | list loaded skills, where they came from, and what the model sees |
 | `/skill:name [request]` | load a skill's instructions and run a turn |
-| `/trust` | trust this directory's skills after answering no; they join the prompt |
 | `/help` | list the commands, the config path and its keys |
 | `/exit`, `/quit` | quit |
 
@@ -229,7 +224,7 @@ directory with every byte outside `[A-Za-z0-9._-]` written as `%XX` — so
 
 | file | contents |
 | --- | --- |
-| `state.json` | model, thinking levels, thoughts toggle, this directory's trust answer |
+| `state.json` | model, thinking levels, thoughts toggle |
 | `<id>.json` | a session's title, summary, dates and message count |
 | `<id>.jsonl` | the session body: one API message per line, append-only |
 | `<id>.jsonl.gz` | a body older than the 30 most recent, gzipped |
@@ -297,10 +292,9 @@ Normal mode runs code as you. `bash` is a full shell, `write` and `edit` change
 files, and no approval prompt stands in between — a deliberate trade-off. A
 cloned repository's instructions, a file, or text you paste in can talk the
 model into running something. Use normal mode only in directories you trust.
-Project skills are withheld until the directory is trusted: axe asks once, on
-the first interactive run, and remembers the answer. The project's `AGENTS.md`
-is still read automatically, so the gate is only as strong as the directory you
-start axe in.
+The project's `AGENTS.md` and its skills are read at startup and go into the
+prompt; axe asks nothing and gates nothing, so the directory you start it in is
+the whole decision.
 `bash` cannot open an internet socket in either mode, and `fetch` and
 `web_search` are refused here, so a tool call cannot reach the network except
 through the model provider.

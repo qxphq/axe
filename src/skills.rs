@@ -1,5 +1,5 @@
 //! Agent Skills: discovery, frontmatter, the prompt catalogue, and the body
-//! read on demand. Project skills are withheld until the directory is trusted.
+//! read on demand.
 
 use std::collections::HashSet;
 use std::fs;
@@ -39,8 +39,6 @@ pub struct Skill {
 
 pub struct Loaded {
     pub skills: Vec<Skill>,
-    /// Project skills skipped because the directory is not trusted.
-    pub withheld: usize,
     pub warnings: Vec<String>,
 }
 
@@ -58,7 +56,7 @@ const MAX_DIRS: usize = 2000;
 const SKIP: &[&str] = &[".git", "node_modules", "target"];
 
 /// Scan the default locations plus the config's `skills` paths.
-pub fn load(cwd: Option<&Path>, trusted: bool, extra: &[PathBuf]) -> Loaded {
+pub fn load(cwd: Option<&Path>, extra: &[PathBuf]) -> Loaded {
     let mut roots = Vec::new();
     if let Some(cwd) = cwd {
         for dir in project_roots(cwd) {
@@ -75,7 +73,7 @@ pub fn load(cwd: Option<&Path>, trusted: bool, extra: &[PathBuf]) -> Loaded {
         roots.push((path.clone(), Scope::Config));
     }
 
-    let mut loaded = scan(&roots, trusted);
+    let mut loaded = scan(&roots);
     for path in extra.iter().filter(|path| !path.as_os_str().is_empty()) {
         if !path.exists() {
             loaded
@@ -106,19 +104,9 @@ fn project_roots(cwd: &Path) -> Vec<PathBuf> {
 
 /// Roots in precedence order. Split from `load` so tests need no home
 /// directory or XDG config.
-pub fn scan(roots: &[(PathBuf, Scope)], trusted: bool) -> Loaded {
+pub fn scan(roots: &[(PathBuf, Scope)]) -> Loaded {
     let mut scan = Scan::default();
     for (dir, scope) in roots {
-        if *scope == Scope::Project && !trusted {
-            // Only the count matters: an untrusted tree is not allowed to
-            // flood the terminal with frontmatter warnings either.
-            let mut found = Vec::new();
-            let warnings = std::mem::take(&mut scan.warnings);
-            scan.walk(dir, *scope, 0, &mut found);
-            scan.warnings = warnings;
-            scan.withheld += found.len();
-            continue;
-        }
         scan.add_root(dir, *scope);
     }
     if scan.capped {
@@ -132,7 +120,6 @@ pub fn scan(roots: &[(PathBuf, Scope)], trusted: bool) -> Loaded {
     }
     Loaded {
         skills: scan.skills,
-        withheld: scan.withheld,
         warnings: scan.warnings,
     }
 }
@@ -140,7 +127,6 @@ pub fn scan(roots: &[(PathBuf, Scope)], trusted: bool) -> Loaded {
 #[derive(Default)]
 struct Scan {
     skills: Vec<Skill>,
-    withheld: usize,
     warnings: Vec<String>,
     files: HashSet<PathBuf>,
     dirs: usize,
@@ -616,7 +602,7 @@ mod tests {
         );
         write_skill(&dir, "fallback", "description: uses the dir name", "body");
         write_skill(&dir, "missing", "name: missing", "body");
-        let loaded = scan(&[(dir.clone(), Scope::Project)], true);
+        let loaded = scan(&[(dir.clone(), Scope::Project)]);
         let names: Vec<&str> = loaded.skills.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"described"));
         assert!(names.contains(&"fallback"));
@@ -635,13 +621,10 @@ mod tests {
         write_skill(&project, "shared", "description: project version", "body");
         write_skill(&global, "shared", "description: global version", "body");
         write_skill(&global, "only-global", "description: global only", "body");
-        let loaded = scan(
-            &[
-                (project.clone(), Scope::Project),
-                (global.clone(), Scope::Global),
-            ],
-            true,
-        );
+        let loaded = scan(&[
+            (project.clone(), Scope::Project),
+            (global.clone(), Scope::Global),
+        ]);
         assert_eq!(loaded.skills.len(), 2);
         let shared = loaded
             .skills
@@ -658,15 +641,12 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_project_skills_are_withheld() {
-        let dir = temp("trust");
+    fn a_project_skill_loads_like_any_other() {
+        let dir = temp("project-skill");
         write_skill(&dir, "repo-skill", "description: from the repo", "body");
-        let loaded = scan(&[(dir.clone(), Scope::Project)], false);
-        assert!(loaded.skills.is_empty());
-        assert_eq!(loaded.withheld, 1);
-        let loaded = scan(&[(dir.clone(), Scope::Project)], true);
+        let loaded = scan(&[(dir.clone(), Scope::Project)]);
         assert_eq!(loaded.skills.len(), 1);
-        assert_eq!(loaded.withheld, 0);
+        assert_eq!(loaded.skills[0].scope, Scope::Project);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -686,7 +666,7 @@ mod tests {
             "---\ndescription: never loaded\n---\nbody\n",
         )
         .unwrap();
-        let loaded = scan(&[(dir.clone(), Scope::Global)], true);
+        let loaded = scan(&[(dir.clone(), Scope::Global)]);
         let names: Vec<&str> = loaded.skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["nested"]);
         let _ = fs::remove_dir_all(&dir);
@@ -696,7 +676,7 @@ mod tests {
     fn a_config_path_may_be_a_skill_file() {
         let dir = temp("file");
         let file = write_skill(&dir, "single", "description: one file", "body");
-        let loaded = scan(&[(file, Scope::Config)], true);
+        let loaded = scan(&[(file, Scope::Config)]);
         assert_eq!(loaded.skills.len(), 1);
         assert_eq!(loaded.skills[0].scope, Scope::Config);
         let _ = fs::remove_dir_all(&dir);
@@ -717,7 +697,7 @@ mod tests {
             "description: hidden\ndisable-model-invocation: true",
             "body",
         );
-        let loaded = scan(&[(dir.clone(), Scope::Global)], true);
+        let loaded = scan(&[(dir.clone(), Scope::Global)]);
         assert_eq!(loaded.skills.len(), 2);
         let visible = loaded
             .skills
@@ -741,7 +721,7 @@ mod tests {
             "name: demo\ndescription: demo skill",
             "Follow these steps.",
         );
-        let loaded = scan(&[(dir.clone(), Scope::Global)], true);
+        let loaded = scan(&[(dir.clone(), Scope::Global)]);
         let skill = &loaded.skills[0];
         assert_eq!(body(skill).unwrap(), "Follow these steps.");
         let text = invocation(skill, "do it").unwrap();
@@ -762,7 +742,7 @@ mod tests {
             "---\nname: Bad_Name\ndescription: still works\n---\nbody\n",
         )
         .unwrap();
-        let loaded = scan(&[(dir.clone(), Scope::Global)], true);
+        let loaded = scan(&[(dir.clone(), Scope::Global)]);
         assert_eq!(loaded.skills.len(), 1);
         assert!(loaded
             .warnings

@@ -38,7 +38,9 @@ invariants a change must not break.
    model, not harness failures. Truncate output, timeout `bash`, cap `fetch` at
    1 MiB/50 000 chars and `web_search` at 1 MiB/20 results.
 8. **No approval prompts.** Bash runs unprompted by explicit user decision. Do not
-   add a permission layer without being asked.
+   add a permission layer without being asked. A directory's `AGENTS.md` and its
+   skills also load without a question: a trust prompt gates text the model could
+   read anyway, so it buys nothing but friction.
 9. **Real cwd, relative paths.** `current_dir()` at startup, used for the prompt and
    every relative path. Never hardcode directories.
 10. **One config file, and it is input.** `~/.config/axe/config.json` (respects
@@ -88,9 +90,7 @@ invariants a change must not break.
 - `web.rs` — `fetch`/`web_search`: host guard, HTML tokenizer, sanitizer,
   Brave/DuckDuckGo parsers, paging.
 - `skills.rs` — Agent Skills discovery, the frontmatter subset, the catalogue,
-  and the body read on `/skill:` activation. Project skills are gated by one
-  question asked on the first interactive run in the directory and remembered
-  in its state; `/trust` is the way back from a no.
+  and the body read on `/skill:` activation.
 - `sandbox.rs` — the only `unsafe`: seccomp, Landlock, Seatbelt, exec allowlist,
   and the explore-mode scratch directory.
 
@@ -109,9 +109,7 @@ invariants a change must not break.
   `about`, so keep it factual and in the same commit as the behavior it describes.
 - Skills: a directory with `SKILL.md` is the unit; only the frontmatter is read at
   startup, the body on demand. The catalogue is appended last in the system
-  prompt; `/trust` appends a system message rather than rewriting the prefix.
-  The startup question is one cooked line above the splash: it needs no screen,
-  no config key, and it is never asked in a piped run.
+  prompt, after the instructions, so the part above it stays byte-identical.
   Project roots stop at the repository root; without a `.git`, only cwd counts.
 - Sessions: `<id>.json` is the mutable sidecar; `<id>.jsonl` is append-only; bodies
   older than `sessions::KEEP` are gzipped. The sidecar stays readable, so listing
@@ -160,8 +158,7 @@ the first line says which engine answered. `BRAVE_SEARCH_API_KEY` selects Brave;
 unset means DuckDuckGo, and a bogus value exercises the fallback.
 
 Skills are checked with a `.agents/skills/<name>/SKILL.md` under `--work DIR`:
-`/skills` lists it, the first run in that directory asks whether to trust it and
-the harness answers `y`, `/skill:name` runs the body. The sandbox is checked the
+`/skills` lists it and `/skill:name` runs the body. The sandbox is checked the
 same way: `tool:bash:{...}` takes JSON arguments and loops; end with `!Escape`
 and `show:`. Normal mode is a `!cmd` line, which does not loop. Examples:
 
