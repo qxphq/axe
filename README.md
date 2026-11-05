@@ -203,10 +203,15 @@ the offer on the row under the prompt, any other key withdraws it, and the
 second stops the turn — which then says so in the transcript, because a cut
 reply reads like a finished one.
 
-The dim row under the prompt is what the turn is doing on the left, and on the
-right the session's name, the provider/model and thinking level, and how much of
-the context window the history fills. The right half never takes more than half
-the row: a long title clips, it does not push out what the turn is doing. The name is the first request until the
+The row under the prompt is what the turn is doing on the left, and on the right
+the session's name, the provider/model and thinking level, and how much of the
+context window the history fills. Each piece on the right carries its own color,
+and every color is one of the terminal's own ANSI names, so the theme decides
+what it actually is: the name in the default foreground, the provider/model in
+the prompt's cyan, the thinking level in magenta, the window green until it is
+70% full, yellow to 90%, then red, and `read-only` in yellow. The right half
+never takes more than half the row: a long title clips, it does not push out
+what the turn is doing. The name is the first request until the
 model names the session after the first answer; it appears as soon as the
 request is in the history, and the generated title replaces it without waiting
 for a key.

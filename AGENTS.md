@@ -110,7 +110,9 @@ invariants a change must not break.
 - `ui.rs` — the screen: the live frame (`Frame`, a layout from the terminal size
   and the mode, put in place by `settle`), prompt buffer and key mapping, the
   chooser, `write` for transcript blocks (wrapped here, since a clipped line
-  would be lost) and the `slack` it places them by.
+  would be lost) and the `slack` it places them by. The info row is pieces
+  (`Info`), each with its own ANSI color: the caller says what a piece is, the
+  screen how it looks.
 - `markdown.rs` — markdown: blocks, inlines, tables, entities, URL checks, and the
   renderer. `Stream` feeds it a line at a time and lays a block out when it ends.
 - `api.rs` — model listing, chat request, SSE parsing, tool-call accumulation.
@@ -141,6 +143,11 @@ invariants a change must not break.
 - Markdown is the model's and the user's, never the binary's. Blocks are laid out
   when they end; the live row says what the turn is doing, not the unfinished line.
 - Style comes from `Paint` in `main.rs`, rendered as cells or ANSI.
+- Colors are the terminal's, never axe's: named ANSI only (`Color::Cyan`,
+  `Color::Red`, …), never `Rgb`, `Indexed`, or a hex value of our own. The
+  user's theme decides what each one is, so axe needs no theme and lands in the
+  shell's colors wherever it runs. A new color is a new `Paint` variant or an
+  `Info` style, and it has to mean something.
 - Tool names and descriptions are part of the prompt. Change them deliberately.
 - `README.md` is the user-facing contract and the GitHub page. It ships through
   `about`, so keep it factual and in the same commit as the behavior it describes.
