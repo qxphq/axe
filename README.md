@@ -146,7 +146,7 @@ catalogue; the prefix already sent is never rewritten.
 
 ## REPL
 
-`❯ ` is the prompt. Enter submits, Shift+Enter starts a new line, Tab completes
+`❯ ` is the prompt. Enter submits, Ctrl+J or Alt+Enter starts a new line, Tab completes
 a command and cycles through the candidates for what you typed; the rest of the
 first one is shown dim after the cursor. A line starting with `!` is your own
 shell: it runs through the same tool, its output joins the history as a user
@@ -174,7 +174,8 @@ the selection.
 
 | key | what it does |
 | --- | --- |
-| Enter / Shift+Enter | submit / new line |
+| Enter | submit |
+| Ctrl+J, Alt+Enter | new line |
 | Tab | complete a command, cycling through its candidates |
 | Shift+Tab | toggle explore mode |
 | ↑ ↓ | move in a chooser |
