@@ -60,6 +60,8 @@ const PROMPT_PAD: usize = 1;
 /// The prompt's cyan, for the rows a list has marked and for what the session
 /// is talking to.
 const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan);
+/// Explore mode's box: the outline says the tool set is read-only.
+const EXPLORE_STYLE: Style = Style::new().fg(Color::Yellow);
 /// Marker for an already committed line in the transcript.
 const MARK: &str = "█";
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
@@ -469,6 +471,9 @@ pub struct Screen {
     /// pointed at. Set by the caller, which owns the model, the thinking level
     /// and the window, and colored here.
     info: Vec<(Info, String)>,
+    /// Explore mode: the box around the prompt changes color, so the mode is
+    /// visible at the line being typed and not only in the info row.
+    explore: bool,
     /// The lines Tab completes, in the caller's spelling: a slash command on
     /// its own, or one with its first argument filled in.
     commands: Vec<String>,
@@ -552,6 +557,7 @@ impl Screen {
             alert: None,
             queued: None,
             info: Vec::new(),
+            explore: false,
             commands: Vec::new(),
             selection: None,
             recall: Recall::default(),
@@ -592,6 +598,7 @@ impl Screen {
             alert: None,
             queued: None,
             info: Vec::new(),
+            explore: false,
             commands: Vec::new(),
             selection: None,
             recall: Recall::default(),
@@ -675,6 +682,13 @@ impl Screen {
     /// screen's; the caller only says what each piece is.
     pub fn set_info(&mut self, parts: impl IntoIterator<Item = (Info, String)>) {
         self.info = parts.into_iter().collect();
+        self.dirty = true;
+    }
+
+    /// Explore mode: the box around the line is drawn in the caution color, so
+    /// a read-only tool set shows at the prompt, not only in the info row.
+    pub fn set_explore(&mut self, explore: bool) {
+        self.explore = explore;
         self.dirty = true;
     }
 
@@ -1323,12 +1337,17 @@ impl Screen {
                         line(first_hint + i as u16),
                     );
                 }
-                // The box is the prompt's cyan: the outline says where the
+                // The box is the prompt's cyan, and the caution's yellow while
+                // explore mode takes the tools away: the outline says where the
                 // line is, and the text stays on the theme's background.
                 let outline = Outline::default()
                     .borders(Borders::ALL)
                     .border_set(symbols::border::PLAIN)
-                    .border_style(PROMPT_STYLE);
+                    .border_style(if self.explore {
+                        EXPLORE_STYLE
+                    } else {
+                        PROMPT_STYLE
+                    });
                 frame.render_widget(
                     Paragraph::new(prompt_rows).block(outline),
                     Rect {
@@ -2263,6 +2282,28 @@ mod tests {
         assert!(text.contains("Thinking…"), "{text}");
         assert!(text.contains("p/m  ·  default"), "{text}");
         assert!(text.contains("Queued: later"), "{text}");
+    }
+
+    #[test]
+    fn explore_mode_colors_the_box_not_the_selection_row() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_explore(true);
+        screen.set_info([(Info::Selection, "p/m".to_string())]);
+        screen.draw().unwrap();
+        // The outline says the tool set is read-only; what the session talks to
+        // is still the prompt's cyan.
+        let row = screen.frame().prompt.y + 1;
+        let info_row = screen.frame().status.y;
+        let cell = |x: u16, y: u16| screen.test_buffer()[(x, y)].clone();
+        assert_eq!(
+            (cell(1, row).symbol(), cell(1, row).fg),
+            ("│", Color::Yellow)
+        );
+        assert_eq!(cell(38, row).fg, Color::Yellow);
+        let x = (0..40)
+            .find(|x| cell(*x, info_row).symbol() == "p")
+            .expect("selection row");
+        assert_eq!(cell(x, info_row).fg, Color::Cyan);
     }
 
     #[test]

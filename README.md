@@ -171,10 +171,13 @@ a task matches.
 
 The line you type sits in a box: an outline in the prompt's cyan, one row per
 line the text wraps to, with a cell of padding between the text and the line and
-no glyph in front of it. The outline is the only thing drawn — the text keeps
-the theme's own foreground and background — because a filled block that wide
-reads as a slab of color rather than as a prompt. Enter submits; Ctrl+J or
-Alt+Enter starts a new line. Typing a slash word lists the matching commands in
+no glyph in front of it. While explore mode takes the writing tools away the
+outline is yellow, so the read-only tool set shows at the line you are typing
+and not only in the info row beside it. The outline is the only thing drawn —
+the text keeps the theme's own foreground and background — because a filled
+block that wide reads as a slab of color rather than as a prompt. Enter submits;
+Ctrl+J or Alt+Enter starts a new line. Typing a slash word lists the matching
+commands in
 the rows above the prompt — as many as the terminal's height allows, up to four
 — the first one marked. ↓ and ↑ move the mark and leave the line as typed,
 wrapping at both ends; Enter runs the marked row and Tab puts it on the line, so

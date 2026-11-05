@@ -84,12 +84,14 @@ invariants a change must not break.
     transcript *ends* — `slack` counts the blank rows a frame that changed left
     above it, and `write` fills them from the top — so a block is always under
     the block before it, never under a gap.
-14. **The prompt is a block.** The line being typed is a field, not a glyph: the
-    frame fills every row it wraps to, plus one row of padding above the text
-    and one below and a cell at each side, with its own background — the
-    theme's bright black, no hue — so a wrapped line reads as one block and the
-    background marks where the line is. A committed line carries `█ ` in the transcript, which has no
-    frame. Named ANSI only, and both ends of the pair are the theme's.
+14. **The prompt is a box.** The line being typed is bordered rather than
+    glyph-prefixed: an outline one cell in from each side, a row of it above the
+    text and a row below, one cell of padding between the text and the line, so
+    a wrapped line reads as one block and the text stays on the theme's
+    background. The outline is the prompt's cyan, and yellow while explore mode
+    takes the writing tools away. A committed line carries `█ ` in the transcript,
+    which has no frame. Named ANSI only, and both ends of the pair are the
+    theme's.
 15. **`bash` is confined by the kernel, not by strings.** Explore mode denies
     writes outside two directories — the session scratch, and the project's
     `plan/` under the state tree, which survives exit so a plan outlives the

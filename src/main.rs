@@ -872,6 +872,7 @@ impl Session {
     /// a turn in flight never blocks the prompt.
     fn run_interactive(mut self) -> Result<(), String> {
         let mut screen = ui::Screen::new().map_err(|e| format!("cannot take the terminal: {e}"))?;
+        screen.set_explore(self.mode.explore());
         screen.set_commands(self.commands());
         screen.set_info(self.info());
         screen.set_history(state::read_history(&self.state.cwd));
@@ -1515,10 +1516,11 @@ impl Session {
         self.messages.push(mode_note(mode));
     }
 
-    /// `/explore` and Shift+Tab share one path, so the selection row and the
-    /// transcript never disagree about the mode.
+    /// `/explore` and Shift+Tab share one path, so the prompt's box, the
+    /// selection row and the transcript never disagree about the mode.
     fn toggle_explore(&mut self, console: &mut Console) {
         self.set_mode(self.mode.flip());
+        console.explore(self.mode.explore());
         console.info(self.info());
         console.output(&format!(
             "Explore: {}\n",
@@ -2273,6 +2275,13 @@ impl Console<'_> {
     fn info(&mut self, parts: Vec<(ui::Info, String)>) {
         if let Some(screen) = self.screen() {
             screen.set_info(parts);
+        }
+    }
+
+    /// The prompt's box, which changes color with the tool set.
+    fn explore(&mut self, on: bool) {
+        if let Some(screen) = self.screen() {
+            screen.set_explore(on);
         }
     }
 
