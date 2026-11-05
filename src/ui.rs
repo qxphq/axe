@@ -962,10 +962,6 @@ impl Screen {
         self.status.clear();
         self.alert = None;
         self.queued = None;
-        #[cfg(test)]
-        if matches!(self.term, Term::Test(_)) {
-            return;
-        }
         match &mut self.term {
             Term::Real(term) => {
                 // `terminal::Clear(All)` only reaches the screen; what scrolled
@@ -975,14 +971,24 @@ impl Screen {
                     terminal::Clear(terminal::ClearType::All),
                     terminal::Clear(terminal::ClearType::Purge)
                 );
-                // Repaints the region once and, as importantly, resets the
-                // back buffer, so the next draw is not diffed against a blank
-                // screen.
-                let _ = term.clear();
             }
             #[cfg(test)]
             Term::Test(_) => {}
         }
+        // The screen above the frame is gone, so the frame stands on nothing:
+        // it goes back to the bottom of an empty terminal.
+        let _ = self.bottom();
+    }
+
+    /// Put the frame at the bottom of the terminal, as `Screen::new` leaves it,
+    /// and blank it. Used where nothing is above the frame any more.
+    fn bottom(&mut self) -> io::Result<()> {
+        let size = self.term.size()?;
+        let height = self.term.area().height;
+        let top = size.height.saturating_sub(height);
+        self.term.set_cursor_position(Position::new(0, top))?;
+        self.term.reshape(height)?;
+        self.term.clear()
     }
 
     /// Repaint the live frame.
@@ -2419,6 +2425,11 @@ mod tests {
         screen.set_status("Thinking…");
         screen.set_queued(Some("later"));
         screen.reset();
+        // The screen above the frame is gone, so the frame stands at the bottom
+        // of the terminal again, not where the last block walked it to.
+        let size = screen.term.size().unwrap();
+        let area = screen.term.area();
+        assert_eq!(area.top(), size.height - area.height);
         assert!(screen.menu.is_none());
         assert!(screen.status().is_empty());
         assert!(screen.last.is_none());
