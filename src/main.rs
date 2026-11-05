@@ -281,6 +281,7 @@ fn run() -> Result<(), String> {
         .as_deref()
         .map(|dir| Store::fresh(sessions::dir(dir), &sid, &spec));
 
+    let bytes = history_bytes(&messages);
     let session = Session {
         state,
         providers,
@@ -290,6 +291,7 @@ fn run() -> Result<(), String> {
         mode,
         used: None,
         messages,
+        bytes,
         sid,
         store,
         startup,
@@ -505,6 +507,9 @@ struct Session {
     /// reports one: the fill is then estimated from the history.
     used: Option<u64>,
     messages: Vec<Value>,
+    /// The history's own size in bytes, kept as it is appended to: the request
+    /// is serialized once per message rather than once per info row.
+    bytes: u64,
     /// The session id: also the provider's `session_header` value.
     sid: String,
     /// The append-only body and its sidecar, when there is a working directory
@@ -527,6 +532,7 @@ struct Session {
 /// reaching the file, and a resumed session replays the same order.
 struct Live<'a> {
     messages: &'a mut Vec<Value>,
+    bytes: &'a mut u64,
     store: Option<&'a mut Store>,
 }
 
@@ -535,6 +541,7 @@ impl turn::History for Live<'_> {
         if let Some(store) = self.store.as_deref_mut() {
             store.record(&message);
         }
+        *self.bytes += weight(&message);
         self.messages.push(message);
     }
 
@@ -1020,6 +1027,7 @@ impl Session {
         if let Some(store) = self.store.as_mut() {
             store.record(&message);
         }
+        self.bytes += weight(&message);
         self.messages.push(message);
     }
 
@@ -1123,6 +1131,7 @@ impl Session {
 
         self.messages = self.base_messages();
         self.messages.extend(messages);
+        self.bytes = history_bytes(&self.messages);
         self.sid = id.to_string();
         self.store = Some(store);
         self.naming = None;
@@ -1225,6 +1234,7 @@ impl Session {
             self.store = Some(Store::fresh(dir, &sid, &model));
         }
         self.messages = self.base_messages();
+        self.bytes = history_bytes(&self.messages);
         self.sid = sid;
         self.naming = None;
         self.picks.clear();
@@ -1493,7 +1503,7 @@ impl Session {
     /// is. The second value is how full the window is, the gauge the info row
     /// colors: without a count there is nothing to measure.
     fn fill(&self) -> (String, Option<u8>) {
-        let used = self.used.unwrap_or_else(|| estimate(&self.messages));
+        let used = self.used.unwrap_or(self.bytes / 4);
         match self.context() {
             Some(ctx) => (
                 format!("{}/{} ({})", scaled(used), scaled(ctx), percent(used, ctx)),
@@ -1513,7 +1523,9 @@ impl Session {
     /// before it is rewritten.
     fn set_mode(&mut self, mode: tools::Mode) {
         self.mode = mode;
-        self.messages.push(mode_note(mode));
+        let note = mode_note(mode);
+        self.bytes += weight(&note);
+        self.messages.push(note);
     }
 
     /// `/explore` and Shift+Tab share one path, so the prompt's box, the
@@ -1682,6 +1694,7 @@ impl Session {
                 self.messages = self.base_messages();
                 self.messages
                     .push(json!({ "role": "user", "content": content }));
+                self.bytes = history_bytes(&self.messages);
                 if let Some(store) = self.store.as_mut() {
                     store.compacted(&sessions::compacted(&content, replaced));
                 }
@@ -1764,6 +1777,7 @@ impl Session {
         let mut used: Option<u64> = None;
         let mut live = Live {
             messages: &mut self.messages,
+            bytes: &mut self.bytes,
             store: self.store.as_mut(),
         };
         let provider = &self.providers[self.provider];
@@ -2034,6 +2048,7 @@ impl Session {
         };
         let mut live = Live {
             messages: &mut self.messages,
+            bytes: &mut self.bytes,
             store: self.store.as_mut(),
         };
         turn::run_turn(&turn, &mut live, sink).map(|_| ())
@@ -2648,14 +2663,17 @@ fn fullness(used: u64, ctx: u64) -> u8 {
     (used.saturating_mul(100) / ctx.max(1)).min(100) as u8
 }
 
-/// Four bytes per token, the usual rule of thumb for English. Only used when no
-/// provider has counted the real thing: it is off by tens of percent.
-fn estimate(messages: &[Value]) -> u64 {
-    messages
-        .iter()
-        .map(|m| m.to_string().len() as u64)
-        .sum::<u64>()
-        / 4
+/// How much of a history one message is, in the bytes the request carries. The
+/// fill is estimated from this sum, four bytes to a token: the usual rule of
+/// thumb for English, and off by tens of percent.
+fn weight(message: &Value) -> u64 {
+    message.to_string().len() as u64
+}
+
+/// The same sum over a whole history, for the points that replace it —
+/// startup, resume, `/new`, `/compact` — rather than append to it.
+fn history_bytes(messages: &[Value]) -> u64 {
+    messages.iter().map(weight).sum()
 }
 
 /// Token counts in three characters where possible: `812`, `34k`, `1.0M`.
@@ -3090,6 +3108,7 @@ mod tests {
             mode: tools::Mode::Explore,
             used: Some(10),
             messages: vec![json!({ "role": "system", "content": "s" })],
+            bytes: 40,
             sid: "abc".into(),
             store: None,
             startup: Vec::new(),
@@ -3217,6 +3236,7 @@ mod tests {
             mode: tools::Mode::Explore,
             used: None,
             messages: vec![json!({ "role": "system", "content": "s" })],
+            bytes: 40,
             sid: "abc".into(),
             store: None,
             startup: Vec::new(),
@@ -3234,6 +3254,51 @@ mod tests {
         assert_eq!(base[0]["content"].as_str(), Some("s"));
     }
 
+    /// A session with a system prompt and nothing else, for the fields that do
+    /// not need a terminal or a directory.
+    fn bare_session() -> Session {
+        let messages = vec![json!({ "role": "system", "content": "s" })];
+        Session {
+            state: state::State::default(),
+            providers: vec![test_provider()],
+            provider: 0,
+            model: "m".into(),
+            thinking: None,
+            mode: tools::Mode::Explore,
+            used: None,
+            bytes: history_bytes(&messages),
+            messages,
+            sid: "abc".into(),
+            store: None,
+            startup: Vec::new(),
+            picks: Vec::new(),
+            naming: None,
+            warning: None,
+            skills: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_history_size_is_counted_as_the_history_grows() {
+        let mut session = bare_session();
+        session.record(json!({ "role": "user", "content": "hi" }));
+        session.set_mode(tools::Mode::Normal);
+        assert_eq!(session.bytes, history_bytes(&session.messages));
+        // The estimate the info row falls back to is that sum, four to a token.
+        assert!(
+            session.fill().0.starts_with(&scaled(session.bytes / 4)),
+            "{} of {}",
+            session.fill().0,
+            session.bytes
+        );
+        // A replacement re-counts rather than carrying the old sum.
+        let grown = session.bytes;
+        session.messages = session.base_messages();
+        session.bytes = history_bytes(&session.messages);
+        assert!(session.bytes < grown);
+        assert_eq!(session.bytes, history_bytes(&session.messages));
+    }
+
     #[test]
     fn session_info_and_mode_note() {
         let mut session = Session {
@@ -3245,6 +3310,7 @@ mod tests {
             mode: tools::Mode::Explore,
             used: None,
             messages: vec![json!({ "role": "system", "content": "s" })],
+            bytes: 40,
             sid: "abc".into(),
             store: None,
             startup: Vec::new(),
@@ -3277,6 +3343,7 @@ mod tests {
             mode: tools::Mode::Normal,
             used: None,
             messages: Vec::new(),
+            bytes: 0,
             sid: "abc".into(),
             store: Some(Store {
                 dir: std::env::temp_dir(),
