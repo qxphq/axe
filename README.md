@@ -147,9 +147,11 @@ catalogue; the prefix already sent is never rewritten.
 ## REPL
 
 `❯ ` is the prompt. Enter submits, Shift+Enter starts a new line, Tab completes
-a command. A line starting with `!` is your own shell: it runs through the same
-tool, its output joins the history as a user message, and no turn follows — the
-model sees it the next time you ask something.
+a command and cycles through the candidates for what you typed; the rest of the
+first one is shown dim after the cursor. A line starting with `!` is your own
+shell: it runs through the same tool, its output joins the history as a user
+message, and no turn follows — the model sees it the next time you ask
+something.
 
 | command | what it does |
 | --- | --- |
@@ -173,7 +175,7 @@ the selection.
 | key | what it does |
 | --- | --- |
 | Enter / Shift+Enter | submit / new line |
-| Tab | complete a command |
+| Tab | complete a command, cycling through its candidates |
 | Shift+Tab | toggle explore mode |
 | ↑ ↓ | move in a chooser |
 | Esc | close a chooser, or cancel the running turn |
