@@ -1260,15 +1260,16 @@ impl Screen {
         // continuation of what is being typed. The marked row is the bright
         // one: Enter runs it, Tab puts it on the line.
         let queued = self.queued.clone();
-        // The row is shared: the status says what the turn is doing, the info
-        // what the session is pointed at. Both are clipped, and the info never
-        // takes more than half of it — a title long enough to fill the row used
-        // to squeeze the status to nothing, so a running turn looked idle. An
-        // alert is the exception: it is a question, so it takes the row and the
-        // info waits.
-        let info = info_line(&self.info, cols / 2);
-        let gap = usize::from(info.width() > 0);
-        let status = clip(&self.status, cols.saturating_sub(info.width() + gap));
+        // The row is shared: the status says what the turn is doing on the
+        // left, the info what the session is pointed at on the right. The info
+        // takes whatever the status leaves, so a row with room to spare cuts
+        // nothing; only a status long enough to fill the row holds the info to
+        // half, because a title long enough to take the row used to squeeze the
+        // status to nothing and a running turn looked idle. An alert is the
+        // exception: it is a question, so it takes the row and the info waits.
+        let (status_cols, info_cols) = shared_row(&self.status, &self.info, cols);
+        let info = info_line(&self.info, info_cols);
+        let status = clip(&self.status, status_cols);
         // A reverse search says what it is looking for where the ESC offer
         // would be: it is a question, like the offer.
         let alert = self.search_label().or_else(|| self.alert.clone());
@@ -1882,6 +1883,25 @@ fn prompt_layout(buf: &str, cursor: usize, width: usize) -> (Vec<String>, (u16, 
     (rows, (at.0 as u16, at.1 as u16))
 }
 
+/// How the one row the status and the info share is split, in cells. The status
+/// keeps what it asks for unless the two together overrun the row; then the
+/// status is held to half so the info never disappears, and the info takes the
+/// rest with an ellipsis.
+fn shared_row(status: &str, parts: &[(Info, String)], cols: usize) -> (usize, usize) {
+    let status_want = status.width();
+    let info_want = info_text(parts).width();
+    if info_want == 0 {
+        return (status_want, 0);
+    }
+    let gap = usize::from(status_want > 0);
+    if status_want + gap + info_want <= cols {
+        return (status_want, info_want);
+    }
+    let status_cols = status_want.min(cols / 2);
+    let info_cols = cols.saturating_sub(status_cols + usize::from(status_cols > 0));
+    (status_cols, info_cols)
+}
+
 /// The info row as styled pieces joined by `SEP`, cut to `width` cells: the
 /// piece that overruns ends with an ellipsis and the rest is dropped, so a
 /// narrow row loses its last piece rather than its colors.
@@ -2327,6 +2347,30 @@ mod tests {
         assert!(text.contains("Responding…"), "{text}");
         // The info keeps its half, clipped, rather than taking the row.
         assert!(text.contains("a long session tit"), "{text}");
+    }
+
+    #[test]
+    fn a_row_with_room_does_not_cut_the_info() {
+        // The info takes what the status leaves: only the row itself bounds it,
+        // so a window wide enough for both shows every piece whole.
+        let mut screen = Screen::test_screen(120, 10);
+        screen.set_status("Thinking…");
+        screen.set_info([
+            (Info::Title, "a long session title".to_string()),
+            (Info::Selection, "mock/mock-1".to_string()),
+            (Info::Level, "default".to_string()),
+            (Info::Fill(Some(3)), "34k/1.0M (3%)".to_string()),
+        ]);
+        screen.draw().unwrap();
+        let text: String = screen
+            .test_buffer()
+            .content
+            .chunks(120)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Thinking…"), "{text}");
+        assert!(text.contains("34k/1.0M (3%)"), "{text}");
     }
 
     #[test]

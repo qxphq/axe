@@ -272,12 +272,13 @@ context window the history fills. Each piece on the right carries its own color,
 and every color is one of the terminal's own ANSI names, so the theme decides
 what it actually is: the name in the default foreground, the provider/model in
 the prompt's cyan, the thinking level in magenta, the window green until it is
-70% full, yellow to 90%, then red, and `read-only` in yellow. The right half
-never takes more than half the row: a long title clips, it does not push out
-what the turn is doing. The name is the first request until the
-model names the session after the first answer; it appears as soon as the
-request is in the history, and the generated title replaces it without waiting
-for a key.
+70% full, yellow to 90%, then red, and `read-only` in yellow. The right side
+takes whatever the status leaves, so a wide row clips nothing; only a status
+long enough to fill the row holds it to half, so what the turn is doing is never
+pushed out, and a title that does not fit is the piece that clips. The name is
+the first request until the model names the session after the first answer; it
+appears as soon as the request is in the history, and the generated title
+replaces it without waiting for a key.
 
 ## Modes
 
