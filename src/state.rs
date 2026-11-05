@@ -23,8 +23,10 @@ pub struct State {
     pub thinking: Vec<(String, String)>,
     /// Show reasoning in the transcript (`/thoughts`).
     pub thoughts: bool,
-    /// Project skills are trusted (`/trust`).
-    pub trusted: bool,
+    /// The directory's answer to the startup trust question: `None` until it is
+    /// asked, then `Some(true)` or `Some(false)` for good. `/trust` is the only
+    /// way back from a `false`.
+    pub trusted: Option<bool>,
 }
 
 /// `$XDG_STATE_HOME` or `$HOME/.local/state`, then `axe`.
@@ -152,7 +154,7 @@ pub fn load(cwd: &Path) -> State {
         })
         .unwrap_or_default();
     state.thoughts = v["thoughts"].as_bool().unwrap_or(false);
-    state.trusted = v["trusted"].as_bool().unwrap_or(false);
+    state.trusted = v["trusted"].as_bool();
     state
 }
 
@@ -174,13 +176,17 @@ impl State {
             .iter()
             .map(|(spec, level)| (spec.clone(), Value::String(level.clone())))
             .collect();
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "cwd": self.cwd.display().to_string(),
             "model": self.model,
             "thinking": thinking,
             "thoughts": self.thoughts,
-            "trusted": self.trusted,
         });
+        // Absent means "never asked", so an unanswered directory is asked again;
+        // a decision is written once and kept.
+        if let Some(trusted) = self.trusted {
+            value["trusted"] = Value::Bool(trusted);
+        }
         let text = serde_json::to_string_pretty(&value)
             .map(|text| format!("{text}\n"))
             .map_err(|e| format!("cannot save state to {}: {e}", file.display()))?;

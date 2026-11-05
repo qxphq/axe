@@ -106,7 +106,7 @@ fn run() -> Result<(), String> {
     // The working directory identifies this directory's state file and anchors
     // the project's AGENTS.md; read it once.
     let cwd = std::env::current_dir().ok();
-    let state = match &cwd {
+    let mut state = match &cwd {
         Some(dir) => state::load(dir),
         None => state::State::default(),
     };
@@ -117,8 +117,26 @@ fn run() -> Result<(), String> {
     let project_agents = project_file.as_deref().and_then(config::read_agents);
 
     // Skills are read once, like the instructions: the catalogue is part of
-    // the stable prefix. A project's skills need `/trust` first.
-    let loaded_skills = skills::load(cwd.as_deref(), state.trusted, &cfg.skills);
+    // the stable prefix. A project's skills need an answer to the trust
+    // question first.
+    let mut loaded_skills = skills::load(cwd.as_deref(), state.trusted == Some(true), &cfg.skills);
+    // A directory that contributes to the prompt earns one question, once. The
+    // answer is remembered in its state, so this runs at most once per
+    // directory; `/trust` stays the way back from a no.
+    if state.trusted.is_none()
+        && ui::is_interactive()
+        && (loaded_skills.withheld > 0 || project_agents.is_some())
+    {
+        if let Some(trusted) = ask_trust(cwd.as_deref()) {
+            state.trusted = Some(trusted);
+            if let Err(e) = state.save() {
+                eprintln!("axe: {}", strip_control(&e));
+            }
+            if trusted {
+                loaded_skills = skills::load(cwd.as_deref(), true, &cfg.skills);
+            }
+        }
+    }
     for warning in &loaded_skills.warnings {
         eprintln!("axe: {}", strip_control(warning));
     }
@@ -1390,7 +1408,7 @@ impl Session {
     /// `/trust`: persist the decision, rescan, and append the project
     /// catalogue as one system message. The built prompt is not rewritten.
     fn trust(&mut self, screen: Option<&mut ui::Screen>) {
-        if self.state.trusted {
+        if self.state.trusted == Some(true) {
             let text = "Project skills: already trusted\n";
             match screen {
                 Some(screen) => screen.output(text),
@@ -1398,7 +1416,7 @@ impl Session {
             }
             return;
         }
-        self.state.trusted = true;
+        self.state.trusted = Some(true);
         if let Err(e) = self.state.save() {
             self.warn(format!("state: {e}"));
         }
@@ -2274,6 +2292,31 @@ impl Sink for ChannelSink {
     }
 }
 
+/// The startup question, asked before a screen exists: one cooked line above the
+/// splash. Empty or EOF answers nothing, and so does anything that is neither y
+/// nor n; an unanswered directory is asked again next run.
+fn ask_trust(cwd: Option<&Path>) -> Option<bool> {
+    let name = cwd
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_else(|| "this directory".to_string());
+    let line = ui::cooked_line(&format!(
+        "Trust the code in {name}? Its project skills join the prompt [y/N] "
+    ))?;
+    let answer = parse_trust(&line);
+    if answer.is_none() && !line.trim().is_empty() {
+        eprintln!("axe: answer y or n; this directory is asked again next run");
+    }
+    answer
+}
+
+fn parse_trust(line: &str) -> Option<bool> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 /// Drop control characters a terminal would execute. Newlines and tabs stay:
 /// this is line output, not a raw terminal stream.
 fn strip_control(text: &str) -> String {
@@ -2903,6 +2946,16 @@ mod tests {
     #[test]
     fn control_bytes_are_stripped_but_lines_survive() {
         assert_eq!(strip_control("a\x1b[31mb\nc\td\u{9b}"), "a[31mb\nc\td");
+    }
+
+    #[test]
+    fn only_an_explicit_answer_is_remembered() {
+        assert_eq!(parse_trust("y"), Some(true));
+        assert_eq!(parse_trust(" YES "), Some(true));
+        assert_eq!(parse_trust("n"), Some(false));
+        assert_eq!(parse_trust("No"), Some(false));
+        assert_eq!(parse_trust(""), None);
+        assert_eq!(parse_trust("sure"), None);
     }
 
     #[test]

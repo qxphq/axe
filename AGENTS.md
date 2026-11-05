@@ -88,7 +88,9 @@ invariants a change must not break.
 - `web.rs` — `fetch`/`web_search`: host guard, HTML tokenizer, sanitizer,
   Brave/DuckDuckGo parsers, paging.
 - `skills.rs` — Agent Skills discovery, the frontmatter subset, the catalogue,
-  and the body read on `/skill:` activation. Project skills are `/trust`-gated.
+  and the body read on `/skill:` activation. Project skills are gated by one
+  question asked on the first interactive run in the directory and remembered
+  in its state; `/trust` is the way back from a no.
 - `sandbox.rs` — the only `unsafe`: seccomp, Landlock, Seatbelt, exec allowlist,
   and the explore-mode scratch directory.
 
@@ -108,6 +110,8 @@ invariants a change must not break.
 - Skills: a directory with `SKILL.md` is the unit; only the frontmatter is read at
   startup, the body on demand. The catalogue is appended last in the system
   prompt; `/trust` appends a system message rather than rewriting the prefix.
+  The startup question is one cooked line above the splash: it needs no screen,
+  no config key, and it is never asked in a piped run.
   Project roots stop at the repository root; without a `.git`, only cwd counts.
 - Sessions: `<id>.json` is the mutable sidecar; `<id>.jsonl` is append-only; bodies
   older than `sessions::KEEP` are gzipped. The sidecar stays readable, so listing
@@ -156,8 +160,8 @@ the first line says which engine answered. `BRAVE_SEARCH_API_KEY` selects Brave;
 unset means DuckDuckGo, and a bogus value exercises the fallback.
 
 Skills are checked with a `.agents/skills/<name>/SKILL.md` under `--work DIR`:
-`/skills` lists it, `/trust` loads the project catalogue, `/skill:name` runs the
-body. The sandbox is checked the same way: `tool:bash:{...}` takes JSON arguments and
+`/skills` lists it, the first run in that directory asks for trust and a `y`
+loads the project catalogue, `/skill:name` runs the body. The sandbox is checked the same way: `tool:bash:{...}` takes JSON arguments and
 loops; end with `!Escape` and `show:`. Normal mode is a `!cmd` line, which does not
 loop. Examples:
 
