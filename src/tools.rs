@@ -27,7 +27,7 @@ struct Spec {
 const READ: Spec = Spec {
     name: "read",
     signature: "read(path, offset?, limit?)",
-    description: "Return the contents of a text file. offset is a 1-based starting line, limit is a line count.",
+    description: "Read a file's lines: offset is a 1-based first line, limit a line count. This is how you look at a file — prefer it to `sed -n A,Bp`, `cat`, `head`, `tail`, `nl` or `awk NR>=` in bash: one call, no shell, exact range. One range per call; call again for another. Use `rg` to search.",
     parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"File path; relative paths resolve from the working directory"},"offset":{"type":"integer","description":"1-based first line"},"limit":{"type":"integer","description":"Maximum number of lines"}},"required":["path"]}"#,
 };
 
@@ -48,7 +48,7 @@ const EDIT: Spec = Spec {
 const BASH: Spec = Spec {
     name: "bash",
     signature: "bash(command)",
-    description: "Run a shell command in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds. The network is not confined, in any mode. In explore mode only a fixed allowlist runs (text and coreutils, checksums, file operations, search, git, curl, jq, interpreters, package managers, sh) and nothing outside a scratch directory is writable; a mutation the kernel would refuse comes back as a permission error.",
+    description: "Use `read` for a file's lines and `rg`/`fd` to find files; bash is for what those cannot do — builds, tests, git, and pipelines. Runs in the working directory. Each call already starts in the working directory and no state persists between calls, so do not prefix commands with cd. Returns exit code, stdout, and stderr. Times out after 120 seconds. The network is not confined, in any mode. In explore mode only a fixed allowlist runs (text and coreutils, checksums, file operations, search, git, curl, jq, interpreters, package managers, sh) and nothing outside a scratch directory is writable; a mutation the kernel would refuse comes back as a permission error.",
     parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"Command passed to sh -c"}},"required":["command"]}"#,
 };
 
