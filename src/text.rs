@@ -59,29 +59,103 @@ pub fn ansi(text: &str, style: Style) -> String {
     if codes.is_empty() {
         text
     } else {
+        let codes: Vec<String> = codes.iter().map(u8::to_string).collect();
         format!("\x1b[{}m{text}\x1b[0m", codes.join(";"))
     }
 }
 
-fn codes(style: Style) -> Vec<&'static str> {
+/// The SGR number of one of the terminal's own colors, and nothing for a color
+/// this harness must not use: the palette is the terminal's, so an `Rgb` or
+/// `Indexed` value here would be a bug, and an unnamed one lands on the default.
+fn color_code(color: Color) -> Option<u8> {
+    Some(match color {
+        Color::Black => 30,
+        Color::Red => 31,
+        Color::Green => 32,
+        Color::Yellow => 33,
+        Color::Blue => 34,
+        Color::Magenta => 35,
+        Color::Cyan => 36,
+        Color::Gray => 37,
+        Color::DarkGray => 90,
+        Color::LightRed => 91,
+        Color::LightGreen => 92,
+        Color::LightYellow => 93,
+        Color::LightBlue => 94,
+        Color::LightMagenta => 95,
+        Color::LightCyan => 96,
+        Color::White => 97,
+        Color::Reset | Color::Indexed(_) | Color::Rgb(_, _, _) => return None,
+    })
+}
+
+fn codes(style: Style) -> Vec<u8> {
     let mut codes = Vec::new();
-    match style.fg {
-        Some(Color::Cyan) => codes.push("36"),
-        Some(Color::Green) => codes.push("32"),
-        Some(Color::Yellow) => codes.push("33"),
-        Some(Color::Red) => codes.push("31"),
-        _ => {}
+    // Every named color, foreground and background: one table per color, so a
+    // piece cannot be colored on the screen and plain in a pipe.
+    if let Some(code) = style.fg.and_then(color_code) {
+        codes.push(code);
+    }
+    if let Some(code) = style.bg.and_then(color_code) {
+        codes.push(code + 10);
     }
     for (bit, code) in [
-        (Modifier::BOLD, "1"),
-        (Modifier::DIM, "2"),
-        (Modifier::ITALIC, "3"),
-        (Modifier::UNDERLINED, "4"),
-        (Modifier::CROSSED_OUT, "9"),
+        (Modifier::BOLD, 1),
+        (Modifier::DIM, 2),
+        (Modifier::ITALIC, 3),
+        (Modifier::UNDERLINED, 4),
+        (Modifier::CROSSED_OUT, 9),
     ] {
         if style.add_modifier.contains(bit) {
             codes.push(code);
         }
     }
     codes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ANSI output only exists for a terminal, so the codes are what a test can
+    /// read.
+    #[test]
+    fn every_named_color_has_a_code() {
+        // Magenta was missing when the table was a hand-picked subset, so the
+        // thinking level was colored on the screen and plain in a pipe.
+        for (color, want) in [
+            (Color::Black, 30),
+            (Color::Red, 31),
+            (Color::Green, 32),
+            (Color::Yellow, 33),
+            (Color::Blue, 34),
+            (Color::Magenta, 35),
+            (Color::Cyan, 36),
+            (Color::Gray, 37),
+            (Color::DarkGray, 90),
+            (Color::LightRed, 91),
+            (Color::LightGreen, 92),
+            (Color::LightYellow, 93),
+            (Color::LightBlue, 94),
+            (Color::LightMagenta, 95),
+            (Color::LightCyan, 96),
+            (Color::White, 97),
+        ] {
+            assert_eq!(codes(Style::new().fg(color)), vec![want], "{color:?}");
+            assert_eq!(codes(Style::new().bg(color)), vec![want + 10], "{color:?}");
+        }
+        // A color the palette does not use draws as the default.
+        assert!(codes(Style::new().fg(Color::Reset)).is_empty());
+        assert!(codes(Style::new().fg(Color::Rgb(1, 2, 3))).is_empty());
+        assert!(codes(Style::new().fg(Color::Indexed(4))).is_empty());
+    }
+
+    #[test]
+    fn modifiers_join_the_color() {
+        let style = Style::new()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+        assert_eq!(codes(style), vec![36, 1, 4]);
+        assert!(codes(Style::new()).is_empty());
+    }
 }
