@@ -323,20 +323,11 @@ def main():
         tmux.start(size, work, command)
 
         # Wait for the model line, or for the process to die with its error.
-        # The first run in a workdir with project skills is asked once whether to
-        # trust it; the harness answers yes. Axe starts its deadline over, since
-        # the question comes before the splash and the model line.
         start = time.monotonic()
-        asked = False
         while time.monotonic() - start < 5:
             screen = tmux.capture(args.scroll, args.ansi)
             if "❯" in screen or "model:" in screen or tmux.dead():
                 break
-            if "Trust the code in" in screen and not asked:
-                asked = True
-                tmux.send_literal("y")
-                start = time.monotonic()
-                continue
             time.sleep(0.05)
 
         for arg in args.turns:

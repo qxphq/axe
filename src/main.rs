@@ -106,7 +106,7 @@ fn run() -> Result<(), String> {
     // The working directory identifies this directory's state file and anchors
     // the project's AGENTS.md; read it once.
     let cwd = std::env::current_dir().ok();
-    let mut state = match &cwd {
+    let state = match &cwd {
         Some(dir) => state::load(dir),
         None => state::State::default(),
     };
@@ -117,26 +117,8 @@ fn run() -> Result<(), String> {
     let project_agents = project_file.as_deref().and_then(config::read_agents);
 
     // Skills are read once, like the instructions: the catalogue is part of
-    // the stable prefix. A project's skills need an answer to the trust
-    // question first.
-    let mut loaded_skills = skills::load(cwd.as_deref(), state.trusted == Some(true), &cfg.skills);
-    // A directory that contributes to the prompt earns one question, once. The
-    // answer is remembered in its state, so this runs at most once per
-    // directory; `/trust` stays the way back from a no.
-    if state.trusted.is_none()
-        && ui::is_interactive()
-        && (loaded_skills.withheld > 0 || project_agents.is_some())
-    {
-        if let Some(trusted) = ask_trust(cwd.as_deref()) {
-            state.trusted = Some(trusted);
-            if let Err(e) = state.save() {
-                eprintln!("axe: {}", strip_control(&e));
-            }
-            if trusted {
-                loaded_skills = skills::load(cwd.as_deref(), true, &cfg.skills);
-            }
-        }
-    }
+    // the stable prefix.
+    let loaded_skills = skills::load(cwd.as_deref(), &cfg.skills);
     for warning in &loaded_skills.warnings {
         eprintln!("axe: {}", strip_control(warning));
     }
@@ -160,19 +142,6 @@ fn run() -> Result<(), String> {
             plural(project_skills)
         ));
     }
-    if loaded_skills.withheld > 0 {
-        notices.push(format!(
-            "{} project skill{} withheld; /trust to load {}",
-            loaded_skills.withheld,
-            plural(loaded_skills.withheld),
-            if loaded_skills.withheld == 1 {
-                "it"
-            } else {
-                "them"
-            }
-        ));
-    }
-
     let mut providers = Vec::new();
     let sid = session_id();
 
@@ -299,9 +268,6 @@ fn run() -> Result<(), String> {
         naming: None,
         warning: None,
         skills: loaded_skills.skills,
-        withheld: loaded_skills.withheld,
-        skill_paths: cfg.skills,
-        system_extra: None,
     };
 
     if ui::is_interactive() {
@@ -439,12 +405,6 @@ struct Session {
     warning: Option<String>,
     /// The skills discovered at startup; the catalogue is in the prompt.
     skills: Vec<skills::Skill>,
-    /// Project skills withheld because the directory is not trusted.
-    withheld: usize,
-    /// The config's `skills` paths, kept for the `/trust` rescan.
-    skill_paths: Vec<std::path::PathBuf>,
-    /// A catalogue appended mid-session by `/trust`: history, not prefix.
-    system_extra: Option<String>,
 }
 
 /// The session on disk. `meta` is loaded with the first message or on resume,
@@ -635,7 +595,6 @@ enum Command {
     Skills,
     /// `/skill:name request`: the body becomes the user turn.
     Skill(String, String),
-    Trust,
     Shell(String),
     Turn(String),
     Unknown(String),
@@ -656,7 +615,6 @@ fn parse_command(line: &str) -> Command {
         "/explore" => return Command::Explore,
         "/sessions" => return Command::Sessions(None),
         "/skills" => return Command::Skills,
-        "/trust" => return Command::Trust,
         _ => {}
     }
     if let Some(rest) = input.strip_prefix("/model ") {
@@ -718,7 +676,6 @@ const COMMANDS: &[&str] = &[
     "/skills",
     "/thinking",
     "/thoughts",
-    "/trust",
 ];
 
 /// A skill name that can be typed as one word after `/skill:`.
@@ -735,7 +692,6 @@ const HELP: &str = "/model [id]    list models, or pick or switch one\n\
                     /sessions [q]  list, search and resume sessions\n\
                     /skills        list loaded skills (project, global, config)\n\
                     /skill:name [request]  load a skill's instructions and run a turn\n\
-                    /trust         trust this project's skills\n\
                     /new           start a new session\n\
                     /explore       toggle explore mode (read-only shell)\n\
                     !cmd           run a shell command; its output joins the context\n\
@@ -1345,21 +1301,15 @@ impl Session {
         ));
     }
 
-    /// The messages every history starts with: the built system prompt, a
-    /// catalogue appended by `/trust`, and the current mode note. The prefix
-    /// itself is never rewritten.
+    /// The messages every history starts with: the built system prompt and the
+    /// current mode note. The prefix itself is never rewritten.
     fn base_messages(&self) -> Vec<Value> {
         let system = self
             .messages
             .first()
             .cloned()
             .unwrap_or_else(|| json!({ "role": "system", "content": tools::system_prompt() }));
-        let mut messages = vec![system];
-        if let Some(extra) = &self.system_extra {
-            messages.push(json!({ "role": "system", "content": extra }));
-        }
-        messages.push(mode_note(self.read_only));
-        messages
+        vec![system, mode_note(self.read_only)]
     }
 
     /// The slash commands Tab completes, including `/skill:<name>` for every
@@ -1373,7 +1323,7 @@ impl Session {
         commands
     }
 
-    /// `/skills`: what was found, what is withheld, and what the model sees.
+    /// `/skills`: what was found, where it came from, and what the model sees.
     fn skill_listing(&self) -> String {
         let mut out = String::new();
         for skill in &self.skills {
@@ -1389,76 +1339,12 @@ impl Session {
                 out.push_str(&format!("  tools: {}\n", skill.allowed_tools.join(" ")));
             }
         }
-        if self.withheld > 0 {
-            out.push_str(&format!(
-                "{} project skill{} withheld; /trust to load {}\n",
-                self.withheld,
-                plural(self.withheld),
-                if self.withheld == 1 { "it" } else { "them" }
-            ));
-        }
         if out.is_empty() {
             out.push_str("no skills\n");
         }
         // Names, descriptions and paths come from a repository: a terminal
         // must not interpret them.
         strip_control(&out)
-    }
-
-    /// `/trust`: persist the decision, rescan, and append the project
-    /// catalogue as one system message. The built prompt is not rewritten.
-    fn trust(&mut self, screen: Option<&mut ui::Screen>) {
-        if self.state.trusted == Some(true) {
-            let text = "Project skills: already trusted\n";
-            match screen {
-                Some(screen) => screen.output(text),
-                None => print!("{text}"),
-            }
-            return;
-        }
-        self.state.trusted = Some(true);
-        if let Err(e) = self.state.save() {
-            self.warn(format!("state: {e}"));
-        }
-        let cwd = self.state.cwd.clone();
-        let cwd = if cwd.as_os_str().is_empty() {
-            None
-        } else {
-            Some(cwd.as_path())
-        };
-        let loaded = skills::load(cwd, true, &self.skill_paths);
-        for warning in loaded.warnings {
-            self.warn(warning);
-        }
-        self.skills = loaded.skills;
-        self.withheld = loaded.withheld;
-        let project: Vec<skills::Skill> = self
-            .skills
-            .iter()
-            .filter(|skill| skill.scope == skills::Scope::Project)
-            .cloned()
-            .collect();
-        let section = skills::prompt_section(&project);
-        if !section.is_empty() {
-            // A project skill may share a name with one already in the
-            // prefix; this says which entry the model should follow now.
-            let section = format!(
-                "\n\nProject skills are trusted now; a name repeated below replaces \
-                 the earlier entry.{section}"
-            );
-            self.messages
-                .push(json!({ "role": "system", "content": section.clone() }));
-            self.system_extra = Some(section);
-        }
-        let text = format!("Project skills: trusted ({} loaded)\n", project.len());
-        match screen {
-            Some(screen) => {
-                screen.set_commands(self.commands());
-                screen.set_info(&self.info());
-                screen.output(&text);
-            }
-            None => print!("{text}"),
-        }
     }
 
     /// `!cmd`: run it here, show it, and let the output join the history. No
@@ -1893,10 +1779,6 @@ impl Session {
                     }
                 }
             }
-            Command::Trust => {
-                self.trust(Some(screen));
-                Cmd::Continue
-            }
             Command::Unknown(input) => {
                 screen.error(&format!("unknown command: {input}\n"));
                 Cmd::Continue
@@ -1993,10 +1875,6 @@ fn dispatch_piped(session: &mut Session, line: &str) -> Cmd {
                     Cmd::Continue
                 }
             }
-        }
-        Command::Trust => {
-            session.trust(None);
-            Cmd::Continue
         }
         Command::Unknown(input) => {
             eprintln!("axe: unknown command: {}", strip_control(&input));
@@ -2289,31 +2167,6 @@ impl Sink for ChannelSink {
             self.thought.get_or_insert_with(Instant::now);
             self.send(Event::Status("Thinking…".to_string()));
         }
-    }
-}
-
-/// The startup question, asked before a screen exists: one cooked line above the
-/// splash. Empty or EOF answers nothing, and so does anything that is neither y
-/// nor n; an unanswered directory is asked again next run.
-fn ask_trust(cwd: Option<&Path>) -> Option<bool> {
-    let name = cwd
-        .map(|dir| dir.display().to_string())
-        .unwrap_or_else(|| "this directory".to_string());
-    let line = ui::cooked_line(&format!(
-        "Trust the code in {name}? Its project skills join the prompt [y/N] "
-    ))?;
-    let answer = parse_trust(&line);
-    if answer.is_none() && !line.trim().is_empty() {
-        eprintln!("axe: answer y or n; this directory is asked again next run");
-    }
-    answer
-}
-
-fn parse_trust(line: &str) -> Option<bool> {
-    match line.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => Some(true),
-        "n" | "no" => Some(false),
-        _ => None,
     }
 }
 
@@ -2949,16 +2802,6 @@ mod tests {
     }
 
     #[test]
-    fn only_an_explicit_answer_is_remembered() {
-        assert_eq!(parse_trust("y"), Some(true));
-        assert_eq!(parse_trust(" YES "), Some(true));
-        assert_eq!(parse_trust("n"), Some(false));
-        assert_eq!(parse_trust("No"), Some(false));
-        assert_eq!(parse_trust(""), None);
-        assert_eq!(parse_trust("sure"), None);
-    }
-
-    #[test]
     fn project_instructions_are_tagged_between_global_and_system() {
         let system = system_with_instructions(
             Some("global text"),
@@ -3009,7 +2852,6 @@ mod tests {
         assert_eq!(parse_command("!"), Command::Empty);
         assert_eq!(parse_command("hello"), Command::Turn("hello".into()));
         assert_eq!(parse_command("/skills"), Command::Skills);
-        assert_eq!(parse_command("/trust"), Command::Trust);
         assert_eq!(
             parse_command("/skill:pdf-tools extract it"),
             Command::Skill("pdf-tools".into(), "extract it".into())
@@ -3166,9 +3008,6 @@ mod tests {
             naming: None,
             warning: None,
             skills: Vec::new(),
-            withheld: 0,
-            skill_paths: Vec::new(),
-            system_extra: None,
         };
         let info = session.set_model(0, "m".into());
         assert!(info.contains("p/m"), "{info}");
@@ -3280,7 +3119,7 @@ mod tests {
             allowed_tools: vec!["Read".into()],
             hidden: false,
         };
-        let mut session = Session {
+        let session = Session {
             state: state::State::default(),
             providers: vec![test_provider()],
             provider: 0,
@@ -3296,19 +3135,14 @@ mod tests {
             naming: None,
             warning: None,
             skills: vec![skill],
-            withheld: 2,
-            skill_paths: Vec::new(),
-            system_extra: None,
         };
         assert!(session.commands().contains(&"/skill:demo".to_string()));
         let listing = session.skill_listing();
         assert!(listing.contains("demo"));
         assert!(listing.contains("tools: Read"));
-        assert!(listing.contains("2 project skills withheld"));
-        session.system_extra = Some("catalogue".into());
         let base = session.base_messages();
-        assert_eq!(base.len(), 3);
-        assert_eq!(base[1]["content"].as_str(), Some("catalogue"));
+        assert_eq!(base.len(), 2);
+        assert_eq!(base[0]["content"].as_str(), Some("s"));
     }
 
     #[test]
@@ -3329,9 +3163,6 @@ mod tests {
             naming: None,
             warning: None,
             skills: Vec::new(),
-            withheld: 0,
-            skill_paths: Vec::new(),
-            system_extra: None,
         };
         assert!(session.info().contains("p/m"));
         assert_eq!(session.context(), Some(100));
