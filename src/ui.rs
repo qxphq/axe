@@ -477,9 +477,9 @@ impl Screen {
     }
 
     /// Everything a terminal would have after this session: the rows that
-    /// scrolled off, then the rows above the live region, oldest first. Trailing
-    /// space and trailing blank rows are trimmed, since one blank row between
-    /// two blocks is the rule and trailing ones are nobody's business.
+    /// scrolled off, then the rows above the live frame, oldest first. Trailing
+    /// space goes, and so do blank rows at either end: the frame's margin above
+    /// the first block and the space left below the last one are not transcript.
     ///
     /// This is what a test asserts on. What is still on screen is only the tail
     /// of it.
@@ -502,6 +502,7 @@ impl Screen {
         while rows.last().is_some_and(|row| row.is_empty()) {
             rows.pop();
         }
+        rows.drain(..rows.iter().take_while(|row| row.is_empty()).count());
         rows
     }
 
@@ -774,6 +775,15 @@ impl Screen {
             self.end_thought();
         }
         let mut lines = lines;
+        // The separator belongs to the writer: a caller's own trailing blank
+        // rows would be a second one, and a block that is nothing but blanks is
+        // not a block at all.
+        while lines.last().is_some_and(blank) {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            return;
+        }
         // Consecutive tool calls are one block: they belong together. A user
         // line is its own, and markdown arrives one laid-out block at a time,
         // so neither continues.
@@ -1606,6 +1616,12 @@ fn inset(area: Rect, pad: u16) -> Rect {
     }
 }
 
+/// A row with nothing on it. Blocks do not begin or end with one: the blank row
+/// between two blocks is the writer's, not the caller's.
+fn blank(line: &Line<'static>) -> bool {
+    line.spans.iter().all(|span| span.content.trim().is_empty())
+}
+
 /// One row of a buffer as text, without the padding to the screen width: a
 /// terminal keeps the text, not the cells that were never written.
 #[cfg(test)]
@@ -2088,6 +2104,16 @@ mod tests {
         screen.insert_text("hello");
         screen.apply_key(key(KeyCode::Up));
         assert_eq!(screen.buf, "hello");
+    }
+
+    #[test]
+    fn a_caller_does_not_add_the_blank_row_between_blocks() {
+        let mut screen = Screen::test_screen(40, 24);
+        // A command's output often ends with a blank line; the writer already
+        // put one above the block, so this is the one that would double it.
+        screen.output("first\n\n");
+        screen.output("second");
+        assert_eq!(screen.transcript(), [" first", "", " second"]);
     }
 
     #[test]

@@ -1819,8 +1819,11 @@ impl Session {
             Command::Thinking(rest) => {
                 let providers = &self.providers;
                 if rest.as_deref().unwrap_or("").is_empty() {
+                    // No blank row of its own: `Screen::write` puts one between
+                    // blocks, and a second here would be a gap the writer never
+                    // asked for.
                     screen.output(&format!(
-                        "thinking: {}\n\n",
+                        "thinking: {}",
                         thinking_label(&providers[self.provider].cfg, &self.thinking)
                     ));
                     return Cmd::Continue;
@@ -1836,7 +1839,7 @@ impl Session {
                         if let Some(e) = save_error {
                             self.warn(format!("state: {e}"));
                         }
-                        screen.output(&format!("thinking: {label}\n\n"));
+                        screen.output(&format!("thinking: {label}"));
                     }
                     Err(e) => screen.error(&format!("axe: {e}\n")),
                 }
@@ -1848,7 +1851,7 @@ impl Session {
                     self.warn(format!("state: {e}"));
                 }
                 screen.output(&format!(
-                    "Thoughts: {}\n\n",
+                    "Thoughts: {}",
                     if self.state.thoughts { "on" } else { "off" }
                 ));
                 Cmd::Continue
@@ -2838,9 +2841,11 @@ impl TextSink {
             }
             if !self.started {
                 self.started = true;
-                // One blank line separates a reply from whatever precedes it.
-                // Emitted here, not per round: a round with no text must not
-                // widen the gap between two tool calls.
+                // Piped output has no screen to put the blank row between two
+                // blocks, so the reply carries its own. Emitted here, not per
+                // round: a round with no text must not widen the gap between
+                // two tool calls. `Screen::write` inserts its own separator and
+                // reads this one as the empty line it is.
                 out.push('\n');
             }
             for _ in 0..self.pending {
