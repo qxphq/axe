@@ -105,7 +105,6 @@ invariants a change must not break.
     Normal mode keeps only `no_new_privs` and the scrubbed environment. The
     network is confined in neither mode: a child connects where the user
     connects, `!cmd` included. A leading-word check is never a substitute.
-    Details and residuals: `SEC_AUDIT.md`.
 16. **One version, in `Cargo.toml`.** `env!("CARGO_PKG_VERSION")` is the banner
     and `--version`; `flake.nix` reads the same file. The `ship` skill bumps it
     per semver (pre-1.0: patch for a fix, minor for a capability, a breaking
