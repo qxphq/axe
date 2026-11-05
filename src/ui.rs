@@ -192,11 +192,11 @@ enum Mode {
 /// the width, which is the terminal's and comes off the sides in `draw`, and
 /// nothing is written against the screen's bottom edge.
 ///
-/// The frame is as tall as the rows it shows, and the status keeps a blank row
-/// above it and one under it however many rows the rest takes. A frame sized by
-/// the terminal instead of by its content would sit on rows it does not use,
-/// and those rows are the transcript's: they are blank forever, right above the
-/// prompt.
+/// The frame is as tall as the rows it shows, and it carries the blank rows it
+/// keeps around the prompt and the status: one above the prompt, one between
+/// the prompt and the status, one under the status, however many rows the
+/// rest takes. A frame sized by the terminal instead of by its content would
+/// sit on rows it does not use, and those rows are the transcript's.
 #[derive(Clone, Copy)]
 struct Frame {
     /// Candidates, or a chooser's header and its entries. Blank when unused.
@@ -236,10 +236,11 @@ impl Frame {
         // row is always there, because a prompt with no row is no prompt.
         let prompt_rows = shown.prompt.clamp(1, 3);
         let queued_rows = u16::from(shown.queued);
-        // Blank row, status row, blank row under it: the frame carries them
-        // whether or not it has anything to say, so the status never touches
-        // the bottom edge and never touches the prompt.
-        let fixed = queued_rows + prompt_rows + 3;
+        // Blank row, prompt, blank row, status row, blank row under it: the
+        // frame carries them whether or not it has anything to say, so the
+        // prompt has a row of its own above it, the status never touches the
+        // prompt, and neither touches the bottom edge.
+        let fixed = queued_rows + prompt_rows + 4;
         // The transcript keeps its own rows on a short terminal, whatever is
         // asking for space.
         let room = height.saturating_sub(fixed + MIN_TRANSCRIPT);
@@ -251,8 +252,8 @@ impl Frame {
         let rows = (fixed + list_rows).min(height);
         let area = Rect::new(0, 0, 0, rows);
         // Top down: the parts are laid end to end, so a part that is not shown
-        // takes its row out of the frame and not out of the gap above the
-        // prompt.
+        // takes its row out of the frame and not out of the blank row above the
+        // prompt, which is the frame's own and always there.
         let list = Rect {
             y: 0,
             height: list_rows,
@@ -269,8 +270,8 @@ impl Frame {
             ..area
         };
         let prompt = Rect {
-            y: list_rows + queued_rows,
-            height: prompt_rows.min(status.y.saturating_sub(list_rows + queued_rows)),
+            y: list_rows + queued_rows + 1,
+            height: prompt_rows.min(status.y.saturating_sub(list_rows + queued_rows + 1)),
             ..area
         };
         Frame {
@@ -2075,25 +2076,27 @@ mod tests {
                 .collect()
         };
         let mut screen = Screen::test_screen(40, 24);
-        // An idle prompt keeps no rows above it: the four it needs are its own
-        // row, a blank, the status and the row under that.
+        // An idle prompt keeps one row above it and no more: the five it needs
+        // are that blank row, its own row, a blank, the status and the row
+        // under that.
         screen.draw().unwrap();
-        assert_eq!(screen.term.area().height, 4);
+        assert_eq!(screen.term.area().height, 5);
         screen.echo_user("a question");
         screen.output("an answer");
         screen.draw().unwrap();
         let frame = screen.frame();
         let text = rows(&screen);
-        // The last block ends on the row above the prompt. Reserved rows here
-        // would be a gap the transcript never gets back.
-        assert_eq!(text[frame.prompt.y as usize - 1].trim_end(), " an answer");
+        // The last block ends under a blank row, and the prompt is under that:
+        // the separation is the frame's, so no block ends with one.
+        assert_eq!(text[frame.prompt.y as usize - 2].trim_end(), " an answer");
+        assert_eq!(text[frame.prompt.y as usize - 1].trim_end(), "");
         assert_eq!(text[frame.prompt.y as usize].trim_end(), " ❯");
         // A wrapped prompt grows into the frame's own top, and the rows it
-        // asks for are the rows it uses.
+        // asks for are the rows it uses; the blank row above it stays.
         screen.insert_text(&"word ".repeat(40));
         screen.draw().unwrap();
         assert_eq!(screen.frame().prompt.height, 3);
-        assert_eq!(screen.term.area().height, 6);
+        assert_eq!(screen.term.area().height, 7);
     }
 
     #[test]
@@ -2421,27 +2424,27 @@ mod tests {
             assert_eq!(screen.term.area().height, want);
             assert_eq!(screen.term.area().top(), height - want);
         }
-        // An idle prompt is its own row, a blank row, the status and the row
-        // under that: nothing is kept for a list that is not there.
-        check(&mut screen, 4, height);
+        // An idle prompt is a blank row, its own row, a blank row, the status
+        // and the row under that: nothing is kept for a list that is not there.
+        check(&mut screen, 5, height);
         // Candidates take rows while they are shown and give them back after.
         screen.set_commands(vec!["/one".into(), "/two".into(), "/three".into()]);
         screen.insert_text("/");
-        check(&mut screen, 6, height);
+        check(&mut screen, 7, height);
         screen.take();
-        check(&mut screen, 4, height);
+        check(&mut screen, 5, height);
         // A prompt that wraps asks for the rows it fills, up to the three it
         // composes in.
         screen.insert_text(&"word ".repeat(40));
-        check(&mut screen, 6, height);
+        check(&mut screen, 7, height);
         screen.take();
-        check(&mut screen, 4, height);
+        check(&mut screen, 5, height);
         // A chooser is a window over the transcript, so it is the one part the
         // terminal sizes.
         screen.set_menu("Header", vec!["one".into(), "two".into()], false);
-        check(&mut screen, 4 + (height / 3).clamp(2, 10), height);
+        check(&mut screen, 5 + (height / 3).clamp(2, 10), height);
         screen.clear_menu(false);
-        check(&mut screen, 4, height);
+        check(&mut screen, 5, height);
     }
 
     #[test]
@@ -2510,8 +2513,9 @@ mod tests {
         // and the candidates past it wait for the selection to walk down.
         assert_eq!(layout.list.height, 1);
         assert_eq!(rows[layout.list.y as usize].trim_end(), "   /c1");
-        // The prompt follows the list directly: there is no reserved row
-        // between what completes and what is being completed.
+        // One blank row, then the prompt: the row above it is the prompt's own
+        // and the list does not take it back.
+        assert_eq!(rows[layout.prompt.y as usize - 1].trim_end(), "");
         assert_eq!(rows[layout.prompt.y as usize].trim_end(), " ❯ /c");
     }
 

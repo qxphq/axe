@@ -195,11 +195,12 @@ turn follows — the model sees it the next time you ask something.
 | `/help` | list the commands, the config path and its keys |
 | `/exit`, `/quit` | quit |
 
-The area under the transcript is as tall as it has to be: the prompt's rows, a
-queued line, the candidates, and the status with its blank rows. An idle prompt
-sits directly under the last block. A chooser is the one part sized by the
-terminal — a window over the transcript, whose rows are committed when it
-closes.
+The area under the transcript is as tall as it has to be: a blank row above the
+prompt, the prompt's rows, a blank row, the status, and a blank row under it,
+with the queued line and the candidates on top of that. The blank rows around
+the prompt are the frame's own, so the prompt keeps one above it and one below
+it whatever is shown. A chooser is the one part sized by the terminal — a window
+over the transcript, whose rows are committed when it closes.
 
 Recent sessions for the directory are offered at startup as a chooser: Up and
 Down move, Enter resumes, Esc closes it, and typing starts a new session and
