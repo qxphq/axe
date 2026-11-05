@@ -72,11 +72,6 @@ impl Buffer {
         self.cursor = from + text.chars().count();
     }
 
-    /// `nth` from the end, where 0 is the last char. Cuts on char boundaries.
-    fn at(&self, nth: usize) -> usize {
-        self.offset(self.len().saturating_sub(nth))
-    }
-
     fn char_at(&self, i: usize) -> Option<char> {
         self.buf.chars().nth(i)
     }
@@ -157,11 +152,7 @@ impl Buffer {
     /// Swap the two chars before the cursor, as readline does: at the end of
     /// the line the cursor steps back one first.
     pub(crate) fn transpose_chars(&mut self) {
-        let end = if self.cursor == self.len() {
-            self.at(0)
-        } else {
-            self.cursor
-        };
+        let end = self.cursor;
         if end < 2 {
             return;
         }
@@ -217,5 +208,49 @@ impl Buffer {
             second_end,
             &format!("{second}{between}{first}"),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A line typed in, with the cursor at its end.
+    fn typed(line: &str) -> Buffer {
+        let mut buffer = Buffer::default();
+        buffer.insert_text(line);
+        buffer
+    }
+
+    #[test]
+    fn transpose_swaps_the_two_chars_before_the_cursor() {
+        let mut buffer = typed("abc");
+        buffer.transpose_chars();
+        assert_eq!(buffer.buf, "acb");
+        assert_eq!(buffer.cursor, 3);
+        // Nothing before the cursor to swap.
+        let mut buffer = typed("a");
+        buffer.transpose_chars();
+        assert_eq!(buffer.buf, "a");
+    }
+
+    #[test]
+    fn transpose_counts_chars_not_bytes() {
+        // `é` is two bytes: a byte offset here stepped past the buffer and
+        // `char_at` returned nothing to the unwrap.
+        let mut buffer = typed("café");
+        buffer.transpose_chars();
+        assert_eq!(buffer.buf, "caéf");
+        assert_eq!(buffer.cursor, 4);
+        // One char, no swap, no panic.
+        let mut buffer = typed("é");
+        buffer.transpose_chars();
+        assert_eq!(buffer.buf, "é");
+        // Mid-line, past a wide char.
+        let mut buffer = typed("日本x");
+        buffer.cursor = 2;
+        buffer.transpose_chars();
+        assert_eq!(buffer.buf, "本日x");
+        assert_eq!(buffer.cursor, 2);
     }
 }
