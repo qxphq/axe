@@ -1,14 +1,17 @@
-//! The screen: a fixed live region at the bottom of the terminal, the
-//! transcript above it.
+//! The screen: a live frame at the bottom of the terminal, the transcript above
+//! it.
 //!
-//! `ratatui` owns everything that used to be arithmetic here: how many rows the
-//! prompt occupies, where the cursor goes, what to repaint after a resize, and
-//! how to push a line into scrollback without losing the drawing. This module
-//! only decides *what* the live region contains: a blank row that keeps the
-//! transcript off the prompt, the queued row, one prompt row per wrapped line,
-//! an empty row under them, and below that one row with the status on the left
-//! and the selection on the right — or, while a question is waiting for an
-//! answer, the question alone.
+//! `ratatui` owns the arithmetic that used to live here: where the cursor goes,
+//! what to repaint after a resize, how to push a line into scrollback without
+//! losing the drawing. This module decides what the two zones are, and one rule
+//! keeps them apart:
+//!
+//! *The frame does not resize.* Its height is a function of the terminal size
+//! and the mode — `Frame::layout` — and never of what it shows: the candidate
+//! list, a chooser, a wrapped prompt and a queued line all scroll or clip
+//! inside the rows they were given. A terminal appends rows at the bottom and
+//! cannot take them back, so a frame that shrank would leave blank rows behind
+//! in the transcript, which is the one thing the transcript must never have.
 
 use std::io::{self, IsTerminal, Stdout, Write};
 
@@ -25,22 +28,17 @@ use ratatui::layout::{Alignment, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
-use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use ratatui::{Frame as TermFrame, Terminal, TerminalOptions, Viewport};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::markdown;
 
-/// Rows the live region occupies besides the prompt itself: a blank gap, the
-/// queue, an empty row under the prompt, the status and selection row, and a
-/// blank row under it. Nothing is written against the bottom edge.
-const CHROME: u16 = 5;
-
 /// Blank cells at each screen edge: nothing is written against the border.
 const PAD: u16 = 1;
 
-/// Rows the candidate list under the prompt may take. The list is a hint, not
-/// a chooser: it never covers the transcript for long.
-const HINTS: usize = 5;
+/// Rows of transcript a list may never take: the frame is at the bottom, but
+/// the conversation has to stay readable through it.
+const MIN_TRANSCRIPT: u16 = 3;
 
 const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan);
 /// Explore mode's prompt: the glyph says the tool set is read-only.
@@ -109,6 +107,112 @@ struct Cycle {
     at: usize,
 }
 
+/// What the live frame is for. A chooser is a different frame, not a taller
+/// one: the mode, never the content, decides the frame's shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The prompt, with the candidates for what is typed in the rows above it.
+    Idle,
+    /// A chooser: its header and entries take the rows the candidates would.
+    Choosing,
+}
+
+/// Where the live frame's parts sit, in screen rows. A function of the terminal
+/// size and the mode and of nothing else — content that does not fit is
+/// scrolled or clipped inside its part. That is the invariant this type exists
+/// to hold: a frame whose height followed its content would have to grow into
+/// the transcript and, on the way back, leave rows behind that a terminal
+/// cannot take away.
+#[derive(Clone, Copy)]
+struct Frame {
+    /// Candidates, or a chooser's header and its entries. Blank when unused.
+    list: Rect,
+    /// The line waiting for the turn boundary: one row, never more.
+    queued: Rect,
+    /// The prompt. It scrolls inside these rows, so a wrapped line does not
+    /// move anything.
+    prompt: Rect,
+    /// What the turn is doing on the left, what the session points at on the
+    /// right, or the one question that outranks both.
+    status: Rect,
+}
+
+impl Frame {
+    /// The frame for a terminal this tall, its top row at zero: the shape, with
+    /// `at` putting it where the terminal has it. The height is the terminal's
+    /// and the mode's, and nothing the frame shows.
+    fn layout(height: u16, mode: Mode) -> Frame {
+        let height = height.max(1);
+        // One row of prompt, and room to compose in: a wrapped line scrolls
+        // inside the box rather than asking the terminal for a row it can never
+        // give back.
+        let prompt_rows = (height / 12).clamp(1, 3);
+        // The queued row, the prompt's rows, the status row: the frame has
+        // them whether or not there is anything to put in them.
+        let fixed = 1 + prompt_rows + 1;
+        let room = height.saturating_sub(fixed + MIN_TRANSCRIPT);
+        let list_rows = match mode {
+            Mode::Idle => (height / 12).clamp(1, 4).min(room),
+            // A header, then entries: a chooser is worth at least two rows.
+            Mode::Choosing => (height / 3).clamp(2, 10).min(room),
+        };
+        let rows = (fixed + list_rows).min(height);
+        let area = Rect::new(0, 0, 0, rows);
+        let status = Rect {
+            y: rows.saturating_sub(1),
+            height: 1,
+            ..area
+        };
+        let prompt = Rect {
+            y: status.y.saturating_sub(prompt_rows),
+            height: prompt_rows.min(status.y.max(1)),
+            ..area
+        };
+        let queued = Rect {
+            y: prompt.y.saturating_sub(1),
+            height: 1,
+            ..area
+        };
+        let list = Rect {
+            y: 0,
+            height: queued.y,
+            ..area
+        };
+        Frame {
+            list,
+            queued,
+            prompt,
+            status,
+        }
+    }
+
+    /// The same parts, `top` rows down the screen.
+    fn at(&self, top: u16) -> Frame {
+        let shift = |part: Rect| Rect {
+            y: part.y + top,
+            ..part
+        };
+        Frame {
+            list: shift(self.list),
+            queued: shift(self.queued),
+            prompt: shift(self.prompt),
+            status: shift(self.status),
+        }
+    }
+
+    /// The rows the frame takes.
+    fn height(&self) -> u16 {
+        self.status.y + self.status.height
+    }
+
+    /// The row the cursor sits on inside the prompt, giving the text the bottom
+    /// of its box: a one-line buffer leaves the frame above it untouched, and a
+    /// longer one grows upward.
+    fn prompt_top(&self, rows: u16) -> u16 {
+        self.prompt.bottom().saturating_sub(rows).max(self.prompt.y)
+    }
+}
+
 enum Term {
     Real(Terminal<Tail<Stdout>>),
     #[cfg(test)]
@@ -132,7 +236,7 @@ impl Term {
         }
     }
 
-    fn draw<F: FnOnce(&mut Frame)>(&mut self, draw: F) -> io::Result<()> {
+    fn draw<F: FnOnce(&mut TermFrame)>(&mut self, draw: F) -> io::Result<()> {
         match self {
             Term::Real(term) => term.draw(draw).map(|_| ()),
             #[cfg(test)]
@@ -269,11 +373,12 @@ impl Screen {
             hook(info);
         }));
         terminal::enable_raw_mode()?;
-        // A terminal shorter than the normal live region must still start.
-        let rows = terminal::size()
-            .map(|(_, height)| height)
-            .unwrap_or(CHROME + 1)
-            .clamp(1, CHROME + 1);
+        // The frame the session starts in; `draw` keeps it there. A terminal
+        // shorter than the frame must still start.
+        let (_, height) = terminal::size().unwrap_or((80, 24));
+        let rows = Frame::layout(height, Mode::Idle)
+            .height()
+            .clamp(1, height.max(1));
         let term = match Terminal::with_options(
             Tail(CrosstermBackend::new(io::stdout())),
             TerminalOptions {
@@ -324,7 +429,7 @@ impl Screen {
     /// Everything `fit` does to a real terminal it does here too.
     #[cfg(test)]
     fn test_screen(width: u16, height: u16) -> Screen {
-        let rows = height.clamp(1, CHROME + 1);
+        let rows = Frame::layout(height, Mode::Idle).height().clamp(1, height);
         let mut backend = TestBackend::new(width, height);
         backend
             .set_cursor_position(Position::new(0, height - rows))
@@ -491,19 +596,6 @@ impl Screen {
     /// menu on a short screen must not eat Enter or the arrows.
     fn menu_active(&self) -> bool {
         self.menu.as_ref().is_some_and(|menu| menu.visible > 0)
-    }
-
-    /// Visible entries: whatever the prompt does not need, but at least one.
-    /// Zero when the screen is too short to hold a chooser at all: drawing one
-    /// there would put the status row outside the terminal.
-    fn menu_visible(&self, rows_n: u16, screen_h: u16) -> usize {
-        let Some(menu) = &self.menu else { return 0 };
-        let base = CHROME as usize + rows_n as usize;
-        if (screen_h as usize) < base + 3 {
-            return 0;
-        }
-        let room = (screen_h as usize).saturating_sub(base + 3).max(1);
-        menu.rows.len().min(room)
     }
 
     /// Keep the selected row inside the visible window.
@@ -852,7 +944,7 @@ impl Screen {
         }
     }
 
-    /// Repaint the live region.
+    /// Repaint the live frame.
     pub fn draw(&mut self) -> io::Result<()> {
         let prompt = self.prompt.clone();
         let prompt_style = self.prompt_style;
@@ -864,39 +956,58 @@ impl Screen {
         let margin = PAD.min(width.saturating_sub(1));
         let cols = (width as usize).saturating_sub(2 * margin as usize);
         let gutter: usize = prompt.chars().map(|c| c.width().unwrap_or(1)).sum();
-        let max_rows = rows_max(size.height);
-        let (rows, first, (crow, ccol)) =
-            prompt_layout(gutter, &self.buf, self.cursor, cols, max_rows);
+        // The frame is a function of the terminal and of the mode. Nothing the
+        // frame *shows* takes part: a taller chooser or a wrapped prompt is
+        // clipped or scrolled inside its part, never paid for with transcript
+        // rows.
+        let mode = if self.menu.is_some() {
+            Mode::Choosing
+        } else {
+            Mode::Idle
+        };
+        let layout = Frame::layout(size.height, mode);
+        self.settle(layout.height())?;
+        // The frame is the live area the last write left us, not a rect derived
+        // from the terminal: an insert walks it down the screen until it
+        // reaches the bottom, and the parts follow it.
+        let layout = layout.at(self.term.area().y);
+        let (rows, first, (crow, ccol)) = prompt_layout(
+            gutter,
+            &self.buf,
+            self.cursor,
+            cols,
+            layout.prompt.height.max(1) as usize,
+        );
         let visible = &rows[first..];
-        let rows_n = visible.len() as u16;
-        // The chooser takes what the prompt leaves, never the last row: the
-        // transcript keeps a place to be read even with 15 sessions on screen.
-        let slots = self.menu_visible(rows_n, size.height);
-        self.menu_follow(slots);
+        let top = layout.prompt_top(visible.len() as u16);
+        // A chooser's rows are its header and its entries; the window follows
+        // the selection so the one the next step takes is on screen. Zero
+        // entries means the frame has no room for a chooser at all, and its
+        // keys must not act on an invisible list.
+        let entries = layout.list.height.saturating_sub(1) as usize;
+        self.menu_follow(entries);
         if let Some(menu) = &mut self.menu {
-            menu.visible = slots;
+            menu.visible = entries;
         }
-        let menu = self.menu.as_ref().filter(|_| slots > 0).map(|menu| {
+        let menu = self.menu.as_ref().filter(|_| entries > 0).map(|menu| {
             let start = menu.scroll;
+            let end = (start + entries).min(menu.rows.len());
             (
                 menu.header.clone(),
-                menu.rows[start..start + slots].to_vec(),
+                menu.rows[start..end].to_vec(),
                 menu.selected,
                 menu.scroll,
             )
         });
-        let menu_h = menu
-            .as_ref()
-            .map(|(_, entries, _, _)| entries.len() as u16 + 2)
-            .unwrap_or(0);
-        // The candidates go under the prompt, at most five of them, and the
-        // window follows the selection so the one the next step takes is on
-        // screen. The list lives inside the half screen the live region may
-        // take, so a short terminal gets fewer rows, or none.
-        let (hints, at) = self.hints();
-        let live = (size.height / 2).max(CHROME + 1);
-        let room = live.saturating_sub(CHROME + rows_n) as usize;
-        let shown = hints.len().min(HINTS).min(room);
+        // The candidates take the list rows while nothing is being chosen, the
+        // window following the selection so the one the next step takes is on
+        // screen. They sit under the prompt's text, and the bottom row of the
+        // list is the one next to the prompt.
+        let (hints, at) = match menu {
+            Some(_) => (Vec::new(), 0),
+            None => self.hints(),
+        };
+        let shown = hints.len().min(layout.list.height as usize);
         let start = if shown == 0 {
             0
         } else {
@@ -904,8 +1015,6 @@ impl Screen {
         };
         let hints = &hints[start..];
         let hints = &hints[..hints.len().min(shown)];
-        let hints_h = hints.len() as u16;
-        self.fit(CHROME + rows_n + menu_h + hints_h)?;
         // Every row carries the glyph, so a wrapped line reads as one prompt.
         let prompt_rows: Vec<Line<'static>> = visible
             .iter()
@@ -934,21 +1043,36 @@ impl Screen {
         let frame = self
             .term
             .draw(|frame| {
-                let area = inset(frame.area(), margin);
-                let row = |offset: u16| Rect {
-                    y: area.y + offset,
-                    height: 1,
-                    ..area
+                // A part is a row range: the frame carries rows, the terminal
+                // carries the width and the margin. A part outside the screen
+                // is dropped rather than drawn: `settle` has just made the two
+                // agree, and the half second a resize takes must not panic.
+                let screen = frame.area();
+                let side = Rect {
+                    x: screen.x + margin,
+                    width: screen.width.saturating_sub(2 * margin),
+                    ..screen
                 };
-                let top = 2 + menu_h;
-                let below = top + rows_n + hints_h + 1;
+                let part = |r: Rect| {
+                    Rect {
+                        y: r.y,
+                        height: r.height,
+                        ..side
+                    }
+                    .intersection(screen)
+                };
+                let row = |r: Rect, offset: u16| Rect {
+                    y: r.y + offset,
+                    height: 1,
+                    ..part(r)
+                };
                 if let Some((header, entries, selected, scroll)) = &menu {
                     frame.render_widget(
                         Paragraph::new(Line::styled(clip(header, cols), DIM)),
-                        row(2),
+                        row(layout.list, 0),
                     );
-                    for (at, entry) in entries.iter().enumerate() {
-                        let on = *selected == scroll + at;
+                    for (i, entry) in entries.iter().enumerate() {
+                        let on = *selected == scroll + i;
                         let marker = if on { "▸ " } else { "  " };
                         let text = clip(entry, cols.saturating_sub(2));
                         frame.render_widget(
@@ -956,18 +1080,13 @@ impl Screen {
                                 format!("{marker}{text}"),
                                 if on { PROMPT_STYLE } else { DIM },
                             )),
-                            row(3 + at as u16),
+                            row(layout.list, 1 + i as u16),
                         );
                     }
                 }
-                frame.render_widget(
-                    Paragraph::new(prompt_rows),
-                    Rect {
-                        y: area.y + top,
-                        height: rows_n,
-                        ..area
-                    },
-                );
+                // Bottom-aligned in its rows, so a suggestion sits against the
+                // prompt it completes.
+                let first_hint = layout.list.bottom() - hints.len() as u16;
                 for (i, hint) in hints.iter().enumerate() {
                     let on = start + i == at;
                     let text = clip(hint, cols.saturating_sub(pad.len()));
@@ -976,33 +1095,51 @@ impl Screen {
                             format!("{pad}{text}"),
                             if on { PROMPT_STYLE } else { DIM },
                         )),
-                        row(top + rows_n + i as u16),
+                        Rect {
+                            y: first_hint + i as u16,
+                            height: 1,
+                            ..part(layout.list)
+                        },
                     );
                 }
-                // One row for the question, whole: the info row is metadata
-                // and comes back when the question is answered.
-                match &self.alert {
-                    Some(text) => frame.render_widget(
-                        Paragraph::new(Line::styled(clip(text, cols), ALERT_STYLE)),
-                        row(below),
-                    ),
-                    None => {
-                        frame.render_widget(Paragraph::new(Line::styled(status, DIM)), row(below));
-                        frame.render_widget(
-                            Paragraph::new(Line::styled(info, DIM)).alignment(Alignment::Right),
-                            row(below),
-                        );
-                    }
-                }
+                frame.render_widget(
+                    Paragraph::new(prompt_rows),
+                    Rect {
+                        y: top,
+                        height: visible.len() as u16,
+                        ..part(layout.prompt)
+                    },
+                );
                 let label = match &queued {
                     // One row: a queued message's own line breaks would be lost.
                     Some(line) => clip(&format!("Queued: {}", line.replace('\n', " ")), cols),
                     None => String::new(),
                 };
-                frame.render_widget(Paragraph::new(Line::styled(label, DIM)), row(1));
+                frame.render_widget(
+                    Paragraph::new(Line::styled(label, DIM)),
+                    row(layout.queued, 0),
+                );
+                // One row for the question, whole: the info row is metadata
+                // and comes back when the question is answered.
+                match &self.alert {
+                    Some(text) => frame.render_widget(
+                        Paragraph::new(Line::styled(clip(text, cols), ALERT_STYLE)),
+                        row(layout.status, 0),
+                    ),
+                    None => {
+                        frame.render_widget(
+                            Paragraph::new(Line::styled(status, DIM)),
+                            row(layout.status, 0),
+                        );
+                        frame.render_widget(
+                            Paragraph::new(Line::styled(info, DIM)).alignment(Alignment::Right),
+                            row(layout.status, 0),
+                        );
+                    }
+                }
                 frame.set_cursor_position(Position::new(
-                    area.x + gutter as u16 + ccol,
-                    area.y + top + crow,
+                    screen.x + margin + gutter as u16 + ccol,
+                    top + crow,
                 ));
             })
             .map(|_| ());
@@ -1025,11 +1162,11 @@ impl Screen {
         self.dirty = true;
     }
 
-    /// Give the live region `height` rows. It keeps its bottom at the screen
-    /// bottom, so growing it upward would cover the last transcript rows: they
-    /// are pushed into scrollback first, which leaves blank rows for the new
-    /// prompt lines.
-    fn fit(&mut self, height: u16) -> io::Result<()> {
+    /// Put the frame where the layout says it belongs: `height` rows ending at
+    /// the screen bottom. Growing it pushes the last transcript rows into
+    /// scrollback first, which is where they belong; shrinking it leaves the
+    /// rows it gives up blank above it, which `write` treats as slack.
+    fn settle(&mut self, height: u16) -> io::Result<()> {
         let size = self.term.size()?;
         let height = height.min(size.height).max(1);
         let area = self.term.area();
@@ -1383,13 +1520,6 @@ impl Drop for Screen {
     fn drop(&mut self) {
         self.close();
     }
-}
-
-/// Prompt rows the live region may use: at most half the screen, so the
-/// transcript keeps a place to be read, and never none.
-fn rows_max(screen_height: u16) -> usize {
-    let live = (screen_height / 2).max(CHROME + 1);
-    live.saturating_sub(CHROME).max(1) as usize
 }
 
 /// Lay the prompt buffer out at `width` cells, with `gutter` cells at the left
@@ -1961,8 +2091,37 @@ mod tests {
     }
 
     #[test]
-    fn hints_are_listed_under_the_prompt() {
-        let mut screen = Screen::test_screen(20, 20);
+    fn the_frame_is_a_function_of_the_terminal_and_the_mode() {
+        let mut screen = Screen::test_screen(40, 24);
+        let size = screen.term.size().unwrap();
+        let idle = Frame::layout(size.height, Mode::Idle).height();
+        let choosing = Frame::layout(size.height, Mode::Choosing).height();
+        assert!(choosing > idle, "a chooser takes more rows than the prompt");
+        fn check(screen: &mut Screen, want: u16, height: u16) {
+            screen.draw().unwrap();
+            assert_eq!(screen.term.area().height, want);
+            assert_eq!(screen.term.area().top(), height - want);
+        }
+        check(&mut screen, idle, size.height);
+        // Candidates come and go inside the rows the frame already has.
+        screen.set_commands(vec!["/one".into(), "/two".into(), "/three".into()]);
+        screen.insert_text("/");
+        check(&mut screen, idle, size.height);
+        // So does a buffer long enough to wrap many times over.
+        screen.insert_text(&"word ".repeat(80));
+        check(&mut screen, idle, size.height);
+        // A chooser is the other frame: the mode changes the rows, and only
+        // the mode.
+        screen.take();
+        screen.set_menu("Header", vec!["one".into(), "two".into()], false);
+        check(&mut screen, choosing, size.height);
+        screen.clear_menu(false);
+        check(&mut screen, idle, size.height);
+    }
+
+    #[test]
+    fn hints_are_listed_above_the_prompt() {
+        let mut screen = Screen::test_screen(20, 24);
         screen.set_commands(vec![
             "/skills".into(),
             "/skill:ship".into(),
@@ -1973,22 +2132,30 @@ mod tests {
         assert_eq!(hints, vec!["/skills", "/skill:ship"]);
         assert_eq!(at, 0);
         screen.draw().unwrap();
-        let top = screen.term.area().top() as usize;
+        let layout =
+            Frame::layout(screen.term.size().unwrap().height, Mode::Idle).at(screen.term.area().y);
         let rows: Vec<String> = screen
             .test_buffer()
             .content
             .chunks(20)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect();
-        // One blank cell of margin, then the prompt, then the list under its
-        // text.
-        assert_eq!(rows[top + 2].trim_end(), " ❯ /sk");
-        assert_eq!(rows[top + 3].trim_end(), "   /skills");
-        assert_eq!(rows[top + 4].trim_end(), "   /skill:ship");
+        // One blank cell of margin, then the prompt at the bottom of its box,
+        // then the list in the rows above it: a list that appears moves
+        // nothing.
+        assert_eq!(
+            rows[layout.prompt.bottom() as usize - 1].trim_end(),
+            " ❯ /sk"
+        );
+        assert_eq!(rows[layout.list.y as usize].trim_end(), "   /skills");
+        assert_eq!(
+            rows[layout.list.y as usize + 1].trim_end(),
+            "   /skill:ship"
+        );
         // The one the next step takes is the bright one.
         let cell = |x: u16, y: u16| screen.test_buffer()[(x, y)].clone();
-        assert_eq!(cell(3, top as u16 + 3).fg, Color::Cyan);
-        assert_ne!(cell(3, top as u16 + 4).fg, Color::Cyan);
+        assert_eq!(cell(3, layout.list.y).fg, Color::Cyan);
+        assert_ne!(cell(3, layout.list.y + 1).fg, Color::Cyan);
         // After a step the whole set stays listed, with the buffer on the
         // second one.
         screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -2008,17 +2175,20 @@ mod tests {
         screen.set_commands(vec!["/c1".into(), "/c2".into(), "/c3".into()]);
         screen.insert_text("/c");
         screen.draw().unwrap();
-        let top = screen.term.area().top() as usize;
+        let layout =
+            Frame::layout(screen.term.size().unwrap().height, Mode::Idle).at(screen.term.area().y);
         let rows: Vec<String> = screen
             .test_buffer()
             .content
             .chunks(20)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect();
-        // Half the screen, less the chrome and the prompt, is one row: the
-        // live region stays inside its cap and the rest of the list is cut.
-        assert_eq!(rows[top + 3].trim_end(), "   /c1");
-        assert_eq!(rows[top + 4].trim_end(), "");
+        // A short terminal gives the list one row, and the transcript keeps its
+        // own: the frame is sized from the screen, not from how many candidates
+        // there happen to be.
+        assert_eq!(layout.list.height, 1);
+        assert_eq!(rows[layout.list.y as usize].trim_end(), "   /c1");
+        assert_eq!(rows[layout.list.y as usize + 1].trim_end(), "");
     }
 
     #[test]
