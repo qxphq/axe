@@ -123,7 +123,9 @@ enum Mode {
     Choosing,
 }
 
-/// Where the live frame's parts sit, in screen rows. A function of the terminal
+/// Where the live frame's parts sit, in screen rows — the parts carry rows, not
+/// the width, which is the terminal's and comes off the sides in `draw`. A
+/// function of the terminal
 /// size and the mode and of nothing else — content that does not fit is
 /// scrolled or clipped inside its part. That is the invariant this type exists
 /// to hold: a frame whose height followed its content would have to grow into
@@ -284,8 +286,8 @@ impl Term {
 
     /// Draw dense rows at an absolute screen position above the viewport: the
     /// rows a shrunk frame left blank. Nothing above the frame is in the
-    /// terminal's back buffer, so this goes through the backend directly, which
-    /// is what `insert_before` does with the block it is given.
+    /// terminal's back buffer, so this goes through the backend, which is what
+    /// `insert_before` does with the block it is given.
     fn paint_above(
         &mut self,
         top: u16,
@@ -293,26 +295,10 @@ impl Term {
         width: u16,
         margin: u16,
     ) -> io::Result<()> {
-        let width = width.max(1);
-        let mut buf = Buffer::empty(Rect::new(0, top, width, rows.len() as u16));
-        paint(&mut buf, rows, margin);
-        let cells = buf.content.iter().enumerate().map(|(i, cell)| {
-            (
-                (i % width as usize) as u16,
-                top + (i / width as usize) as u16,
-                cell,
-            )
-        });
         match self {
-            Term::Real(term) => {
-                term.backend_mut().draw(cells)?;
-                Backend::flush(term.backend_mut())
-            }
+            Term::Real(term) => paint_above(term.backend_mut(), top, rows, width, margin),
             #[cfg(test)]
-            Term::Test(term) => {
-                term.backend_mut().draw(cells)?;
-                Backend::flush(term.backend_mut())
-            }
+            Term::Test(term) => paint_above(term.backend_mut(), top, rows, width, margin),
         }
     }
 
@@ -853,22 +839,22 @@ impl Screen {
             .flat_map(|line| wrap(line, cols))
             .collect();
         let total = rows.len() as u16;
-        // The rows the frame gave up are blank and already above it: the top of
+        // The rows a frame gave up are blank and already above it: the top of
         // the block goes there, and only what does not fit is inserted next to
         // the frame. Either way the block starts at `frame.top - max(total,
         // slack)`, which is exactly under the block before it.
-        let fill = self.slack.min(total);
-        let mut rows = rows;
-        let tail = rows.split_off(fill as usize);
-        if total > fill {
+        let fits = self.slack.min(total);
+        let mut above = rows;
+        let rest = above.split_off(fits as usize);
+        if total > fits {
             let _ = self
                 .term
-                .insert_before(total - fill, |buf| paint(buf, tail, margin));
+                .insert_before(total - fits, |buf| paint(buf, rest, margin));
         }
-        if fill > 0 {
+        if fits > 0 {
             let top = self.term.area().top().saturating_sub(total.max(self.slack));
-            let _ = self.term.paint_above(top, rows, width as u16, margin);
-            self.slack -= fill;
+            let _ = self.term.paint_above(top, above, width as u16, margin);
+            self.slack -= fits;
         }
         let _ = self.draw();
     }
@@ -1234,12 +1220,9 @@ impl Screen {
             self.term.insert_before(height - area.height, |_| {})?;
         } else {
             // The rows the frame gives up are above the new top, where the new
-            // terminal's clear cannot reach: they are blank now, and they are
-            // the transcript's, so `write` may fill them from the top.
+            // terminal's clear cannot reach.
             self.term.clear()?;
-            self.slack = self.slack.saturating_add(area.height - height);
         }
-        self.slack = self.slack.min(size.height.saturating_sub(height));
         // An inline area starts at the cursor row and this one's bottom is the
         // screen's, so the cursor goes where the new top has to be.
         let top = size.height - height;
@@ -1247,6 +1230,17 @@ impl Screen {
         self.term.reshape(height)?;
         // Blank the whole region and force a full repaint.
         self.term.clear()?;
+        // Count the rows above the new top that are blank now, because they are
+        // the transcript's and `write` fills them from the top. The transcript
+        // ends one row above the old top less the slack it already had; what
+        // moves that end is the frame's own move, plus the scroll a growth needs
+        // when the rows do not fit above the frame.
+        let mut slack = i32::from(self.slack) + i32::from(top) - i32::from(area.y);
+        if height > area.height {
+            let scroll = i32::from(area.y) + i32::from(height) - i32::from(size.height);
+            slack += scroll.max(0);
+        }
+        self.slack = slack.clamp(0, i32::from(top)) as u16;
         Ok(())
     }
 
@@ -1670,6 +1664,28 @@ fn inset(area: Rect, pad: u16) -> Rect {
 /// between two blocks is the writer's, not the caller's.
 fn blank(line: &Line<'static>) -> bool {
     line.spans.iter().all(|span| span.content.trim().is_empty())
+}
+
+/// The rows of a block that go above the frame, at the absolute row `top`.
+fn paint_above<B: Backend>(
+    backend: &mut B,
+    top: u16,
+    rows: Vec<Line<'static>>,
+    width: u16,
+    margin: u16,
+) -> io::Result<()> {
+    let width = width.max(1);
+    let mut buf = Buffer::empty(Rect::new(0, top, width, rows.len() as u16));
+    paint(&mut buf, rows, margin);
+    let cells = buf.content.iter().enumerate().map(|(i, cell)| {
+        (
+            (i % width as usize) as u16,
+            top + (i / width as usize) as u16,
+            cell,
+        )
+    });
+    backend.draw(cells)?;
+    backend.flush()
 }
 
 /// Lay rows out in `buf` with `margin` cells at each side, then mark where each
@@ -2240,13 +2256,21 @@ mod tests {
         screen.commit();
         screen.output("another reply\n");
         packed(&mut screen);
-        // A chooser is the other frame and gives its rows back; what it committed
+        // A chooser is the other frame and gives its rows back; what it commits
         // to the transcript lands under the block before it.
         screen.set_menu("Sessions", vec!["one".into(), "two".into()], false);
         screen.repaint();
         packed(&mut screen);
         screen.clear_menu(true);
         packed(&mut screen);
+        // Resuming from a chooser: the list vanishes without a trace and the
+        // session's own transcript replays into the rows it gave back.
+        screen.set_menu("Sessions", vec!["one".into(), "two".into()], false);
+        screen.repaint();
+        screen.clear_menu(false);
+        screen.output("Resumed: a title");
+        packed(&mut screen);
+        screen.echo_user("the old question");
         packed(&mut screen);
         // A resize reflows the terminal and moves the frame; nothing it moves
         // may land between two blocks.
