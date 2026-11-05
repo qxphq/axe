@@ -11,6 +11,7 @@ OpenAI-compatible `chat/completions` server, seven tools, **four dependencies**.
 your scrollback: axe never takes the screen.
 
 Axe starts in read-only mode by default; web search works there only.
+Axe does not re-implement or compete with the functionality of your other tools, shell, or Unix system.
 
 ## Build
 
