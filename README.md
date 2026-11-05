@@ -192,7 +192,8 @@ it is on: `write` and `edit` are unavailable, `bash` runs only a fixed
 allowlist of read-only commands and writes only inside a scratch directory,
 and `fetch` and `web_search` are the way to read the web. When it is off,
 `write`, `edit` and a full `bash` are back — `fetch` and `web_search` are
-refused, and `bash` still cannot reach the network. Every change is announced
+refused. The network is confined in neither mode: a command connects where you
+connect. Every change is announced
 in the conversation as `explore mode: on` or `explore mode: off`, so the model
 knows which side it is on.
 
@@ -203,7 +204,7 @@ knows which side it is on.
 | `read(path, offset?, limit?)` | a text file; relative paths resolve from cwd; up to 50 000 characters |
 | `write(path, content)` | create or overwrite; parent directories are created |
 | `edit(path, old, new, replace_all?)` | exact text; ambiguous `old` fails |
-| `bash(command)` | run `sh -c` here; 120 s, 30 000 characters, no network |
+| `bash(command)` | run `sh -c` here; 120 s, 30 000 characters |
 | `about()` | return this file: tools, config, paths, limits |
 | `fetch(url, start?, chars?)` | read a web page as text; explore mode only |
 | `web_search(query, count?)` | ranked results; explore mode only |
@@ -245,26 +246,31 @@ first answer, and fall back to the first request if that fails.
 
 ## Sandbox
 
-`bash` is confined by the kernel, not by string checks. On Linux that is seccomp
-plus Landlock, on macOS a Seatbelt profile.
+`bash` is confined by the kernel, not by string checks. On Linux that is
+Landlock plus one seccomp rule, on macOS a Seatbelt profile. The confinement
+applies in explore mode and is about writes and execution; the network is not
+confined, and normal mode keeps only `no_new_privs` and the scrubbed
+environment.
 
-Layer 1 is mandatory and applies in every mode: no child reaches the network,
-ever. That is the accepted cost — `git clone`, `git fetch`, `git push`, `ssh`,
-`gh`, `docker` and `cargo` with a cold cache do not work inside a tool call,
-and `!cmd` is no exception. Where the filter cannot be installed, no command
-runs at all.
-
-Layer 2 applies in explore mode: writes outside a session scratch directory are
-denied, and only an allowlist of programs may be executed — `ls`, `cat`, `head`,
-`tail`, `grep`, `rg`, `fd`, `find`, `sort`, `wc`, `diff`, `du`, `df`, `file`,
-`jq`, `stat`, `tree`, `uname`, `uniq`, `id`, `ps`, `pwd`, `date`, `cut`, `tr`,
-`which`, `git`, and the shell itself, plus the ELF interpreter each of those
-binaries names — the kernel opens it for every dynamically linked binary, and
-it is read from `PT_INTERP` rather than assumed, since a NixOS system keeps it
-in `/nix/store`. So `ld.so` can start a program that is not on the list, and an
+In explore mode, writes outside a session scratch directory are denied, and only
+an allowlist of programs may be executed — `ls`, `cat`, `curl`, `head`, `tail`,
+`grep`, `rg`, `fd`, `find`, `sort`, `wc`, `diff`, `du`, `df`, `file`, `jq`,
+`stat`, `tree`, `uname`, `uniq`, `id`, `ps`, `pwd`, `date`, `cut`, `tr`, `which`,
+`git`, and the shell itself, plus the ELF interpreter each of those binaries
+names — the kernel opens it for every dynamically linked binary, and it is read
+from `PT_INTERP` rather than assumed, since a NixOS system keeps it in
+`/nix/store`. So `ld.so` can start a program that is not on the list, and an
 allowed program can load code with `LD_PRELOAD`. Loaded code runs in the same
-domain: it still cannot write outside the scratch directory or open an internet
-socket. It degrades with one line at startup on a kernel without Landlock.
+domain: it still cannot write outside the scratch directory. `curl -o` into the
+working directory fails for that reason; `$TMPDIR` inside a tool call is the
+scratch directory, and it is removed at exit. It degrades with one line at
+startup on a kernel without Landlock.
+
+The network is not confined, in either mode: a command connects where you
+connect, private ranges included. `io_uring_setup` is the only syscall denied,
+in explore mode, because Landlock does not mediate io_uring and allowing it
+would punch a hole in the write confinement. Normal mode installs no filter, so
+a 32-bit binary runs there.
 
 A refusal comes from the kernel, not from axe's argument parsing, and its
 message says so: a missing binary and a denied one read differently.
@@ -273,11 +279,10 @@ A command child inherits a minimal environment — `PATH`, `HOME`, `LANG`,
 `LC_ALL`, `TERM`, `TMPDIR`, `USER`, `SHELL` — not axe's own. Provider and
 search tokens stay in the parent's memory.
 
-Known residuals, in both modes: `connect` over AF_UNIX, writes through an
-inherited file descriptor, metadata such as `chmod` outside the scratch
-directory, and `fetch`/`web_search`, which run in axe's own process by design.
-In explore mode, code loaded by an allowed program (`LD_PRELOAD`, the loader)
-runs too, inside the same write and network confinement.
+Known residuals: writes through an inherited file descriptor, metadata such as
+`chmod` outside the scratch directory, and `fetch`/`web_search`, which run in
+axe's own process by design. In explore mode, code loaded by an allowed program
+(`LD_PRELOAD`, the loader) runs too, inside the same write confinement.
 
 ## Trust and security
 
@@ -295,18 +300,17 @@ model into running something. Use normal mode only in directories you trust.
 The project's `AGENTS.md` and its skills are read at startup and go into the
 prompt; axe asks nothing and gates nothing, so the directory you start it in is
 the whole decision.
-`bash` cannot open an internet socket in either mode, and `fetch` and
-`web_search` are refused here, so a tool call cannot reach the network except
-through the model provider.
+`bash` runs as you and reaches the network as you do, and `fetch` and
+`web_search` are refused here, so in normal mode a command is the only way to
+the network and nothing stands between it and the internet.
 
 Explore mode bounds integrity, not secrecy. The kernel denies writes outside
-the session scratch directory, direct execution outside the allowlist, and
-internet sockets; on a kernel without Landlock, the startup line says when that
-is weaker. Reads are not confined: `read` and `bash` can read any file you can,
-and `fetch` and `web_search` can send any of it to any host. `!cmd` is your own
-shell — it bypasses explore mode's write confinement, and it is still
-network-denied. When confidentiality matters, use a container, a VM, or a
-dedicated user.
+the session scratch directory and direct execution outside the allowlist; on a
+kernel without Landlock, the startup line says when that is weaker. Reads are
+not confined: `read` and `bash` can read any file you can, and `curl`, `fetch`
+and `web_search` can send any of it to any host. `!cmd` is your own shell — it
+bypasses explore mode's write confinement. When confidentiality matters, use a
+container, a VM, or a dedicated user.
 
 Prompt injection cannot be sanitized away. `fetch` and `web_search` results
 start with `source: ... (untrusted)`, a project's instructions are wrapped in
