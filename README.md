@@ -173,16 +173,16 @@ The line you type sits in a box: an outline in the prompt's cyan, one row per
 line the text wraps to, with a cell of padding between the text and the line and
 no glyph in front of it. The outline is the only thing drawn — the text keeps
 the theme's own foreground and background — because a filled block that wide
-reads as a slab of color rather than as a prompt. Enter submits, Ctrl+J or
+reads as a slab of color rather than as a prompt. Enter submits; Ctrl+J or
 Alt+Enter starts a new line. Typing a slash word lists the matching commands in
 the rows above the prompt — as many as the terminal's height allows, up to four
 — the first one marked. ↓ and ↑ move the mark and leave the line as typed,
-wrapping at both ends; Enter runs the marked command, Tab puts it on the line,
-so stepping through the list never rewrites the prompt. A command's first
-argument completes the same way: `/model ` lists the models, `/model dee`
-narrows them, and Enter applies the marked one. Until the mark is moved the list
-is a preview: Enter there submits what is typed, and Tab takes the first row. A
-model or a thinking level is therefore chosen in the prompt, like any other
+wrapping at both ends; Enter runs the marked row and Tab puts it on the line, so
+a step never rewrites the prompt by itself. A command's first argument completes
+the same way: `/model ` lists the models, `/model dee` narrows them, and Enter
+applies the marked one. The rule does not depend on where the list came from: a
+path in a message lists what it could be, and Enter submits the completed line.
+A model or a thinking level is therefore chosen in the prompt, like any other
 line. A line starting with `!` is your own shell: it runs through the same tool,
 its output joins the history as a user message, and no turn follows — the model
 sees it the next time you ask something.
@@ -204,7 +204,9 @@ space. `@` is a trigger, not part of the path: `@READ` completes to
 `README.md`, and what the model reads is the path, not a sigil. A word that is
 none of those is prose, and Tab leaves it alone: a file in the working directory
 is reached with `@`, and a root path with `@` or its own slash, because `/model`
-is a command. A path with a space in it is not completed.
+is a command. A path with a space in it is not completed. Enter runs the
+marked entry here as it does for a command, so a message about a file submits
+the file.
 
 | command | what it does |
 | --- | --- |
@@ -234,9 +236,9 @@ and Enter on an empty line resumes the selection.
 
 | key | what it does |
 | --- | --- |
-| Enter | submit |
+| Enter | submit the marked candidate when a list is under the prompt, else the line |
 | Ctrl+J, Alt+Enter | new line |
-| Tab | complete a command, its first argument, or a path token: put the marked candidate on the line |
+| Tab | complete a command, its first argument, or a path token: put the marked candidate on the line without submitting it |
 | ↑ ↓ | move the mark over the candidates above the prompt, walk the history when there is no list, or move in a chooser |
 | Shift+Tab | toggle explore mode |
 | Esc | close a chooser; twice to interrupt the running turn |

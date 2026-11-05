@@ -472,8 +472,9 @@ pub struct Screen {
     /// The lines Tab completes, in the caller's spelling: a slash command on
     /// its own, or one with its first argument filled in.
     commands: Vec<String>,
-    /// The candidates the line put under the prompt, if any: the arrows move
-    /// its marker and Enter runs what they moved to.
+    /// The candidates the arrows stepped through, if any: what the marker was
+    /// moved to is what Enter runs. A list nobody stepped through has no
+    /// selection and Enter still runs its first row, from `hints`.
     selection: Option<Selection>,
     /// The lines typed here before, and where the prompt is in them.
     recall: Recall,
@@ -810,8 +811,9 @@ impl Screen {
             // says otherwise, and asking for that costs every shifted
             // character its layout.
             KeyCode::Enter if alt => self.insert_char('\n'),
-            // Enter runs what the marker was moved to. A list nobody stepped
-            // through is a preview of Tab, so the line submits as typed.
+            // Enter runs the marked row, whether the marker was stepped to or
+            // is still on the first row of a list that just appeared: the list
+            // is a choice, and a line with one under it submits the choice.
             KeyCode::Enter => {
                 self.take_marked();
                 return Action::Submit;
@@ -1736,21 +1738,23 @@ impl Screen {
         })
     }
 
-    /// Enter takes what the marker was moved to: a stepped line runs the marked
-    /// candidate even though its text is still the prefix it was typed as.
+    /// Enter runs the marked row: the candidate the arrows stepped to, or the
+    /// first one when the list was never stepped through. The line is what the
+    /// marker points at, even though its text may still be the prefix typed.
     fn take_marked(&mut self) {
-        let Some(sel) = self
-            .selection
-            .as_ref()
-            .filter(|sel| sel.belongs(&self.ed.buf))
-        else {
-            return;
-        };
-        if sel.matches[sel.at] == self.ed.buf {
+        // A chooser owns the list rows while it is open; the candidates are not
+        // on screen, so they are not what Enter runs.
+        if self.menu_active() {
             return;
         }
-        let line = sel.matches[sel.at].clone();
-        self.ed.buf = line;
+        let (hints, at) = self.hints();
+        let Some(line) = hints.get(at) else {
+            return;
+        };
+        if *line == self.ed.buf {
+            return;
+        }
+        self.ed.buf = line.clone();
         self.ed.cursor = self.ed.len();
     }
 
@@ -2742,23 +2746,42 @@ mod tests {
         let mut screen = Screen::test_screen(40, 10);
         screen.set_commands(vec!["/skill:ship".into(), "/skills".into()]);
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        // A list nobody stepped through is a preview: Enter submits the text.
+        // A list nobody stepped through runs its first row: the mark is the
+        // choice, whether the marker was moved or not.
         screen.insert_text("/sk");
         screen.apply_key(key(KeyCode::Enter));
-        assert_eq!(screen.take(), "/sk");
-        // A marker that was moved makes the line the marked candidate.
+        assert_eq!(screen.take(), "/skill:ship");
+        // A marker that was moved makes the line that row.
         screen.insert_text("/sk");
         screen.apply_key(key(KeyCode::Down));
         assert_eq!(screen.ed.buf, "/sk");
         screen.apply_key(key(KeyCode::Enter));
         assert_eq!(screen.take(), "/skills");
-        // An edit ends the list, so Enter is back to what is typed.
+        // An edit drops the step, not the list: Enter takes its first row.
         screen.insert_text("/sk");
         screen.apply_key(key(KeyCode::Down));
         screen.apply_key(key(KeyCode::Char('i')));
         assert_eq!(screen.ed.buf, "/ski");
         screen.apply_key(key(KeyCode::Enter));
-        assert_eq!(screen.take(), "/ski");
+        assert_eq!(screen.take(), "/skill:ship");
+        // A line that is already the marked row submits as it stands.
+        screen.insert_text("/skill:ship");
+        screen.apply_key(key(KeyCode::Enter));
+        assert_eq!(screen.take(), "/skill:ship");
+    }
+
+    #[test]
+    fn enter_completes_a_path_in_a_message() {
+        // Candidates are whole lines, so a path in prose completes like a
+        // command does.
+        fn file(_line: &str, _cursor: usize) -> Vec<String> {
+            vec!["why does src/ui.rs wrap?".to_string()]
+        }
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_completer(file);
+        screen.insert_text("why does src/ui wrap?");
+        screen.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(screen.take(), "why does src/ui.rs wrap?");
     }
 
     /// The invariant: one blank row between two blocks, never two, and never a
