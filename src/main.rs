@@ -625,6 +625,27 @@ fn session_row(meta: &sessions::Meta) -> String {
     row
 }
 
+/// This directory's sessions that match `query`, as (id, row). An empty query
+/// keeps them all, newest first.
+fn session_rows(
+    dir: &std::path::Path,
+    metas: &[sessions::Meta],
+    query: &str,
+) -> Vec<(String, String)> {
+    sessions::search(dir, metas, query)
+        .into_iter()
+        .map(|hit| {
+            let meta = &metas[hit.index];
+            let mut row = session_row(meta);
+            if !hit.snippet.is_empty() {
+                row.push_str("  ·  ");
+                row.push_str(&hit.snippet);
+            }
+            (meta.id.clone(), row)
+        })
+        .collect()
+}
+
 /// What a submitted line asks for.
 enum Cmd {
     Exit,
@@ -1371,64 +1392,14 @@ impl Session {
             screen.output(NO_SESSIONS);
             return;
         }
-        let mut query = query.trim().to_string();
-        loop {
-            let found: Vec<(usize, String)> = if query.is_empty() {
-                (0..metas.len())
-                    .map(|index| (index, String::new()))
-                    .collect()
-            } else {
-                sessions::search(&self.state.cwd, &metas, &query)
-                    .into_iter()
-                    .map(|hit| (hit.index, hit.snippet))
-                    .collect()
-            };
-            if found.is_empty() {
-                screen.output(&format!("no sessions match {query:?}\n"));
-                query.clear();
-                continue;
-            }
-            let mut ids = Vec::new();
-            let mut rows = Vec::new();
-            for (index, snippet) in &found {
-                let meta = &metas[*index];
-                ids.push(meta.id.clone());
-                let mut row = session_row(meta);
-                if !snippet.is_empty() {
-                    row.push_str("  ·  ");
-                    row.push_str(snippet);
-                }
-                rows.push(row);
-            }
-            let header = if query.is_empty() {
-                "Sessions (↑↓ · Enter; type to search; Esc to close)".to_string()
-            } else {
-                format!("Sessions matching {query:?} (↑↓ · Enter; type to refine; Esc)")
-            };
-            screen.set_menu(&header, rows, false);
-            match readline(screen, rx, &mut |_| {}) {
-                Some(Input::Menu(index)) => {
-                    let Some(id) = ids.get(index).cloned() else {
-                        continue;
-                    };
-                    screen.clear_menu(false);
-                    match self.resume(&id, Some(screen)) {
-                        Ok(_) => return,
-                        Err(e) => {
-                            screen.error(&format!("axe: {e}\n"));
-                            return;
-                        }
-                    }
-                }
-                Some(Input::Cancel) | None => {
-                    screen.clear_menu(true);
-                    return;
-                }
-                Some(Input::Line(line)) => {
-                    query = line.trim().to_string();
-                }
-                Some(Input::Explore) => continue,
-            }
+        let dir = self.state.cwd.clone();
+        let Some(id) = choose(screen, rx, "Sessions", "search", query, None, |query| {
+            session_rows(&dir, &metas, query)
+        }) else {
+            return;
+        };
+        if let Err(e) = self.resume(&id, Some(screen)) {
+            screen.error(&format!("axe: {e}\n"));
         }
     }
 
@@ -1456,15 +1427,17 @@ impl Session {
                 })
             })
             .collect();
-        let on = items.iter().position(|(spec, _)| *spec == self.spec());
         let header = match scope {
             Scope::Dir => "Models",
             Scope::Global => "Default model",
         };
-        let Some(index) = choose(screen, rx, header, &items, on, query) else {
+        let on = self.spec();
+        let Some(picked) = choose(screen, rx, header, "narrow", query, Some(&on), |query| {
+            narrow(&items, query)
+        }) else {
             return;
         };
-        let Some((provider, id)) = find(&self.providers, &items[index].0) else {
+        let Some((provider, id)) = find(&self.providers, &picked) else {
             return;
         };
         let mut console = Console::Screen { screen, rx };
@@ -1479,13 +1452,18 @@ impl Session {
             .iter()
             .map(|name| (name.clone(), name.clone()))
             .collect();
-        let on = names
-            .iter()
-            .position(|name| Some(name) == self.thinking.as_ref());
-        let Some(index) = choose(screen, rx, "Thinking levels", &items, on, query) else {
+        let on = self.thinking.clone();
+        let Some(level) = choose(
+            screen,
+            rx,
+            "Thinking levels",
+            "narrow",
+            query,
+            on.as_deref(),
+            |query| narrow(&items, query),
+        ) else {
             return;
         };
-        let level = names[index].clone();
         let mut console = Console::Screen { screen, rx };
         self.choose_level(level, &mut console);
     }
@@ -1519,27 +1497,15 @@ impl Session {
             self.picks.clear();
             return;
         }
-        let selected: Vec<(sessions::Meta, String)> = if arg.trim().is_empty() {
-            all.into_iter().map(|meta| (meta, String::new())).collect()
-        } else {
-            sessions::search(&self.state.cwd, &all, arg)
-                .into_iter()
-                .map(|hit| (all[hit.index].clone(), hit.snippet))
-                .collect()
-        };
+        let selected = session_rows(&self.state.cwd, &all, arg);
         if selected.is_empty() {
             println!("no sessions match {:?}", arg.trim());
             self.picks.clear();
             return;
         }
-        self.picks = selected.iter().map(|(meta, _)| meta.id.clone()).collect();
-        for (at, (meta, snippet)) in selected.iter().enumerate() {
-            let mut row = session_row(meta);
-            if !snippet.is_empty() {
-                row.push_str("  ·  ");
-                row.push_str(snippet);
-            }
-            println!("{:>2}) {}", at + 1, terminal_text(&row));
+        self.picks = selected.iter().map(|(id, _)| id.clone()).collect();
+        for (at, (_, row)) in selected.iter().enumerate() {
+            println!("{:>2}) {}", at + 1, terminal_text(row));
         }
         // The numbers are useless without the line that says what to do with
         // one, and a run without a terminal cannot arrow its way out.
@@ -2617,54 +2583,55 @@ fn readline(
     }
 }
 
-/// The items a query keeps: a case-insensitive substring of the spec, which is
+/// The items a query keeps: a case-insensitive substring of the key, which is
 /// what typing matches, never the row with its context window.
-fn narrow(items: &[(String, String)], query: &str) -> Vec<usize> {
+fn narrow(items: &[(String, String)], query: &str) -> Vec<(String, String)> {
     let query = query.to_lowercase();
     items
         .iter()
-        .enumerate()
-        .filter(|(_, (spec, _))| spec.to_lowercase().contains(&query))
-        .map(|(index, _)| index)
+        .filter(|(key, _)| key.to_lowercase().contains(&query))
+        .cloned()
         .collect()
 }
 
 /// Walk a chooser until Enter, Esc or the end of input: the arrows move, a
-/// typed line narrows the list, Enter takes a row. `items` are (spec, row) — a
-/// query matches the spec, the screen draws the row — and the answer is the
-/// index into `items` that Enter chose. `on` is where the marker starts, so the
-/// chooser opens on what the session already uses.
+/// typed line narrows the list, Enter takes a row. `find` answers a query with
+/// the rows to offer, as (key, row) — the key is what Enter is worth, the row
+/// what the screen draws — and `on` is the key the marker starts on, so a
+/// chooser opens where the session already is. `verb` is what typing does:
+/// `/model` narrows a list, `/sessions` searches one.
 fn choose(
     screen: &mut ui::Screen,
     rx: &Receiver<Event>,
     title: &str,
-    items: &[(String, String)],
-    on: Option<usize>,
+    verb: &str,
     query: &str,
-) -> Option<usize> {
+    on: Option<&str>,
+    find: impl Fn(&str) -> Vec<(String, String)>,
+) -> Option<String> {
     let mut query = query.trim().to_string();
     loop {
-        let found = narrow(items, &query);
+        let found = find(&query);
         if found.is_empty() {
             // The header is prose for a title; the sentence needs it lower.
             screen.output(&format!("no {} match {query:?}\n", title.to_lowercase()));
             query.clear();
             continue;
         }
-        let rows: Vec<String> = found.iter().map(|index| items[*index].1.clone()).collect();
+        let rows: Vec<String> = found.iter().map(|(_, row)| row.clone()).collect();
         let header = if query.is_empty() {
-            format!("{title} (↑↓ · Enter; type to narrow; Esc)")
+            format!("{title} (↑↓ · Enter; type to {verb}; Esc)")
         } else {
             format!("{title} matching {query:?} (↑↓ · Enter; type to refine; Esc)")
         };
         screen.set_menu(&header, rows, false);
-        if let Some(at) = on.and_then(|index| found.iter().position(|hit| *hit == index)) {
+        if let Some(at) = on.and_then(|key| found.iter().position(|(k, _)| k == key)) {
             screen.menu_select(at);
         }
         match readline(screen, rx, &mut |_| {}) {
             Some(Input::Menu(at)) => {
                 screen.clear_menu(false);
-                return found.get(at).copied();
+                return found.get(at).map(|(key, _)| key.clone());
             }
             Some(Input::Cancel) | None => {
                 screen.clear_menu(true);
@@ -2977,13 +2944,22 @@ mod tests {
                 "opencode-go/big  (200000 ctx)".to_string(),
             ),
         ];
-        assert_eq!(narrow(&items, ""), vec![0, 1, 2]);
-        assert_eq!(narrow(&items, "DEEP"), vec![0]);
-        assert_eq!(narrow(&items, "local"), vec![1]);
-        assert_eq!(narrow(&items, "go/"), vec![2]);
+        let keys = |query: &str| -> Vec<String> {
+            narrow(&items, query)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect()
+        };
+        assert_eq!(
+            keys(""),
+            vec!["deepseek/deepseek-chat", "local/qwen3", "opencode-go/big"]
+        );
+        assert_eq!(keys("DEEP"), vec!["deepseek/deepseek-chat"]);
+        assert_eq!(keys("local"), vec!["local/qwen3"]);
+        assert_eq!(keys("go/"), vec!["opencode-go/big"]);
         // The context window is drawn, not searched.
-        assert_eq!(narrow(&items, "ctx"), Vec::<usize>::new());
-        assert_eq!(narrow(&items, "open/code"), Vec::<usize>::new());
+        assert!(keys("ctx").is_empty());
+        assert!(keys("open/code").is_empty());
     }
 
     #[test]
