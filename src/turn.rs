@@ -29,7 +29,8 @@ pub trait Sink {
     /// Streamed reasoning. Shown or not is the sink's business; when it is
     /// hidden, one line with its duration stands in for it.
     fn reasoning(&mut self, text: &str);
-    /// A transient label for the live region: "⋯ Thinking", a running command.
+    /// A transient label for the live region: a request waiting for the
+    /// provider, a running command.
     fn status(&mut self, text: &str);
     /// One tool call, finished: the call and its outcome on one line, and the
     /// failure's own words beneath it.
@@ -230,8 +231,8 @@ pub fn run_turn(
         // round: a provider prefills a long history before it streams a byte,
         // and the arguments of a tool call arrive as deltas the sinks never
         // see. The row says what the turn is doing until a more specific state
-        // — the answer, a hidden thought, the command being run — replaces it.
-        sink.status("⋯ Thinking");
+        // — the answer, a thought, the command being run — replaces it.
+        sink.status("⋯ Waiting for provider");
 
         // Both callbacks borrow the sink, so it is shared rather than captured
         // twice. The borrow ends with the block, so the turn can still report
@@ -544,7 +545,9 @@ mod tests {
             .expect("the call is shown");
         assert!(echoed.contains("about") && echoed.contains('✓'), "{echoed}");
         assert!(
-            sink.seen.iter().any(|e| e == "status:⋯ Thinking"),
+            sink.seen
+                .iter()
+                .any(|e| e == "status:⋯ Waiting for provider"),
             "{:?}",
             sink.seen
         );

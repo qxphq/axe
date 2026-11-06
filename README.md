@@ -327,12 +327,13 @@ the prompt are the frame's own, so the prompt keeps one above it and one below
 it whatever is shown. The status says what the turn is doing — thinking, running
 a command, responding — and is blank only when nothing is in flight, so a wait
 on the provider is never a silent row. A glyph leads the states that a user
-interrupts or waits on: `⋯` thinking, `▸` responding, `▷` a command running,
-`▣` compacting, `×` interrupting — and `×` also marks a compaction that was
-cancelled and `◦` leads the notices axe prints about itself (`Resumed:`, `New
-session`, `compacted N messages`, `nothing to compact`,
-`default model:`). A chooser is the one part sized by the terminal — a window
-over the transcript, whose rows are committed when it closes.
+interrupts or waits on: `⋯` waiting for the provider and then thinking, `▸`
+responding, `▷` a command running, `▣` compacting, `×` interrupting — and `×`
+also marks a compaction that was cancelled and `◦` leads the notices axe prints
+about itself (`Resumed:`, `New session`, `compacted N messages`,
+`nothing to compact`, `default model:`). A chooser is the one part sized by the
+terminal — a window over the transcript, whose rows are committed when it
+closes.
 
 Recent sessions for the directory are offered at startup as a chooser: Up and
 Down move, Enter resumes, Esc closes it, and typing starts a new session and

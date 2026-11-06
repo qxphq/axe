@@ -1836,7 +1836,7 @@ impl Session {
         // Whether the turn was actually stopped, for the line that says so.
         let mut interrupted = false;
 
-        screen.set_status("⋯ Thinking");
+        screen.set_status("⋯ Waiting for provider");
         screen.repaint();
 
         // What the last round counted, handed back by the turn's thread. The
@@ -2718,13 +2718,15 @@ impl Sink for ChannelSink {
     }
 
     fn reasoning(&mut self, text: &str) {
+        // The model working, shown or not: the row says so either way. The
+        // turn loop drops a repeat, so one per delta costs nothing extra.
+        self.send(Event::Status("⋯ Thinking".to_string()));
         if self.thoughts {
             self.send(Event::Thought(text.to_string()));
         } else {
             // The thought is hidden, but not its cost: its first chunk starts
             // the clock, and `end_thought` puts the duration in its place.
             self.thought.get_or_insert_with(Instant::now);
-            self.send(Event::Status("Thinking…".to_string()));
         }
     }
 }
