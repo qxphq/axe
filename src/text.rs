@@ -51,9 +51,17 @@ pub fn truncate(text: String, max: usize) -> String {
 /// names are the terminal's (`Color::Cyan`), never an RGB value of ours, so the
 /// user's theme decides what each one is. Redirected output is plain.
 pub fn ansi(text: &str, style: Style) -> String {
-    if !io::stdout().is_terminal() {
-        return text.to_string();
+    if io::stdout().is_terminal() {
+        styled(text, style)
+    } else {
+        text.to_string()
     }
+}
+
+/// The codes for a span, whether or not there is a terminal to read. `ansi`
+/// decides by stdout; this is what it does once that is known, so the styling
+/// itself can be checked without borrowing the process's own output.
+pub fn styled(text: &str, style: Style) -> String {
     let text = strip_control(text);
     let codes = codes(style);
     if codes.is_empty() {

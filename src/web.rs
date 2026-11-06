@@ -59,9 +59,10 @@ pub fn fetch(args: &Value, cancel: &Cancel) -> String {
     // already whole, so the endpoint contributes nothing to it.
     ep.prefix.clear();
     // The harness needs loopback; a release build must not let an environment
-    // variable turn the SSRF guard off, so the knob exists only in debug.
-    let local =
-        cfg!(debug_assertions) && std::env::var("AXE_FETCH_ALLOW_LOCAL").is_ok_and(|v| v == "1");
+    // variable turn the SSRF guard off, so the knob exists only where the code
+    // is built for a test: a debug binary, or a test build whatever its profile.
+    let local = (cfg!(debug_assertions) || cfg!(test))
+        && std::env::var("AXE_FETCH_ALLOW_LOCAL").is_ok_and(|v| v == "1");
     let pins = if local {
         None
     } else {

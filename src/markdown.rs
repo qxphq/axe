@@ -1968,10 +1968,17 @@ mod tests {
 
     #[test]
     fn ansi_output_is_plain_when_the_output_is_not_a_terminal() {
-        // The test binary's stdout is a pipe, and a redirect gets no escapes:
-        // the text is the same, only the codes are gone.
+        // A redirect gets no escapes: the text is the same, only the codes are
+        // gone. The codes are asserted on `styled`, which does not read stdout,
+        // so the test does not depend on whatever the runner gave it.
         let line = &document("**bold** `code`", 80)[0];
-        assert_eq!(ansi(line), "bold code");
+        assert_eq!(plain(line), "bold code");
+        let styled: String = line
+            .spans
+            .iter()
+            .map(|span| crate::text::styled(&span.content, span.style))
+            .collect();
+        assert_eq!(styled.trim_end(), "\x1b[1mbold\x1b[0m\x1b[32m code\x1b[0m");
     }
 
     #[test]

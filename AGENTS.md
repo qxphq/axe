@@ -274,7 +274,7 @@ and `mock.py` for fixtures and replies.
 `fetch:PAGE` has the mock call `fetch` on a fixture page (plain, inject, big,
 image, redirect, latin1, slow); `PAGE@START+CHARS` sets paging. The harness serves
 those pages on loopback and sets `AXE_FETCH_ALLOW_LOCAL=1`; that variable is a
-**debug-build test knob only, off by default; release builds ignore it**.
+**debug- or test-build knob only, off by default; a release build ignores it**.
 `--no-fetch-local` checks the refusal. `show:x` streams the last tool result back.
 
 `web_search` asks fixed public hosts; `tool:` can call it. A `tool:` turn keeps
