@@ -501,10 +501,19 @@ pub fn request_with_timeout(
     let mut stream = connect(ep, pinned, cancel, read_timeout)?;
 
     let mut head = format!(
-        "{method} {target} HTTP/1.1\r\nHost: {}\r\nUser-Agent: axe/{}\r\nAccept: */*\r\nConnection: close\r\n",
+        "{method} {target} HTTP/1.1\r\nHost: {}\r\nUser-Agent: axe/{}\r\nConnection: close\r\n",
         host_header(ep),
         env!("CARGO_PKG_VERSION")
     );
+    // A caller that names an Accept (MCP's streamable HTTP needs
+    // `application/json, text/event-stream`) keeps it; a second `Accept: */*`
+    // read first would fail a strict server like Home Assistant.
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("accept"))
+    {
+        head.push_str("Accept: */*\r\n");
+    }
     if let Some(key) = api_key {
         head.push_str(&format!("Authorization: Bearer {key}\r\n"));
     }
