@@ -2474,19 +2474,23 @@ mod tests {
 
     #[test]
     fn trust_is_by_path_and_content() {
-        let dir = state::testenv::dir("mcp-trust");
-        let file = dir.join(".mcp.json");
-        fs::write(&file, "{}").unwrap();
-        let hash = hash_of(b"{}");
-        assert!(!approved(&dir, &file, &hash));
-        remember(&dir, &file, &hash);
-        assert!(approved(&dir, &file, &hash));
-        assert!(!approved(&dir, &file, &hash_of(b"{\"mcpServers\":{}}")));
-        let mode = fs::metadata(trust_file(&dir)).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "the record is the user's");
-        assert!(forget_trust(&dir).contains("forgotten"));
-        assert!(!approved(&dir, &file, &hash));
-        let _ = fs::remove_dir_all(&dir);
+        // The record lives under the state root, so the test needs a scratch
+        // home: a sandboxed build has none the process may write.
+        state::testenv::home("mcp-trust", |home| {
+            let dir = home.join("repo");
+            fs::create_dir_all(&dir).unwrap();
+            let file = dir.join(".mcp.json");
+            fs::write(&file, "{}").unwrap();
+            let hash = hash_of(b"{}");
+            assert!(!approved(&dir, &file, &hash));
+            remember(&dir, &file, &hash);
+            assert!(approved(&dir, &file, &hash));
+            assert!(!approved(&dir, &file, &hash_of(b"{\"mcpServers\":{}}")));
+            let mode = fs::metadata(trust_file(&dir)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the record is the user's");
+            assert!(forget_trust(&dir).contains("forgotten"));
+            assert!(!approved(&dir, &file, &hash));
+        });
     }
 
     #[test]
