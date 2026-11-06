@@ -3138,8 +3138,7 @@ mod tests {
                 .messages
                 .iter()
                 .filter(|message| {
-                    message["content"].as_str()
-                        == Some(&*tools::Mode::Explore.note(crate::sandbox::plan()))
+                    message["content"].as_str() == Some(&*tools::Mode::Explore.note())
                 })
                 .count()
         };

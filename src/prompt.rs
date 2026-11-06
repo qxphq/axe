@@ -9,7 +9,6 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::sandbox;
 use crate::tools;
 
 /// The system prompt: built-in rules, then instructions. `global` and the
@@ -56,11 +55,11 @@ fn tag_path(path: &str) -> String {
 
 /// The note that tells the model which mode it is in. A `user` message, the
 /// same role `!cmd` output joins as; the mode is history, so the prompt above
-/// it never changes. The words are `Mode`'s: explore mode names where it may
-/// write and the way out, so a model that cannot change files hands the
-/// decision back instead of apologizing.
+/// it never changes. The words are `Mode`'s: explore mode says what it cannot
+/// do and the way out, so a model that cannot change files hands the decision
+/// back instead of apologizing.
 pub(crate) fn mode_note(mode: tools::Mode) -> Value {
-    json!({ "role": "user", "content": mode.note(sandbox::plan()) })
+    json!({ "role": "user", "content": mode.note() })
 }
 
 #[cfg(test)]
@@ -105,8 +104,8 @@ mod tests {
         assert_eq!(on["role"].as_str(), Some("user"));
         let on = on["content"].as_str().unwrap().to_string();
         let off = off["content"].as_str().unwrap().to_string();
-        assert_eq!(on, tools::Mode::Explore.note(sandbox::plan()));
-        assert_eq!(off, tools::Mode::Normal.note(sandbox::plan()));
+        assert_eq!(on, tools::Mode::Explore.note());
+        assert_eq!(off, tools::Mode::Normal.note());
         assert!(on.contains("/explore off"), "{on}");
         assert!(
             off.contains("fetch and web_search are unavailable"),

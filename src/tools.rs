@@ -46,7 +46,7 @@ const EDIT: Spec = Spec {
 
 const BASH: Spec = Spec {
     name: "bash",
-    description: "Run a command with `sh -c` in the working directory; no state persists between calls, so do not `cd`. For builds, tests, git, pipelines — `read` for file lines, `rg`/`fd` to search. Returns exit code, stdout, stderr; 120s timeout. Network unconfined. Explore mode: allowlisted commands only, writes only to the scratch directory and the project's plan directory; a kernel refusal means that.",
+    description: "Run a command with `sh -c` in the working directory; no state persists between calls, so do not `cd`. For builds, tests, git, pipelines — `read` for file lines, `rg`/`fd` to search. Returns exit code, stdout, stderr; 120s timeout. Network unconfined. Explore mode: allowlisted commands only, writes confined by the kernel; a kernel refusal means that.",
     parameters: r#"{"type":"object","properties":{"command":{"type":"string","description":"Command passed to sh -c"}},"required":["command"]}"#,
 };
 
@@ -91,9 +91,9 @@ const WEB_SEARCH: Spec = Spec {
 /// them back and takes `fetch` and `web_search` away.
 ///
 /// The sentences that tell the model this live next to `execute`'s match,
-/// because they describe the same policy: the writable places are named here
-/// once, and the note, the denial and the prompt's static paragraph all mean
-/// the same thing.
+/// because they describe the same policy. The prefix and the note say what is
+/// confined; the plan path lives only in the denial, so a session is not told
+/// about a directory it was not asked to fill.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Normal,
@@ -113,28 +113,26 @@ impl Mode {
         }
     }
 
-    /// Where a confined `bash` may write: `$TMPDIR` inside the call, and the
-    /// project's plan directory, which is the one that outlives the session.
+    /// Where a confined `bash` may write, for the denial only: the note says
+    /// that writes are confined and leaves the plan directory out, so a model
+    /// meets the path when a write was attempted, not as an invitation.
     fn writable(plan: Option<&Path>) -> String {
         match plan {
-            Some(dir) => format!(
-                "a scratch directory ($TMPDIR) and to {} for a plan",
-                dir.display()
-            ),
+            Some(dir) => format!("a scratch directory ($TMPDIR) and to {}", dir.display()),
             None => "a scratch directory ($TMPDIR)".to_string(),
         }
     }
 
     /// The note that goes into the history when the mode is set. The mode is
     /// history, never the cached prefix, so a toggle rewrites nothing above it.
-    pub fn note(self, plan: Option<&Path>) -> String {
+    pub fn note(self) -> String {
         match self {
-            Mode::Explore => format!(
-                "explore mode: on — write and edit are unavailable; bash runs allowlisted \
-                 commands and writes only to {}, and the network is not confined. If the user \
-                 asks for changes, do not attempt them: say `/explore off` and they can switch.",
-                Self::writable(plan)
-            ),
+            Mode::Explore => "explore mode: on — write and edit are unavailable; bash runs \
+                 allowlisted commands and writes only to a scratch directory ($TMPDIR) and \
+                 one private directory axe keeps, for files the user asks you to write; the \
+                 network is not confined. If the user asks for changes, do not attempt them: \
+                 say `/explore off` and they can switch."
+                .to_string(),
             Mode::Normal => "explore mode: off — write, edit and a full bash are available; \
                              fetch and web_search are unavailable."
                 .to_string(),
@@ -217,8 +215,7 @@ pub fn system_prompt() -> String {
          is in force. In explore mode, read the working directory, read the web \
          through `fetch` and `web_search`, and run commands to understand it, answer, \
          and propose changes: `write` and `edit` are unavailable, `bash` runs only \
-         a fixed allowlist and writes only to a scratch directory and the project's \
-         plan directory. Outside explore \
+         a fixed allowlist and has its writes confined by the kernel. Outside explore \
          mode, `write`, `edit` and a full `bash` are available, and `fetch` and \
          `web_search` are unavailable.\n",
     );
@@ -744,34 +741,32 @@ mod tests {
     }
 
     #[test]
-    fn one_policy_names_the_same_places_in_every_text() {
-        // The prompt, the mode note and the denial describe one policy, so a
-        // writable path added to one has to reach the others. The plan
-        // directory is the one that was left behind the first time.
+    fn only_a_denial_names_the_plan_directory() {
+        // The plan directory is in neither the cached prefix nor the note:
+        // every session that starts read-only would otherwise hear about a
+        // writable place, and a model fills what it is told about. The denial
+        // is the one text that names it, and it arrives after a write failed.
         let plan = Path::new("/state/projects/x/plan");
         let on = Mode::Explore;
-        let note = on.note(Some(plan));
+        let note = on.note();
         let refusal = on.denial(Some(plan));
-        for text in [&note, &refusal] {
-            assert!(text.contains("/state/projects/x/plan"), "{text}");
-            assert!(text.contains("scratch directory"), "{text}");
+        assert!(refusal.contains("/state/projects/x/plan"), "{refusal}");
+        assert!(refusal.contains("scratch directory"), "{refusal}");
+        for text in [&note, &system_prompt(), BASH.description] {
+            assert!(!text.contains("/state/projects"), "{text}");
+            assert!(!text.contains("plan"), "{text}");
         }
-        // The kernel and a file mode both say "Permission denied", so the note
-        // states the rule rather than claiming this command was denied by it.
+        assert!(note.contains("scratch directory"), "{note}");
+        // The kernel and a file mode both say "Permission denied", so the
+        // denial states the rule rather than claiming this command was denied
+        // by it.
         assert!(refusal.contains("no write outside"), "{refusal}");
         assert!(!refusal.contains("only the allowlist runs"), "{refusal}");
-        for text in [on.note(None), on.denial(None)] {
-            assert!(!text.contains("for a plan"), "{text}");
-        }
-        // The static paragraph and the tool description are in the cached
-        // prefix, so they name the directory without a path of their own.
-        for text in [&system_prompt(), BASH.description] {
-            assert!(text.contains("the project's plan directory"), "{text}");
-        }
+        assert!(!on.denial(None).contains("plan"));
         // What each note says is unavailable is what `execute` refuses.
         assert!(note.contains("write and edit are unavailable"));
         assert!(Mode::Normal
-            .note(None)
+            .note()
             .contains("fetch and web_search are unavailable"));
         assert_eq!(Mode::Normal.flip(), Mode::Explore);
         assert_eq!(Mode::Explore.flip(), Mode::Normal);
