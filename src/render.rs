@@ -130,10 +130,16 @@ pub(crate) fn call_line(call: &api::ToolCall, explore: bool) -> Vec<(Paint, Stri
         }
     }
 
+    // `ℹ` is missing from most text fonts, so the terminal falls back to a wide
+    // glyph whose ink covers the cell the line reserves after it and the name
+    // reads glued to it. A second space is a cell for the overflow to cover: the
+    // line is one cell wider than a narrow `ℹ` needs, which is the cheaper
+    // fault. No other glyph in the palette draws wider than its advance.
+    let gap = if call.name == "about" { "  " } else { " " };
     let mut spans = vec![
         (Paint::Plain, "  ".to_string()),
         (paint, glyph.to_string()),
-        (Paint::Plain, " ".to_string()),
+        (Paint::Plain, gap.to_string()),
         (paint, call.name.clone()),
     ];
     if parts.is_empty() {

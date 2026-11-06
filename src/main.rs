@@ -3013,6 +3013,17 @@ mod tests {
         let text = plain_text(&edit);
         assert!(text.contains("src/ui.rs"));
         assert!(text.contains("2→1 lines"));
+        // A font that lacks the glyph draws it wide: the second space is the
+        // cell its ink covers, so the name keeps its gap.
+        let about = call_line(
+            &api::ToolCall {
+                id: "3".into(),
+                name: "about".into(),
+                arguments: "{}".into(),
+            },
+            false,
+        );
+        assert_eq!(plain_text(&about), "ℹ  about");
         let shell = shell_line("echo hi", false);
         assert!(plain_text(&shell).contains("echo hi"));
     }
