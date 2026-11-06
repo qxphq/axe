@@ -97,6 +97,7 @@ pub const COMMANDS: &[&str] = &[
     "pacman",
     "paste",
     "perl",
+    "pgrep",
     "pip",
     "pip3",
     "pnpm",
@@ -114,6 +115,7 @@ pub const COMMANDS: &[&str] = &[
     "rpm",
     "ruby",
     "rustup",
+    "sed",
     "seq",
     "sha1sum",
     "sha256sum",
@@ -810,6 +812,8 @@ mod tests {
     fn allowlist_is_nonempty_and_resolves_sh() {
         assert!(COMMANDS.contains(&"ls"));
         assert!(COMMANDS.contains(&"git"));
+        assert!(COMMANDS.contains(&"sed"));
+        assert!(COMMANDS.contains(&"pgrep"));
         assert!(resolve("sh").is_some());
     }
 
