@@ -3631,29 +3631,31 @@ mod tests {
 
     #[test]
     fn the_info_row_names_the_directory_left_of_the_model() {
-        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
-            return;
-        };
-        let mut session = bare_session();
-        session.state.cwd = home.join("work");
-        let text = info_text(&session);
-        assert!(text.starts_with("~/work  ·  p/m"), "{text}");
-        // The home directory itself is the one path with nothing after the `~`,
-        // and a path outside it keeps its own name.
-        session.state.cwd = home.clone();
-        let text = info_text(&session);
-        assert!(text.starts_with("~  ·  p/m"), "{text}");
-        session.state.cwd = std::path::PathBuf::from("/tmp/x");
-        let text = info_text(&session);
-        assert!(text.starts_with("/tmp/x  ·  p/m"), "{text}");
-        // A session with no working directory has nothing to say: the row
-        // starts at the model, with no empty piece and no stray separator.
-        session.state.cwd = std::path::PathBuf::new();
-        let text = info_text(&session);
-        assert!(text.starts_with("p/m"), "{text}");
-        // A sibling whose name starts with the home path is not under it.
-        let sibling = std::path::PathBuf::from(format!("{}-old", home.display()));
-        assert_eq!(dir_label(&sibling), sibling.display().to_string());
+        // `dir_label` reads `HOME` itself, so the test holds the environment
+        // still: a scratch home another test writes between the two reads is
+        // a path neither of them meant.
+        state::testenv::home("info-row-dir", |home| {
+            let mut session = bare_session();
+            session.state.cwd = home.join("work");
+            let text = info_text(&session);
+            assert!(text.starts_with("~/work  ·  p/m"), "{text}");
+            // The home directory itself is the one path with nothing after the
+            // `~`, and a path outside it keeps its own name.
+            session.state.cwd = home.to_path_buf();
+            let text = info_text(&session);
+            assert!(text.starts_with("~  ·  p/m"), "{text}");
+            session.state.cwd = std::path::PathBuf::from("/tmp/x");
+            let text = info_text(&session);
+            assert!(text.starts_with("/tmp/x  ·  p/m"), "{text}");
+            // A session with no working directory has nothing to say: the row
+            // starts at the model, with no empty piece and no stray separator.
+            session.state.cwd = std::path::PathBuf::new();
+            let text = info_text(&session);
+            assert!(text.starts_with("p/m"), "{text}");
+            // A sibling whose name starts with the home path is not under it.
+            let sibling = std::path::PathBuf::from(format!("{}-old", home.display()));
+            assert_eq!(dir_label(&sibling), sibling.display().to_string());
+        });
     }
 
     use crate::http::support::{reply, sse, Server};
