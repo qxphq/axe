@@ -7,8 +7,7 @@
 ```
 
 A minimal coding agent in Rust. One binary, one line REPL, any
-OpenAI-compatible `chat/completions` server, seven tools, **six dependencies**. The transcript is
-your scrollback: axe never takes the screen.
+OpenAI-compatible `chat/completions` server, seven tools, **six dependencies**.
 
 Axe starts in read-only mode by default; web search works there only.
 Axe does not re-implement or compete with the functionality of your other tools, shell, or Unix system.
