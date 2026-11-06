@@ -33,7 +33,9 @@ use ratatui::crossterm::terminal;
 use serde_json::{json, Value};
 
 use prompt::{mode_note, system_with_instructions};
-use render::{call_line, detail, failed, line_of, mark, plain_text, shell_line, Paint};
+use render::{
+    body, call_line, detail, failed, line_of, mark, plain_text, shell_echo, shell_line, Paint,
+};
 use store::{history_bytes, weight, Live, Store, COMPACT_NOTE};
 use text::{head_tail, plural, strip_control, terminal_text};
 use turn::{PlainSink, Queue, Sink, TextSink};
@@ -996,13 +998,13 @@ impl Session {
                     self.name_session();
                 }
                 Cmd::Shell(command) => {
-                    // The user's own shell, and the same glyph the screen
-                    // draws: `!cmd` is never confined, so the line is the
-                    // unconfined color.
+                    // The user's own shell, and the same line and glyph the
+                    // screen draws: `!cmd` is never confined, so the line is
+                    // the unconfined color.
                     let mut console = Console::Stdout;
-                    console.output(&format!("{}\n", plain_text(&shell_line(&command, false))));
                     let result = self.run_shell(&command);
-                    console.output(&result);
+                    console.output(&format!("{}\n", plain_text(&shell_echo(&command, &result))));
+                    console.output(body(&result));
                 }
                 Cmd::Compact => {
                     self.compact(&mut Console::Stdout);
@@ -1664,8 +1666,9 @@ impl Session {
         screen: &mut ui::Screen,
         rx: &Receiver<Event>,
     ) -> Option<String> {
-        screen.insert(vec![line_of(&shell_line(command, false))], ui::Block::Tool);
-        screen.set_status("▷ Running");
+        // What is running, while it runs: the finished line appears below once
+        // there is a result to put on it, the same way a tool call does.
+        screen.set_status(&plain_text(&shell_line(command, false)));
         screen.repaint();
         let cancel = http::Cancel::new();
         let args = json!({ "command": command }).to_string();
@@ -1680,7 +1683,17 @@ impl Session {
             joined.unwrap_or_else(|| "error: shell thread panicked".into())
         });
         screen.set_status("");
-        screen.output(&result);
+        screen.insert(
+            vec![line_of(&shell_echo(command, &result))],
+            ui::Block::Tool,
+        );
+        // The command's own words: the glyph on the line has already said how
+        // it went, so the `exit: N` header would only repeat it.
+        if failed("bash", &result) {
+            screen.fail(body(&result));
+        } else {
+            screen.output(body(&result));
+        }
         // The output is part of the history now: drop the provider's last
         // count so the fill estimate includes it.
         self.used = None;
@@ -4133,7 +4146,31 @@ mod tests {
         assert!(content.contains("sous"), "{content}");
         assert!(session.used.is_none(), "the count is an estimate again");
         let rows = screen.transcript();
+        // The same line a tool call leaves: what ran, with one glyph, and the
+        // command's own words under it — the `exit: 0` header the glyph has
+        // just said is not repeated.
+        assert!(
+            rows.iter().any(|row| row.contains("▷ echo sous ✓")),
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("exit:")), "{rows:?}");
         assert!(rows.iter().any(|row| row.contains("sous")), "{rows:?}");
+    }
+
+    #[test]
+    fn a_failed_shell_command_keeps_its_words_and_loses_the_header() {
+        let server = Server::new(Vec::new());
+        let mut session = session_at(&server);
+        let (_tx, rx) = events();
+        let mut screen = ui::Screen::test_screen(60, 20);
+
+        session.shell("exit 3", &mut screen, &rx);
+        let rows = screen.transcript();
+        assert!(
+            rows.iter().any(|row| row.contains("▷ exit 3 ✗")),
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("exit: 3")), "{rows:?}");
     }
 
     #[test]

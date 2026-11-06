@@ -178,15 +178,31 @@ pub(crate) fn mark(name: &str, result: &str) -> (Paint, &'static str) {
     }
 }
 
+/// A finished command on one line: what ran, and one glyph for how it went.
+/// The model's calls and the user's `!cmd` share it, so a command reads the
+/// same whichever side ran it.
+pub(crate) fn shell_echo(command: &str, result: &str) -> Vec<(Paint, String)> {
+    let mut spans = shell_line(command, false);
+    spans.push((Paint::Plain, " ".to_string()));
+    let (paint, glyph) = mark("bash", result);
+    spans.push((paint, glyph.to_string()));
+    spans
+}
+
+/// A tool result's own words: the `exit: N` header is dropped, since the glyph
+/// on the call's line already reports the outcome.
+pub(crate) fn body(result: &str) -> &str {
+    match result.strip_prefix("exit: ") {
+        Some(rest) => rest.split_once('\n').map(|(_, body)| body).unwrap_or(""),
+        None => result,
+    }
+}
+
 /// What to say under a failed call: one line. The `exit: N` header is dropped,
 /// since the mark already reports the failure. The full result still reaches
 /// the model; a build log must not reach the transcript.
 pub(crate) fn detail(result: &str) -> String {
-    let body = match result.strip_prefix("exit: ") {
-        Some(rest) => rest.split_once('\n').map(|(_, body)| body).unwrap_or(""),
-        None => result,
-    };
-    text::oneline(body.trim_start_matches('\n'), 120)
+    text::oneline(body(result).trim_start_matches('\n'), 120)
 }
 
 #[cfg(test)]

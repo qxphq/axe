@@ -246,7 +246,8 @@ invariants a change must not break.
   the newest are not steps.
 - `!cmd` is the user's shell. It runs through `tools::execute`, its output joins
   the history as a `user` message, no turn follows, and explore-mode write
-  confinement does not apply.
+  confinement does not apply. It leaves the line a call leaves — `render`'s
+  `shell_echo`, glyph and all — and its words under it, not the `exit: N` header.
 - Commit messages: imperative, one feature per commit.
 
 ## Provider notes

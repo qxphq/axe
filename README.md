@@ -282,7 +282,10 @@ same chooser, already narrowed, and `/model provider/id` sets one directly.
 
  A line starting with `!` is your own shell: it runs through the same tool,
 its output joins the history as a user message, and no turn follows — the model
-sees it the next time you ask something.
+sees it the next time you ask something. It leaves the same line in the
+transcript as a call the model made (`▷ cmd ✓`, or `✗` when it failed), with the
+command's own words under it and the exit status carried by the glyph, not
+printed as a header.
 
 Every submitted line is remembered for the directory, across sessions, so ↑
 walks what was typed here before, newest first; ↓ comes back down and gives the
