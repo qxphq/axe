@@ -7,12 +7,17 @@ use serde_json::{json, Value};
 
 use crate::http::{self, Cancel, Endpoint, Response};
 
+/// One row of the provider's model list.
 #[derive(Clone)]
 pub struct ModelInfo {
     pub id: String,
+    /// The context window when the provider reports one; the info row's fill
+    /// has no denominator without it.
     pub context: Option<u64>,
 }
 
+/// A call a round named, with its arguments as the JSON text the provider
+/// streamed: they are parsed only when the tool runs.
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -33,6 +38,8 @@ pub struct Reply {
     pub finish_reason: Option<String>,
 }
 
+/// What the provider counted for one request: the whole prompt it read
+/// (history included) and the answer it wrote.
 pub struct Usage {
     pub prompt: u64,
     pub completion: u64,

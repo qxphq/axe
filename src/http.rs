@@ -18,6 +18,8 @@ const BODY_MAX: u64 = 8 << 20;
 const CONNECT_SECONDS: u64 = 10;
 const WRITE_SECONDS: u64 = 30;
 
+// ---- the target ----
+
 #[derive(Clone)]
 enum Scheme {
     Http,
@@ -184,6 +186,8 @@ fn host_header(ep: &Endpoint) -> String {
         format!("{}:{}", ep.host, ep.port)
     }
 }
+
+// ---- the connection ----
 
 enum Stream {
     Plain(TcpStream),
@@ -372,6 +376,8 @@ impl<R: Read> Read for BodyReader<R> {
     }
 }
 
+// ---- the response ----
+
 pub struct Response {
     pub status: u16,
     pub content_type: Option<String>,
@@ -427,6 +433,8 @@ impl Response {
         }
     }
 }
+
+// ---- requests ----
 
 pub fn request(
     ep: &Endpoint,
@@ -587,6 +595,8 @@ pub fn request_with_timeout(
         }),
     })
 }
+
+// ---- lines ----
 
 fn read_line<R: BufRead>(reader: &mut R) -> Result<String, String> {
     let mut line = String::new();

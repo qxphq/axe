@@ -9,12 +9,18 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+/// One provider: the same OpenAI-compatible API, with the differences
+/// expressed as data.
 #[derive(Clone)]
 pub struct ProviderConfig {
     pub name: String,
+    /// The API root, with no trailing slash: `chat/completions` hangs off it.
     pub base_url: String,
+    /// The variable holding the bearer token; unset means no key is sent.
     pub api_key_env: Option<String>,
+    /// Where the model list lives when it is not `base_url/models`.
     pub models_url: Option<String>,
+    /// A header that carries a stable session id the provider wants echoed.
     pub session_header: Option<String>,
     /// Level name -> JSON object merged into the request body.
     pub thinking: Vec<(String, Value)>,
@@ -44,8 +50,10 @@ pub struct Search {
     pub brave_key: Option<String>,
 }
 
+/// The file as a whole. Everything here is input: axe never writes it back.
 pub struct Config {
     pub providers: Vec<ProviderConfig>,
+    /// The model a directory starts on when nothing narrower was chosen.
     pub model: Option<String>,
     /// Whether a session starts in explore mode (`read` and a read-only
     /// `bash`). On unless the config sets `"explore_by_default": false`.
@@ -54,7 +62,9 @@ pub struct Config {
     pub search: Search,
     /// Model spec (`provider/id`) -> remembered thinking level.
     pub thinking: Vec<(String, String)>,
+    /// Instructions appended after `agents` and the project file.
     pub system: Option<String>,
+    /// A global `AGENTS.md`-style file, read before the project's.
     pub agents: Option<PathBuf>,
     /// Extra skill directories or `SKILL.md` files, scanned after the
     /// default user locations.

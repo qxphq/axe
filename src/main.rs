@@ -10,9 +10,11 @@ mod markdown;
 mod mcp;
 mod prompt;
 mod render;
+mod repl;
 mod sandbox;
 mod sessions;
 mod skills;
+mod startup;
 mod state;
 mod store;
 mod text;
@@ -22,23 +24,31 @@ mod ui;
 mod web;
 
 use std::collections::VecDeque;
-use std::io::Read;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::crossterm::terminal;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use serde_json::{json, Value};
 
-use prompt::{mode_note, system_with_instructions};
+use prompt::mode_note;
 use render::{
     body, call_line, detail, failed, line_of, mark, plain_text, shell_echo, shell_line, Paint,
 };
+use repl::{
+    choose, narrow, pump, readline, recall_lines, show_queue, spawn_input, take_back, Event, Input,
+    Pending,
+};
+use startup::{
+    dir_label, find, fullness, level, level_names, models, percent, place, scaled, session_id,
+    set_thinking, thinking_label, NO_SESSIONS,
+};
 use store::{history_bytes, weight, Live, Store, COMPACT_NOTE};
-use text::{head_tail, plural, strip_control, terminal_text};
+use text::{head_tail, strip_control, terminal_text};
 use turn::{PlainSink, Queue, Sink, TextSink};
+
+// ---- providers and the command line ----
 
 #[derive(Clone)]
 struct Provider {
@@ -110,7 +120,7 @@ fn main() {
         }
         Cli::Run => {}
     }
-    let result = run();
+    let result = startup::run();
     // The scratch directory is the one thing a session creates outside the
     // terminal; a static's `Drop` never runs, so this is the hook.
     sandbox::cleanup();
@@ -119,240 +129,6 @@ fn main() {
     if let Err(e) = result {
         eprintln!("axe: {}", strip_control(&e));
         std::process::exit(1);
-    }
-}
-
-fn run() -> Result<(), String> {
-    let cfg = config::load()?;
-    // `web_search` holds its token rather than the config: read once, like the
-    // providers, and never re-read mid-session.
-    web::set_brave_key(cfg.search.brave_key.clone());
-    // Confinement is announced before anything runs, once, next to the
-    // provider lines: weaker than promised must never be silent.
-    if let Some(note) = sandbox::init() {
-        eprintln!("axe: {}", strip_control(&note));
-    }
-    // Instructions are read once at startup, before any request: the system
-    // prompt is a stable prefix and must not change mid-session.
-    // Order: config `agents`, then the project's AGENTS.md, then `system`.
-    let global_agents = cfg.agents.as_deref().and_then(config::read_agents);
-    // The working directory identifies this directory's state file and anchors
-    // the project's AGENTS.md; read it once.
-    let cwd = std::env::current_dir().ok();
-    let state = match &cwd {
-        Some(dir) => state::load(dir),
-        None => state::State::default(),
-    };
-    let project_file = cwd
-        .as_deref()
-        .and_then(config::find_agents)
-        .filter(|f| Some(f.as_path()) != cfg.agents.as_deref());
-    let project_agents = project_file.as_deref().and_then(config::read_agents);
-
-    // Skills are read once, like the instructions: the catalogue is part of
-    // the stable prefix.
-    let loaded_skills = skills::load(cwd.as_deref(), &cfg.skills);
-    // Explore mode's second writable directory, and the only one that outlives
-    // the session: scratch is removed at exit, so a plan needs its own place.
-    if let Some(dir) = &cwd {
-        let plan = state::project(dir).join("plan");
-        match state::private_dir(&plan) {
-            Ok(()) => sandbox::set_plan(&plan),
-            Err(e) => eprintln!("axe: plan directory: {e}"),
-        }
-    }
-    for warning in &loaded_skills.warnings {
-        eprintln!("axe: {}", strip_control(warning));
-    }
-    let project_skills = loaded_skills
-        .skills
-        .iter()
-        .filter(|skill| skill.scope == skills::Scope::Project)
-        .count();
-    // Named once, next to the splash: which instructions and skills are in
-    // force is part of the session's identity, not a warning.
-    let mut notices = Vec::new();
-    if let Some(file) = project_file.as_deref().filter(|_| project_agents.is_some()) {
-        notices.push(format!(
-            "Using project instructions from {}",
-            file.display()
-        ));
-    }
-    if project_skills > 0 {
-        notices.push(format!(
-            "Using {project_skills} project skill{}",
-            plural(project_skills)
-        ));
-    }
-    // The mode is history, not prompt: the config decides where a session
-    // starts, and the note below tells the model which side it is on.
-    let mode = if cfg.explore_by_default {
-        tools::Mode::Explore
-    } else {
-        tools::Mode::Normal
-    };
-    // The directory's sessions: archive the old bodies before the listing so
-    // the markers match what a chooser will resume. Read before the banner, so
-    // a directory with no sessions gets the line that says where to start.
-    let mut startup = Vec::new();
-    if let Some(dir) = &cwd {
-        sessions::archive_old(dir, sessions::KEEP);
-        startup = sessions::list(dir);
-        startup.truncate(15);
-    }
-    if startup.is_empty() {
-        notices.push(first_run_note(mode).to_string());
-    }
-    // The splash comes before the first provider is asked for anything: it
-    // needs nothing from one, and a provider that is slow or silent must not
-    // leave the terminal blank. A piped run prints neither the splash, the
-    // selection nor these notices: stdout is the transcript, and nobody asked
-    // who is answering.
-    if ui::is_interactive() {
-        banner(&notices);
-    }
-    let mut providers = Vec::new();
-    let sid = session_id();
-
-    for pc in &cfg.providers {
-        let ep = http::parse_url(&pc.base_url).map_err(|e| format!("{}: {e}", pc.name))?;
-        let key = pc.resolved_key();
-        if key.is_none() {
-            if let Some(var) = &pc.api_key_env {
-                eprintln!(
-                    "{}: {} is not set, skipping",
-                    strip_control(&pc.name),
-                    strip_control(var)
-                );
-                continue;
-            }
-        }
-
-        let mut headers = Vec::new();
-        if let Some(name) = &pc.session_header {
-            headers.push((name.clone(), sid.clone()));
-        }
-
-        let (models_ep, models_path) = match &pc.models_url {
-            Some(url) => {
-                let ep = http::parse_url(url).map_err(|e| format!("{}: {e}", pc.name))?;
-                let path = if ep.prefix.is_empty() { "/models" } else { "" };
-                (ep, path)
-            }
-            None => (ep.clone(), "/models"),
-        };
-
-        match api::list_models(&models_ep, models_path, key.as_deref(), &headers) {
-            Ok(models) if !models.is_empty() => {
-                // One line per provider as it answers, so a slow network reads
-                // as work rather than as a dead terminal. A run without a
-                // terminal says nothing here: stdout is the transcript.
-                if ui::is_interactive() {
-                    println!(
-                        " {}",
-                        Paint::Dim.ansi(&format!(
-                            "{}: {} model{}",
-                            strip_control(&pc.name),
-                            models.len(),
-                            plural(models.len())
-                        ))
-                    );
-                }
-                providers.push(Provider {
-                    name: pc.name.clone(),
-                    cfg: pc.clone(),
-                    ep,
-                    key,
-                    headers,
-                    models,
-                });
-            }
-            Ok(_) => eprintln!("{}: no models", strip_control(&pc.name)),
-            Err(e) => eprintln!("{}: {}", strip_control(&pc.name), strip_control(&e)),
-        }
-    }
-
-    if providers.is_empty() {
-        return Err("no models available".into());
-    }
-
-    // The directory's own choice wins, then the state root's default, then the
-    // config's `model`, which is the seed for a machine that has picked none.
-    let global = state::load_default();
-    let (provider, model) = resolve(
-        &providers,
-        state
-            .model
-            .as_deref()
-            .or(global.as_deref())
-            .or(cfg.model.as_deref()),
-    );
-    // Thinking level follows the model: it is remembered per `provider/id`,
-    // first for this directory, then for the config, and turned into request
-    // fields by `thinking_body`.
-    let spec = format!("{}/{}", providers[provider].name, model);
-    let thinking = state.thinking_for(&spec).or_else(|| {
-        cfg.thinking
-            .iter()
-            .find(|(s, _)| *s == spec)
-            .map(|(_, level)| level.clone())
-    });
-    validate_level(&providers[provider].cfg, thinking.as_deref());
-
-    // Built once. The mode lives in the history, not here, so a toggle leaves
-    // the prefix byte-identical and the provider's cache intact. The project's
-    // file is tagged: it is data about the repository, not authority.
-    let skills_section = skills::prompt_section(&loaded_skills.skills);
-    let system = system_with_instructions(
-        global_agents.as_deref(),
-        project_agents.as_deref().zip(project_file.as_deref()),
-        cfg.system.as_deref(),
-        Some(skills_section.as_str()).filter(|text| !text.is_empty()),
-    );
-    // MCP servers are read once, like the instructions: their tools join the
-    // tool catalogue, and the catalogue is part of the request's cached prefix.
-    // A project's file is code the repository shipped, so it runs only after
-    // one approval; the prompt here is the only question a start asks.
-    for line in mcp::start(cwd.as_deref(), ui::is_interactive(), mode.explore()) {
-        if ui::is_interactive() {
-            println!("{}", strip_control(&line));
-        } else {
-            eprintln!("axe: {}", strip_control(&line));
-        }
-    }
-    let messages: Vec<Value> = vec![
-        json!({ "role": "system", "content": system }),
-        mode_note(mode),
-    ];
-
-    let store = cwd
-        .as_deref()
-        .map(|dir| Store::fresh(sessions::dir(dir), &sid));
-
-    let bytes = history_bytes(&messages);
-    let session = Session {
-        state,
-        providers,
-        provider,
-        model,
-        thinking,
-        mode,
-        used: None,
-        messages,
-        bytes,
-        sid,
-        store,
-        startup,
-        picks: Vec::new(),
-        naming: None,
-        warning: None,
-        skills: loaded_skills.skills,
-    };
-
-    if ui::is_interactive() {
-        session.run_interactive()
-    } else {
-        session.run_piped()
     }
 }
 
@@ -648,6 +424,8 @@ fn session_rows(
         .collect()
 }
 
+// ---- commands ----
+
 /// What a submitted line asks for.
 enum Cmd {
     Exit,
@@ -786,18 +564,6 @@ fn parse_command(line: &str) -> Command {
     Command::Turn(input.to_string())
 }
 
-/// What the prompt yielded: a line, or a mode toggle that is not one.
-enum Input {
-    /// The committed line.
-    Line(String),
-    /// Shift+Tab: explore mode, handled without touching the history.
-    Explore,
-    /// Enter on a chooser: the selected row.
-    Menu(usize),
-    /// Esc on a chooser.
-    Cancel,
-}
-
 /// Slash commands, for Tab completion in the prompt. Only the name is
 /// completed; `/model` and `/thinking` take their argument as typed.
 const COMMANDS: &[&str] = &[
@@ -859,6 +625,8 @@ fn help_text() -> String {
         config::path().display()
     )
 }
+
+// ---- the session ----
 
 impl Session {
     /// One line at a time from a terminal we own. Keys arrive on the channel, so
@@ -1832,30 +1600,14 @@ impl Session {
         screen.set_info(self.info());
 
         let cancel = http::Cancel::new();
-        // The lines waiting for a boundary, oldest first, and the count of
-        // those Up took back after the turn had read them: their echo is still
-        // owed, and it must not take a waiting line off the frame with it.
-        let mut queued: Vec<Pending> = Vec::new();
-        let mut awaiting = 0usize;
         // A line typed while this turn runs, handed to the turn's own thread so
         // that it joins the history at the next round boundary instead of after
         // the last one. A command cannot go that way and waits for the end.
         let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
         let turn_queue = queue.clone();
-        // Streamed text up to the last newline is permanent; the rest is the
-        // line still being written and lives in the status row.
-        let mut partial = String::new();
-        // Reasoning before the answer. Its last line is unfinished until the
-        // answer starts or the round ends, so it is held until then.
-        let mut thought = String::new();
-        // A mode switch pressed while the turn runs. Shift+Tab reached the live
-        // prompt and used to be dropped; it is held here instead, because the
-        // turn's tool set and history are fixed before it starts.
-        let mut switch = false;
-        // ESC asks first: one press offers the interrupt, the next one takes it.
-        let mut armed = false;
-        // Whether the turn was actually stopped, for the line that says so.
-        let mut interrupted = false;
+        // Everything the live prompt owns: the waiting lines, the interrupt,
+        // and the unfinished line. The turn's thread owns the history.
+        let mut held = Held::default();
 
         screen.set_status("⋯ Waiting for provider");
         screen.repaint();
@@ -1914,182 +1666,17 @@ impl Session {
                     },
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
-                let mut done = false;
                 let Some(first) = first else {
                     continue;
                 };
+                let mut done = false;
                 let mut next = Some(first);
                 while let Some(ev) = next.take().or_else(|| rx.try_recv().ok()) {
-                    match ev {
-                        // ESC is the interrupt, and it takes two presses: the
-                        // first offers it and any other key withdraws the
-                        // offer, so a mistyped ESC cannot end a turn that was
-                        // nearly done. The flag ends the turn between
-                        // requests; the socket shutdown unblocks the one in
-                        // flight.
-                        Event::Key(key) if key.code == KeyCode::Esc => {
-                            if armed {
-                                interrupted = true;
-                                cancel.cancel();
-                                screen.set_alert(Some("× Interrupting"));
-                            } else {
-                                armed = true;
-                                screen.set_alert(Some("× press ESC again to interrupt"));
-                            }
-                        }
-                        Event::Key(key) => {
-                            // A key other than ESC withdraws the offer.
-                            if armed {
-                                armed = false;
-                                screen.set_alert(None);
-                            }
-                            match screen.apply_key(key) {
-                                ui::Action::Eof => {
-                                    cancel.cancel();
-                                    done = true;
-                                }
-                                ui::Action::Submit => {
-                                    if !screen.is_empty() {
-                                        // Queue without echoing here: the
-                                        // transcript shows the line where the
-                                        // model saw it, which is the round
-                                        // boundary the turn takes it at, or
-                                        // the turn's end for a command.
-                                        let line = screen.take();
-                                        // A plain request reaches the model
-                                        // between rounds; a command needs the
-                                        // session and the screen, so it stays
-                                        // for the boundary in the REPL loop.
-                                        let turn = match parse_command(&line) {
-                                            Command::Turn(input) => {
-                                                if let Ok(mut lines) = queue.lock() {
-                                                    lines.push_back(input);
-                                                }
-                                                true
-                                            }
-                                            _ => false,
-                                        };
-                                        queued.push(Pending { line, turn });
-                                        show_queue(screen, &queued);
-                                    }
-                                }
-                                // Up: the waiting lines come back to the
-                                // prompt, above what was typed, and the frame
-                                // lets go of them.
-                                ui::Action::Recall => {
-                                    let (kept, read) = take_back(&queue, &queued);
-                                    awaiting += read;
-                                    queued.clear();
-                                    show_queue(screen, &queued);
-                                    recall_lines(screen, &kept);
-                                }
-                                // The turn already captured its tool set and its
-                                // history prefix; the switch is applied at the
-                                // boundary, below, so the note lands after the
-                                // answer it did not affect.
-                                ui::Action::Explore => switch = true,
-                                // A chooser only exists while idle.
-                                ui::Action::MenuStep(_)
-                                | ui::Action::MenuAccept
-                                | ui::Action::MenuCancel => {}
-                                ui::Action::None => {}
-                            }
-                        }
-                        Event::Paste(text) => screen.insert_text(&text),
-                        // The turn took a queued line into its history: it is
-                        // no longer pending, and it belongs in the transcript
-                        // at the point the model saw it. The queue is read
-                        // oldest first, which is the row the frame drops.
-                        Event::User(line) => {
-                            // The turn read the oldest line still on the frame.
-                            // One Up took back was read too, so only its echo
-                            // is due.
-                            if awaiting > 0 {
-                                awaiting -= 1;
-                            } else if let Some(at) = queued.iter().position(|entry| entry.turn) {
-                                queued.remove(at);
-                                show_queue(screen, &queued);
-                            }
-                            screen.echo_user(&line);
-                        }
-                        // Model text, already spaced by the sink: everything up
-                        // to the last newline is a finished line.
-                        Event::Printed(text) => {
-                            // The answer starting is the end of the thought: its
-                            // unfinished last line goes out first.
-                            let tail = std::mem::take(&mut thought);
-                            screen.thought(&tail);
-                            partial.push_str(&text);
-                            // Lines end at a newline; blank lines at the tail
-                            // are the separator before whatever comes next, so
-                            // they wait. A chunk boundary cannot then split one
-                            // paragraph break into two.
-                            let tail = partial.len() - partial.trim_end_matches('\n').len();
-                            if tail > 0 {
-                                let end = partial.len() - (tail - 1);
-                                let finished: String = partial.drain(..end).collect();
-                                if !finished.is_empty() {
-                                    screen.text(&finished);
-                                }
-                            }
-                            // The unfinished line is not the status: the row
-                            // says what the turn is doing, not what it says.
-                            screen.set_status("▸ Responding");
-                        }
-                        // A tool call and its outcome, on one line.
-                        Event::Echo(spans, error) => {
-                            // A round that only reasoned and called a tool: its
-                            // thought ends here, before the call it produced.
-                            let tail = std::mem::take(&mut thought);
-                            screen.thought(&tail);
-                            // The command that was running is in the transcript
-                            // now; the status row goes back to being empty.
-                            screen.set_status("");
-                            screen.insert(vec![line_of(&spans)], ui::Block::Tool);
-                            if let Some(error) = &error {
-                                screen.fail(error);
-                            }
-                        }
-                        // Reasoning, dim: it precedes the answer and is not the
-                        // answer, and it must not disturb the status row.
-                        Event::Thought(text) => {
-                            thought.push_str(&text);
-                            let finished = match thought.rfind('\n') {
-                                Some(at) => thought.drain(..=at).collect::<String>(),
-                                None => String::new(),
-                            };
-                            screen.thought(&finished);
-                        }
-                        Event::Status(text) => {
-                            if screen.status() != text {
-                                screen.set_status(&text);
-                            }
-                        }
-                        // The area under us changed: paint even if no state
-                        // did.
-                        Event::Resize => screen.invalidate(),
-                        Event::Done(Err(e)) => {
-                            screen.error(&format!("axe: {e}\n"));
-                            done = true;
-                        }
-                        Event::Done(Ok(count)) => {
-                            used = count;
-                            let tail = std::mem::take(&mut thought);
-                            screen.thought(&tail);
-                            // The last block has no ending line of its own.
-                            screen.flush();
-                            partial.clear();
-                            done = true;
-                        }
-                        Event::Eof => {
-                            cancel.cancel();
-                            done = true;
-                        }
-                    }
                     // An interrupt does not break the loop: the turn thread
                     // still reports what the killed command did, and `Done`
                     // is the only event that ends the drain.
-                    if done {
+                    if held.event(ev, screen, &queue, &cancel, &mut used) {
+                        done = true;
                         break;
                     }
                 }
@@ -2106,7 +1693,7 @@ impl Session {
         screen.set_alert(None);
         // The transcript says the turn was stopped: an interrupted reply ends
         // mid-sentence and looks like a finished one otherwise.
-        if interrupted {
+        if held.interrupted {
             // No emoji-presentation glyph here: `unicode-width` calls those one
             // cell while the terminal may draw two, and the space after it is
             // the cost.
@@ -2119,7 +1706,7 @@ impl Session {
 
         // Held from the turn: applied now, so the note sits below the answer
         // and above whatever the user types next.
-        if switch {
+        if held.switch {
             self.toggle_explore(&mut Console::Screen {
                 screen: &mut *screen,
                 rx,
@@ -2139,7 +1726,7 @@ impl Session {
         // that arrived too late for one, and a command line never entered the
         // queue at all. The REPL runs them in the order they were typed.
         show_queue(screen, &[]);
-        Ok(queued.into_iter().map(|entry| entry.line).collect())
+        Ok(held.queued.into_iter().map(|entry| entry.line).collect())
     }
 
     fn turn(&mut self, sink: &mut dyn Sink, cancel: &http::Cancel) -> Result<(), String> {
@@ -2303,6 +1890,224 @@ impl Session {
     }
 }
 
+// ---- the live prompt ----
+
+/// What the live prompt owns while a turn runs: the lines waiting for a
+/// boundary, the interrupt's two-press arming, and the text that is not a
+/// finished line yet. The turn's thread owns the history; this owns what a key
+/// or an event does to the frame.
+#[derive(Default)]
+struct Held {
+    /// Submitted lines, oldest first.
+    queued: Vec<Pending>,
+    /// Lines Up took back after the turn had read them: their echo is still
+    /// owed, and it must not take a waiting line off the frame with it.
+    awaiting: usize,
+    /// Streamed text up to the last newline is permanent; the rest is the line
+    /// still being written.
+    partial: String,
+    /// Reasoning before the answer. Its last line is unfinished until the
+    /// answer starts or the round ends, so it is held until then.
+    thought: String,
+    /// A mode switch pressed while the turn runs. Shift+Tab reached the live
+    /// prompt; it is applied at the boundary, because the turn's tool set and
+    /// history are fixed before it starts.
+    switch: bool,
+    /// ESC asks first: one press offers the interrupt, the next takes it.
+    armed: bool,
+    /// Whether the turn was actually stopped, for the line that says so.
+    interrupted: bool,
+}
+
+impl Held {
+    /// One event from a producer. Returns whether the turn is over.
+    fn event(
+        &mut self,
+        event: Event,
+        screen: &mut ui::Screen,
+        queue: &Queue,
+        cancel: &http::Cancel,
+        used: &mut Option<u64>,
+    ) -> bool {
+        match event {
+            Event::Key(key) => return self.key(key, screen, queue, cancel),
+            Event::Paste(text) => screen.insert_text(&text),
+            // The turn took a queued line into its history: it is no longer
+            // pending, and it belongs in the transcript at the point the model
+            // saw it. The queue is read oldest first, which is the row the
+            // frame drops.
+            Event::User(line) => self.took(&line, screen),
+            // Model text, already spaced by the sink.
+            Event::Printed(text) => self.printed(&text, screen),
+            // A tool call and its outcome, on one line.
+            Event::Echo(spans, error) => {
+                // A round that only reasoned and called a tool: its thought
+                // ends here, before the call it produced.
+                let tail = std::mem::take(&mut self.thought);
+                screen.thought(&tail);
+                // The command that was running is in the transcript now; the
+                // status row goes back to being empty.
+                screen.set_status("");
+                screen.insert(vec![line_of(&spans)], ui::Block::Tool);
+                if let Some(error) = &error {
+                    screen.fail(error);
+                }
+            }
+            // Reasoning, dim: it precedes the answer and is not the answer, and
+            // it must not disturb the status row.
+            Event::Thought(text) => self.reasoned(&text, screen),
+            Event::Status(text) => {
+                if screen.status() != text {
+                    screen.set_status(&text);
+                }
+            }
+            // The area under us changed: paint even if no state did.
+            Event::Resize => screen.invalidate(),
+            Event::Done(Err(e)) => {
+                screen.error(&format!("axe: {e}\n"));
+                return true;
+            }
+            Event::Done(Ok(count)) => {
+                *used = count;
+                let tail = std::mem::take(&mut self.thought);
+                screen.thought(&tail);
+                // The last block has no ending line of its own.
+                screen.flush();
+                self.partial.clear();
+                return true;
+            }
+            Event::Eof => {
+                cancel.cancel();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A key reached the live prompt. ESC is the interrupt and takes two
+    /// presses: the first offers it and any other key withdraws the offer, so
+    /// a mistyped ESC cannot end a turn that was nearly done. The flag ends the
+    /// turn between requests; the socket shutdown unblocks the one in flight.
+    fn key(
+        &mut self,
+        key: KeyEvent,
+        screen: &mut ui::Screen,
+        queue: &Queue,
+        cancel: &http::Cancel,
+    ) -> bool {
+        if key.code == KeyCode::Esc {
+            if self.armed {
+                self.interrupted = true;
+                cancel.cancel();
+                screen.set_alert(Some("× Interrupting"));
+            } else {
+                self.armed = true;
+                screen.set_alert(Some("× press ESC again to interrupt"));
+            }
+            return false;
+        }
+        if self.armed {
+            self.armed = false;
+            screen.set_alert(None);
+        }
+        match screen.apply_key(key) {
+            ui::Action::Eof => {
+                cancel.cancel();
+                return true;
+            }
+            ui::Action::Submit => self.submit(screen, queue),
+            // Up: the waiting lines come back to the prompt, above what was
+            // typed, and the frame lets go of them.
+            ui::Action::Recall => self.recall(screen, queue),
+            // The turn already captured its tool set and its history prefix;
+            // the switch is applied at the boundary, after the answer it did
+            // not affect.
+            ui::Action::Explore => self.switch = true,
+            // A chooser only exists while idle.
+            ui::Action::MenuStep(_) | ui::Action::MenuAccept | ui::Action::MenuCancel => {}
+            ui::Action::None => {}
+        }
+        false
+    }
+
+    /// A submitted line. Queued without echoing here: the transcript shows the
+    /// line where the model saw it, which is the round boundary the turn takes
+    /// it at, or the turn's end for a command. A plain request reaches the
+    /// model between rounds; a command needs the session and the screen, so it
+    /// waits for the REPL loop.
+    fn submit(&mut self, screen: &mut ui::Screen, queue: &Queue) {
+        if screen.is_empty() {
+            return;
+        }
+        let line = screen.take();
+        let turn = match parse_command(&line) {
+            Command::Turn(input) => {
+                if let Ok(mut lines) = queue.lock() {
+                    lines.push_back(input);
+                }
+                true
+            }
+            _ => false,
+        };
+        self.queued.push(Pending { line, turn });
+        show_queue(screen, &self.queued);
+    }
+
+    fn recall(&mut self, screen: &mut ui::Screen, queue: &Queue) {
+        let (kept, read) = take_back(queue, &self.queued);
+        self.awaiting += read;
+        self.queued.clear();
+        show_queue(screen, &self.queued);
+        recall_lines(screen, &kept);
+    }
+
+    /// The turn read the oldest line still on the frame. One Up took back was
+    /// read too, so only its echo is due.
+    fn took(&mut self, line: &str, screen: &mut ui::Screen) {
+        if self.awaiting > 0 {
+            self.awaiting -= 1;
+        } else if let Some(at) = self.queued.iter().position(|entry| entry.turn) {
+            self.queued.remove(at);
+            show_queue(screen, &self.queued);
+        }
+        screen.echo_user(line);
+    }
+
+    /// Model text: everything up to the last newline is a finished line.
+    fn printed(&mut self, text: &str, screen: &mut ui::Screen) {
+        // The answer starting is the end of the thought: its unfinished last
+        // line goes out first.
+        let tail = std::mem::take(&mut self.thought);
+        screen.thought(&tail);
+        self.partial.push_str(text);
+        // Lines end at a newline; blank lines at the tail are the separator
+        // before whatever comes next, so they wait. A chunk boundary cannot
+        // then split one paragraph break into two.
+        let tail = self.partial.len() - self.partial.trim_end_matches('\n').len();
+        if tail > 0 {
+            let end = self.partial.len() - (tail - 1);
+            let finished: String = self.partial.drain(..end).collect();
+            if !finished.is_empty() {
+                screen.text(&finished);
+            }
+        }
+        // The unfinished line is not the status: the row says what the turn is
+        // doing, not what it says.
+        screen.set_status("▸ Responding");
+    }
+
+    fn reasoned(&mut self, text: &str, screen: &mut ui::Screen) {
+        self.thought.push_str(text);
+        let finished = match self.thought.rfind('\n') {
+            Some(at) => self.thought.drain(..=at).collect::<String>(),
+            None => String::new(),
+        };
+        screen.thought(&finished);
+    }
+}
+
+// ---- output ----
+
 /// Where a command's output goes. The screen writes it into the transcript;
 /// without a terminal, stdout gets the same text. Only a chooser needs the
 /// screen itself, so the console hands it out and the other arms never ask.
@@ -2358,397 +2163,7 @@ impl Console<'_> {
     }
 }
 
-/// Events from the two producers that never draw: keys, and the turn.
-enum Event {
-    Key(ratatui::crossterm::event::KeyEvent),
-    /// Bracketed paste: inserted at the cursor, never submitted on its own.
-    Paste(String),
-    /// Transcript text: finished model lines, already spaced.
-    Printed(String),
-    /// One tool call and its outcome, as styled spans, and the failure's own
-    /// words when it failed.
-    Echo(Vec<(Paint, String)>, Option<String>),
-    /// A transient label for the status row.
-    Status(String),
-    /// Streamed reasoning, before any answer text.
-    Thought(String),
-    /// A line typed during the turn that the turn has just taken into its
-    /// history: the transcript shows it where the model saw it.
-    User(String),
-    /// The terminal changed size; the live region must repaint.
-    Resize,
-    Done(Result<Option<u64>, String>),
-    Eof,
-}
-
-/// How long a held `[` waits for the rest of a cursor report: a terminal
-/// answers in one burst, a person does not type that fast.
-const REPORT_WINDOW: Duration = Duration::from_millis(50);
-
-/// A report is short (`[24;80R`); a longer run is typing that happens to look
-/// like one at its start.
-const REPORT_MAX: usize = 12;
-
-/// A cursor-position report whose escape was read as a key: ratatui's inline
-/// viewport asks the terminal where the cursor is (at startup, and on every
-/// resize), and the answer — `ESC [ row ; col R` — arrives on stdin. When it
-/// splits, the escape is a key press and the rest reads as typing. A run that
-/// starts with `[` and reads as `[0-9;]*R`, in one burst, is a report and is
-/// dropped; anything else is handed on unchanged.
-#[derive(Default)]
-struct CursorReport {
-    held: Vec<KeyEvent>,
-    started: Option<Instant>,
-}
-
-impl CursorReport {
-    /// The keys to forward. Empty while a report is being swallowed.
-    fn feed(&mut self, key: KeyEvent) -> Vec<KeyEvent> {
-        if self.held.is_empty() {
-            if plain(key, '[') {
-                self.hold(key);
-                return Vec::new();
-            }
-            return vec![key];
-        }
-        if self.expired() {
-            return self.flush(Some(key));
-        }
-        match key.code {
-            KeyCode::Char('R') if plain(key, 'R') => {
-                self.held.clear();
-                self.started = None;
-                Vec::new()
-            }
-            KeyCode::Char(c)
-                if plain(key, c)
-                    && (c.is_ascii_digit() || c == ';')
-                    && self.held.len() < REPORT_MAX =>
-            {
-                self.hold(key);
-                Vec::new()
-            }
-            _ => self.flush(Some(key)),
-        }
-    }
-
-    /// A held `[` that never became a report was typing: hand it over.
-    fn flush_expired(&mut self) -> Vec<KeyEvent> {
-        if self.expired() {
-            return self.flush(None);
-        }
-        Vec::new()
-    }
-
-    fn hold(&mut self, key: KeyEvent) {
-        if self.held.is_empty() {
-            self.started = Some(Instant::now());
-        }
-        self.held.push(key);
-    }
-
-    fn flush(&mut self, key: Option<KeyEvent>) -> Vec<KeyEvent> {
-        self.started = None;
-        let mut keys = std::mem::take(&mut self.held);
-        keys.extend(key);
-        keys
-    }
-
-    fn expired(&self) -> bool {
-        self.started.is_some_and(|at| at.elapsed() > REPORT_WINDOW)
-    }
-}
-
-/// Whether the key types `c` with no control or alt chord. Shift is not a
-/// chord: the report's `R` is uppercase, and a terminal reports it as shifted.
-fn plain(key: KeyEvent, c: char) -> bool {
-    key.code == KeyCode::Char(c)
-        && !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-}
-
-/// The terminal's keys. Nothing else may read stdin.
-fn spawn_input(tx: Sender<Event>) {
-    thread::spawn(move || {
-        use ratatui::crossterm::event::{poll, read, Event as TermEvent};
-        let mut report = CursorReport::default();
-        loop {
-            for key in report.flush_expired() {
-                if tx.send(Event::Key(key)).is_err() {
-                    return;
-                }
-            }
-            // A zero timeout, not `read`: waiting for a key holds crossterm's
-            // event-reader lock, and the screen needs it to ask the terminal
-            // where the cursor is when the prompt wraps. A poll holds it for
-            // microseconds and releases it; input is picked up a few
-            // milliseconds later.
-            match poll(Duration::ZERO) {
-                Ok(true) => {}
-                Ok(false) => {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(_) => break,
-            }
-            match read() {
-                // Key releases (kitty protocol) are not new input.
-                Ok(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
-                    for key in report.feed(key) {
-                        if tx.send(Event::Key(key)).is_err() {
-                            return;
-                        }
-                    }
-                }
-                Ok(TermEvent::Paste(text)) if !text.is_empty() => {
-                    if tx.send(Event::Paste(text)).is_err() {
-                        return;
-                    }
-                }
-                Ok(TermEvent::Resize(_, _)) => {
-                    if tx.send(Event::Resize).is_err() {
-                        return;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-        let _ = tx.send(Event::Eof);
-    });
-}
-
-/// A line submitted mid-turn, waiting for the round boundary that lets it join
-/// the turn. `turn` says the model will read it, which is what Up can take
-/// back; a command waits for the turn's end instead and never enters the turn's
-/// own queue.
-struct Pending {
-    line: String,
-    turn: bool,
-}
-
-/// The queue as the frame draws it: the waiting lines, oldest first.
-fn show_queue(screen: &mut ui::Screen, queue: &[Pending]) {
-    let lines: Vec<String> = queue.iter().map(|entry| entry.line.clone()).collect();
-    screen.set_queued(&lines);
-}
-
-/// What Up takes back: the command lines, which never went to the turn, and the
-/// lines the turn has not drained yet — draining its queue here is what makes
-/// them unsent. The rest were read, and only their echo is borrowed: the count
-/// comes back for the caller to swallow.
-fn take_back(queue: &Queue, queued: &[Pending]) -> (Vec<String>, usize) {
-    let unsent = queue
-        .lock()
-        .map(|mut lines| lines.drain(..).count())
-        .unwrap_or(0);
-    let waiting = queued.iter().filter(|entry| entry.turn).count();
-    let read = waiting.saturating_sub(unsent);
-    let mut kept = Vec::new();
-    let mut seen = 0;
-    for entry in queued {
-        if !entry.turn {
-            kept.push(entry.line.clone());
-            continue;
-        }
-        seen += 1;
-        if seen > read {
-            kept.push(entry.line.clone());
-        }
-    }
-    (kept, read)
-}
-
-/// Put waiting lines back on the prompt, above whatever was typed: they came
-/// first, so the turn would have read them first.
-fn recall_lines(screen: &mut ui::Screen, lines: &[String]) {
-    if lines.is_empty() {
-        return;
-    }
-    let mut text = lines.join("\n");
-    if !screen.is_empty() {
-        let typed = screen.take();
-        text.push('\n');
-        text.push_str(&typed);
-    }
-    screen.insert_text(&text);
-}
-
-/// How often the idle prompt looks for work that finished off the UI thread.
-const IDLE: Duration = Duration::from_millis(100);
-
-/// Wait for work another thread is doing while the prompt stays live: keys are
-/// folded into the line, Esc asks the cancel for it, and the loop ends when the
-/// work is finished. What the thread joined to comes back with the one line
-/// typed while it ran — a panic is `None`, and the caller names it.
-///
-/// `!cmd` and `/compact` wait the same way, which is why this is one function:
-/// the two used to be one loop each, and only one of them took a line.
-fn pump<T>(
-    screen: &mut ui::Screen,
-    rx: &Receiver<Event>,
-    cancel: &http::Cancel,
-    handle: thread::ScopedJoinHandle<'_, T>,
-) -> (Option<T>, Option<String>) {
-    let mut queued: Option<String> = None;
-    loop {
-        match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(Event::Key(key)) if key.code == KeyCode::Esc => {
-                cancel.cancel();
-                screen.set_status("× Interrupting");
-                screen.repaint();
-            }
-            Ok(Event::Key(key)) => match screen.apply_key(key) {
-                ui::Action::Submit if !screen.is_empty() && queued.is_none() => {
-                    queued = Some(screen.take());
-                }
-                ui::Action::Eof => {
-                    cancel.cancel();
-                    break;
-                }
-                _ => {}
-            },
-            Ok(Event::Paste(text)) => screen.insert_text(&text),
-            Ok(Event::Resize) => screen.invalidate(),
-            Ok(Event::Eof) => {
-                cancel.cancel();
-                break;
-            }
-            Ok(_) => {}
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if handle.is_finished() {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                cancel.cancel();
-                break;
-            }
-        }
-        // A setter marked the screen; one paint per event.
-        screen.repaint();
-    }
-    (handle.join().ok(), queued)
-}
-
-/// Collect one line from the prompt. Keys are the only input while idle;
-/// `idle` runs on every tick, so work that finishes on another thread — the
-/// session's title — lands without waiting for a key.
-fn readline(
-    screen: &mut ui::Screen,
-    rx: &Receiver<Event>,
-    idle: &mut dyn FnMut(&mut ui::Screen),
-) -> Option<Input> {
-    screen.repaint();
-    loop {
-        let event = match rx.recv_timeout(IDLE) {
-            Ok(event) => event,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                idle(screen);
-                screen.repaint();
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
-        };
-        match event {
-            Event::Key(key) => match screen.apply_key(key) {
-                ui::Action::Submit if screen.is_empty() => {}
-                ui::Action::Submit => return Some(Input::Line(screen.commit())),
-                ui::Action::Explore => return Some(Input::Explore),
-                ui::Action::MenuStep(delta) => {
-                    screen.menu_move(delta);
-                    screen.repaint();
-                }
-                ui::Action::MenuAccept => return Some(Input::Menu(screen.menu_selected())),
-                ui::Action::MenuCancel => {
-                    // The list stays in the transcript: a chooser that closes
-                    // must not leave blank rows where it was.
-                    screen.clear_menu(true);
-                    screen.repaint();
-                    return Some(Input::Cancel);
-                }
-                ui::Action::Eof => return None,
-                // A queue belongs to a turn, and none is running here.
-                ui::Action::Recall => {}
-                ui::Action::None => {
-                    screen.repaint();
-                }
-            },
-            Event::Paste(text) => {
-                screen.insert_text(&text);
-                screen.repaint();
-            }
-            Event::Resize => {
-                screen.invalidate();
-                screen.repaint();
-            }
-            Event::Eof => return None,
-            // A turn's events cannot arrive while idle; drop them if they do.
-            _ => {}
-        }
-    }
-}
-
-/// The items a query keeps: a case-insensitive substring of the key, which is
-/// what typing matches, never the row with its context window.
-fn narrow(items: &[(String, String)], query: &str) -> Vec<(String, String)> {
-    let query = query.to_lowercase();
-    items
-        .iter()
-        .filter(|(key, _)| key.to_lowercase().contains(&query))
-        .cloned()
-        .collect()
-}
-
-/// Walk a chooser until Enter, Esc or the end of input: the arrows move, a
-/// typed line narrows the list, Enter takes a row. `find` answers a query with
-/// the rows to offer, as (key, row) — the key is what Enter is worth, the row
-/// what the screen draws — and `on` is the key the marker starts on, so a
-/// chooser opens where the session already is. `verb` is what typing does:
-/// `/model` narrows a list, `/sessions` searches one.
-fn choose(
-    screen: &mut ui::Screen,
-    rx: &Receiver<Event>,
-    title: &str,
-    verb: &str,
-    query: &str,
-    on: Option<&str>,
-    find: impl Fn(&str) -> Vec<(String, String)>,
-) -> Option<String> {
-    let mut query = query.trim().to_string();
-    loop {
-        let found = find(&query);
-        if found.is_empty() {
-            // The header is prose for a title; the sentence needs it lower.
-            screen.output(&format!("no {} match {query:?}\n", title.to_lowercase()));
-            query.clear();
-            continue;
-        }
-        let rows: Vec<String> = found.iter().map(|(_, row)| row.clone()).collect();
-        let header = if query.is_empty() {
-            format!("{title} (↑↓ · Enter; type to {verb}; Esc)")
-        } else {
-            format!("{title} matching {query:?} (↑↓ · Enter; type to refine; Esc)")
-        };
-        screen.set_menu(&header, rows, false);
-        if let Some(at) = on.and_then(|key| found.iter().position(|(k, _)| k == key)) {
-            screen.menu_select(at);
-        }
-        match readline(screen, rx, &mut |_| {}) {
-            Some(Input::Menu(at)) => {
-                screen.clear_menu(false);
-                return found.get(at).map(|(key, _)| key.clone());
-            }
-            Some(Input::Cancel) | None => {
-                screen.clear_menu(true);
-                return None;
-            }
-            Some(Input::Line(line)) => query = line.trim().to_string(),
-            Some(Input::Explore) => continue,
-        }
-    }
-}
+// ---- the sinks ----
 
 struct ChannelSink {
     tx: Sender<Event>,
@@ -2838,219 +2253,11 @@ impl Sink for ChannelSink {
     }
 }
 
-fn thinking_label(provider: &config::ProviderConfig, level: &Option<String>) -> String {
-    match level {
-        Some(level) => format!("{level}  (levels: {})", level_names(provider).join(", ")),
-        None => "default (not set)".to_string(),
-    }
-}
-
-fn level_names(provider: &config::ProviderConfig) -> Vec<String> {
-    let mut names: Vec<String> = provider.thinking.iter().map(|(k, _)| k.clone()).collect();
-    if names.is_empty() {
-        names.push("off".to_string());
-    }
-    names
-}
-
-/// Map user input onto a configured level name. Returns the canonical name, so
-/// the config never stores an alias.
-fn set_thinking(provider: &config::ProviderConfig, input: &str) -> Result<String, String> {
-    let names = level_names(provider);
-    names
-        .iter()
-        .find(|name| name.eq_ignore_ascii_case(input))
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "unknown thinking level: {input} (known: {})",
-                names.join(", ")
-            )
-        })
-}
-
-/// Warn once at startup if the config remembers a level the provider dropped.
-fn validate_level(provider: &config::ProviderConfig, level: Option<&str>) {
-    let Some(level) = level else { return };
-    if !level_names(provider).iter().any(|name| name == level) {
-        eprintln!(
-            "axe: {}: thinking level \"{level}\" is not configured, using default",
-            provider.name
-        );
-    }
-}
-
-/// `provider/model`, the pair that answers a turn.
-fn place(providers: &[Provider], provider: usize, model: &str) -> String {
-    format!("{}/{}", providers[provider].name, model)
-}
-
-/// The directory a session runs in, as the info row says it: the home
-/// directory is written `~`, which is the one part of the path that never has
-/// to be read twice.
-fn dir_label(cwd: &std::path::Path) -> String {
-    let text = cwd.display().to_string();
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
-    let home = home.display().to_string();
-    if home.is_empty() || !text.starts_with(&home) {
-        return text;
-    }
-    match &text[home.len()..] {
-        "" => "~".to_string(),
-        // At a boundary: `/home/anonette` is not under `/home/anon`.
-        rest if rest.starts_with('/') => format!("~{rest}"),
-        _ => text,
-    }
-}
-
-fn level(thinking: &Option<String>) -> String {
-    thinking.clone().unwrap_or_else(|| "default".to_string())
-}
-
-/// The window as a whole percent, saturating: a count that overshoots the
-/// window is full, not 140%.
-fn fullness(used: u64, ctx: u64) -> u8 {
-    (used.saturating_mul(100) / ctx.max(1)).min(100) as u8
-}
-
-/// Token counts in three characters where possible: `812`, `34k`, `1.0M`.
-fn scaled(n: u64) -> String {
-    match n {
-        0..=9_999 => n.to_string(),
-        10_000..=999_999 => format!("{}k", n / 1_000),
-        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
-    }
-}
-
-/// Whole percent, with `<1%` for a history that is started but rounds to zero:
-/// true on a million-token window, and `0%` would read as empty.
-fn percent(used: u64, ctx: u64) -> String {
-    let ctx = ctx.max(1);
-    match used * 100 / ctx {
-        0 if used > 0 => "<1%".to_string(),
-        n => format!("{n}%"),
-    }
-}
-
-/// Splash, printed once above the live region: block letters for `axe`. It
-/// lands in the transcript and is never repainted, so it must be narrower than
-/// the terminal's margin-to-margin width on a narrow window.
-const LOGO: &[&str] = &[" ▄▄▄  ▄▄ ▄▄ ▄▄▄▄▄", "██▀██ ▀█▄█▀ ██▄▄", "██▀██ ██ ██ ██▄▄▄"];
-
-/// What `/sessions` says where this directory has none, with a terminal and
-/// without one: a session is what the first request starts, and the empty list
-/// is the only place that has to say so.
-const NO_SESSIONS: &str =
-    "no sessions in this directory\n  one begins with the first request; /new starts another\n";
-
-/// The one line a directory with no sessions gets. The box's colour and the
-/// `read-only` piece say what the mode is; neither says where to start, and the
-/// keys that open the rest of the interface are named nowhere else on screen. A
-/// directory with sessions to resume gets the chooser instead, whose header
-/// carries its own keys.
-fn first_run_note(mode: tools::Mode) -> &'static str {
-    if mode.explore() {
-        "read-only: /explore to write · /help · ↑ history · Tab completes"
-    } else {
-        "/help · ↑ history · Tab completes"
-    }
-}
-
-fn banner(notes: &[String]) {
-    // One leading blank: the same margin `ui::Screen` keeps on both edges.
-    println!();
-    let width = terminal::size().map(|(width, _)| width).unwrap_or(0);
-    let logo_width = LOGO
-        .iter()
-        .map(|line| line.chars().count() as u16)
-        .max()
-        .unwrap_or(0);
-    // The block logo must fit between the margins; a narrow terminal gets the
-    // one-word mark instead of a wrapped banner.
-    let logo: &[&str] = if width == 0 || width > logo_width {
-        LOGO
-    } else {
-        &["axe"]
-    };
-    // The release rides the mark's second row; the one-word fallback has no
-    // second row, so it takes the one it has.
-    let version_row = (logo.len() - 1).min(1);
-    for (i, line) in logo.iter().enumerate() {
-        let mut out = Paint::Cyan.ansi(line);
-        if i == version_row {
-            out.push_str("   ");
-            out.push_str(&Paint::Dim.ansi(env!("CARGO_PKG_VERSION")));
-        }
-        println!(" {}", out);
-    }
-    if !notes.is_empty() {
-        println!();
-        for note in notes {
-            println!(" {}", Paint::Dim.ansi(note));
-        }
-    }
-    println!();
-}
-
-fn session_id() -> String {
-    let mut bytes = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        if f.read_exact(&mut bytes).is_ok() {
-            return bytes.iter().map(|b| format!("{b:02x}")).collect();
-        }
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{:x}{:x}", std::process::id(), nanos)
-}
-
-fn models(providers: &[Provider]) -> String {
-    let mut text = String::new();
-    for p in providers {
-        text.push_str(&format!("{}:\n", p.name));
-        for m in &p.models {
-            match m.context {
-                Some(ctx) => text.push_str(&format!("  {}/{}  ({} ctx)\n", p.name, m.id, ctx)),
-                None => text.push_str(&format!("  {}/{}\n", p.name, m.id)),
-            }
-        }
-    }
-    text
-}
-
-fn find(providers: &[Provider], spec: &str) -> Option<(usize, String)> {
-    if let Some((pname, mid)) = spec.split_once('/') {
-        if let Some(pi) = providers.iter().position(|p| p.name == pname) {
-            if providers[pi].models.iter().any(|m| m.id == mid) {
-                return Some((pi, mid.to_string()));
-            }
-        }
-    }
-    for (pi, p) in providers.iter().enumerate() {
-        if p.models.iter().any(|m| m.id == spec) {
-            return Some((pi, spec.to_string()));
-        }
-    }
-    None
-}
-
-fn resolve(providers: &[Provider], spec: Option<&str>) -> (usize, String) {
-    if let Some(spec) = spec {
-        if let Some(hit) = find(providers, spec) {
-            return hit;
-        }
-        eprintln!("axe: model {spec:?} not available, using default");
-    }
-    (0, providers[0].models[0].id.clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use ratatui::crossterm::event::KeyModifiers;
 
     use crate::text::oneline;
 
@@ -3058,37 +2265,6 @@ mod tests {
     /// anything that asserts on them.
     fn info_text(session: &Session) -> String {
         ui::info_text(&session.info())
-    }
-
-    #[test]
-    fn a_chooser_query_narrows_by_spec_not_by_row() {
-        let items = vec![
-            (
-                "deepseek/deepseek-chat".to_string(),
-                "deepseek/deepseek-chat  (128000 ctx)".to_string(),
-            ),
-            ("local/qwen3".to_string(), "local/qwen3".to_string()),
-            (
-                "opencode-go/big".to_string(),
-                "opencode-go/big  (200000 ctx)".to_string(),
-            ),
-        ];
-        let keys = |query: &str| -> Vec<String> {
-            narrow(&items, query)
-                .into_iter()
-                .map(|(key, _)| key)
-                .collect()
-        };
-        assert_eq!(
-            keys(""),
-            vec!["deepseek/deepseek-chat", "local/qwen3", "opencode-go/big"]
-        );
-        assert_eq!(keys("DEEP"), vec!["deepseek/deepseek-chat"]);
-        assert_eq!(keys("local"), vec!["local/qwen3"]);
-        assert_eq!(keys("go/"), vec!["opencode-go/big"]);
-        // The context window is drawn, not searched.
-        assert!(keys("ctx").is_empty());
-        assert!(keys("open/code").is_empty());
     }
 
     #[test]
@@ -3250,14 +2426,14 @@ mod tests {
         for needle in ["Tab", "Ctrl+R", "Shift+Tab", "keys"] {
             assert!(HELP.contains(needle), "{needle} missing from HELP");
         }
-        let explore = first_run_note(tools::Mode::Explore);
+        let explore = startup::first_run_note(tools::Mode::Explore);
         assert!(explore.contains("/explore"), "{explore}");
-        for note in [explore, first_run_note(tools::Mode::Normal)] {
+        for note in [explore, startup::first_run_note(tools::Mode::Normal)] {
             assert!(note.contains("/help") && note.contains("Tab"), "{note}");
         }
         // Normal mode has no write tool to explain, so the note must not name
         // the toggle that would turn one on.
-        assert!(!first_run_note(tools::Mode::Normal).contains("/explore"));
+        assert!(!startup::first_run_note(tools::Mode::Normal).contains("/explore"));
     }
 
     #[test]
@@ -3278,47 +2454,9 @@ mod tests {
 
     #[test]
     fn session_ids_are_32_hex_chars() {
-        let id = session_id();
+        let id = startup::session_id();
         assert_eq!(id.len(), 32);
         assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
-    }
-
-    /// The keys a screen would receive for `text`, as characters.
-    fn report_through(report: &mut CursorReport, text: &str) -> String {
-        let mut out = String::new();
-        for c in text.chars() {
-            let modifiers = if c.is_uppercase() {
-                KeyModifiers::SHIFT
-            } else {
-                KeyModifiers::NONE
-            };
-            for key in report.feed(KeyEvent::new(KeyCode::Char(c), modifiers)) {
-                if let KeyCode::Char(c) = key.code {
-                    out.push(c);
-                }
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn a_split_cursor_report_is_not_typing() {
-        let mut report = CursorReport::default();
-        // The escape was read as a key press; the rest is the report.
-        assert_eq!(report_through(&mut report, "[18;1R"), "");
-        // The next keys are typing again.
-        assert_eq!(report_through(&mut report, "hi"), "hi");
-    }
-
-    #[test]
-    fn typing_that_starts_like_a_report_is_kept() {
-        let mut report = CursorReport::default();
-        assert_eq!(report_through(&mut report, "[x"), "[x");
-        assert_eq!(report_through(&mut report, "[1]"), "[1]");
-        // A run that stops matching comes through whole, in order.
-        assert_eq!(report_through(&mut report, "[18;1x"), "[18;1x");
-        // Plain text never waits.
-        assert_eq!(report_through(&mut report, "hello"), "hello");
     }
 
     #[test]
@@ -3356,19 +2494,19 @@ mod tests {
             }],
         };
         assert_eq!(
-            find(std::slice::from_ref(&provider), "p/m"),
+            startup::find(std::slice::from_ref(&provider), "p/m"),
             Some((0, "m".into()))
         );
         assert_eq!(
-            find(std::slice::from_ref(&provider), "m"),
+            startup::find(std::slice::from_ref(&provider), "m"),
             Some((0, "m".into()))
         );
         assert_eq!(
-            resolve(std::slice::from_ref(&provider), Some("p/m")),
+            startup::resolve(std::slice::from_ref(&provider), Some("p/m")),
             (0, "m".into())
         );
         assert_eq!(
-            resolve(std::slice::from_ref(&provider), Some("missing")),
+            startup::resolve(std::slice::from_ref(&provider), Some("missing")),
             (0, "m".into())
         );
     }
@@ -3758,45 +2896,6 @@ mod tests {
     /// The pair a turn's events travel on.
     fn events() -> (Sender<Event>, Receiver<Event>) {
         mpsc::channel()
-    }
-
-    #[test]
-    fn up_takes_back_only_the_lines_the_turn_has_not_read() {
-        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
-        let queued = [
-            Pending {
-                line: "read".into(),
-                turn: true,
-            },
-            Pending {
-                line: "/help".into(),
-                turn: false,
-            },
-            Pending {
-                line: "waiting".into(),
-                turn: true,
-            },
-        ];
-        queue.lock().unwrap().push_back("waiting".into());
-        let (kept, read) = take_back(&queue, &queued);
-        assert_eq!(kept, vec!["/help", "waiting"]);
-        assert_eq!(read, 1, "one line was read and its echo is still owed");
-        assert!(queue.lock().unwrap().is_empty(), "the rest is taken back");
-    }
-
-    #[test]
-    fn a_recalled_queue_lands_above_what_was_typed() {
-        let mut screen = ui::Screen::test_screen(40, 10);
-        screen.insert_text("typed");
-        recall_lines(&mut screen, &["one".to_string(), "two".to_string()]);
-        // The waiting lines came first, so they would have been read first.
-        assert_eq!(screen.take(), "one\ntwo\ntyped");
-        // Nothing typed: the queue is the whole line, and nothing is inserted
-        // for an empty one.
-        recall_lines(&mut screen, &["only".to_string()]);
-        assert_eq!(screen.take(), "only");
-        recall_lines(&mut screen, &[]);
-        assert!(screen.is_empty());
     }
 
     #[test]
@@ -4323,8 +3422,8 @@ mod tests {
     fn the_banner_prints_a_plain_mark_when_the_terminal_is_narrow() {
         // No terminal in the test: the width is unknown and the block logo is
         // the fallback, and the notes follow it.
-        banner(&["a note".to_string()]);
-        banner(&[]);
+        startup::banner(&["a note".to_string()]);
+        startup::banner(&[]);
     }
 
     fn down(code: KeyCode) -> Event {

@@ -80,6 +80,8 @@ const ERROR_STYLE: Style = Paint::Red.style();
 /// which says the tool set is read-only.
 const CAUTION: Style = Paint::Yellow.style();
 
+// ---- the pieces a caller names ----
+
 /// The cells between two pieces of the info row.
 pub const SEP: &str = "  ·  ";
 
@@ -152,6 +154,8 @@ pub enum Block {
     Tool,
 }
 
+// ---- keys and actions ----
+
 /// What a key asked the caller to do.
 pub enum Action {
     /// Nothing to submit.
@@ -172,6 +176,8 @@ pub enum Action {
     /// End of input.
     Eof,
 }
+
+// ---- the live frame ----
 
 /// A chooser above the prompt: startup's recent sessions, `/sessions`, and the
 /// models and levels `/model` and `/thinking` pick from.
@@ -375,6 +381,8 @@ impl Frame {
     }
 }
 
+// ---- the terminal ----
+
 enum Term {
     Real(Terminal<Tail<Stdout>>),
     #[cfg(test)]
@@ -503,6 +511,8 @@ impl Term {
         Ok(())
     }
 }
+
+// ---- the screen ----
 
 pub struct Screen {
     term: Term,
@@ -1910,6 +1920,8 @@ impl Drop for Screen {
     }
 }
 
+// ---- layout and painting ----
+
 /// Lay the prompt buffer out at `width` cells. Returns the rows and the cursor
 /// as (row, column). A buffer that fills a row to its last cell puts the cursor
 /// on the next, empty one: the text broke there, so the cursor did too.
@@ -2118,6 +2130,8 @@ pub(crate) fn split(text: &str) -> Vec<&str> {
     }
     lines
 }
+
+// ---- without a tty ----
 
 /// Read one line with cooked input. Used when stdin or stdout is not a tty:
 /// there is no terminal to own, so the kernel does the editing, and nothing is

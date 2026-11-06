@@ -19,6 +19,8 @@ use serde_json::{json, Value};
 
 use crate::state;
 
+// ---- a session on disk ----
+
 /// Bodies kept plain. Older ones are compressed on startup: they still list
 /// and answer searches through title and summary.
 pub const KEEP: usize = 30;
@@ -127,6 +129,8 @@ impl Meta {
     }
 }
 
+// ---- listing and loading ----
+
 /// Every readable meta, newest activity first. A malformed sidecar is skipped:
 /// one broken session must not hide the others.
 pub fn list(cwd: &Path) -> Vec<Meta> {
@@ -190,6 +194,8 @@ impl Log {
             .map_err(|e| format!("append session: {e}"))
     }
 }
+
+// ---- compaction ----
 
 /// The marker a compacted body carries. The message under it is the summary the
 /// session continues from, and the count says how many messages it replaced.
@@ -289,6 +295,8 @@ fn unpack(dir: &Path, meta: &mut Meta, gz: &Path, plain: &Path) -> Result<(), St
     Ok(())
 }
 
+// ---- archiving ----
+
 /// Compress the bodies older than `keep`. Best-effort: a failure is reported
 /// and the next startup tries again.
 pub fn archive_old(cwd: &Path, keep: usize) {
@@ -382,6 +390,8 @@ fn gzip(args: &[&OsStr], out: &Path) -> Result<(), String> {
     Err(err)
 }
 
+// ---- search ----
+
 /// One search hit: the session's position in the caller's slice, and a line
 /// from the place that matched.
 pub struct Hit {
@@ -473,6 +483,8 @@ fn snip(text: &str, terms: &[String]) -> String {
         .unwrap_or("");
     collapse(line, 100)
 }
+
+// ---- text ----
 
 /// One line, whitespace collapsed, capped.
 pub fn collapse(text: &str, max: usize) -> String {

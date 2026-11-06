@@ -1,9 +1,9 @@
 //! Markdown.
 //!
-//! The parser is a port of `md.ts`: same block and inline rules, same limits,
-//! same URL check, same entity table, so the two cannot drift apart in
-//! behavior. The renderer is ours: blocks to transcript lines, wrapped at a
-//! given width, 0 meaning unbounded.
+//! The parser reads markdown into blocks and inlines, with the limits, the
+//! URL check and the entity table this transcript needs. The renderer turns
+//! blocks into transcript lines, wrapped at a given width, 0 meaning
+//! unbounded.
 //!
 //! `Stream` adapts the document parser to a stream of lines. Lines are held
 //! until the block they belong to ends, because laying a block out needs all

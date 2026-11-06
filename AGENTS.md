@@ -16,7 +16,7 @@ invariants a change must not break.
    insufficient. MCP servers are the one addition on that list: they are the
    only way to give the model a capability axe will never build in, and they
    are additive — no built-in tool moves behind one. One feature per change.
-3. **Small surface.** Twenty modules; a new module needs a separate concern,
+3. **Small surface.** Twenty-two modules; a new module needs a separate concern,
    not a line count.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` +
    SSE only. Express differences as config (`base_url`, `models_url`,
@@ -140,11 +140,18 @@ invariants a change must not break.
 
 ## Architecture
 
-- `main.rs` — REPL, provider setup, model and thinking selection (a chooser
-  that typing narrows; no argument completion, because Enter would take the
-  candidate), session lifecycle (startup chooser, `/sessions`, `/new`, naming),
-  agent loop. Two producers (keys, a turn)
-  feed one `mpsc` channel; the main thread applies events and draws once per batch.
+- `main.rs` — what a session is: the lifecycle (startup chooser, `/sessions`,
+  `/new`, naming), model and thinking selection (a chooser that typing narrows;
+  no argument completion, because Enter would take the candidate), slash
+  commands, the agent loop, and the two sinks. Two producers (keys, a turn) feed
+  one `mpsc` channel; the main thread applies events and draws once per batch.
+- `repl.rs` — the terminal's line loop: the key thread and the cursor-report
+  filter, `readline`, the chooser's keys, `pump` for work behind a live prompt,
+  and the queue the frame draws while a turn runs.
+- `startup.rs` — the process bootstrap: config, providers, instructions,
+  skills, the MCP start, the splash, and the session the first line runs. The
+  model-selection strings the info row and the choosers report are here too,
+  because this is where the choice is made.
 - `prompt.rs` — the system prompt: the built-in rules, then the instructions and
   the skills catalogue, built once as the prefix every request shares.
 - `store.rs` — the session on disk and the live history that feeds it: one
