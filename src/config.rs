@@ -442,4 +442,87 @@ mod tests {
         assert!(read_agents(&dir.join("missing.md")).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    use crate::state::testenv;
+
+    #[test]
+    fn the_first_run_writes_the_example_and_says_so() {
+        testenv::home("config-first-run", |_home| {
+            let err = load().err().unwrap();
+            assert!(err.contains("created default config"), "{err}");
+            let file = path();
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert!(text.contains("\"providers\""), "the example is the file");
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "it can hold keys, so only its owner reads it");
+            // The example parses, so the next run is a config like any other.
+            let cfg = load().unwrap();
+            assert!(cfg.providers.len() >= 3);
+        });
+    }
+
+    #[test]
+    fn a_broken_config_names_itself() {
+        testenv::home("config-broken", |_home| {
+            let file = path();
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "{ nope").unwrap();
+            let err = load().err().unwrap();
+            assert!(err.contains("invalid JSON"), "{err}");
+            assert!(err.contains("config.json"), "{err}");
+
+            std::fs::write(&file, r#"{"providers": {"p": {}}}"#).unwrap();
+            let err = load().err().unwrap();
+            assert!(err.contains("missing \"base_url\""), "{err}");
+        });
+    }
+
+    #[test]
+    fn paths_expand_and_follow_the_config_file() {
+        testenv::home("config-paths", |home| {
+            assert_eq!(resolve_path("~"), home);
+            assert_eq!(resolve_path("~/skills"), home.join("skills"));
+            let abs = Path::new("/opt/skills");
+            assert_eq!(resolve_path("/opt/skills"), abs);
+            let cfg = parse_value(&serde_json::json!({
+                "base_url": "http://p",
+                "skills": ["relative"],
+                "agents": "~/AGENTS.md"
+            }))
+            .unwrap();
+            assert_eq!(
+                cfg.skills[0],
+                path().parent().unwrap().join("relative"),
+                "a relative path is relative to the config file"
+            );
+            assert_eq!(
+                cfg.agents.as_deref(),
+                Some(home.join("AGENTS.md").as_path())
+            );
+        });
+    }
+
+    #[test]
+    fn an_agents_file_is_skipped_when_empty_or_cut_when_huge() {
+        let dir = testenv::dir("config-agents");
+        let empty = dir.join("empty.md");
+        std::fs::write(&empty, " \n\n ").unwrap();
+        assert!(
+            read_agents(&empty).is_none(),
+            "whitespace is no instructions"
+        );
+
+        let big = dir.join("big.md");
+        std::fs::write(&big, "é".repeat(AGENTS_LIMIT / 2 + 10)).unwrap();
+        let text = read_agents(&big).expect("truncated, not dropped");
+        assert!(text.len() <= AGENTS_LIMIT, "{}", text.len());
+        assert!(text.chars().all(|c| c == 'é'), "cut on a char boundary");
+
+        let unreadable = dir.join("unreadable.md");
+        std::fs::write(&unreadable, "secret").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(read_agents(&unreadable).is_none());
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

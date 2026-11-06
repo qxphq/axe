@@ -328,6 +328,54 @@ impl State {
     }
 }
 
+/// A scratch home for the tests that read the environment. The state, config
+/// and skills paths all derive from `HOME`, `XDG_STATE_HOME` and
+/// `XDG_CONFIG_HOME`, and the environment is the process's: the tests that
+/// change it run one at a time under this lock, and everything they write lands
+/// inside the directory and is removed with it.
+#[cfg(test)]
+pub(crate) mod testenv {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    fn lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// A directory named for the test, emptied first.
+    pub fn dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("axe-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        dir
+    }
+
+    /// Run `f` with a scratch home, a scratch state root and a scratch config
+    /// root, so a test's writes land there and nowhere else.
+    pub fn home<T>(name: &str, f: impl FnOnce(&Path) -> T) -> T {
+        let _held = lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = dir(name);
+        let saved: Vec<(&str, Option<OsString>)> = ["HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME"]
+            .iter()
+            .map(|var| (*var, std::env::var_os(var)))
+            .collect();
+        std::env::set_var("HOME", &dir);
+        std::env::set_var("XDG_STATE_HOME", dir.join("state"));
+        std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
+        let out = f(&dir);
+        for (var, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +483,93 @@ mod tests {
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&file), 0o600);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_state_file_roundtrips_under_the_state_home() {
+        testenv::home("state-roundtrip", |home| {
+            let cwd = home.join("work");
+            fs::create_dir_all(&cwd).unwrap();
+            let mut state = State {
+                cwd: cwd.clone(),
+                ..State::default()
+            };
+            state.set_model("prov/model");
+            state.set_thinking("prov/model", "high");
+            state.thoughts = true;
+            state.save().unwrap();
+
+            let loaded = load(&cwd);
+            assert_eq!(loaded.model.as_deref(), Some("prov/model"));
+            assert_eq!(loaded.thinking_for("prov/model").as_deref(), Some("high"));
+            assert!(loaded.thoughts);
+            assert_eq!(loaded.cwd, cwd);
+
+            let mode =
+                |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&project(&cwd)), 0o700);
+            assert_eq!(mode(&file(&cwd)), 0o600);
+        });
+    }
+
+    #[test]
+    fn a_missing_or_broken_state_file_is_a_fresh_start() {
+        testenv::home("state-broken", |home| {
+            let cwd = home.join("work");
+            let fresh = load(&cwd);
+            assert!(fresh.model.is_none() && fresh.thinking.is_empty() && !fresh.thoughts);
+
+            fs::create_dir_all(project(&cwd)).unwrap();
+            fs::write(file(&cwd), "{ not json").unwrap();
+            assert!(load(&cwd).model.is_none());
+
+            // Fields that are absent keep their defaults; what is there is read.
+            fs::write(
+                file(&cwd),
+                r#"{"thoughts": true, "model": "", "thinking": {"a/b": "low", "c/d": 3}}"#,
+            )
+            .unwrap();
+            let loaded = load(&cwd);
+            assert!(loaded.model.is_none(), "an empty model is no model");
+            assert!(loaded.thoughts);
+            assert_eq!(loaded.thinking_for("a/b").as_deref(), Some("low"));
+            assert!(loaded.thinking_for("c/d").is_none(), "a level is a string");
+        });
+    }
+
+    #[test]
+    fn saving_nowhere_is_a_no_op() {
+        assert!(State::default().save().is_ok());
+    }
+
+    #[test]
+    fn the_prompt_history_lives_under_the_project() {
+        testenv::home("state-history", |home| {
+            let cwd = home.join("work");
+            fs::create_dir_all(&cwd).unwrap();
+            assert!(read_history(&cwd).is_empty());
+            append_history(&cwd, "first").unwrap();
+            append_history(&cwd, "second").unwrap();
+            append_history(&cwd, "second").unwrap();
+            assert_eq!(
+                read_history(&cwd),
+                vec!["first".to_string(), "second".to_string()]
+            );
+            assert!(history(&cwd).is_file());
+            // An empty cwd remembers nothing and reads nothing.
+            assert!(append_history(Path::new(""), "x").is_ok());
+            assert!(read_history(Path::new("")).is_empty());
+        });
+    }
+
+    #[test]
+    fn a_long_key_becomes_a_hash() {
+        let deep = Path::new("/x").join("y".repeat(400));
+        let long = key(&deep);
+        assert!(long.len() <= 200, "{long}");
+        assert!(!long.contains('/'));
+        // The same path always keys the same directory.
+        assert_eq!(long, key(&deep));
+        assert_ne!(long, key(&Path::new("/x").join("z".repeat(400))));
     }
 }

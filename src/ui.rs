@@ -584,7 +584,7 @@ impl Screen {
     /// terminal, the transcript above it, and a scrollback the backend keeps.
     /// Everything `fit` does to a real terminal it does here too.
     #[cfg(test)]
-    fn test_screen(width: u16, height: u16) -> Screen {
+    pub(crate) fn test_screen(width: u16, height: u16) -> Screen {
         let rows = Frame::layout(height, Mode::Idle, Shown::default())
             .height()
             .clamp(1, height);
@@ -642,7 +642,7 @@ impl Screen {
     /// This is what a test asserts on. What is still on screen is only the tail
     /// of it.
     #[cfg(test)]
-    fn transcript(&mut self) -> Vec<String> {
+    pub(crate) fn transcript(&mut self) -> Vec<String> {
         let top = self.term.area().top() as usize;
         let Term::Test(term) = &self.term else {
             unreachable!()
@@ -3231,5 +3231,252 @@ mod tests {
         screen.error("red text\n");
         screen.echo_user("user **markdown**");
         screen.flush();
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn alt(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn every_editing_binding_touches_the_line_it_names() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.insert_text("one two three");
+        screen.apply_key(key(KeyCode::Home));
+        assert_eq!(screen.ed.cursor, 0);
+        screen.apply_key(key(KeyCode::End));
+        assert_eq!(screen.ed.cursor, 13);
+        screen.apply_key(key(KeyCode::Left));
+        assert_eq!(screen.ed.cursor, 12);
+        screen.apply_key(key(KeyCode::Right));
+        assert_eq!(screen.ed.cursor, 13);
+        screen.apply_key(key(KeyCode::Right));
+        assert_eq!(screen.ed.cursor, 13, "the end is the end");
+        screen.apply_key(ctrl('b'));
+        assert_eq!(screen.ed.cursor, 12);
+        screen.apply_key(ctrl('f'));
+        assert_eq!(screen.ed.cursor, 13);
+        screen.apply_key(ctrl('a'));
+        assert_eq!(screen.ed.cursor, 0);
+        screen.apply_key(ctrl('e'));
+        assert_eq!(screen.ed.cursor, 13);
+        screen.apply_key(alt(KeyCode::Char('b')));
+        assert_eq!(screen.ed.cursor, 8, "a word back from the end");
+        screen.apply_key(alt(KeyCode::Char('f')));
+        assert_eq!(screen.ed.cursor, 13);
+        screen.apply_key(alt(KeyCode::Left));
+        assert_eq!(screen.ed.cursor, 8);
+        screen.apply_key(alt(KeyCode::Right));
+        assert_eq!(screen.ed.cursor, 13);
+
+        // Kills, yanks and transposes, through the same keys readline uses.
+        screen.apply_key(ctrl('w'));
+        assert_eq!(screen.ed.buf, "one two ");
+        screen.apply_key(ctrl('y'));
+        assert_eq!(screen.ed.buf, "one two three");
+        screen.apply_key(ctrl('u'));
+        assert_eq!(screen.ed.buf, "");
+        screen.apply_key(ctrl('a'));
+        screen.insert_text("alpha beta");
+        screen.apply_key(alt(KeyCode::Char('t')));
+        assert_eq!(screen.ed.buf, "beta alpha");
+        screen.apply_key(ctrl('t'));
+        assert_eq!(screen.ed.buf, "beta alpah");
+        screen.apply_key(alt(KeyCode::Backspace));
+        assert_eq!(screen.ed.buf, "beta ");
+        screen.apply_key(alt(KeyCode::Char('d')));
+        assert_eq!(screen.ed.buf, "beta ");
+        screen.apply_key(ctrl('k'));
+        assert_eq!(screen.ed.buf, "beta ");
+        screen.apply_key(key(KeyCode::Home));
+        screen.apply_key(key(KeyCode::Delete));
+        assert_eq!(screen.ed.buf, "eta ");
+        screen.apply_key(key(KeyCode::Backspace));
+        assert_eq!(screen.ed.buf, "eta ", "nothing before the start");
+    }
+
+    #[test]
+    fn the_keys_that_leave_the_line_ask_for_what_they_mean() {
+        let mut screen = Screen::test_screen(40, 10);
+        assert!(matches!(
+            screen.apply_key(key(KeyCode::BackTab)),
+            Action::Explore
+        ));
+        assert!(matches!(screen.apply_key(ctrl('d')), Action::Eof));
+        screen.insert_text("text");
+        screen.ed.cursor = 2;
+        assert!(matches!(screen.apply_key(ctrl('d')), Action::None));
+        assert_eq!(screen.ed.buf, "tet", "with a line, Ctrl-D deletes");
+        screen.apply_key(ctrl('c'));
+        assert_eq!(screen.ed.buf, "", "Ctrl-C drops what was typed");
+        screen.insert_text("a line");
+        screen.apply_key(alt(KeyCode::Enter));
+        assert_eq!(screen.ed.buf, "a line\n", "Alt-Enter is a new line");
+        screen.apply_key(ctrl('j'));
+        assert_eq!(screen.ed.buf, "a line\n\n");
+        assert!(matches!(
+            screen.apply_key(key(KeyCode::Enter)),
+            Action::Submit
+        ));
+        // Submitting is the caller's to finish: the line is taken, not cleared.
+        screen.take();
+        // A key with no binding is nothing, and does not eat the line.
+        screen.insert_text("kept");
+        assert!(matches!(
+            screen.apply_key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Action::None
+        ));
+        assert_eq!(screen.ed.buf, "kept");
+    }
+
+    #[test]
+    fn a_reverse_search_walks_the_history_and_gives_it_back() {
+        let mut screen = Screen::test_screen(40, 10);
+        // No history: Ctrl-R opens nothing.
+        screen.apply_key(ctrl('r'));
+        assert!(screen.recall.search.is_none());
+
+        screen.set_history(vec![
+            "make build".into(),
+            "cargo test".into(),
+            "git status".into(),
+        ]);
+        screen.insert_text("draft");
+        screen.apply_key(ctrl('r'));
+        assert_eq!(
+            screen.search_label().as_deref(),
+            Some("reverse-i-search: (type to search)")
+        );
+        screen.apply_key(key(KeyCode::Char('t')));
+        assert_eq!(screen.ed.buf, "git status", "the newest match");
+        assert_eq!(
+            screen.search_label().as_deref(),
+            Some("reverse-i-search: t [1/2]")
+        );
+        screen.apply_key(ctrl('r'));
+        assert_eq!(screen.ed.buf, "cargo test", "the one above it");
+        assert_eq!(
+            screen.search_label().as_deref(),
+            Some("reverse-i-search: t [2/2]")
+        );
+        screen.apply_key(ctrl('r'));
+        assert_eq!(screen.ed.buf, "cargo test", "the oldest match is the last");
+        // Backspace empties the query, and the draft comes back.
+        screen.apply_key(key(KeyCode::Backspace));
+        assert_eq!(screen.ed.buf, "draft");
+        assert_eq!(
+            screen.search_label().as_deref(),
+            Some("reverse-i-search: (type to search)")
+        );
+        // A query with no match leaves the line where it was.
+        screen.apply_key(key(KeyCode::Char('z')));
+        assert_eq!(
+            screen.search_label().as_deref(),
+            Some("reverse-i-search: z (no match)")
+        );
+        screen.apply_key(key(KeyCode::Esc));
+        assert!(screen.recall.search.is_none());
+        assert_eq!(screen.ed.buf, "draft", "Esc gives the draft back");
+
+        // Enter keeps the match on the line, unsubmitted.
+        screen.apply_key(ctrl('r'));
+        screen.apply_key(key(KeyCode::Char('c')));
+        assert_eq!(screen.ed.buf, "cargo test");
+        assert!(matches!(
+            screen.apply_key(key(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(screen.recall.search.is_none());
+        assert_eq!(screen.ed.buf, "cargo test");
+
+        // A key the search does not take ends it and edits the line.
+        screen.apply_key(ctrl('r'));
+        screen.apply_key(key(KeyCode::Left));
+        assert!(screen.recall.search.is_none());
+        assert_eq!(screen.ed.cursor, 9);
+    }
+
+    #[test]
+    fn a_chooser_takes_the_keys_it_owns_and_not_the_others() {
+        let mut screen = Screen::test_screen(40, 18);
+        screen.set_menu(
+            "Pick a session",
+            vec!["first".into(), "second".into(), "third".into()],
+            false,
+        );
+        screen.draw().unwrap();
+        assert!(matches!(
+            screen.apply_key(key(KeyCode::Up)),
+            Action::MenuStep(-1)
+        ));
+        assert!(matches!(
+            screen.apply_key(key(KeyCode::Down)),
+            Action::MenuStep(1)
+        ));
+        assert!(matches!(
+            screen.apply_key(key(KeyCode::Enter)),
+            Action::MenuAccept
+        ));
+        assert!(matches!(
+            screen.apply_key(key(KeyCode::Esc)),
+            Action::MenuCancel
+        ));
+        // The selection clamps at both ends.
+        screen.menu_select(99);
+        assert_eq!(screen.menu_selected(), 2);
+        screen.menu_move(5);
+        assert_eq!(screen.menu_selected(), 2);
+        screen.menu_move(-5);
+        assert_eq!(screen.menu_selected(), 0);
+
+        // With a line typed, Enter submits it rather than accepting the menu.
+        screen.insert_text("typed");
+        assert!(matches!(
+            screen.apply_key(key(KeyCode::Enter)),
+            Action::Submit
+        ));
+
+        // Closing without committing leaves nothing in the transcript.
+        let mut screen = Screen::test_screen(40, 18);
+        screen.set_menu("Pick", vec!["row".into()], false);
+        screen.draw().unwrap();
+        screen.clear_menu(false);
+        assert!(screen.menu.is_none());
+        assert!(!screen.transcript().iter().any(|row| row.contains("row")));
+
+        // Closing with the rows committed leaves them, without a marker.
+        let mut screen = Screen::test_screen(40, 18);
+        screen.set_menu("Pick", vec!["kept row".into()], false);
+        screen.draw().unwrap();
+        screen.clear_menu(true);
+        let rows = screen.transcript();
+        assert!(rows.iter().any(|row| row.contains("kept row")), "{rows:?}");
+        // A menu of no rows is no menu at all.
+        screen.set_menu("Empty", Vec::new(), false);
+        assert!(screen.menu.is_none());
+    }
+
+    #[test]
+    fn a_prompt_that_is_not_a_terminal_is_one_cooked_line() {
+        // The test binary's stdin is at its end, so the line is over.
+        assert!(cooked_line("prompt> ").is_none());
+    }
+
+    #[test]
+    fn closing_twice_gives_the_terminal_back_once() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.close();
+        screen.close();
+        assert!(screen.restored);
     }
 }

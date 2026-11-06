@@ -1709,4 +1709,291 @@ mod tests {
         assert_eq!(text("## Title ##"), "Title");
         assert!(text("---").contains("─"));
     }
+
+    #[test]
+    fn entities_decode_only_when_they_are_ones() {
+        let at0 = |text: &str| {
+            let c: Vec<char> = text.chars().collect();
+            entity_at(&c, 0)
+        };
+        assert_eq!(at0("&amp;"), Some(('&', 5)));
+        assert_eq!(at0("&nbsp;"), Some(('\u{a0}', 6)));
+        assert_eq!(at0("&#65;"), Some(('A', 5)));
+        assert_eq!(at0("&#x42;"), Some(('B', 6)));
+        assert_eq!(at0("&#X42;"), Some(('B', 6)));
+        // Not an entity: no digits, no name, no semicolon, or no such name.
+        for bad in [
+            "&#;",
+            "&#x;",
+            "&;",
+            "&amp",
+            "&bogus;",
+            "&",
+            "&#0;",
+            "&#1114112;",
+            "&#xd800;",
+        ] {
+            assert_eq!(at0(bad), None, "{bad}");
+        }
+        assert_eq!(decode_entities("a &amp; b &#x41; &nope;"), "a & b A &nope;");
+        // An entity must be followed by something: the index past it is exact.
+        let c: Vec<char> = "x&amp;y".chars().collect();
+        assert_eq!(entity_at(&c, 1), Some(('&', 6)));
+    }
+
+    #[test]
+    fn only_a_real_and_safe_scheme_links() {
+        for url in [
+            "https://e/x",
+            "http://e",
+            "mailto:a@b",
+            "/relative",
+            "#frag",
+            "e/x",
+        ] {
+            assert!(safe_url(url), "{url}");
+        }
+        for url in [
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "//host/x",
+            "file:/etc",
+        ] {
+            assert!(!safe_url(url), "{url}");
+        }
+        // Case does not decide it, and neither does leading whitespace.
+        assert!(safe_url("  HTTPS://e/x "));
+        // A tab or a newline inside a scheme is stripped before the check.
+        assert!(safe_url("ht\ttps://e/x"));
+        // A colon after one letter is still a scheme, and it is not on the list.
+        assert!(!safe_url("a:b/c"));
+        // A scheme starts with a letter: `1http:` is a path with a colon in it.
+        assert!(safe_url("1http:x"));
+        assert!(!safe_url("c++:x"), "a real scheme outside the list");
+    }
+
+    #[test]
+    fn inline_marks_nest_and_unmatched_ones_stand() {
+        let out = text("**bold** and *italic* and _under_ and __strong__ and ~~gone~~");
+        for kept in ["bold", "italic", "under", "strong", "gone"] {
+            assert!(out.contains(kept), "{kept}: {out}");
+        }
+        for mark in ["**", "~~", "*italic*", "_under_"] {
+            assert!(!out.contains(mark), "{mark}: {out}");
+        }
+        // A double underscore is not emphasis here: it stays as written.
+        assert!(out.contains("__strong__"), "{out}");
+        // An asterisk with a space on one side is text, not emphasis.
+        assert_eq!(text("a * b"), "a * b");
+        // Two asterisks with text between them are a span, spaces included.
+        assert_eq!(text("2 * 3 * 4"), "2 3 4");
+        // Emphasis inside a link stays inside it.
+        let out = text("[**bold link**](https://e/x)");
+        assert!(out.contains("bold link"), "{out}");
+        assert!(out.contains("(https://e/x)"), "{out}");
+    }
+
+    #[test]
+    fn a_link_shows_its_target_and_keeps_an_unsafe_one_as_text() {
+        let out = text("[docs](https://example.com/a)");
+        assert!(out.contains("docs"), "{out}");
+        assert!(out.contains("(https://example.com/a)"), "{out}");
+        let out = text("[click](javascript:alert(1))");
+        assert!(out.contains("click"), "{out}");
+        assert!(out.contains("(javascript:alert(1))"), "{out}");
+        // The difference is the style, not the text: the unsafe one keeps the
+        // base style, so no span of the line is a link.
+        let line = &document("[click](javascript:alert(1))", 80)[0];
+        assert!(
+            line.spans
+                .iter()
+                .all(|span| span.style.fg != Some(Color::Cyan)),
+            "{:?}",
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        );
+        // An image is a link with a description.
+        let out = text("![alt](https://e/i.png)");
+        assert!(out.contains("alt"), "{out}");
+    }
+
+    #[test]
+    fn a_code_span_takes_its_own_backticks() {
+        assert_eq!(text("``a ` b``"), "a ` b");
+        assert_eq!(text("`one`"), "one");
+        // An unclosed backtick is text.
+        assert_eq!(text("a ` b"), "a ` b");
+        // Backslash escapes the mark that follows it.
+        assert_eq!(text("\\*not italic\\*"), "*not italic*");
+    }
+
+    #[test]
+    fn a_fence_keeps_what_is_inside_it() {
+        let out = text("```rust\nlet x = 1;\n  indented\n```");
+        assert_eq!(out, "let x = 1;\n  indented");
+        // An unclosed fence runs to the end of the message.
+        let out = text("~~~\nabc\n\ndef");
+        assert!(out.contains("abc"), "{out}");
+        assert!(out.contains("def"), "{out}");
+        // A fence of one marker is closed only by one as long.
+        let out = text("````\n```\ninner\n````");
+        assert!(out.contains("```"), "{out}");
+        assert!(out.contains("inner"), "{out}");
+        assert!(fence_open("```js").is_some());
+        assert!(fence_open("`` ``").is_none());
+        assert!(fence_closes("````", '`', 4));
+        assert!(!fence_closes("```", '`', 4));
+    }
+
+    #[test]
+    fn headings_lists_and_rules_take_their_forms() {
+        let out = text("# One\n\n### Three ###\n\n---");
+        assert!(out.contains("One"), "{out}");
+        assert!(out.contains("Three"), "{out}");
+        assert!(!out.contains('#'), "{out}");
+        assert!(out.lines().any(|line| line.starts_with('─')), "{out}");
+        for marks in ["***", "___", "- - -"] {
+            assert!(heading(marks).is_none(), "{marks} is a rule");
+            assert!(is_hr(marks));
+        }
+        assert!(heading("###Four").is_none(), "a heading needs a space");
+        assert!(heading("####### seven").is_none(), "seven hashes are text");
+        assert_eq!(heading("## Two ##").unwrap().0, 2);
+
+        let out = text("- one\n- two\n  - nested");
+        assert!(out.contains("• one"), "{out}");
+        assert!(out.contains("• nested"), "{out}");
+
+        let out = text("1. first\n2) second");
+        assert!(out.contains("1. first"), "{out}");
+        assert!(out.contains("2. second"), "{out}");
+        assert!(!out.contains("3. third"));
+        // An ordered list keeps its own start number.
+        let out = text("3. three\n4. four");
+        assert!(out.contains("3. three"), "{out}");
+        assert!(out.contains("4. four"), "{out}");
+
+        let out = text("> quoted\n>\n> more");
+        assert!(out.contains("│ quoted"), "{out}");
+        assert!(out.contains("│ more"), "{out}");
+    }
+
+    #[test]
+    fn list_items_read_markers_and_indent() {
+        assert_eq!(list_item("- x"), Some((0, "-".into(), "x")));
+        assert_eq!(list_item("   * x"), Some((3, "*".into(), "x")));
+        assert_eq!(list_item("12) x"), Some((0, "12)".into(), "x")));
+        assert_eq!(list_item("-x"), None, "a marker needs its space");
+        assert_eq!(list_item("x - y"), None);
+        assert_eq!(list_item("1.x"), None);
+    }
+
+    #[test]
+    fn a_table_is_drawn_with_its_columns_and_alignment() {
+        let out = text("| a | b |\n|:--|--:|\n| 1 | 2 |\n| 3 |");
+        assert!(out.contains("a │ b"), "{out}");
+        assert!(out.contains("─┼─"), "{out}");
+        assert!(out.contains("1 │ 2"), "{out}");
+        // A short row is padded, not merged into the next column.
+        assert!(out.contains("3 │"), "{out}");
+        // A cell escapes the pipe that would split it.
+        let out = text("| a \\| b | c |\n|---|---|\n| x | y |");
+        assert!(out.contains("a | b"), "{out}");
+        // A table with no body is still a table.
+        let out = text("| h |\n|---|");
+        assert!(out.trim().lines().count() == 2, "{out}");
+        assert_eq!(parse_cells("|a|b|"), vec!["a", "b"]);
+        assert_eq!(parse_cells("|a\\|b|c"), vec!["a|b", "c"]);
+        let aligns = parse_alignments("|:--|:-:|--:|---|");
+        assert!(matches!(aligns[0], Some(Align::Left)));
+        assert!(matches!(aligns[1], Some(Align::Center)));
+        assert!(matches!(aligns[2], Some(Align::Right)));
+        assert!(aligns[3].is_none());
+        assert!(is_table_delim("| --- | :--: |"));
+        assert!(!is_table_delim("| -- | --- |"), "two dashes are not a rule");
+        assert!(!is_table_delim("| a | b |"));
+    }
+
+    #[test]
+    fn details_keep_the_summary_and_their_blocks() {
+        let out = text("<details><summary>The summary</summary>\n\n- inside\n</details>");
+        assert!(out.contains("The summary"), "{out}");
+        assert!(out.contains("• inside"), "{out}");
+        assert!(!out.contains("<details>"), "{out}");
+        assert_eq!(summary_of("<summary> one </summary>"), "one");
+        assert_eq!(summary_of("<summary>unclosed"), "");
+        assert_eq!(
+            strip_details("<details><summary>s</summary>body</details>"),
+            "body"
+        );
+        assert_eq!(strip_details("<details>plain</details>"), "plain");
+        assert!(details_start("<details open>"));
+        assert!(!details_start("x <details>"));
+        assert!(details_end("  </details>"));
+        assert!(!details_end("</detail"));
+    }
+
+    #[test]
+    fn a_long_line_is_clipped_and_a_long_word_broken() {
+        let long = "one two three four five six seven eight nine ten";
+        let out = document(long, 12);
+        let rendered: Vec<String> = out.iter().map(plain).collect();
+        assert!(rendered.len() > 1, "{rendered:?}");
+        for line in &rendered {
+            assert!(text_width(line) <= 12, "{line:?}");
+        }
+        // A word wider than the line is broken, not dropped.
+        let out: Vec<String> = document("supercalifragilistic", 6)
+            .iter()
+            .map(plain)
+            .collect();
+        assert_eq!(out.join(""), "supercalifragilistic");
+
+        // A table cell that does not fit loses its tail and says so, and a
+        // table is narrowed until it fits the width it is given.
+        let table = "| header | b |\n|---|---|\n| a very long cell indeed | 2 |";
+        let out: String = document(table, 16)
+            .iter()
+            .map(plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(out.contains('…'), "{out}");
+        assert!(out.contains("header"), "{out}");
+        for line in document(table, 16).iter().map(plain) {
+            assert!(text_width(&line) <= 16, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn ansi_output_is_plain_when_the_output_is_not_a_terminal() {
+        // The test binary's stdout is a pipe, and a redirect gets no escapes:
+        // the text is the same, only the codes are gone.
+        let line = &document("**bold** `code`", 80)[0];
+        assert_eq!(ansi(line), "bold code");
+    }
+
+    #[test]
+    fn a_stream_lays_out_each_block_when_it_ends() {
+        let mut stream = Stream::new();
+        let mut out = Vec::new();
+        stream.push("```", 20, &mut out);
+        stream.push("code", 20, &mut out);
+        stream.push("```", 20, &mut out);
+        assert!(out.is_empty(), "the fence is not a block yet");
+        stream.push("", 20, &mut out);
+        assert_eq!(out.iter().map(plain).collect::<Vec<_>>(), vec!["code"]);
+        // Flushing ends the block that is still open.
+        let mut stream = Stream::new();
+        let mut out = Vec::new();
+        stream.push("tail without a blank line", 20, &mut out);
+        assert!(out.is_empty());
+        stream.flush(20, &mut out);
+        let rendered: String = out.iter().map(plain).collect::<Vec<_>>().join(" ");
+        assert_eq!(rendered, "tail without a blank line");
+        // Too deep to parse is a paragraph when there is text, nothing when not.
+        assert!(parse_blocks("deep", 100).len() == 1);
+        assert!(parse_blocks("", 100).is_empty());
+    }
 }

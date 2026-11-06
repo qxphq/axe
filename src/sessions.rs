@@ -670,4 +670,276 @@ mod tests {
         mark("none", &terms, &mut seen);
         assert!(!seen[0]);
     }
+
+    use crate::state::testenv;
+
+    /// One session with a title and a body of user messages, stamped so the
+    /// listing order is the test's, not the clock's.
+    fn session(dir: &Path, id: &str, title: &str, lines: &[&str], updated: u64) {
+        let mut meta = Meta::new(id);
+        meta.title = title.to_string();
+        meta.updated = updated;
+        meta.save(dir).unwrap();
+        let mut log = Log::open(dir, id).unwrap();
+        for line in lines {
+            log.append(&json!({ "role": "user", "content": line }))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn list_orders_by_activity_and_skips_junk() {
+        testenv::home("sessions-list", |home| {
+            let cwd = home.join("work");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let dir = dir(&cwd);
+            session(&dir, "aa11", "older", &[], 10);
+            session(&dir, "bb22", "newer", &[], 20);
+            // A body with no sidecar, an id that is not hex, and a sidecar that
+            // does not parse are all skipped, not fatal.
+            std::fs::write(dir.join("cc33.jsonl"), "").unwrap();
+            std::fs::write(dir.join("not-hex.json"), "{}").unwrap();
+            std::fs::write(dir.join("dd44.json"), "{").unwrap();
+            let ids: Vec<String> = list(&cwd).into_iter().map(|meta| meta.id).collect();
+            assert_eq!(ids, vec!["bb22".to_string(), "aa11".to_string()]);
+            // A directory that does not exist lists nothing.
+            assert!(list(&home.join("nowhere")).is_empty());
+        });
+    }
+
+    #[test]
+    fn a_sidecar_is_validated_before_it_is_believed() {
+        let dir = testenv::dir("sessions-meta");
+        assert!(Meta::load(&dir, "not-a-session").is_err());
+        assert!(Meta::load(&dir, "abc123").is_err(), "nothing to read");
+        std::fs::write(dir.join("abc123.json"), r#"{"v": 99}"#).unwrap();
+        let err = Meta::load(&dir, "abc123").err().unwrap();
+        assert!(err.contains("newer format"), "{err}");
+        std::fs::write(dir.join("abc123.json"), r#"{"v": 1}"#).unwrap();
+        let meta = Meta::load(&dir, "abc123").unwrap();
+        assert_eq!(meta.title, "");
+        assert_eq!(meta.messages, 0);
+        assert!(valid_id("abc123"));
+        assert!(valid_id("ABC123"), "hex digits are digits either case");
+        assert!(!valid_id("abc xyz"));
+        assert!(!valid_id(""));
+        assert!(!valid_id(&"a".repeat(65)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_reads_titles_summaries_and_bodies() {
+        testenv::home("sessions-search", |home| {
+            let cwd = home.join("work");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let dir = dir(&cwd);
+            let mut meta = Meta::new("aa11");
+            meta.title = "Parse the sessions".into();
+            meta.summary = "a parse-heavy session".into();
+            meta.updated = 20;
+            meta.save(&dir).unwrap();
+            let mut log = Log::open(&dir, "aa11").unwrap();
+            log.append(&json!({ "role": "user", "content": "the needle is here" }))
+                .unwrap();
+            session(&dir, "bb22", "Nothing to see", &["unrelated"], 10);
+            let metas = list(&cwd);
+            assert_eq!(metas[0].id, "aa11");
+
+            // A term only the title holds.
+            let hits = search(&cwd, &metas, "parse");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].index, 0);
+            assert!(hits[0].snippet.contains("parse"), "{}", hits[0].snippet);
+
+            // A term only the body holds: the snippet is the line it is on.
+            let hits = search(&cwd, &metas, "needle");
+            assert_eq!(hits[0].snippet, "the needle is here");
+
+            // Every term must match, and they may match different places.
+            assert_eq!(search(&cwd, &metas, "parse needle").len(), 1);
+            assert!(search(&cwd, &metas, "parse unrelated").is_empty());
+
+            // No terms: every session, and no snippet to show.
+            let all = search(&cwd, &metas, "   ");
+            assert_eq!(all.len(), 2);
+            assert!(all.iter().all(|hit| hit.snippet.is_empty()));
+
+            // An archived body is not read; title and summary still answer.
+            let mut archived = metas.clone();
+            archived[0].archived = true;
+            assert!(search(&cwd, &archived, "needle").is_empty());
+            assert_eq!(search(&cwd, &archived, "parse").len(), 1);
+        });
+    }
+
+    #[test]
+    fn archive_old_compresses_the_bodies_past_the_keep_count() {
+        if !have_gzip() {
+            return;
+        }
+        testenv::home("sessions-archive", |home| {
+            let cwd = home.join("work");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let dir = dir(&cwd);
+            session(&dir, "aa11", "oldest", &["one"], 10);
+            session(&dir, "bb22", "middle", &["two"], 20);
+            session(&dir, "cc33", "newest", &["three"], 30);
+            archive_old(&cwd, 1);
+
+            let metas = list(&cwd);
+            let archived: Vec<&str> = metas
+                .iter()
+                .filter(|meta| meta.archived)
+                .map(|meta| meta.id.as_str())
+                .collect();
+            assert_eq!(archived, vec!["bb22", "aa11"]);
+            assert!(gz_path(&dir, "aa11").is_file());
+            assert!(!log_path(&dir, "aa11").exists());
+            assert!(log_path(&dir, "cc33").is_file(), "the kept one stays plain");
+
+            // Reading an archived session unpacks it and makes it live again.
+            let mut meta = metas.iter().find(|meta| meta.id == "aa11").unwrap().clone();
+            let mut warnings = Vec::new();
+            let body = load_messages(&dir, &mut meta, &mut warnings).unwrap();
+            assert_eq!(body.len(), 1);
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert!(!meta.archived);
+            assert!(log_path(&dir, "aa11").is_file());
+            assert!(!gz_path(&dir, "aa11").exists());
+            assert!(!Meta::load(&dir, "aa11").unwrap().archived);
+        });
+    }
+
+    #[test]
+    fn a_body_that_is_missing_is_reported() {
+        let dir = testenv::dir("sessions-nobody");
+        let mut meta = Meta::new("abc123");
+        let mut warnings = Vec::new();
+        let err = load_messages(&dir, &mut meta, &mut warnings).err().unwrap();
+        assert!(err.contains("has no body"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fallback_handles_what_is_missing() {
+        assert_eq!(fallback(&[]), (String::new(), String::new()));
+        let (title, summary) = fallback(&[json!({ "role": "user", "content": "only a request" })]);
+        assert_eq!(title, "only a request");
+        assert_eq!(summary, "only a request");
+        // A long request is cut for the title and again for the summary, and
+        // the assistant's own words join it.
+        let long = "word ".repeat(20);
+        let (title, summary) = fallback(&[
+            json!({ "role": "user", "content": long }),
+            json!({ "role": "assistant", "content": "   " }),
+            json!({ "role": "assistant", "content": "the answer" }),
+        ]);
+        assert!(title.ends_with('…'), "{title}");
+        assert!(title.chars().count() <= 61, "{title}");
+        assert!(summary.contains("the answer"), "{summary}");
+        assert!(summary.chars().count() <= 240, "{summary}");
+        assert_eq!(collapse(&"x".repeat(20), 3), "xxx…");
+        assert_eq!(collapse("x", 3), "x");
+    }
+
+    #[test]
+    fn dates_survive_leap_days_and_the_epoch() {
+        assert_eq!(civil(0), (1970, 1, 1));
+        // 2000-02-29, a leap day in a leap year.
+        assert_eq!(civil(11_016), (2000, 2, 29));
+        // 1970-01-01 is day zero; the day before it is 1969.
+        assert_eq!(civil(-1), (1969, 12, 31));
+        assert_eq!(stamp(11_016 * 86_400 + 3_600), "2000-02-29 01:00");
+        assert_eq!(stamp(1_709_164_800), "2024-02-29 00:00");
+    }
+
+    #[test]
+    fn a_failed_gzip_leaves_no_partial_file() {
+        let dir = testenv::dir("sessions-gzip-fail");
+        let out = dir.join("out.gz");
+        let missing = dir.join("no-such-file");
+        let err = gzip(&[OsStr::new("-nc"), missing.as_os_str()], &out)
+            .err()
+            .unwrap();
+        assert!(err.starts_with("gzip"), "{err}");
+        assert!(!out.exists(), "a failed run removes what it started");
+
+        // The output cannot be created at all: the directory is not there.
+        let err = gzip(
+            &[OsStr::new("-nc"), missing.as_os_str()],
+            &dir.join("no/dir.gz"),
+        )
+        .err()
+        .unwrap();
+        assert!(err.starts_with("create"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_compressed_body_left_beside_its_plain_copy_is_finished_off() {
+        if !have_gzip() {
+            return;
+        }
+        let dir = testenv::dir("sessions-crash");
+        let meta = Meta::new("abc123");
+        let plain = log_path(&dir, "abc123");
+        let gz = gz_path(&dir, "abc123");
+        std::fs::write(&plain, "plain\n").unwrap();
+        gzip(&[OsStr::new("-nc"), plain.as_os_str()], &gz).unwrap();
+        // A crash after the rename but before the plain copy went away.
+        compress(&dir, &meta, &plain, &gz).unwrap();
+        assert!(!plain.exists(), "the plain copy is removed");
+        assert!(gz.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_session_already_compressed_only_gets_its_marker() {
+        if !have_gzip() {
+            return;
+        }
+        testenv::home("sessions-marker", |home| {
+            let cwd = home.join("work");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let dir = dir(&cwd);
+            // A body that is compressed but whose sidecar never learned it.
+            let mut meta = Meta::new("abc123");
+            meta.updated = 1;
+            meta.save(&dir).unwrap();
+            let plain = log_path(&dir, "abc123");
+            std::fs::write(&plain, "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+            gzip(
+                &[OsStr::new("-nc"), plain.as_os_str()],
+                &gz_path(&dir, "abc123"),
+            )
+            .unwrap();
+            std::fs::remove_file(&plain).unwrap();
+
+            archive_old(&cwd, 0);
+            assert!(Meta::load(&dir, "abc123").unwrap().archived);
+            // Nothing left to do the second time.
+            archive_old(&cwd, 0);
+            assert!(Meta::load(&dir, "abc123").unwrap().archived);
+            // And there is nothing to archive when the keep count covers it.
+            archive_old(&cwd, 5);
+        });
+    }
+
+    #[test]
+    fn a_body_count_is_corrected_when_the_file_disagrees() {
+        let dir = testenv::dir("sessions-count");
+        let mut meta = Meta::new("abc123");
+        meta.messages = 9;
+        meta.save(&dir).unwrap();
+        let mut log = Log::open(&dir, "abc123").unwrap();
+        log.append(&json!({ "role": "user", "content": "one" }))
+            .unwrap();
+        // The sidecar said nine; the body says one, and the body wins.
+        let mut warnings = Vec::new();
+        let body = load_messages(&dir, &mut meta, &mut warnings).unwrap();
+        assert_eq!(body.len(), 1);
+        assert_eq!(meta.messages, 1);
+        assert_eq!(Meta::load(&dir, "abc123").unwrap().messages, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

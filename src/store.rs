@@ -196,6 +196,8 @@ mod tests {
 
     use serde_json::json;
 
+    use crate::turn::History;
+
     #[test]
     fn store_records_and_finalizes() {
         let dir = std::env::temp_dir().join(format!("axe-test-store-{}", std::process::id()));
@@ -228,5 +230,110 @@ mod tests {
             None,
             "a compaction summary is not the user's request"
         );
+    }
+
+    #[test]
+    fn a_store_reopens_what_it_wrote() {
+        let dir = crate::state::testenv::dir("store-resume");
+        let mut store = Store::fresh(dir.clone(), "abc123");
+        store.record(&json!({ "role": "user", "content": "fix it" }));
+        let meta = store.meta.clone().unwrap();
+        assert_eq!(meta.summary, "fix it", "the first request stands in");
+
+        let mut resumed = Store::resumed(dir.clone(), meta).unwrap();
+        let mut messages = Vec::new();
+        let mut bytes = 0;
+        {
+            let mut live = Live {
+                messages: &mut messages,
+                bytes: &mut bytes,
+                store: Some(&mut resumed),
+            };
+            live.push(json!({ "role": "assistant", "content": "done" }));
+            assert_eq!(live.messages().len(), 1);
+        }
+        assert_eq!(messages.len(), 1);
+        assert_eq!(bytes, weight(&messages[0]));
+        // Both messages reached the file, and the count followed.
+        let meta = sessions::Meta::load(&dir, "abc123").unwrap();
+        assert_eq!(meta.messages, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_history_without_a_store_is_still_counted() {
+        let mut messages = Vec::new();
+        let mut bytes = 0;
+        {
+            let mut live = Live {
+                messages: &mut messages,
+                bytes: &mut bytes,
+                store: None,
+            };
+            live.push(json!({ "role": "user", "content": "one" }));
+            live.push(json!({ "role": "user", "content": "two" }));
+        }
+        assert_eq!(messages.len(), 2);
+        assert_eq!(bytes, history_bytes(&messages));
+    }
+
+    #[test]
+    fn a_compaction_leaves_one_message_in_the_body() {
+        let dir = crate::state::testenv::dir("store-compact");
+        let mut store = Store::fresh(dir.clone(), "abc123");
+        store.record(&json!({ "role": "user", "content": "one" }));
+        store.record(&json!({ "role": "user", "content": "two" }));
+        store.compacted(&sessions::compacted("summary", 2));
+        assert_eq!(store.meta.as_ref().unwrap().messages, 1);
+
+        let mut meta = store.meta.clone().unwrap();
+        let mut warnings = Vec::new();
+        let body = sessions::load_messages(&dir, &mut meta, &mut warnings).unwrap();
+        assert_eq!(body.len(), 1);
+        assert_eq!(body[0]["content"], "summary");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_title_is_cut_and_an_empty_one_falls_back() {
+        let dir = crate::state::testenv::dir("store-title");
+        let mut store = Store::fresh(dir.clone(), "abc123");
+        // Nothing is written before the first message, so there is nothing to
+        // title yet.
+        store.set_title("early", "early");
+        assert!(store.meta.is_none());
+        store.finalize(&[]);
+        assert!(store.meta.is_none());
+
+        store.record(&json!({ "role": "user", "content": "first request" }));
+        store.set_title(&"x".repeat(100), "   ");
+        let meta = store.meta.clone().unwrap();
+        assert_eq!(meta.title, format!("{}…", "x".repeat(60)));
+        assert_eq!(
+            meta.summary, "first request",
+            "an empty summary is not used"
+        );
+
+        // A session that ends unnamed takes the first request as its title.
+        let mut unnamed = Store::fresh(dir.clone(), "def456");
+        unnamed.record(&json!({ "role": "user", "content": "make it green" }));
+        unnamed.finalize(&[json!({ "role": "user", "content": "make it green" })]);
+        assert_eq!(unnamed.meta.as_ref().unwrap().title, "make it green");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_failure_warns_once_and_the_session_goes_on() {
+        let root = crate::state::testenv::dir("store-warn");
+        let blocked = root.join("blocked");
+        std::fs::write(&blocked, "not a directory").unwrap();
+        let mut store = Store::fresh(blocked, "abc123");
+        store.record(&json!({ "role": "user", "content": "one" }));
+        let warning = store.take_warning().expect("the failure is reported");
+        assert!(warning.starts_with("session:"), "{warning}");
+        assert!(store.take_warning().is_none(), "reported once");
+        store.record(&json!({ "role": "user", "content": "two" }));
+        assert!(store.take_warning().is_none(), "and not again");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -339,4 +339,148 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("bad key"));
     }
+
+    #[test]
+    fn a_model_list_reads_over_the_wire() {
+        let server = crate::http::support::Server::new(vec![crate::http::support::json(
+            r#"{"data":[{"id":"local/qwen3","context_window":8192}]}"#,
+        )]);
+        let models = list_models(&server.ep, "/models", Some("k"), &[]).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "local/qwen3");
+        assert_eq!(models[0].context, Some(8192));
+        assert!(server.text().starts_with("GET /models "));
+    }
+
+    #[test]
+    fn a_model_list_failure_carries_the_status_and_body() {
+        let server = crate::http::support::Server::new(vec![crate::http::support::reply(
+            "401 Unauthorized",
+            &[],
+            "bad key",
+        )]);
+        let err = list_models(&server.ep, "/models", None, &[]).err().unwrap();
+        assert!(err.contains("HTTP 401"), "{err}");
+        assert!(err.contains("bad key"), "{err}");
+
+        let server = crate::http::support::Server::new(vec![crate::http::support::json("nope")]);
+        let err = list_models(&server.ep, "/models", None, &[]).err().unwrap();
+        assert!(err.contains("models json"), "{err}");
+    }
+
+    #[test]
+    fn a_chat_request_carries_the_level_fields_and_asks_for_usage() {
+        let server =
+            crate::http::support::Server::new(vec![crate::http::support::sse(&["[DONE]"])]);
+        let cancel = Cancel::new();
+        let extra = serde_json::json!({ "reasoning_effort": "high" });
+        let res = chat(
+            &server.ep,
+            Some("k"),
+            &[],
+            "local/qwen3",
+            &[serde_json::json!({"role":"user","content":"hi"})],
+            &serde_json::json!([]),
+            Some(&extra),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(res.status, 200);
+
+        let sent = server.text();
+        let body = sent.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["model"], "local/qwen3");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert_eq!(body["messages"][0]["content"], "hi");
+        assert!(sent.starts_with("POST /chat/completions "), "{sent:?}");
+    }
+
+    #[test]
+    fn a_streamed_reply_arrives_through_the_sockets() {
+        let server = crate::http::support::Server::new(vec![crate::http::support::sse(&[
+            r#"{"choices":[{"delta":{"reasoning":"th"}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning":"ink"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"ans"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"wer"}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":"{\"path\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}}]}}]}"#,
+            r#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#,
+            "[DONE]",
+        ])]);
+        let cancel = Cancel::new();
+        let mut text = String::new();
+        let mut thought = String::new();
+        let reply = stream_chat(
+            &server.ep,
+            None,
+            &[],
+            "m",
+            &[],
+            &serde_json::json!([]),
+            None,
+            &cancel,
+            |part| text.push_str(part),
+            |part| thought.push_str(part),
+        )
+        .unwrap();
+        assert_eq!(text, "answer");
+        assert_eq!(thought, "think");
+        assert_eq!(reply.text, "answer");
+        assert_eq!(reply.calls.len(), 1);
+        assert_eq!(reply.calls[0].id, "c1");
+        assert_eq!(reply.calls[0].arguments, "{\"path\":\"x\"}");
+        assert_eq!(reply.usage.unwrap().prompt, 5);
+    }
+
+    #[test]
+    fn a_streamed_error_chunk_fails_the_request() {
+        let server = crate::http::support::Server::new(vec![crate::http::support::sse(&[
+            r#"{"error":{"message":"rate limited"}}"#,
+        ])]);
+        let cancel = Cancel::new();
+        let err = stream_chat(
+            &server.ep,
+            None,
+            &[],
+            "m",
+            &[],
+            &serde_json::json!([]),
+            None,
+            &cancel,
+            |_| {},
+            |_| {},
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("rate limited"), "{err}");
+    }
+
+    #[test]
+    fn a_refused_chat_reports_the_status_and_body() {
+        let server = crate::http::support::Server::new(vec![crate::http::support::reply(
+            "403 Forbidden",
+            &[],
+            "no go",
+        )]);
+        let cancel = Cancel::new();
+        let err = stream_chat(
+            &server.ep,
+            None,
+            &[],
+            "m",
+            &[],
+            &serde_json::json!([]),
+            None,
+            &cancel,
+            |_| {},
+            |_| {},
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("HTTP 403"), "{err}");
+        assert!(err.contains("no go"), "{err}");
+    }
 }

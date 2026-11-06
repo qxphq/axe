@@ -253,4 +253,173 @@ mod tests {
         assert_eq!(buffer.buf, "本日x");
         assert_eq!(buffer.cursor, 2);
     }
+
+    #[test]
+    fn the_cursor_can_be_sent_home_and_to_the_end() {
+        let mut buffer = typed("one two");
+        buffer.cursor = 4;
+        buffer.word_back();
+        assert_eq!(buffer.cursor, 0, "the space and the word before it");
+        buffer.word_back();
+        assert_eq!(buffer.cursor, 0, "the line has a start");
+        buffer.word_forward();
+        assert_eq!(buffer.cursor, 3);
+        buffer.word_forward();
+        assert_eq!(buffer.cursor, 7, "past the last word is the end");
+        buffer.word_forward();
+        assert_eq!(buffer.cursor, 7);
+
+        // From inside a word the cursor goes to that word's start.
+        buffer.cursor = 6;
+        buffer.word_back();
+        assert_eq!(buffer.cursor, 4);
+        // Whitespace before the cursor is stepped over with the word.
+        let mut buffer = typed("one   two");
+        buffer.cursor = 6;
+        buffer.word_back();
+        assert_eq!(buffer.cursor, 0);
+    }
+
+    #[test]
+    fn a_word_kill_takes_the_words_and_remembers_them() {
+        let mut buffer = typed("alpha beta gamma");
+        buffer.kill_word_back();
+        assert_eq!(buffer.buf, "alpha beta ");
+        assert_eq!(buffer.cursor, 11);
+        assert_eq!(buffer.killed, "gamma");
+        buffer.kill_word_forward();
+        assert_eq!(buffer.buf, "alpha beta ", "nothing ahead to kill");
+
+        let mut buffer = typed("alpha beta");
+        buffer.cursor = 2;
+        buffer.kill_word_forward();
+        assert_eq!(buffer.buf, "al beta", "from the cursor to the word's end");
+        assert_eq!(buffer.cursor, 2);
+        assert_eq!(buffer.killed, "pha");
+    }
+
+    #[test]
+    fn a_kill_to_the_edges_takes_the_rest_of_the_line() {
+        let mut buffer = typed("one two");
+        buffer.cursor = 3;
+        buffer.kill_to_start();
+        assert_eq!(buffer.buf, " two");
+        assert_eq!(buffer.cursor, 0);
+        assert_eq!(buffer.killed, "one");
+        buffer.kill_to_end();
+        assert_eq!(buffer.buf, "");
+        assert_eq!(buffer.killed, " two");
+
+        // At the edges there is nothing to kill, and what was killed stays.
+        let mut buffer = typed("abc");
+        buffer.killed = "kept".into();
+        buffer.cursor = 0;
+        buffer.kill_to_start();
+        assert_eq!(buffer.buf, "abc");
+        assert_eq!(buffer.killed, "kept");
+        buffer.cursor = 3;
+        buffer.kill_to_end();
+        assert_eq!(buffer.buf, "abc");
+        assert_eq!(buffer.killed, "kept");
+    }
+
+    #[test]
+    fn yank_puts_the_killed_text_at_the_cursor() {
+        let mut buffer = typed("one two");
+        buffer.kill_word_back();
+        assert_eq!(buffer.buf, "one ");
+        buffer.yank();
+        assert_eq!(buffer.buf, "one two");
+        assert_eq!(buffer.cursor, 7);
+        buffer.cursor = 0;
+        buffer.yank();
+        assert_eq!(buffer.buf, "twoone two");
+        assert_eq!(buffer.cursor, 3);
+
+        // Nothing killed yet: a yank is not an empty insertion.
+        let mut buffer = typed("abc");
+        buffer.cursor = 1;
+        buffer.yank();
+        assert_eq!(buffer.buf, "abc");
+        assert_eq!(buffer.cursor, 1);
+    }
+
+    #[test]
+    fn backspace_and_delete_stop_at_the_edges() {
+        let mut buffer = typed("abc");
+        buffer.cursor = 1;
+        buffer.backspace();
+        assert_eq!(buffer.buf, "bc");
+        assert_eq!(buffer.cursor, 0);
+        buffer.backspace();
+        assert_eq!(buffer.buf, "bc", "nothing before the start");
+        buffer.delete();
+        assert_eq!(buffer.buf, "c");
+        buffer.delete();
+        assert_eq!(buffer.buf, "");
+        buffer.delete();
+        assert_eq!(buffer.buf, "", "nothing past the end");
+
+        // Wide chars are one step each.
+        let mut buffer = typed("日本");
+        buffer.cursor = 1;
+        buffer.backspace();
+        assert_eq!(buffer.buf, "本");
+        assert_eq!(buffer.cursor, 0);
+    }
+
+    #[test]
+    fn transpose_words_swaps_the_pair_before_the_cursor() {
+        let mut buffer = typed("alpha beta");
+        buffer.transpose_words();
+        assert_eq!(buffer.buf, "beta alpha");
+        assert_eq!(buffer.cursor, 10);
+
+        // Trailing whitespace is stepped over, not swapped.
+        let mut buffer = typed("alpha beta   ");
+        buffer.transpose_words();
+        assert_eq!(buffer.buf, "beta alpha   ");
+
+        // The space between the two words travels with them.
+        let mut buffer = typed("one  two");
+        buffer.transpose_words();
+        assert_eq!(buffer.buf, "two  one");
+
+        // One word, or none, is nothing to swap.
+        let mut buffer = typed("only");
+        buffer.transpose_words();
+        assert_eq!(buffer.buf, "only");
+        assert_eq!(buffer.cursor, 4);
+        let mut buffer = typed("   ");
+        buffer.transpose_words();
+        assert_eq!(buffer.buf, "   ");
+        let mut buffer = typed("one two");
+        buffer.cursor = 3;
+        buffer.transpose_words();
+        assert_eq!(
+            buffer.buf, "one two",
+            "two words are needed before the cursor"
+        );
+    }
+
+    #[test]
+    fn a_paste_joins_the_line_where_the_cursor_is() {
+        let mut buffer = typed("ac");
+        buffer.cursor = 1;
+        buffer.insert_text("b\nline");
+        assert_eq!(buffer.buf, "ab\nlinec");
+        assert_eq!(buffer.cursor, 7);
+        buffer.insert_char('!');
+        assert_eq!(buffer.buf, "ab\nline!c");
+        assert_eq!(buffer.cursor, 8);
+        assert_eq!(buffer.take(), "ab\nline!c");
+        assert!(buffer.buf.is_empty());
+        assert_eq!(buffer.cursor, 0);
+        assert_eq!(buffer.offset(0), 0);
+        assert_eq!(
+            buffer.offset(99),
+            0,
+            "past the end is the end of an empty line"
+        );
+    }
 }

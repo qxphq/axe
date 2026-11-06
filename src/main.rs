@@ -3221,4 +3221,668 @@ mod tests {
             info_text(&session)
         );
     }
+
+    use crate::http::support::{reply, sse, Server};
+
+    /// A session pointed at a loopback provider, with the two history
+    /// messages every session starts with.
+    fn session_at(server: &Server) -> Session {
+        let mut session = bare_session();
+        session.messages = session.base_messages();
+        session.bytes = history_bytes(&session.messages);
+        let provider = &mut session.providers[0];
+        provider.ep = server.ep.clone();
+        provider.models = vec![api::ModelInfo {
+            id: "m".into(),
+            context: Some(1000),
+        }];
+        session
+    }
+
+    /// The pair a turn's events travel on.
+    fn events() -> (Sender<Event>, Receiver<Event>) {
+        mpsc::channel()
+    }
+
+    #[test]
+    fn a_turn_streams_into_the_screen_and_the_history() {
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"hel"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"lo"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"\n"}}]}"#,
+            r#"{"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+            "[DONE]",
+        ])]);
+        let mut session = session_at(&server);
+        let (tx, rx) = events();
+        let mut screen = ui::Screen::test_screen(40, 20);
+
+        let leftover = session
+            .messages_turn("say hello", &tx, &rx, &mut screen)
+            .unwrap();
+        assert!(leftover.is_none());
+        assert_eq!(session.messages[2]["content"], "say hello");
+        assert_eq!(session.messages[3]["role"], "assistant");
+        assert_eq!(session.messages[3]["content"], "hello\n");
+        assert_eq!(session.used, Some(4), "the round counted its tokens");
+        assert!(screen.status().is_empty(), "the status row is cleared");
+        let rows = screen.transcript();
+        assert!(rows.iter().any(|row| row.contains("hello")), "{rows:?}");
+    }
+
+    #[test]
+    fn a_turn_that_calls_a_tool_shows_the_call_it_ran() {
+        let server = Server::new(vec![
+            sse(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"about","arguments":"{}"}}]}}]}"#,
+                "[DONE]",
+            ]),
+            sse(&[r#"{"choices":[{"delta":{"content":"done"}}]}"#, "[DONE]"]),
+        ]);
+        let mut session = session_at(&server);
+        let (tx, rx) = events();
+        let mut screen = ui::Screen::test_screen(60, 20);
+
+        session
+            .messages_turn("look it up", &tx, &rx, &mut screen)
+            .unwrap();
+        assert_eq!(session.messages[2 + 1]["tool_calls"][0]["id"], "c1");
+        assert_eq!(session.messages[2 + 2]["role"], "tool");
+        let rows = screen.transcript();
+        assert!(rows.iter().any(|row| row.contains("about")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("done")), "{rows:?}");
+    }
+
+    #[test]
+    fn a_refused_turn_is_reported_on_the_screen() {
+        let server = Server::new(vec![reply("500 Server Error", &[], "it broke")]);
+        let mut session = session_at(&server);
+        let (tx, rx) = events();
+        let mut screen = ui::Screen::test_screen(60, 20);
+
+        let leftover = session
+            .messages_turn("do it", &tx, &rx, &mut screen)
+            .unwrap();
+        assert!(leftover.is_none());
+        assert_eq!(session.messages.len(), 3, "only the request was recorded");
+        let rows = screen.transcript();
+        assert!(rows.iter().any(|row| row.contains("it broke")), "{rows:?}");
+        assert!(
+            rows.iter().any(|row| row.starts_with(" axe:")),
+            "the failure is the binary's line, not the model's: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn esc_asks_first_and_the_second_press_stops_the_turn() {
+        let server = Server::new(vec![sse(&["[DONE]"])]);
+        let mut session = session_at(&server);
+        let (tx, rx) = events();
+        let mut screen = ui::Screen::test_screen(60, 20);
+        // Both presses are already waiting when the turn starts: the first
+        // offers the interrupt, the second takes it.
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        tx.send(Event::Key(esc)).unwrap();
+        tx.send(Event::Key(esc)).unwrap();
+
+        session
+            .messages_turn("stop me", &tx, &rx, &mut screen)
+            .unwrap();
+        let rows = screen.transcript();
+        assert!(
+            rows.iter().any(|row| row.contains("Turn interrupted")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_paste_and_a_resize_reach_the_screen() {
+        let server = Server::new(vec![sse(&["[DONE]"])]);
+        let mut session = session_at(&server);
+        let (tx, rx) = events();
+        let mut screen = ui::Screen::test_screen(60, 20);
+        tx.send(Event::Paste("pasted text".into())).unwrap();
+        tx.send(Event::Resize).unwrap();
+        tx.send(Event::Eof).unwrap();
+
+        session.messages_turn("go", &tx, &rx, &mut screen).unwrap();
+        // The paste went into the line, which the turn never took: the event
+        // loop is the only place it could land.
+        assert_eq!(screen.take(), "pasted text");
+    }
+
+    #[test]
+    fn every_command_is_dispatched_by_name() {
+        let mut session = bare_session();
+        let mut console = Console::Stdout;
+        assert!(matches!(session.dispatch("/exit", &mut console), Cmd::Exit));
+        assert!(matches!(session.dispatch("", &mut console), Cmd::Continue));
+        assert!(matches!(
+            session.dispatch("/help", &mut console),
+            Cmd::Continue
+        ));
+        assert!(matches!(
+            session.dispatch("/new", &mut console),
+            Cmd::Continue
+        ));
+        assert!(matches!(
+            session.dispatch("/model", &mut console),
+            Cmd::Continue
+        ));
+        assert!(matches!(
+            session.dispatch("/model p/m", &mut console),
+            Cmd::Continue
+        ));
+        assert!(matches!(
+            session.dispatch("/model nope", &mut console),
+            Cmd::Continue
+        ));
+        assert_eq!(session.model, "m", "an unknown spec changes nothing");
+        assert!(matches!(
+            session.dispatch("/thinking", &mut console),
+            Cmd::Continue
+        ));
+        assert!(matches!(
+            session.dispatch("/thinking off", &mut console),
+            Cmd::Continue
+        ));
+        assert!(matches!(
+            session.dispatch("/thinking nope", &mut console),
+            Cmd::Continue
+        ));
+        assert!(matches!(
+            session.dispatch("/thoughts", &mut console),
+            Cmd::Continue
+        ));
+        assert!(session.state.thoughts);
+        assert!(matches!(
+            session.dispatch("/explore", &mut console),
+            Cmd::Continue
+        ));
+        assert_eq!(session.mode, tools::Mode::Normal);
+        assert!(matches!(
+            session.dispatch("/sessions", &mut console),
+            Cmd::Continue
+        ));
+        assert!(matches!(
+            session.dispatch("/compact", &mut console),
+            Cmd::Compact
+        ));
+        assert!(matches!(
+            session.dispatch("/skills", &mut console),
+            Cmd::Continue
+        ));
+        assert!(matches!(
+            session.dispatch("/skill:none go", &mut console),
+            Cmd::Continue
+        ));
+        assert!(matches!(
+            session.dispatch("/bogus", &mut console),
+            Cmd::Continue
+        ));
+        assert!(matches!(
+            session.dispatch("!echo hi", &mut console),
+            Cmd::Shell(command) if command == "echo hi"
+        ));
+        assert!(matches!(
+            session.dispatch("a request", &mut console),
+            Cmd::Turn(request) if request == "a request"
+        ));
+    }
+
+    #[test]
+    fn a_skill_that_is_loaded_becomes_the_turn() {
+        let dir = crate::state::testenv::dir("main-skill");
+        std::fs::create_dir_all(dir.join("demo")).unwrap();
+        std::fs::write(
+            dir.join("demo/SKILL.md"),
+            "---\nname: demo\ndescription: a demo\n---\nDo the demo.\n",
+        )
+        .unwrap();
+        let loaded = skills::scan(&[(dir.clone(), skills::Scope::Project)]);
+        let mut session = bare_session();
+        session.skills = loaded.skills;
+        let mut console = Console::Stdout;
+        match session.dispatch("/skill:demo run it", &mut console) {
+            Cmd::Turn(text) => {
+                assert!(text.contains("Do the demo."), "{text}");
+                assert!(text.ends_with("run it"), "{text}");
+            }
+            _ => panic!("a loaded skill is a turn"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compacting_replaces_the_history_with_one_summary() {
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"the summary"}}]}"#,
+            "[DONE]",
+        ])]);
+        let mut session = session_at(&server);
+        session.record(json!({ "role": "assistant", "content": "an answer" }));
+        let before = session.messages.len();
+        let mut console = Console::Stdout;
+
+        assert!(session.compact(&mut console).is_none());
+        assert_eq!(session.messages.len(), 3, "the base, then the summary");
+        assert!(session.messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("the summary"));
+        assert!(session.messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(COMPACT_NOTE));
+        assert_eq!(session.bytes, history_bytes(&session.messages));
+        assert!(session.used.is_none(), "the old count is gone");
+        assert_eq!(before, 3);
+    }
+
+    #[test]
+    fn a_session_with_nothing_answered_has_nothing_to_compact() {
+        let mut session = bare_session();
+        let mut console = Console::Stdout;
+        assert!(session.compact(&mut console).is_none());
+        assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
+    fn a_title_request_is_read_from_the_two_lines_it_asks_for() {
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"TITLE: A short title\n"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"SUMMARY: One sentence.\n"}}]}"#,
+            "[DONE]",
+        ])]);
+        let provider = Provider {
+            ep: server.ep.clone(),
+            ..test_provider()
+        };
+        let text = title_request(&provider, "m", "the request", "the answer").unwrap();
+        assert_eq!(
+            parse_naming(&text),
+            Some(("A short title".to_string(), "One sentence.".to_string()))
+        );
+        assert!(server
+            .text()
+            .contains("\"content\":\"User: the request\\nAssistant: the answer\""));
+    }
+
+    #[test]
+    fn a_naming_reply_is_read_loosely_or_not_at_all() {
+        assert_eq!(
+            parse_naming("title: T\nsummary: S"),
+            Some(("T".into(), "S".into()))
+        );
+        assert_eq!(
+            parse_naming("TITLE: \"quoted\"\nSUMMARY: \"also quoted\""),
+            Some(("quoted".into(), "also quoted".into()))
+        );
+        // A title with no summary is still a title.
+        assert_eq!(
+            parse_naming("TITLE: only"),
+            Some(("only".into(), String::new()))
+        );
+        // No title, no name.
+        assert_eq!(parse_naming("SUMMARY: orphan"), None);
+        assert_eq!(parse_naming(""), None);
+        assert_eq!(parse_naming("TITLE:\nSUMMARY: x"), None);
+    }
+
+    #[test]
+    fn a_finished_title_is_applied_at_the_next_poll() {
+        let dir = crate::state::testenv::dir("main-naming");
+        let mut session = bare_session();
+        session.store = Some(Store::fresh(dir.clone(), "abc123"));
+        session.record(json!({ "role": "user", "content": "fix the parser" }));
+        let (tx, rx) = mpsc::channel();
+        tx.send(Some(("Named".to_string(), "Summary".to_string())))
+            .unwrap();
+        session.naming = Some(rx);
+        let mut screen = ui::Screen::test_screen(60, 20);
+        session.poll_naming(Some(&mut screen));
+        let meta = session.store.as_ref().unwrap().meta.as_ref().unwrap();
+        assert_eq!(meta.title, "Named");
+        assert_eq!(meta.summary, "Summary");
+        assert!(session.naming.is_none());
+
+        // A poll with nothing to apply does nothing.
+        session.poll_naming(None);
+        // A thread that answered nothing ends the wait.
+        let (tx, rx) = mpsc::channel();
+        tx.send(None).unwrap();
+        session.naming = Some(rx);
+        session.poll_naming(None);
+        assert!(session.naming.is_none());
+        // So does one that died.
+        let (tx, rx) = mpsc::channel::<Option<(String, String)>>();
+        drop(tx);
+        session.naming = Some(rx);
+        session.poll_naming(None);
+        assert!(session.naming.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_named_session_is_named_once_and_synchronously() {
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"TITLE: Made by hand\n"}}]}"#,
+            "[DONE]",
+        ])]);
+        let dir = crate::state::testenv::dir("main-name-session");
+        let mut session = session_at(&server);
+        session.store = Some(Store::fresh(dir.clone(), "abc123"));
+        session.record(json!({ "role": "user", "content": "a request" }));
+        session.record(json!({ "role": "assistant", "content": "an answer" }));
+        session.name_session();
+        let meta = session.store.as_ref().unwrap().meta.as_ref().unwrap();
+        assert_eq!(meta.title, "Made by hand");
+        assert!(!session.may_name(), "named once is named");
+        // A session with no store cannot be named at all.
+        let mut bare = bare_session();
+        bare.name_session();
+        assert!(bare.store.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_resumed_history_is_replayed_into_the_transcript() {
+        let mut session = bare_session();
+        session.state.thoughts = true;
+        session.messages = session.base_messages();
+        session.messages[1] = json!({ "role": "user", "content": "explore mode: on" });
+        session
+            .messages
+            .push(json!({ "role": "user", "content": "fix it" }));
+        session.messages.push(json!({
+            "role": "assistant",
+            "content": "looking",
+            "reasoning_content": "a thought",
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": { "name": "read", "arguments": "{\"path\":\"x\"}" }
+            }]
+        }));
+        session.messages.push(json!({
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": "error: read x: no such file"
+        }));
+        let mut screen = ui::Screen::test_screen(60, 30);
+        session.replay(&mut screen);
+        let rows = screen.transcript();
+        assert!(rows.iter().any(|row| row.contains("fix it")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("looking")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("a thought")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("read")), "{rows:?}");
+        assert!(
+            rows.iter().any(|row| row.contains("no such file")),
+            "a failed call carries its reason: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_session_replay_says_what_it_left_out() {
+        let mut session = bare_session();
+        for i in 0..110 {
+            session
+                .messages
+                .push(json!({ "role": "user", "content": format!("line {i}") }));
+        }
+        let mut screen = ui::Screen::test_screen(60, 30);
+        session.replay(&mut screen);
+        let rows = screen.transcript();
+        assert!(
+            rows.iter().any(|row| row.contains("earlier messages")),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|row| row.contains("line 109")), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("line 0")), "{rows:?}");
+    }
+
+    #[test]
+    fn a_shell_line_joins_the_history_without_a_turn() {
+        let mut session = bare_session();
+        let result = session.run_shell("echo hi");
+        assert!(result.contains("hi"), "{result}");
+        let last = session.messages.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert!(last["content"].as_str().unwrap().starts_with("$ echo hi"));
+    }
+
+    #[test]
+    fn the_banner_prints_a_plain_mark_when_the_terminal_is_narrow() {
+        // No terminal in the test: the width is unknown and the block logo is
+        // the fallback, and the notes follow it.
+        banner(&["a note".to_string()]);
+        banner(&[]);
+    }
+
+    fn down(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// One session on disk, under the directory `Store` keeps its bodies in.
+    fn stored_session(dir: &std::path::Path, id: &str, title: &str, line: &str) {
+        let mut meta = sessions::Meta::new(id);
+        meta.title = title.to_string();
+        meta.updated = 10;
+        meta.save(dir).unwrap();
+        let mut log = sessions::Log::open(dir, id).unwrap();
+        log.append(&json!({ "role": "user", "content": line }))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_shell_command_runs_behind_a_live_prompt() {
+        let server = Server::new(Vec::new());
+        let mut session = session_at(&server);
+        let (_tx, rx) = events();
+        let mut screen = ui::Screen::test_screen(60, 20);
+
+        let leftover = session.shell("echo sous", &mut screen, &rx);
+        assert!(leftover.is_none());
+        let last = session.messages.last().unwrap();
+        assert_eq!(last["role"], "user");
+        let content = last["content"].as_str().unwrap();
+        assert!(content.starts_with("$ echo sous"), "{content}");
+        assert!(content.contains("sous"), "{content}");
+        assert!(session.used.is_none(), "the count is an estimate again");
+        let rows = screen.transcript();
+        assert!(rows.iter().any(|row| row.contains("sous")), "{rows:?}");
+    }
+
+    #[test]
+    fn keys_and_work_share_the_prompt_while_a_command_runs() {
+        let cancel = http::Cancel::new();
+        let (tx, rx) = events();
+        tx.send(down(KeyCode::Char('q'))).unwrap();
+        tx.send(down(KeyCode::Char('p'))).unwrap();
+        tx.send(Event::Paste("asted".into())).unwrap();
+        tx.send(Event::Resize).unwrap();
+        tx.send(down(KeyCode::Enter)).unwrap();
+        tx.send(Event::Eof).unwrap();
+        let mut screen = ui::Screen::test_screen(60, 20);
+
+        let (joined, queued) = thread::scope(|scope| {
+            let handle = scope.spawn(|| 7u32);
+            pump(&mut screen, &rx, &cancel, handle)
+        });
+        assert_eq!(joined, Some(7));
+        assert_eq!(queued.as_deref(), Some("qpasted"), "the line is kept");
+        assert!(cancel.cancelled(), "the end of input cancels the work");
+    }
+
+    #[test]
+    fn the_model_chooser_switches_to_the_row_enter_is_on() {
+        let (tx, rx) = events();
+        tx.send(down(KeyCode::Enter)).unwrap();
+        let mut session = bare_session();
+        session.providers[0].models.push(api::ModelInfo {
+            id: "n".into(),
+            context: Some(1),
+        });
+        let mut screen = ui::Screen::test_screen(60, 20);
+        session.browse_models(&mut screen, &rx, "p/n");
+        assert_eq!(session.model, "n");
+        assert_eq!(screen.menu_selected(), 0, "the chooser closed");
+
+        // A query that matches nothing is reported and then cleared.
+        let (tx, rx) = events();
+        tx.send(down(KeyCode::Enter)).unwrap();
+        let mut screen = ui::Screen::test_screen(60, 20);
+        session.browse_models(&mut screen, &rx, "nothing-matches");
+        assert!(session.model == "n", "the earlier choice stands");
+    }
+
+    #[test]
+    fn the_level_chooser_sets_and_remembers_a_level() {
+        let dir = crate::state::testenv::dir("main-levels");
+        let (tx, rx) = events();
+        tx.send(down(KeyCode::Enter)).unwrap();
+        let mut session = Session {
+            state: state::State {
+                cwd: dir.clone(),
+                ..state::State::default()
+            },
+            ..bare_session()
+        };
+        session.providers[0].cfg.thinking = vec![
+            ("off".into(), json!({})),
+            ("high".into(), json!({ "reasoning_effort": "high" })),
+        ];
+        let mut screen = ui::Screen::test_screen(60, 20);
+        session.browse_levels(&mut screen, &rx, "");
+        assert_eq!(session.thinking.as_deref(), Some("off"));
+        assert_eq!(
+            session.state.thinking_for(&session.spec()).as_deref(),
+            Some("off")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_session_chooser_resumes_what_it_is_on_and_closes_on_esc() {
+        crate::state::testenv::home("main-browse-sessions", |home| {
+            let cwd = home.join("work");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let dir = sessions::dir(&cwd);
+            stored_session(&dir, "abc123", "the one", "earlier words");
+
+            // Esc closes the chooser and leaves its rows in the transcript.
+            let (tx, rx) = events();
+            tx.send(down(KeyCode::Esc)).unwrap();
+            let mut session = bare_session();
+            session.state.cwd = cwd.clone();
+            session.store = Some(Store::fresh(dir.clone(), "aaa111"));
+            let mut screen = ui::Screen::test_screen(60, 20);
+            session.browse_sessions(&mut screen, &rx, "");
+            assert!(
+                session.store.as_ref().unwrap().meta.is_none(),
+                "nothing resumed"
+            );
+
+            // Enter resumes the selected session: its history replaces the
+            // live one, and the screen replays it.
+            let (tx, rx) = events();
+            tx.send(down(KeyCode::Enter)).unwrap();
+            let mut screen = ui::Screen::test_screen(60, 40);
+            session.browse_sessions(&mut screen, &rx, "");
+            assert_eq!(session.sid, "abc123");
+            assert!(session
+                .messages
+                .iter()
+                .any(|m| m["content"] == "earlier words"));
+            let rows = screen.transcript();
+            assert!(rows.iter().any(|row| row.contains("Resumed")), "{rows:?}");
+            assert!(
+                rows.iter().any(|row| row.contains("earlier words")),
+                "{rows:?}"
+            );
+
+            // A directory with no sessions says so.
+            let mut session = bare_session();
+            session.state.cwd = home.join("empty");
+            std::fs::create_dir_all(home.join("empty")).unwrap();
+            let mut screen = ui::Screen::test_screen(60, 20);
+            session.browse_sessions(&mut screen, &rx, "");
+            let rows = screen.transcript();
+            assert!(
+                rows.iter().any(|row| row.contains("No sessions")),
+                "{rows:?}"
+            );
+
+            // And no working directory at all is its own answer.
+            let mut session = bare_session();
+            session.browse_sessions(&mut screen, &rx, "");
+            let rows = screen.transcript();
+            assert!(
+                rows.iter().any(|row| row.contains("working directory")),
+                "{rows:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_piped_listing_numbers_what_it_shows_and_resumes_by_number() {
+        crate::state::testenv::home("main-list-piped", |home| {
+            let cwd = home.join("work");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let dir = sessions::dir(&cwd);
+            stored_session(&dir, "abc123", "the first", "a needle");
+            let mut session = bare_session();
+            session.state.cwd = cwd.clone();
+            session.store = Some(Store::fresh(dir.clone(), "aaa111"));
+
+            session.list_piped("");
+            assert_eq!(session.picks, vec!["abc123".to_string()]);
+            session.list_piped("needle");
+            assert_eq!(session.picks, vec!["abc123".to_string()]);
+            session.list_piped("nothing");
+            assert!(session.picks.is_empty(), "a search replaces the list");
+            session.list_piped("");
+            session.list_piped("1");
+            assert_eq!(session.sid, "abc123", "the number resumes the row");
+            assert!(session.messages.iter().any(|m| m["content"] == "a needle"));
+
+            // A number that was never listed, and a directory with nothing in
+            // it, are both answered rather than fatal.
+            session.list_piped("9");
+            let mut empty = bare_session();
+            empty.state.cwd = home.join("empty");
+            std::fs::create_dir_all(home.join("empty")).unwrap();
+            empty.list_piped("");
+            empty.list_piped("7");
+            // No working directory: nothing to list at all.
+            let mut bare = bare_session();
+            bare.list_piped("");
+        });
+    }
+
+    #[test]
+    fn a_new_session_keeps_the_store_and_takes_a_new_id() {
+        let dir = crate::state::testenv::dir("main-new");
+        let mut session = bare_session();
+        session.store = Some(Store::fresh(dir.clone(), "abc123"));
+        session.sid = "abc123".into();
+        session.providers[0].cfg.session_header = Some("x-session".into());
+        session.providers[0]
+            .headers
+            .push(("x-session".into(), "abc123".into()));
+        session.record(json!({ "role": "user", "content": "hi" }));
+        let mut screen = ui::Screen::test_screen(60, 20);
+
+        session.new_session(Some(&mut screen));
+        assert_ne!(session.sid, "abc123");
+        assert_eq!(session.messages.len(), 2, "the base, and nothing else");
+        assert!(session.messages[0]["role"] == "system");
+        assert_eq!(
+            session.providers[0].headers[0],
+            ("x-session".to_string(), session.sid.clone()),
+            "the provider token follows the conversation"
+        );
+        assert_eq!(session.store.as_ref().unwrap().dir, dir, "same directory");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

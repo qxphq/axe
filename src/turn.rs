@@ -423,4 +423,223 @@ mod tests {
         assert_eq!(out, "\nhello world");
         assert!(sink.wrote);
     }
+
+    /// What the turn showed, in order: enough to assert on a whole turn
+    /// without a terminal.
+    #[derive(Default)]
+    struct Recorder {
+        seen: Vec<String>,
+    }
+
+    impl Sink for Recorder {
+        fn text(&mut self, text: &str) {
+            self.seen.push(format!("text:{text}"));
+        }
+        fn reasoning(&mut self, text: &str) {
+            self.seen.push(format!("think:{text}"));
+        }
+        fn status(&mut self, text: &str) {
+            self.seen.push(format!("status:{text}"));
+        }
+        fn echo(
+            &mut self,
+            call: &[(Paint, String)],
+            mark: (Paint, &'static str),
+            error: Option<&str>,
+        ) {
+            let line: String = call.iter().map(|(_, text)| text.as_str()).collect();
+            self.seen
+                .push(format!("echo:{line} {} {:?}", mark.1, error));
+        }
+        fn user(&mut self, line: &str) {
+            self.seen.push(format!("user:{line}"));
+        }
+        fn end_round(&mut self) {
+            self.seen.push("round".into());
+        }
+    }
+
+    struct Log(Vec<Value>);
+
+    impl History for Log {
+        fn push(&mut self, message: Value) {
+            self.0.push(message);
+        }
+        fn messages(&self) -> &[Value] {
+            &self.0
+        }
+    }
+
+    /// A sink and a history, for the tests that run a whole turn.
+    fn log() -> Log {
+        Log(vec![json!({ "role": "user", "content": "hi" })])
+    }
+
+    #[test]
+    fn a_turn_runs_the_calls_a_round_named_and_asks_again() {
+        use crate::http::support::{sse, Server};
+
+        let server = Server::new(vec![
+            sse(&[
+                r#"{"choices":[{"delta":{"content":"let me look"}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"about","arguments":"{}"}}]}}]}"#,
+                r#"{"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
+                "[DONE]",
+            ]),
+            sse(&[r#"{"choices":[{"delta":{"content":"done"}}]}"#, "[DONE]"]),
+        ]);
+        let cancel = Cancel::new();
+        let turn = Turn {
+            ep: &server.ep,
+            key: None,
+            headers: &[],
+            model: "m",
+            extra: None,
+            mode: tools::Mode::Normal,
+            queue: None,
+            cancel: &cancel,
+        };
+        let mut history = log();
+        let mut sink = Recorder::default();
+        let used = run_turn(&turn, &mut history, &mut sink).unwrap();
+
+        assert_eq!(used, Some(12));
+        // The call is answered before the second request, and the answer that
+        // ends the turn is the assistant message.
+        assert_eq!(history.0[1]["tool_calls"][0]["function"]["name"], "about");
+        assert_eq!(history.0[2]["role"], "tool");
+        assert_eq!(history.0[2]["tool_call_id"], "c1");
+        assert_eq!(history.0[3]["content"], "done");
+        let echoed = sink
+            .seen
+            .iter()
+            .find(|e| e.starts_with("echo:"))
+            .expect("the call is shown");
+        assert!(echoed.contains("about") && echoed.contains('✓'), "{echoed}");
+        assert!(
+            sink.seen.iter().any(|e| e == "status:⋯ Thinking"),
+            "{:?}",
+            sink.seen
+        );
+        assert_eq!(sink.seen.iter().filter(|e| *e == "round").count(), 2);
+    }
+
+    #[test]
+    fn a_queued_line_joins_the_turn_at_the_next_round() {
+        use crate::http::support::{sse, Server};
+
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
+            "[DONE]",
+        ])]);
+        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
+        queue.lock().unwrap().push_back("and this".into());
+        let cancel = Cancel::new();
+        let turn = Turn {
+            ep: &server.ep,
+            key: None,
+            headers: &[],
+            model: "m",
+            extra: None,
+            mode: tools::Mode::Normal,
+            queue: Some(&queue),
+            cancel: &cancel,
+        };
+        let mut history = log();
+        let mut sink = Recorder::default();
+        run_turn(&turn, &mut history, &mut sink).unwrap();
+
+        assert_eq!(history.0[1]["role"], "user");
+        assert_eq!(history.0[1]["content"], "and this");
+        assert_eq!(history.0[2]["content"], "ok");
+        assert!(sink.seen.contains(&"user:and this".to_string()));
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_interrupt_before_a_round_starts_asks_nothing() {
+        let server = crate::http::support::Server::new(Vec::new());
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let turn = Turn {
+            ep: &server.ep,
+            key: None,
+            headers: &[],
+            model: "m",
+            extra: None,
+            mode: tools::Mode::Normal,
+            queue: None,
+            cancel: &cancel,
+        };
+        let mut history = log();
+        let mut sink = Recorder::default();
+        assert_eq!(run_turn(&turn, &mut history, &mut sink).unwrap(), None);
+        assert_eq!(history.0.len(), 1);
+        assert!(sink.seen.is_empty());
+    }
+
+    #[test]
+    fn a_queue_is_drained_once_and_missing_queues_are_empty() {
+        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
+        queue.lock().unwrap().push_back("a".into());
+        queue.lock().unwrap().push_back("b".into());
+        assert_eq!(take_queue(Some(&queue)), vec!["a", "b"]);
+        assert!(take_queue(Some(&queue)).is_empty());
+        assert!(take_queue(None).is_empty());
+    }
+
+    #[test]
+    fn an_assistant_message_returns_the_reasoning_it_streamed() {
+        let reply = api::Reply {
+            text: "answer".into(),
+            reasoning: "thought".into(),
+            calls: Vec::new(),
+            usage: None,
+        };
+        let message = assistant_message(&reply);
+        assert_eq!(message["content"], "answer");
+        assert_eq!(message["reasoning_content"], "thought");
+
+        let plain = api::Reply {
+            reasoning: String::new(),
+            ..reply
+        };
+        assert!(assistant_message(&plain).get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn a_text_sink_takes_its_blank_rows_once() {
+        let mut sink = TextSink::default();
+        let mut out = String::new();
+        // No newline: nothing is written yet, and nothing is claimed.
+        sink.push("", &mut out);
+        assert!(!sink.take_wrote());
+        sink.push("first", &mut out);
+        assert!(sink.take_wrote());
+        assert!(!sink.take_wrote());
+        sink.push("\n\n\nsecond", &mut out);
+        sink.commit();
+        assert_eq!(out, "\nfirst\n\n\nsecond");
+    }
+
+    #[test]
+    fn a_plain_sink_spaces_blocks_the_way_the_screen_does() {
+        let mut sink = PlainSink::default();
+        // Text that ends a block, then a tool line, then text again: the blank
+        // rows between them come from `ui::separated`, not from the provider.
+        sink.text("hello\n\n\n");
+        sink.end_round();
+        assert!(matches!(sink.last, Some(ui::Block::Text)));
+        sink.echo(
+            &[(Paint::Cyan, "read x".to_string())],
+            (Paint::Green, "ok"),
+            Some("boom"),
+        );
+        assert!(matches!(sink.last, Some(ui::Block::Tool)));
+        sink.text("after");
+        sink.reasoning("hidden");
+        sink.status("ignored");
+        sink.end_round();
+        assert!(matches!(sink.last, Some(ui::Block::Text)));
+    }
 }

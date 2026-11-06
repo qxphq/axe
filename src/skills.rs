@@ -546,6 +546,7 @@ pub fn invocation(skill: &Skill, request: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn temp(name: &str) -> PathBuf {
@@ -748,6 +749,262 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("lowercase letters")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_roots_stop_at_the_repository() {
+        let dir = temp("roots");
+        let repo = dir.join("repo");
+        let deep = repo.join("a/b/c");
+        fs::create_dir_all(&deep).unwrap();
+        // Without a `.git` anywhere above, only the working directory counts.
+        assert_eq!(project_roots(&deep), vec![deep.join(".agents/skills")]);
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let roots = project_roots(&deep);
+        assert_eq!(roots.len(), 4, "{roots:?}");
+        assert_eq!(roots[0], deep.join(".agents/skills"));
+        assert_eq!(roots[3], repo.join(".agents/skills"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_reads_project_config_home_and_extra_roots() {
+        use crate::state::testenv;
+
+        testenv::home("skills-load", |home| {
+            let repo = home.join("repo");
+            let cwd = repo.join("sub");
+            fs::create_dir_all(repo.join(".git")).unwrap();
+            fs::create_dir_all(&cwd).unwrap();
+            write_skill(
+                &cwd.join(".agents/skills"),
+                "project-skill",
+                "description: from the repo",
+                "body",
+            );
+            write_skill(
+                &home.join("config/axe/skills"),
+                "config-skill",
+                "description: from the config",
+                "body",
+            );
+            write_skill(
+                &home.join(".agents/skills"),
+                "home-skill",
+                "description: from the home directory",
+                "body",
+            );
+            let extra = home.join("extra");
+            write_skill(
+                &extra,
+                "extra-skill",
+                "description: from the config key",
+                "body",
+            );
+
+            let missing = home.join("nowhere");
+            let loaded = load(Some(&cwd), &[extra, missing.clone()]);
+            let found: Vec<(&str, Scope)> = loaded
+                .skills
+                .iter()
+                .map(|skill| (skill.name.as_str(), skill.scope))
+                .collect();
+            assert!(
+                found.contains(&("project-skill", Scope::Project)),
+                "{found:?}"
+            );
+            assert!(
+                found.contains(&("config-skill", Scope::Global)),
+                "{found:?}"
+            );
+            assert!(found.contains(&("home-skill", Scope::Global)), "{found:?}");
+            assert!(found.contains(&("extra-skill", Scope::Config)), "{found:?}");
+            assert!(
+                loaded
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("does not exist")),
+                "{:?}",
+                loaded.warnings
+            );
+            // No working directory: no project roots, and nothing to fail on.
+            let bare = load(None, &[]);
+            assert!(!bare
+                .skills
+                .iter()
+                .any(|skill| skill.name == "project-skill"));
+        });
+    }
+
+    #[test]
+    fn frontmatter_reads_the_subset_it_documents() {
+        let text = "---\nunknown: value\n\nname: 'it''s named'\n\
+                    description: \"quoted\\nwith\\ttab\\q\"\n\
+                    allowed-tools: |\n  bash\n\n  read\ndisable-model-invocation: TRUE\n\
+                    ---\nbody\n";
+        let (front, body) = split_frontmatter(text).unwrap();
+        assert_eq!(front.name.as_deref(), Some("it's named"));
+        assert_eq!(front.description.as_deref(), Some("quoted\nwith\ttabq"));
+        assert_eq!(front.allowed_tools.as_deref(), Some("bash\n\nread"));
+        assert!(front.hidden);
+        assert_eq!(body, "body\n");
+        // A folded block ends at the next top-level key.
+        let (front, _) =
+            split_frontmatter("---\ndescription: >-\n  folded\n  text\nname: after\n---\n")
+                .unwrap();
+        assert_eq!(front.description.as_deref(), Some("folded text"));
+        assert_eq!(front.name.as_deref(), Some("after"));
+        // A line with no colon is skipped, not fatal.
+        let (front, _) = split_frontmatter("---\nno colon here\nname: x\n---\n").unwrap();
+        assert_eq!(front.name.as_deref(), Some("x"));
+        assert_eq!(scalar("plain text"), "plain text");
+        assert_eq!(scalar("\"a\\\"b\""), "a\"b");
+        assert_eq!(scalar("'single'"), "single");
+    }
+
+    #[test]
+    fn a_name_is_checked_against_each_rule() {
+        assert!(name_problems("pdf-tools").is_empty());
+        let long = "a".repeat(65);
+        let problems = name_problems(&long);
+        assert!(
+            problems.iter().any(|p| p.contains("longer than 64")),
+            "{problems:?}"
+        );
+        let problems = name_problems("Bad_Name");
+        assert!(
+            problems.iter().any(|p| p.contains("lowercase")),
+            "{problems:?}"
+        );
+        for name in ["-lead", "trail-", "two--hyphens"] {
+            let problems = name_problems(name);
+            assert!(
+                problems.iter().any(|p| p.contains("hyphen")),
+                "{name}: {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_may_be_empty_missing_or_huge() {
+        let dir = temp("bodies");
+        let file = write_skill(&dir, "empty", "description: nothing to say", "");
+        let mut loaded = scan(&[(dir.clone(), Scope::Global)]);
+        let err = body(&loaded.skills[0]).err().unwrap();
+        assert!(err.contains("no instructions"), "{err}");
+
+        // Frontmatter only: the body is empty too.
+        fs::write(&file, "---\nname: empty\ndescription: x\n---\n").unwrap();
+        loaded = scan(&[(dir.clone(), Scope::Global)]);
+        assert!(body(&loaded.skills[0]).is_err());
+
+        // No frontmatter at all: the skill is skipped before its body is read.
+        let bare = dir.join("bare");
+        fs::create_dir_all(&bare).unwrap();
+        fs::write(bare.join("SKILL.md"), "steps\n").unwrap();
+        loaded = scan(&[(dir.clone(), Scope::Global)]);
+        assert!(!loaded.skills.iter().any(|skill| skill.name == "bare"));
+
+        // A body over the cap is cut and says so.
+        let huge = dir.join("huge");
+        fs::create_dir_all(&huge).unwrap();
+        let mut text = String::from("---\ndescription: huge\n---\n");
+        text.push_str(&"x".repeat(MAX_BODY_BYTES + 10));
+        fs::write(huge.join("SKILL.md"), text).unwrap();
+        let loaded = scan(&[(dir.clone(), Scope::Global)]);
+        let skill = loaded.skills.iter().find(|s| s.name == "huge").unwrap();
+        let out = body(skill).unwrap();
+        assert!(
+            out.ends_with("[skill body truncated at 48 KiB]..."),
+            "{out:.80}"
+        );
+        assert!(out.len() > MAX_BODY_BYTES, "the cap plus the note");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_invocation_with_no_request_asks_for_the_instructions() {
+        let dir = temp("invocation");
+        write_skill(&dir, "demo", "description: demo", "Do the thing.");
+        let loaded = scan(&[(dir.clone(), Scope::Global)]);
+        let text = invocation(&loaded.skills[0], "   ").unwrap();
+        assert!(
+            text.ends_with("Follow this skill's instructions."),
+            "{text}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symlinked_directory_is_not_followed() {
+        let dir = temp("symlink");
+        let real = dir.join("outside");
+        write_skill(&real, "real", "description: reached directly", "body");
+        fs::create_dir_all(dir.join("scan")).unwrap();
+        std::os::unix::fs::symlink(&real, dir.join("scan/link")).unwrap();
+        fs::create_dir_all(dir.join("scan/.hidden")).unwrap();
+        fs::write(
+            dir.join("scan/.hidden/SKILL.md"),
+            "---\ndescription: hidden dir\n---\nbody\n",
+        )
+        .unwrap();
+        let loaded = scan(&[(dir.join("scan"), Scope::Global)]);
+        assert!(loaded.skills.is_empty(), "{} skills", loaded.skills.len());
+        // The same skill loads when its directory is named, not linked.
+        let loaded = scan(&[(real, Scope::Global)]);
+        assert_eq!(loaded.skills.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_skill_file_warns_and_is_skipped() {
+        let dir = temp("unreadable");
+        let file = write_skill(&dir, "broken", "description: cannot be read", "body");
+        fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let loaded = scan(&[(dir.clone(), Scope::Global)]);
+        assert!(loaded.skills.is_empty());
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("skill")),
+            "{:?}",
+            loaded.warnings
+        );
+        fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_skill_without_a_directory_name_or_description_is_skipped() {
+        let dir = temp("skips");
+        // A SKILL.md at the root of the scanned tree has no skill directory.
+        let root = dir.join("scan");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            "---\ndescription: at the root\n---\nbody\n",
+        )
+        .unwrap();
+        // A separate root: a directory holding SKILL.md is not descended into.
+        let other = dir.join("other");
+        fs::create_dir_all(other.join("unclosed")).unwrap();
+        fs::write(other.join("unclosed/SKILL.md"), "---\nname: x\n").unwrap();
+        let loaded = scan(&[(root.clone(), Scope::Global), (other, Scope::Global)]);
+        // A SKILL.md at the root of a scanned tree takes that directory's name.
+        assert_eq!(loaded.skills.len(), 1);
+        assert_eq!(loaded.skills[0].name, "scan");
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("frontmatter is missing or unclosed")),
+            "{:?}",
+            loaded.warnings
+        );
+        // The catalogue of nothing is nothing: no heading, no empty block.
+        assert_eq!(prompt_section(&[]), "");
         let _ = fs::remove_dir_all(&dir);
     }
 }

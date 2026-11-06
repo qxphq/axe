@@ -759,4 +759,155 @@ mod tests {
         assert_eq!(Mode::Normal.flip(), Mode::Explore);
         assert_eq!(Mode::Explore.flip(), Mode::Normal);
     }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        crate::state::testenv::dir(name)
+    }
+
+    #[test]
+    fn the_mode_decides_which_tools_exist() {
+        let cancel = Cancel::new();
+        let dir = scratch_dir("tools-mode");
+        let file = dir.join("f");
+        let args = json!({ "path": file.to_string_lossy(), "content": "x" }).to_string();
+        let refused = execute("write", &args, &cancel, Mode::Explore);
+        assert!(refused.contains("explore mode"), "{refused}");
+        assert!(!file.exists(), "nothing was written");
+        assert!(execute("edit", &args, &cancel, Mode::Explore).contains("explore mode"));
+        assert!(execute("fetch", "{}", &cancel, Mode::Normal).contains("explore mode"));
+        assert!(execute("web_search", "{}", &cancel, Mode::Normal).contains("explore mode"));
+        // About is a string in both modes, and the tools never reach the kernel.
+        assert!(execute("about", "{}", &cancel, Mode::Normal).contains("axe"));
+        assert!(execute("nonesuch", "{}", &cancel, Mode::Normal).contains("unknown tool"));
+        assert!(execute("read", "{ not json", &cancel, Mode::Normal).contains("invalid arguments"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_streams_the_window_it_is_given() {
+        let dir = scratch_dir("tools-read");
+        let file = dir.join("lines.txt");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+        let path = file.to_string_lossy().to_string();
+        let body = |args: Value| read(&args).trim_end().to_string();
+        assert_eq!(body(json!({ "path": path })), "one\ntwo\nthree");
+        assert_eq!(body(json!({ "path": path, "offset": 2 })), "two\nthree");
+        assert_eq!(body(json!({ "path": path, "limit": 1 })), "one");
+        assert_eq!(
+            body(json!({ "path": path, "offset": 2, "limit": 1 })),
+            "two"
+        );
+        // Past the end says so rather than pretending the file is empty.
+        assert!(read(&json!({ "path": path, "offset": 9 })).contains("past the end"));
+        assert!(read(&json!({})).contains("missing"));
+        assert!(read(&json!({ "path": dir.to_string_lossy() })).contains("not a regular file"));
+        assert!(read(&json!({ "path": dir.join("nope").to_string_lossy() })).contains("error:"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_creates_the_directories_it_needs() {
+        let dir = scratch_dir("tools-write");
+        let file = dir.join("a/b/c.txt");
+        let result = write(&json!({
+            "path": file.to_string_lossy(),
+            "content": "hello\n",
+        }));
+        assert!(result.starts_with("wrote 6 bytes"), "{result}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello\n");
+        assert!(write(&json!({ "path": file.to_string_lossy() })).contains("missing \"content\""));
+        assert!(write(&json!({ "content": "x" })).contains("missing \"path\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_needs_one_match_unless_it_is_told_otherwise() {
+        let dir = scratch_dir("tools-edit");
+        let file = dir.join("f.txt");
+        let path = file.to_string_lossy().to_string();
+        std::fs::write(&file, "one two one").unwrap();
+        assert!(edit(&json!({ "path": path, "old": "two", "new": "2" })).starts_with("edited"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one 2 one");
+        let ambiguous = edit(&json!({ "path": path, "old": "one", "new": "1" }));
+        assert!(ambiguous.contains("2 matches"), "{ambiguous}");
+        assert!(
+            edit(&json!({ "path": path, "old": "one", "new": "1", "replace_all": true }))
+                .contains("2 replacements")
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "1 2 1");
+        assert!(edit(&json!({ "path": path, "old": "gone", "new": "x" })).contains("not found"));
+        assert!(edit(&json!({ "path": path })).contains("missing \"old\""));
+        assert!(edit(&json!({ "path": path, "old": "1" })).contains("missing \"new\""));
+        assert!(edit(&json!({ "old": "x", "new": "y" })).contains("missing \"path\""));
+        assert!(edit(
+            &json!({ "path": dir.join("nope").to_string_lossy(), "old": "x", "new": "y" })
+        )
+        .contains("error: read"));
+        std::fs::remove_file(&file).unwrap();
+        assert!(edit(&json!({ "path": path, "old": "x", "new": "y" })).starts_with("error:"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_command_reports_its_exit_code_and_both_streams() {
+        let cancel = Cancel::new();
+        assert!(bash(&json!({}), &cancel, Mode::Normal).contains("missing \"command\""));
+        let out = execute(
+            "bash",
+            &json!({ "command": "echo out; echo err >&2" }).to_string(),
+            &cancel,
+            Mode::Normal,
+        );
+        assert!(out.starts_with("exit: 0"), "{out}");
+        assert!(out.contains("out"), "{out}");
+        assert!(out.contains("err"), "{out}");
+
+        let failed = execute(
+            "bash",
+            &json!({ "command": "exit 3" }).to_string(),
+            &cancel,
+            Mode::Normal,
+        );
+        assert!(failed.starts_with("exit: 3"), "{failed}");
+
+        // A signal has no code, and says so.
+        let signal = execute(
+            "bash",
+            &json!({ "command": "kill -TERM $$" }).to_string(),
+            &cancel,
+            Mode::Normal,
+        );
+        assert!(signal.starts_with("exit: signal"), "{signal}");
+    }
+
+    #[test]
+    fn explore_mode_bash_runs_a_command_that_writes_nothing() {
+        let cancel = Cancel::new();
+        let out = execute(
+            "bash",
+            &json!({ "command": "echo explore" }).to_string(),
+            &cancel,
+            Mode::Explore,
+        );
+        assert!(out.starts_with("exit: 0"), "{out}");
+        assert!(out.contains("explore"), "{out}");
+    }
+
+    #[test]
+    fn an_interrupt_kills_the_command_it_started() {
+        let cancel = std::sync::Arc::new(Cancel::new());
+        let trigger = cancel.clone();
+        let flag = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            trigger.cancel();
+        });
+        let out = execute(
+            "bash",
+            &json!({ "command": "sleep 30" }).to_string(),
+            &cancel,
+            Mode::Normal,
+        );
+        flag.join().unwrap();
+        assert!(out.contains("interrupted"), "{out}");
+    }
 }

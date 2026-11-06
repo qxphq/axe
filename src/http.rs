@@ -597,8 +597,133 @@ fn read_line_raw<R: Read>(reader: &mut R) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
+/// A loopback HTTP server for the tests that need one. It answers the
+/// connections it is given, in order, with the exact bytes it is given, and
+/// reports what the client wrote, so a test asserts on the wire and not on a
+/// mock's idea of it. Plain HTTP only: TLS would need a certificate this
+/// repository does not ship.
+#[cfg(test)]
+pub(crate) mod support {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    use super::{parse_url, Endpoint};
+
+    pub struct Server {
+        pub ep: Endpoint,
+        got: Receiver<Vec<u8>>,
+        /// Kept only so the thread outlives the last connection it serves; it
+        /// is never joined, because a test may leave a response unasked.
+        _thread: JoinHandle<()>,
+    }
+
+    impl Server {
+        /// One response per connection, in order, on a port the kernel picks.
+        pub fn new(responses: Vec<Vec<u8>>) -> Server {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let port = listener.local_addr().expect("loopback addr").port();
+            let (tx, got) = mpsc::channel();
+            let thread = thread::spawn(move || {
+                for response in &responses {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = tx.send(read_request(&mut stream));
+                    let _ = stream.write_all(response);
+                    let _ = stream.flush();
+                }
+            });
+            let url = format!("http://127.0.0.1:{port}");
+            Server {
+                ep: parse_url(&url).expect("loopback url"),
+                got,
+                _thread: thread,
+            }
+        }
+
+        /// The next request as the client wrote it, headers and body.
+        pub fn text(&self) -> String {
+            String::from_utf8_lossy(&self.got.recv().expect("request")).into_owned()
+        }
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+            let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            // Every request this client writes carries a length, so the body
+            // needs no framing guesswork.
+            let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if buf.len() >= end + 4 + length {
+                break;
+            }
+        }
+        buf
+    }
+
+    /// A response with a length, the headers given, and a body.
+    pub fn reply(status: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
+        let mut out = format!("HTTP/1.1 {status}\r\n");
+        for (name, value) in headers {
+            out.push_str(&format!("{name}: {value}\r\n"));
+        }
+        out.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        out.push_str("Connection: close\r\n\r\n");
+        out.push_str(body);
+        out.into_bytes()
+    }
+
+    /// A 200 `application/json` with a length.
+    pub fn json(body: &str) -> Vec<u8> {
+        reply("200 OK", &[("Content-Type", "application/json")], body)
+    }
+
+    /// A 200 body sent in chunks, so the reader has to decode the framing.
+    pub fn chunked(body: &[&str]) -> Vec<u8> {
+        let mut out = String::from(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                          Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        );
+        for piece in body {
+            out.push_str(&format!("{:x}\r\n{piece}\r\n", piece.len()));
+        }
+        out.push_str("0\r\n\r\n");
+        out.into_bytes()
+    }
+
+    /// A 200 body with no length at all: the connection closing is the end of
+    /// it, which is what `llm.local` does.
+    pub fn close_delimited(body: &str) -> Vec<u8> {
+        format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n{body}").into_bytes()
+    }
+
+    /// One SSE `data:` line per entry, as the provider writes it.
+    pub fn sse(events: &[&str]) -> Vec<u8> {
+        let framed: Vec<String> = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        let pieces: Vec<&str> = framed.iter().map(String::as_str).collect();
+        chunked(&pieces)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::support::{chunked, close_delimited, json, reply, sse, Server};
     use super::*;
 
     #[test]
@@ -736,5 +861,254 @@ mod tests {
         let mut reader = &b"a: b\r\n"[..];
         assert_eq!(read_line(&mut reader).unwrap(), "a: b\r\n");
         assert!(read_line(&mut reader).is_err());
+    }
+
+    #[test]
+    fn a_request_writes_the_target_key_and_headers() {
+        let server = Server::new(vec![json(r#"{"ok":true}"#)]);
+        let ep = &server.ep;
+        let mut res = request(
+            ep,
+            "GET",
+            "/v1/models?q=1",
+            Some("secret"),
+            &[("x-opencode-session".into(), "sid".into())],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(res.status, 200);
+        assert_eq!(res.content_type.as_deref(), Some("application/json"));
+        assert_eq!(res.read_all().unwrap(), r#"{"ok":true}"#);
+
+        let sent = server.text();
+        assert!(
+            sent.starts_with("GET /v1/models?q=1 HTTP/1.1\r\n"),
+            "{sent:?}"
+        );
+        assert!(sent.contains("\r\nHost: 127.0.0.1:"), "{sent:?}");
+        assert!(
+            sent.contains("\r\nAuthorization: Bearer secret\r\n"),
+            "{sent:?}"
+        );
+        assert!(sent.contains("\r\nx-opencode-session: sid\r\n"), "{sent:?}");
+        assert!(sent.ends_with("\r\n\r\n"), "{sent:?}");
+    }
+
+    #[test]
+    fn a_post_sends_its_length_and_body() {
+        let server = Server::new(vec![json("{}")]);
+        let mut res = request(
+            &server.ep,
+            "POST",
+            "/chat",
+            None,
+            &[],
+            Some("{\"a\":1}"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(res.read_all().unwrap(), "{}");
+        let sent = server.text();
+        assert!(sent.contains("\r\nContent-Length: 7\r\n"), "{sent:?}");
+        assert!(sent.ends_with("{\"a\":1}"), "{sent:?}");
+    }
+
+    #[test]
+    fn a_chunked_body_decodes_across_reads() {
+        let server = Server::new(vec![chunked(&["hello ", "wor", "ld"])]);
+        let mut res = request(&server.ep, "GET", "/", None, &[], None, None).unwrap();
+        assert_eq!(res.read_all().unwrap(), "hello world");
+    }
+
+    #[test]
+    fn a_body_without_a_length_ends_at_the_close() {
+        let server = Server::new(vec![close_delimited("plain text")]);
+        let mut res = request(&server.ep, "GET", "/", None, &[], None, None).unwrap();
+        assert_eq!(res.read_all().unwrap(), "plain text");
+    }
+
+    #[test]
+    fn a_reader_takes_lines_and_reports_the_end() {
+        let server = Server::new(vec![sse(&["{\"a\":1}", "{\"b\":2}"])]);
+        let mut res = request(&server.ep, "GET", "/", None, &[], None, None).unwrap();
+        assert_eq!(
+            res.read_line().unwrap().as_deref(),
+            Some("data: {\"a\":1}\n")
+        );
+        assert_eq!(res.read_line().unwrap().as_deref(), Some("\n"));
+        assert_eq!(
+            res.read_line().unwrap().as_deref(),
+            Some("data: {\"b\":2}\n")
+        );
+        assert_eq!(res.read_line().unwrap().as_deref(), Some("\n"));
+        assert_eq!(res.read_line().unwrap(), None);
+    }
+
+    #[test]
+    fn a_capped_read_stops_at_the_limit_or_the_deadline() {
+        let server = Server::new(vec![json("abcdefghij")]);
+        let mut res = request(&server.ep, "GET", "/", None, &[], None, None).unwrap();
+        let cut = res
+            .read_capped(4, Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(cut, "abcd");
+
+        let server = Server::new(vec![json("abcdefghij")]);
+        let mut res = request(&server.ep, "GET", "/", None, &[], None, None).unwrap();
+        let expired = res.read_capped(4, Instant::now()).unwrap();
+        assert_eq!(expired, "", "a deadline already past reads nothing");
+    }
+
+    #[test]
+    fn the_location_and_type_headers_are_kept() {
+        let server = Server::new(vec![reply(
+            "302 Found",
+            &[
+                ("Location", "https://example.com/next"),
+                ("Content-Type", "text/html"),
+            ],
+            "",
+        )]);
+        let mut res = request(&server.ep, "GET", "/", None, &[], None, None).unwrap();
+        assert_eq!(res.status, 302);
+        assert_eq!(res.location.as_deref(), Some("https://example.com/next"));
+        assert_eq!(res.content_type.as_deref(), Some("text/html"));
+        assert_eq!(res.read_all().unwrap(), "");
+    }
+
+    #[test]
+    fn a_pinned_address_skips_the_name() {
+        let server = Server::new(vec![json("{}")]);
+        let addr: SocketAddr = ([127, 0, 0, 1], server.ep.port).into();
+        let res = request_with_timeout(
+            &server.ep,
+            "GET",
+            "/pinned",
+            None,
+            &[],
+            None,
+            Some(&[addr]),
+            None,
+            Duration::from_secs(5),
+        );
+        assert_eq!(res.unwrap().status, 200);
+        assert!(server.text().starts_with("GET /pinned "));
+    }
+
+    #[test]
+    fn a_cancelled_request_never_connects() {
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let server = Server::new(Vec::new());
+        let err = request(&server.ep, "GET", "/", None, &[], None, Some(&cancel))
+            .err()
+            .unwrap();
+        assert_eq!(err, "interrupted");
+    }
+
+    #[test]
+    fn a_closed_socket_before_the_response_is_an_error() {
+        let server = Server::new(vec![Vec::new()]);
+        let err = request(&server.ep, "GET", "/", None, &[], None, None)
+            .err()
+            .unwrap();
+        assert!(err.contains("closed before response"), "{err}");
+    }
+
+    #[test]
+    fn a_bad_status_line_is_an_error() {
+        let server = Server::new(vec![b"HTTP/1.1 banana\r\n\r\n".to_vec()]);
+        let err = request(&server.ep, "GET", "/", None, &[], None, None)
+            .err()
+            .unwrap();
+        assert!(err.contains("bad status line"), "{err}");
+    }
+
+    #[test]
+    fn a_stalled_read_times_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_millis(600));
+                drop(stream);
+            }
+        });
+        let ep = parse_url(&format!("http://127.0.0.1:{port}")).unwrap();
+        let err = request_with_timeout(
+            &ep,
+            "GET",
+            "/",
+            None,
+            &[],
+            None,
+            None,
+            None,
+            Duration::from_millis(100),
+        )
+        .err()
+        .unwrap();
+        assert!(err.starts_with("read:"), "{err}");
+    }
+
+    #[test]
+    fn a_closed_port_is_reported_as_a_failed_connect() {
+        // Bind, read the port, drop the listener: nothing is listening there.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let ep = parse_url(&format!("http://127.0.0.1:{port}")).unwrap();
+        let err = request(&ep, "GET", "/", None, &[], None, None)
+            .err()
+            .unwrap();
+        assert!(
+            err.starts_with(&format!("connect 127.0.0.1:{port}:")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_tls_config_is_built_once() {
+        let first = tls_config().unwrap();
+        let second = tls_config().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the certificate store is shared"
+        );
+    }
+
+    #[test]
+    fn a_header_that_would_split_the_request_is_refused() {
+        let server = Server::new(Vec::new());
+        let err = request(
+            &server.ep,
+            "GET",
+            "/",
+            Some("a\r\nX: y"),
+            &[("bad name".into(), "v".into())],
+            None,
+            None,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("Authorization"), "{err}");
+        let err = request(
+            &server.ep,
+            "GET",
+            "/",
+            None,
+            &[("bad name".into(), "v".into())],
+            None,
+            None,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("invalid header name"), "{err}");
+        let err = request(&server.ep, "GET", "/a b", None, &[], None, None)
+            .err()
+            .unwrap();
+        assert!(err.contains("invalid character"), "{err}");
     }
 }
