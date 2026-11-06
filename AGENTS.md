@@ -83,7 +83,8 @@ invariants a change must not break.
     at the bottom and cannot take them back, so a frame that shrinks leaves
     blank rows above it; `slack` counts them and the next block fills them
     from the top. Everything above is appended, never repainted — except
-    `/new`, which wipes the screen and its scrollback: a session boundary.
+    `/new`, which wipes the screen and its scrollback and starts the next
+    session read-only: a session boundary.
 13. **One writer, and it paints what is dirty.** While `ui::Screen` owns the
     terminal, only it draws. Every setter and transcript writer marks the screen
     dirty; `Screen::repaint()` paints only then, and the loops call it —

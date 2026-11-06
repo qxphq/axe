@@ -312,7 +312,7 @@ the file.
 | `/thinking [level]` | show or set the thinking level; bare, a chooser over the levels the provider configures |
 | `/thoughts` | show or hide the model's reasoning |
 | `/explore` | toggle explore mode (also Shift+Tab) |
-| `/new` | start a new session, naming the one it left and clearing the screen |
+| `/new` | start a new session, naming the one it left, clearing the screen, and turning explore mode back on |
 | `/sessions [query]` | browse or search this directory's sessions |
 | `/compact` | summarize the session and continue from the summary |
 | `/skills` | list loaded skills, where they came from, and what the model sees |
@@ -390,8 +390,9 @@ allowlist of commands and writes only inside a scratch directory and the
 project's `plan/` directory,
 and `fetch` and `web_search` are the way to read the web. When it is off,
 `write`, `edit` and a full `bash` are back — `fetch` and `web_search` are
-refused. The network is confined in neither mode: a command connects where you
-connect. Every change is announced
+refused. `/new` turns explore mode back on: the mode belongs to the session,
+and the next one starts read-only. The network is confined in neither mode: a
+command connects where you connect. Every change is announced
 in the conversation as `explore mode: on` or `explore mode: off`, so the model
 knows which side it is on.
 

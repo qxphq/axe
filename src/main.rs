@@ -2145,6 +2145,13 @@ impl Session {
                     )),
                     None => console.output("◦ New session\n"),
                 }
+                // A session begins read-only: `/new` is where one begins, so
+                // the mode comes back with it. `toggle_explore` is the one
+                // path that announces the change, colors the box, restarts
+                // the servers and puts the note in the new history.
+                if !self.mode.explore() {
+                    self.toggle_explore(console);
+                }
                 Cmd::Continue
             }
             Command::Model(spec, scope) => {
@@ -3788,6 +3795,36 @@ mod tests {
             session.dispatch("a request", &mut console),
             Cmd::Turn(request) if request == "a request"
         ));
+    }
+
+    #[test]
+    fn a_new_session_begins_read_only_again() {
+        let mut session = bare_session();
+        let mut console = Console::Stdout;
+        session.set_mode(tools::Mode::Normal);
+        assert!(matches!(
+            session.dispatch("/new", &mut console),
+            Cmd::Continue
+        ));
+        assert_eq!(session.mode, tools::Mode::Explore);
+        // The mode rides in the new history, once: a second `/new` starts with
+        // the note it already has.
+        let notes = |session: &Session| {
+            session
+                .messages
+                .iter()
+                .filter(|message| {
+                    message["content"].as_str()
+                        == Some(&*tools::Mode::Explore.note(crate::sandbox::plan()))
+                })
+                .count()
+        };
+        assert_eq!(notes(&session), 1);
+        assert!(matches!(
+            session.dispatch("/new", &mut console),
+            Cmd::Continue
+        ));
+        assert_eq!(notes(&session), 1);
     }
 
     #[test]
