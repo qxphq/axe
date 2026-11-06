@@ -874,7 +874,7 @@ impl Session {
             self.warn(format!("state: {e}"));
         }
         let label = thinking_label(&self.providers[self.provider].cfg, &self.thinking);
-        console.output(&format!("thinking: {label}\n"));
+        console.output(&format!("◦ thinking: {label}\n"));
     }
 
     fn finalize_session(&mut self) {
@@ -938,7 +938,7 @@ impl Session {
             for warning in warnings {
                 screen.error(&format!("axe: {warning}\n"));
             }
-            screen.output(&format!("Resumed: {title}\n"));
+            screen.output(&format!("◦ Resumed: {title}\n"));
             self.replay(screen);
             screen.set_info(self.info());
         } else {
@@ -969,7 +969,7 @@ impl Session {
 
         let start = history.len().saturating_sub(100);
         if start > 0 {
-            screen.output(&format!("… {start} earlier messages\n"));
+            screen.output(&format!("◦ {start} earlier messages\n"));
         }
         for message in &history[start..] {
             match message["role"].as_str() {
@@ -1154,7 +1154,7 @@ impl Session {
                     .collect()
             };
             if found.is_empty() {
-                screen.output(&format!("No sessions match {query:?}\n"));
+                screen.output(&format!("◦ No sessions match {query:?}\n"));
                 query.clear();
                 continue;
             }
@@ -1266,7 +1266,7 @@ impl Session {
                 return;
             };
             match self.resume(&id, None) {
-                Ok(title) => println!("Resumed: {}", terminal_text(&title)),
+                Ok(title) => println!("◦ Resumed: {}", terminal_text(&title)),
                 Err(e) => eprintln!("axe: {}", strip_control(&e)),
             }
             return;
@@ -1439,7 +1439,7 @@ impl Session {
         rx: &Receiver<Event>,
     ) -> Option<String> {
         screen.insert(vec![line_of(&shell_line(command, false))], ui::Block::Tool);
-        screen.set_status("Running…");
+        screen.set_status("▷ Running");
         screen.repaint();
         let cancel = http::Cancel::new();
         let args = json!({ "command": command }).to_string();
@@ -1481,7 +1481,7 @@ impl Session {
             .skip(2)
             .any(|message| message["role"].as_str() == Some("assistant"))
         {
-            console.output("nothing to compact\n");
+            console.output("◦ nothing to compact\n");
             return None;
         }
         // Half the window, as characters: the request has to fit with room for
@@ -1506,7 +1506,7 @@ impl Session {
         let mut queued = None;
         let result = match console {
             Console::Screen { screen, rx } => {
-                screen.set_status("Compacting…");
+                screen.set_status("▣ Compacting");
                 screen.repaint();
                 let result = thread::scope(|scope| {
                     let handle =
@@ -1539,10 +1539,10 @@ impl Session {
                 if let Some(screen) = console.screen() {
                     screen.set_info(self.info());
                 }
-                console.output(&format!("compacted {replaced} messages into 1 summary\n"));
+                console.output(&format!("◦ compacted {replaced} messages into 1 summary\n"));
             }
             Ok(_) => console.error("compaction: the model returned nothing"),
-            Err(_) if cancel.cancelled() => console.output("Compaction cancelled\n"),
+            Err(_) if cancel.cancelled() => console.output("× Compaction cancelled\n"),
             Err(e) => console.error(&e),
         }
         if let Some(screen) = console.screen() {
@@ -1603,7 +1603,7 @@ impl Session {
         // Whether the turn was actually stopped, for the line that says so.
         let mut interrupted = false;
 
-        screen.set_status("Thinking…");
+        screen.set_status("⋯ Thinking");
         screen.repaint();
 
         // What the last round counted, handed back by the turn's thread. The
@@ -1677,10 +1677,10 @@ impl Session {
                             if armed {
                                 interrupted = true;
                                 cancel.cancel();
-                                screen.set_alert(Some("Interrupting…"));
+                                screen.set_alert(Some("× Interrupting"));
                             } else {
                                 armed = true;
-                                screen.set_alert(Some("press ESC again to interrupt"));
+                                screen.set_alert(Some("× press ESC again to interrupt"));
                             }
                         }
                         Event::Key(key) => {
@@ -1758,7 +1758,7 @@ impl Session {
                             }
                             // The unfinished line is not the status: the row
                             // says what the turn is doing, not what it says.
-                            screen.set_status("Responding…");
+                            screen.set_status("▸ Responding");
                         }
                         // A tool call and its outcome, on one line.
                         Event::Echo(spans, error) => {
@@ -1902,7 +1902,7 @@ impl Session {
             }
             Command::New => {
                 self.new_session(console.screen());
-                console.output("New session\n");
+                console.output("◦ New session\n");
                 Cmd::Continue
             }
             Command::Model(None) => {
@@ -2239,7 +2239,7 @@ fn pump<T>(
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(Event::Key(key)) if key.code == KeyCode::Esc => {
                 cancel.cancel();
-                screen.set_status("Interrupting…");
+                screen.set_status("× Interrupting");
                 screen.repaint();
             }
             Ok(Event::Key(key)) => match screen.apply_key(key) {
