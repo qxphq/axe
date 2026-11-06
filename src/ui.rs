@@ -559,8 +559,14 @@ impl Screen {
             EnableBracketedPaste,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
         );
-        Ok(Screen {
-            term: Term::Real(term),
+        Ok(Screen::bare(Term::Real(term)))
+    }
+
+    /// A screen whose terminal is already taken: every field starts where a
+    /// session starts, and the first draw is owed.
+    fn bare(term: Term) -> Screen {
+        Screen {
+            term,
             ed: Buffer::default(),
             status: String::new(),
             alert: None,
@@ -578,7 +584,7 @@ impl Screen {
             menu: None,
             restored: false,
             dirty: true,
-        })
+        }
     }
 
     /// A screen shaped like a real one: an inline region at the bottom of the
@@ -600,26 +606,7 @@ impl Screen {
             },
         )
         .unwrap();
-        Screen {
-            term: Term::Test(term),
-            ed: Buffer::default(),
-            status: String::new(),
-            alert: None,
-            queued: None,
-            info: Vec::new(),
-            explore: false,
-            commands: Vec::new(),
-            selection: None,
-            recall: Recall::default(),
-            complete: None,
-            last: None,
-            slack: 0,
-            md: markdown::Stream::new(),
-            thought: markdown::Stream::new(),
-            menu: None,
-            restored: false,
-            dirty: true,
-        }
+        Screen::bare(Term::Test(term))
     }
 
     #[cfg(test)]
@@ -1075,14 +1062,25 @@ impl Screen {
     /// collected until the block they belong to ends, which is where they
     /// reach the transcript.
     pub fn text(&mut self, text: &str) {
+        self.streamed(text, false);
+    }
+
+    /// Reasoning is model text with one difference: dimmed, and its own stream,
+    /// so a thought's last paragraph cannot run into the answer's first.
+    fn streamed(&mut self, text: &str, thought: bool) {
         let width = self.cols();
         for line in split(text) {
             let mut lines = Vec::new();
-            self.md.push(line, width, &mut lines);
-            // One write per rendered block: the block separator belongs
-            // between them, not once per chunk.
-            if !lines.is_empty() {
-                self.write(lines, Block::Text);
+            if thought {
+                self.thought.push(line, width, &mut lines);
+                self.notes(lines);
+            } else {
+                self.md.push(line, width, &mut lines);
+                // One write per rendered block: the block separator belongs
+                // between them, not once per chunk.
+                if !lines.is_empty() {
+                    self.write(lines, Block::Text);
+                }
             }
         }
     }
@@ -1090,13 +1088,19 @@ impl Screen {
     /// Text this binary produced, not the model's: written as it is, one
     /// transcript line per line. Markdown belongs to the model and the user.
     pub fn output(&mut self, text: &str) {
+        self.plain(text, Style::new(), "", Block::Text);
+    }
+
+    /// One transcript line per line of `text`, indented by `indent` and painted
+    /// with `style`: the shape of everything the binary itself says.
+    fn plain(&mut self, text: &str, style: Style, indent: &str, block: Block) {
         self.flush();
         let lines: Vec<Line<'static>> = split(text)
             .into_iter()
-            .map(|line| Line::raw(line.to_string()))
+            .map(|line| Line::styled(format!("{indent}{line}"), style))
             .collect();
         if !lines.is_empty() {
-            self.write(lines, Block::Text);
+            self.write(lines, block);
         }
     }
 
@@ -1104,12 +1108,7 @@ impl Screen {
     /// answer, and collected the same way: a block reaches the transcript when
     /// it ends.
     pub fn thought(&mut self, text: &str) {
-        let width = self.cols();
-        for line in split(text) {
-            let mut lines = Vec::new();
-            self.thought.push(line, width, &mut lines);
-            self.notes(lines);
-        }
+        self.streamed(text, true);
     }
 
     /// End the reasoning: its last line was unfinished while it streamed, so
@@ -1136,27 +1135,15 @@ impl Screen {
 
     /// A warning or an error: same as `output`, in red.
     pub fn error(&mut self, text: &str) {
-        self.flush();
-        let lines: Vec<Line<'static>> = split(text)
-            .into_iter()
-            .map(|line| Line::styled(line.to_string(), ERROR_STYLE))
-            .collect();
-        if !lines.is_empty() {
-            self.write(lines, Block::Text);
-        }
+        self.plain(text, ERROR_STYLE, "", Block::Text);
     }
 
     /// A failed tool call's own words, red, directly under the call: it is part
     /// of the call's block, so no blank line separates the two.
     pub fn fail(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
+        if !text.is_empty() {
+            self.plain(text, ERROR_STYLE, "    ", Block::Tool);
         }
-        let lines: Vec<Line<'static>> = split(text)
-            .into_iter()
-            .map(|line| Line::styled(format!("    {line}"), ERROR_STYLE))
-            .collect();
-        self.insert(lines, Block::Tool);
     }
 
     /// `/new`: the transcript above belongs to the session that just ended, so
