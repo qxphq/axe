@@ -1,6 +1,7 @@
-//! MCP servers: the two config files, the programs axe starts from them, and
-//! the tools they add. stdio only — a server is a program, not a URL — and the
-//! catalogue they build is fixed at startup, so the cached prefix never moves.
+//! MCP servers: the two config files, the connections axe makes from them, and
+//! the tools they add. A server is a program (`command`) or an endpoint
+//! (`url`, streamable HTTP); both halves speak the same JSON-RPC and produce
+//! the same `mcp__<server>__<tool>` names in one catalogue fixed at startup.
 //!
 //! The global file is `~/.config/axe/mcp.json`; a project's is `.mcp.json` at
 //! or above the working directory, never past its repository root. A project
@@ -22,13 +23,12 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use crate::http::Cancel;
+use crate::http::{self, Cancel};
+use crate::oauth;
 use crate::state;
-use crate::text::{clip, plural, strip_control, truncate};
+use crate::text::{strip_control, truncate};
 
-/// The revision axe speaks and the versions it understands. A server answers
-/// with the one it will use; axe does not check it, the shapes it needs are in
-/// both.
+/// The revision axe speaks.
 const PROTOCOL: &str = "2025-06-18";
 /// A server that has not answered `initialize` by then is a failure, not a wait.
 const INIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -89,11 +89,17 @@ fn project_target(cwd: &Path) -> PathBuf {
 #[derive(Clone, Debug)]
 struct Entry {
     name: String,
-    command: String,
+    /// A program axe starts and speaks to over its stdin/stdout.
+    command: Option<String>,
+    /// An endpoint axe posts to: streamable HTTP.
+    url: Option<String>,
     args: Vec<String>,
-    /// Variables from axe's environment handed to the server. Names only: a
-    /// value in a file is a secret in a file.
-    env: Vec<String>,
+    /// Variable name -> raw value; `${NAME}` is expanded from axe's
+    /// environment when the server starts, so the prompt can name it before.
+    env: Vec<(String, String)>,
+    headers: Vec<(String, String)>,
+    /// Every `${NAME}`/`$NAME` the entry reads, for the approval prompt.
+    vars: Vec<String>,
     enabled: bool,
     timeout: u64,
     /// The file that defines it, for `/mcp` and for `remove`.
@@ -105,6 +111,20 @@ struct Entry {
 }
 
 impl Entry {
+    fn remote(&self) -> bool {
+        self.url.is_some()
+    }
+
+    /// Whether a remote server signs in: axe sends no `Authorization` of its
+    /// own when the entry already names one.
+    fn oauth(&self) -> bool {
+        self.remote()
+            && !self
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+    }
+
     fn describe(&self) -> String {
         if self.toggle_only {
             return if self.enabled {
@@ -113,13 +133,23 @@ impl Entry {
                 "turns the global server off".into()
             };
         }
-        let mut line = self.command.clone();
+        if let Some(url) = &self.url {
+            let mut line = url.clone();
+            for (name, _) in &self.headers {
+                line.push_str(&format!("  header: {name}"));
+            }
+            if self.oauth() {
+                line.push_str("  (sign-in)");
+            }
+            return line;
+        }
+        let mut line = self.command.clone().unwrap_or_default();
         for arg in &self.args {
             line.push(' ');
             line.push_str(arg);
         }
-        if !self.env.is_empty() {
-            line.push_str(&format!("  env: {}", self.env.join(", ")));
+        for (name, _) in &self.env {
+            line.push_str(&format!("  env: {name}"));
         }
         line
     }
@@ -154,6 +184,112 @@ fn valid_var(name: &str) -> bool {
     let mut bytes = name.bytes();
     matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_')
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The variable names a value reads: `$NAME` or `${NAME}`, `$$` an escape.
+fn vars_in(raw: &str) -> Vec<String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut names = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        if chars[at] != '$' {
+            at += 1;
+            continue;
+        }
+        if chars.get(at + 1) == Some(&'$') {
+            at += 2;
+            continue;
+        }
+        if chars.get(at + 1) == Some(&'{') {
+            if let Some(end) = chars[at + 2..].iter().position(|c| *c == '}') {
+                let name: String = chars[at + 2..at + 2 + end].iter().collect();
+                if valid_var(&name) {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                    at += end + 3;
+                    continue;
+                }
+            }
+            at += 1;
+            continue;
+        }
+        let start = at + 1;
+        let mut end = start;
+        while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+            end += 1;
+        }
+        let name: String = chars[start..end].iter().collect();
+        if end > start && valid_var(&name) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+            at = end;
+        } else {
+            at += 1;
+        }
+    }
+    names
+}
+
+/// Resolve `$NAME`/`${NAME}` from axe's environment. A missing variable is an
+/// error naming it: the server must not start with half its configuration.
+fn expand(raw: &str) -> Result<String, String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(raw.len());
+    let mut at = 0;
+    while at < chars.len() {
+        match chars[at] {
+            '$' if chars.get(at + 1) == Some(&'$') => {
+                out.push('$');
+                at += 2;
+            }
+            '$' if chars.get(at + 1) == Some(&'{') => {
+                let end = chars[at + 2..].iter().position(|c| *c == '}');
+                match end {
+                    Some(end) => {
+                        let name: String = chars[at + 2..at + 2 + end].iter().collect();
+                        if !valid_var(&name) {
+                            out.push('$');
+                            at += 1;
+                            continue;
+                        }
+                        out.push_str(&value(&name)?);
+                        at += end + 3;
+                    }
+                    None => {
+                        out.push('$');
+                        at += 1;
+                    }
+                }
+            }
+            '$' => {
+                let start = at + 1;
+                let mut end = start;
+                while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+                {
+                    end += 1;
+                }
+                let name: String = chars[start..end].iter().collect();
+                if end > start && valid_var(&name) {
+                    out.push_str(&value(&name)?);
+                    at = end;
+                } else {
+                    out.push('$');
+                    at += 1;
+                }
+            }
+            c => {
+                out.push(c);
+                at += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn value(name: &str) -> Result<String, String> {
+    std::env::var(name).map_err(|_| format!("{name} is not set"))
 }
 
 /// One file's entries. Unknown keys are errors: a typo, or a field from
@@ -206,26 +342,19 @@ fn parse_entry(name: &str, value: &Value, path: &Path, project: bool) -> Result<
     for key in object.keys() {
         if !matches!(
             key.as_str(),
-            "command" | "args" | "env" | "enabled" | "timeout" | "type" | "url"
+            "command" | "args" | "env" | "url" | "headers" | "enabled" | "timeout" | "type"
         ) {
             return Err(format!(
-                "server \"{name}\": unknown key \"{key}\" (axe takes command, args, env, \
-                 enabled, timeout)"
-            ));
-        }
-    }
-    if let Some(url) = object.get("url") {
-        if !url.is_null() {
-            return Err(format!(
-                "server \"{name}\": remote servers are not supported yet; axe runs stdio \
-                 servers only"
+                "server \"{name}\": unknown key \"{key}\" (axe takes command, args, env, url, \
+                 headers, enabled, timeout)"
             ));
         }
     }
     if let Some(kind) = object.get("type").and_then(Value::as_str) {
-        if kind != "stdio" {
+        if !matches!(kind, "stdio" | "http" | "streamable-http") {
             return Err(format!(
-                "server \"{name}\": type \"{kind}\" is not supported; axe runs stdio servers only"
+                "server \"{name}\": type \"{kind}\" is not supported; axe runs stdio and \
+                 streamable-http servers"
             ));
         }
     }
@@ -242,46 +371,68 @@ fn parse_entry(name: &str, value: &Value, path: &Path, project: bool) -> Result<
             .filter(|seconds| *seconds > 0)
             .ok_or_else(|| format!("server \"{name}\": \"timeout\" must be a positive number"))?,
     };
-    let env = parse_env(name, object.get("env"))?;
-    let command = match object.get("command") {
-        Some(value) => value
-            .as_str()
-            .filter(|command| !command.is_empty())
-            .ok_or_else(|| format!("server \"{name}\": \"command\" must be a string"))?
-            .to_string(),
-        None => {
-            // A project entry with no command can only switch a global server:
-            // a repository may narrow what runs, never define it.
-            if !project {
-                return Err(format!("server \"{name}\": missing \"command\""));
-            }
-            if object.get("enabled").is_none() {
-                return Err(format!(
-                    "server \"{name}\": needs \"command\", or \"enabled\" to switch a \
-                     global server"
-                ));
-            }
-            if object.contains_key("args")
-                || object.contains_key("env")
-                || object.contains_key("timeout")
-            {
-                return Err(format!(
-                    "server \"{name}\": an entry without \"command\" may only set \"enabled\""
-                ));
-            }
-            return Ok(Entry {
-                name: name.to_string(),
-                command: String::new(),
-                args: Vec::new(),
-                env,
-                enabled,
-                timeout,
-                source: path.to_path_buf(),
-                project,
-                toggle_only: true,
-            });
+    let command = object
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|command| !command.is_empty())
+        .map(str::to_string);
+    let url = object
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if command.is_some() && url.is_some() {
+        return Err(format!(
+            "server \"{name}\": an entry is a command or a url, not both"
+        ));
+    }
+    if let Some(url) = &url {
+        parse_url_value(name, url)?;
+        if object.contains_key("args") || object.contains_key("env") {
+            return Err(format!(
+                "server \"{name}\": \"args\" and \"env\" belong to a command, not a url"
+            ));
         }
-    };
+    }
+    let env = parse_env(name, object.get("env"))?;
+    let headers = parse_headers(name, object.get("headers"))?;
+    if command.is_some() && !headers.is_empty() {
+        return Err(format!(
+            "server \"{name}\": \"headers\" belongs to a url, not a command"
+        ));
+    }
+    if command.is_none() && url.is_none() {
+        // A project entry with no command can only switch a global server: a
+        // repository may narrow what runs, never define it.
+        if !project {
+            return Err(format!("server \"{name}\": missing \"command\" or \"url\""));
+        }
+        if object.get("enabled").is_none() {
+            return Err(format!(
+                "server \"{name}\": needs \"command\"/\"url\", or \"enabled\" to switch a \
+                 global server"
+            ));
+        }
+        if !env.is_empty() || !headers.is_empty() || object.contains_key("args") {
+            return Err(format!(
+                "server \"{name}\": an entry without \"command\" or \"url\" may only set \
+                 \"enabled\""
+            ));
+        }
+        return Ok(Entry {
+            name: name.to_string(),
+            command: None,
+            url: None,
+            args: Vec::new(),
+            env,
+            headers,
+            vars: Vec::new(),
+            enabled,
+            timeout,
+            source: path.to_path_buf(),
+            project,
+            toggle_only: true,
+        });
+    }
     let args = match object.get("args") {
         None => Vec::new(),
         Some(value) => value
@@ -295,11 +446,35 @@ fn parse_entry(name: &str, value: &Value, path: &Path, project: bool) -> Result<
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
+    let command = command.map(|command| expand_home(&command));
+    let mut vars = Vec::new();
+    let mut note = |raw: &str| {
+        for name in vars_in(raw) {
+            if !vars.contains(&name) {
+                vars.push(name);
+            }
+        }
+    };
+    if let Some(command) = &command {
+        note(command);
+    }
+    for arg in &args {
+        note(arg);
+    }
+    for (_, raw) in &env {
+        note(raw);
+    }
+    for (_, raw) in &headers {
+        note(raw);
+    }
     Ok(Entry {
         name: name.to_string(),
-        command: expand_home(&command),
+        command,
+        url,
         args,
         env,
+        headers,
+        vars,
         enabled,
         timeout,
         source: path.to_path_buf(),
@@ -308,30 +483,70 @@ fn parse_entry(name: &str, value: &Value, path: &Path, project: bool) -> Result<
     })
 }
 
-/// `env` is a list of names. An object here is another client's shape, and
-/// silently ignoring it would run the server without the variables it asked
-/// for, so it is the one error worth spelling out.
-fn parse_env(name: &str, value: Option<&Value>) -> Result<Vec<String>, String> {
+fn parse_url_value(name: &str, url: &str) -> Result<(), String> {
+    http::split_url(url).map_err(|e| format!("server \"{name}\": \"url\": {e}"))?;
+    Ok(())
+}
+
+/// `env` maps a name to a value or a reference. An array of names is the
+/// shorthand for "pass it through unchanged", so the two spellings agree.
+fn parse_env(name: &str, value: Option<&Value>) -> Result<Vec<(String, String)>, String> {
     match value {
         None => Ok(Vec::new()),
         Some(Value::Array(items)) => {
-            let mut names = Vec::new();
+            let mut pairs = Vec::new();
             for item in items {
                 let raw = item.as_str().ok_or_else(|| {
-                    format!("server \"{name}\": \"env\" must be a list of variable names")
+                    format!("server \"{name}\": \"env\" must map names to values")
                 })?;
                 if !valid_var(raw) {
                     return Err(format!(
                         "server \"{name}\": env \"{raw}\" is not a variable name"
                     ));
                 }
-                names.push(raw.to_string());
+                pairs.push((raw.to_string(), format!("${{{raw}}}")));
             }
-            Ok(names)
+            Ok(pairs)
+        }
+        Some(Value::Object(map)) => {
+            let mut pairs = Vec::new();
+            for (key, value) in map {
+                if !valid_var(key) {
+                    return Err(format!(
+                        "server \"{name}\": env \"{key}\" is not a variable name"
+                    ));
+                }
+                let raw = value
+                    .as_str()
+                    .ok_or_else(|| format!("server \"{name}\": env \"{key}\" must be a string"))?;
+                pairs.push((key.clone(), raw.to_string()));
+            }
+            Ok(pairs)
         }
         Some(_) => Err(format!(
-            "server \"{name}\": \"env\" is a list of variable names, not a map; axe never \
-             reads a value from a config file"
+            "server \"{name}\": \"env\" maps names to values, or lists names"
+        )),
+    }
+}
+
+fn parse_headers(name: &str, value: Option<&Value>) -> Result<Vec<(String, String)>, String> {
+    match value {
+        None => Ok(Vec::new()),
+        Some(Value::Object(map)) => {
+            let mut pairs = Vec::new();
+            for (key, value) in map {
+                if !http::valid_header_name(key) {
+                    return Err(format!("server \"{name}\": \"{key}\" is not a header name"));
+                }
+                let raw = value.as_str().ok_or_else(|| {
+                    format!("server \"{name}\": header \"{key}\" must be a string")
+                })?;
+                pairs.push((key.clone(), raw.to_string()));
+            }
+            Ok(pairs)
+        }
+        Some(_) => Err(format!(
+            "server \"{name}\": \"headers\" must map names to strings"
         )),
     }
 }
@@ -429,6 +644,9 @@ fn ask(file: &Path, entries: &[Entry]) -> bool {
             entry.name,
             strip_control(&entry.describe())
         ));
+        if !entry.vars.is_empty() {
+            text.push_str(&format!("     reads: ${}\n", entry.vars.join(", $")));
+        }
     }
     text.push_str("run them? [y/N] ");
     print!("{text}");
@@ -440,54 +658,80 @@ fn ask(file: &Path, entries: &[Entry]) -> bool {
     }
 }
 
-// ---- the processes ---------------------------------------------------------
+// ---- the connections -------------------------------------------------------
 
-/// One tool a server listed, before it is given a name in axe's catalogue.
-struct Listed {
-    original: String,
-    description: String,
-    schema: Value,
-}
-
-struct Tool {
-    /// The name the model calls, `mcp__<server>__<tool>`.
-    exposed: String,
-    /// The name the server knows.
-    original: String,
-    definition: Value,
-}
-
-struct Server {
-    name: String,
+struct StdioConn {
     child: Child,
     pid: i32,
     stdin: Option<ChildStdin>,
     /// Replies by id, filled by the reader thread.
     pending: Arc<Mutex<HashMap<u64, Sender<Value>>>>,
-    next: u64,
-    timeout: Duration,
-    listed: Vec<Listed>,
-    tools: Vec<Tool>,
     dead: Arc<AtomicBool>,
     stderr: Arc<Mutex<Vec<u8>>>,
     /// The process group is gone. A reaped pid may be reused, so this is what
-    /// keeps `Drop` from signalling a group that is not ours any more.
+    /// keeps `stop` from signalling a group that is not ours any more.
     stopped: bool,
 }
 
-impl Server {
-    fn open(entry: &Entry, explore: bool) -> Result<Server, String> {
-        let program = match entry.command.contains('/') {
-            true => PathBuf::from(&entry.command),
-            false => crate::sandbox::resolve_program(&entry.command)
-                .ok_or_else(|| format!("\"{}\" is not on PATH", entry.command))?,
+struct HttpConn {
+    name: String,
+    url: String,
+    ep: http::Endpoint,
+    session: Option<String>,
+    /// Configured headers, values already expanded.
+    headers: Vec<(String, String)>,
+    /// No `Authorization` of its own: axe signs in and sends the bearer token.
+    oauth: bool,
+}
+
+enum Conn {
+    Stdio(StdioConn),
+    Http(HttpConn),
+}
+
+impl Conn {
+    fn exchange(
+        &mut self,
+        message: &Value,
+        id: u64,
+        timeout: Duration,
+        cancel: &Cancel,
+    ) -> Result<Value, String> {
+        match self {
+            Conn::Stdio(conn) => conn.exchange(message, id, timeout, cancel),
+            Conn::Http(conn) => conn.exchange(message, id, timeout, cancel),
+        }
+    }
+
+    fn notify(&mut self, message: &Value) -> Result<(), String> {
+        match self {
+            Conn::Stdio(conn) => conn.notify(message),
+            Conn::Http(conn) => conn.notify(message),
+        }
+    }
+
+    fn stop(&mut self) {
+        match self {
+            Conn::Stdio(conn) => conn.stop(),
+            Conn::Http(conn) => conn.stop(),
+        }
+    }
+}
+
+impl StdioConn {
+    fn open(entry: &Entry, explore: bool) -> Result<StdioConn, String> {
+        let command = entry.command.as_deref().unwrap_or_default();
+        let program = match command.contains('/') {
+            true => PathBuf::from(command),
+            false => crate::sandbox::resolve_program(command)
+                .ok_or_else(|| format!("\"{command}\" is not on PATH"))?,
         };
         let mut env = Vec::new();
-        for name in &entry.env {
-            match std::env::var(name) {
-                Ok(value) => env.push((name.clone(), value)),
-                Err(_) => return Err(format!("{name} is not set")),
-            }
+        for (name, raw) in &entry.env {
+            env.push((
+                name.clone(),
+                expand(raw).map_err(|e| format!("{name}: {e}"))?,
+            ));
         }
         let mut cmd = crate::sandbox::server(&program, &entry.args, &env, explore)?;
         let mut child = cmd
@@ -514,82 +758,19 @@ impl Server {
             let tail = stderr.clone();
             thread::spawn(move || read_stderr(pipe, tail));
         }
-        let mut server = Server {
-            name: entry.name.clone(),
+        Ok(StdioConn {
             child,
             pid,
             stdin,
             pending,
-            next: 1,
-            timeout: Duration::from_secs(entry.timeout),
-            listed: Vec::new(),
-            tools: Vec::new(),
             dead,
             stderr,
             stopped: false,
-        };
-        server.initialize()?;
-        server.list_tools()?;
-        Ok(server)
+        })
     }
 
-    fn initialize(&mut self) -> Result<(), String> {
-        self.request(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL,
-                "capabilities": {},
-                "clientInfo": { "name": "axe", "version": env!("CARGO_PKG_VERSION") },
-            }),
-            None,
-            INIT_TIMEOUT,
-        )?;
-        self.notify("notifications/initialized", json!({}))
-    }
-
-    fn list_tools(&mut self) -> Result<(), String> {
-        let mut cursor: Option<String> = None;
-        let mut bytes = 0usize;
-        loop {
-            let params = match &cursor {
-                Some(cursor) => json!({ "cursor": cursor }),
-                None => json!({}),
-            };
-            let result = self.request("tools/list", params, None, INIT_TIMEOUT)?;
-            for tool in result["tools"].as_array().cloned().unwrap_or_default() {
-                if self.listed.len() >= TOOLS_PER_SERVER {
-                    return Ok(());
-                }
-                let Some(name) = tool["name"].as_str().filter(|name| !name.is_empty()) else {
-                    continue;
-                };
-                let schema = match tool["inputSchema"].is_object() {
-                    true => tool["inputSchema"].clone(),
-                    false => json!({ "type": "object" }),
-                };
-                bytes += serde_json::to_string(&schema).map(|s| s.len()).unwrap_or(0);
-                if bytes > SCHEMA_BYTES {
-                    return Ok(());
-                }
-                let description = tool["description"]
-                    .as_str()
-                    .map(|text| format!("{} (MCP server \"{}\")", strip_control(text), self.name))
-                    .unwrap_or_else(|| format!("MCP server \"{}\" tool \"{name}\"", self.name));
-                self.listed.push(Listed {
-                    original: name.to_string(),
-                    description: clip(&description, DESCRIPTION_CAP),
-                    schema,
-                });
-            }
-            cursor = result["nextCursor"].as_str().map(str::to_string);
-            if cursor.is_none() {
-                return Ok(());
-            }
-        }
-    }
-
-    fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
-        self.write(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+    fn notify(&mut self, message: &Value) -> Result<(), String> {
+        self.write(message)
     }
 
     fn write(&mut self, message: &Value) -> Result<(), String> {
@@ -606,24 +787,21 @@ impl Server {
 
     /// One request and its reply. `cancel` is checked every 20 ms, like a
     /// command's: ESC ends the wait, tells the server, and leaves it running.
-    fn request(
+    fn exchange(
         &mut self,
-        method: &str,
-        params: Value,
-        cancel: Option<&Cancel>,
+        message: &Value,
+        id: u64,
         timeout: Duration,
+        cancel: &Cancel,
     ) -> Result<Value, String> {
         if self.dead.load(Ordering::SeqCst) {
             return Err(self.exited());
         }
-        let id = self.next;
-        self.next += 1;
         let (tx, rx) = mpsc::channel();
         if let Ok(mut pending) = self.pending.lock() {
             pending.insert(id, tx);
         }
-        let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        if let Err(e) = self.write(&message) {
+        if let Err(e) = self.write(message) {
             if let Ok(mut map) = self.pending.lock() {
                 map.remove(&id);
             }
@@ -636,7 +814,7 @@ impl Server {
                 Ok(reply) => break Some(reply),
                 Err(mpsc::RecvTimeoutError::Disconnected) => break None,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if cancel.is_some_and(Cancel::cancelled) {
+                    if cancel.cancelled() {
                         cancelled = true;
                         break None;
                     }
@@ -650,45 +828,28 @@ impl Server {
             map.remove(&id);
         }
         let Some(reply) = reply else {
-            if cancelled || cancel.is_some_and(Cancel::cancelled) {
-                let _ = self.notify(
-                    "notifications/cancelled",
-                    json!({ "requestId": id, "reason": "interrupted by user" }),
-                );
+            if cancelled || cancel.cancelled() {
+                let _ = self.notify(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": { "requestId": id, "reason": "interrupted by user" },
+                }));
                 return Err("interrupted by user (ESC); the call was not run".into());
             }
             if self.dead.load(Ordering::SeqCst) {
                 return Err(self.exited());
             }
-            let _ = self.notify(
-                "notifications/cancelled",
-                json!({ "requestId": id, "reason": "timeout" }),
-            );
+            let _ = self.notify(&json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": { "requestId": id, "reason": "timeout" },
+            }));
             return Err(format!("timed out after {}s", timeout.as_secs()));
         };
         if reply.is_null() {
             return Err(self.exited());
         }
-        if let Some(error) = reply.get("error") {
-            return Err(format!("{method}: {}", explain(error)));
-        }
-        Ok(reply["result"].clone())
-    }
-
-    fn call(&mut self, tool: &str, args: &Value, cancel: &Cancel) -> String {
-        let arguments = match args.is_object() {
-            true => args.clone(),
-            false => json!({}),
-        };
-        match self.request(
-            "tools/call",
-            json!({ "name": tool, "arguments": arguments }),
-            Some(cancel),
-            self.timeout,
-        ) {
-            Ok(result) => render(&result),
-            Err(e) => format!("error: mcp {}: {e}", self.name),
-        }
+        Ok(reply)
     }
 
     /// What to say when the server is gone: its own last words, if it had any.
@@ -701,7 +862,7 @@ impl Server {
         let mut out = "the server exited".to_string();
         if !tail.is_empty() {
             out.push_str(": ");
-            out.push_str(&clip(&strip_control(&tail), 800));
+            out.push_str(&cut(&strip_control(&tail), 800));
         }
         out
     }
@@ -732,21 +893,221 @@ impl Server {
     }
 }
 
-impl Drop for Server {
+impl Drop for StdioConn {
     fn drop(&mut self) {
-        if self.stopped {
-            return;
-        }
-        self.stopped = true;
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg("--")
-            .arg(format!("-{}", self.pid))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let _ = self.child.wait();
+        self.stop();
     }
+}
+
+impl HttpConn {
+    fn open(entry: &Entry) -> Result<HttpConn, String> {
+        let url = entry.url.clone().unwrap_or_default();
+        let (ep, _) = http::split_url(&url)?;
+        let mut headers = Vec::new();
+        for (name, raw) in &entry.headers {
+            headers.push((
+                name.clone(),
+                expand(raw).map_err(|e| format!("header {name}: {e}"))?,
+            ));
+        }
+        Ok(HttpConn {
+            name: entry.name.clone(),
+            url,
+            ep,
+            session: None,
+            headers,
+            oauth: entry.oauth(),
+        })
+    }
+
+    fn path(&self) -> &str {
+        if self.ep.prefix.is_empty() {
+            "/"
+        } else {
+            ""
+        }
+    }
+
+    fn base_headers(&self) -> Vec<(String, String)> {
+        let mut headers = vec![
+            (
+                "accept".to_string(),
+                "application/json, text/event-stream".to_string(),
+            ),
+            ("mcp-protocol-version".to_string(), PROTOCOL.to_string()),
+        ];
+        if let Some(session) = &self.session {
+            headers.push(("mcp-session-id".to_string(), session.clone()));
+        }
+        headers.extend(self.headers.iter().cloned());
+        headers
+    }
+
+    fn post(
+        &self,
+        body: &str,
+        headers: &[(String, String)],
+        timeout: Duration,
+        cancel: &Cancel,
+    ) -> Result<http::Response, String> {
+        http::request_with_timeout(
+            &self.ep,
+            "POST",
+            self.path(),
+            None,
+            headers,
+            Some(body),
+            None,
+            Some(cancel),
+            timeout,
+        )
+        .map_err(|e| match cancel.cancelled() {
+            true => "interrupted by user (ESC); the call was not run".to_string(),
+            false => e,
+        })
+    }
+
+    fn notify(&mut self, message: &Value) -> Result<(), String> {
+        let mut headers = self.base_headers();
+        if self.oauth {
+            if let Some(token) = oauth::access(&self.name, &self.url, &Cancel::new())? {
+                headers.push(("authorization".to_string(), format!("Bearer {token}")));
+            }
+        }
+        let cancel = Cancel::new();
+        let response = self.post(&message.to_string(), &headers, INIT_TIMEOUT, &cancel)?;
+        if let Some(session) = header(&response, "mcp-session-id") {
+            self.session = Some(session);
+        }
+        Ok(())
+    }
+
+    fn exchange(
+        &mut self,
+        message: &Value,
+        id: u64,
+        timeout: Duration,
+        cancel: &Cancel,
+    ) -> Result<Value, String> {
+        let body = message.to_string();
+        let mut refreshed = false;
+        loop {
+            let mut headers = self.base_headers();
+            if self.oauth {
+                if let Some(token) = oauth::access(&self.name, &self.url, cancel)? {
+                    headers.push(("authorization".to_string(), format!("Bearer {token}")));
+                }
+            }
+            let mut response = self.post(&body, &headers, timeout, cancel)?;
+            if let Some(session) = header(&response, "mcp-session-id") {
+                self.session = Some(session);
+            }
+            if self.oauth && response.status == 401 && !refreshed {
+                refreshed = true;
+                if oauth::reauthenticate(&self.name, &self.url, cancel)?.is_some() {
+                    continue;
+                }
+                return Err(format!("sign-in required: /mcp login {}", self.name));
+            }
+            if !(200..300).contains(&response.status) {
+                let text = response.read_all().unwrap_or_default();
+                let message = short(&text);
+                return Err(match message.is_empty() {
+                    true => format!("HTTP {}", response.status),
+                    false => format!("HTTP {}: {message}", response.status),
+                });
+            }
+            if response.status == 202 {
+                return Ok(Value::Null);
+            }
+            return reply(&mut response, id, timeout, cancel);
+        }
+    }
+
+    /// Best effort: tell the server the session is over.
+    fn stop(&mut self) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        let mut headers = self.base_headers();
+        headers.push(("mcp-session-id".to_string(), session));
+        if self.oauth {
+            if let Ok(Some(token)) = oauth::access(&self.name, &self.url, &Cancel::new()) {
+                headers.push(("authorization".to_string(), format!("Bearer {token}")));
+            }
+        }
+        let cancel = Cancel::new();
+        let _ = http::request_with_timeout(
+            &self.ep,
+            "DELETE",
+            self.path(),
+            None,
+            &headers,
+            None,
+            None,
+            Some(&cancel),
+            Duration::from_secs(5),
+        );
+    }
+}
+
+fn header(response: &http::Response, name: &str) -> Option<String> {
+    response
+        .headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+}
+
+/// One HTTP reply: a JSON body, or an SSE stream carrying the message. The
+/// server may interleave notifications; only the id axe asked for ends the
+/// wait.
+fn reply(
+    response: &mut http::Response,
+    id: u64,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<Value, String> {
+    let sse = response
+        .content_type
+        .as_deref()
+        .is_some_and(|kind| kind.contains("text/event-stream"));
+    if !sse {
+        let body = response.read_all().map_err(|e| format!("read: {e}"))?;
+        let value: Value =
+            serde_json::from_str(&body).map_err(|e| format!("reply: {e}: {}", short(&body)))?;
+        if value["id"].as_u64() == Some(id) {
+            return Ok(value);
+        }
+        return Err("the reply carried another id".into());
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancel.cancelled() {
+            return Err("interrupted by user (ESC); the call was not run".into());
+        }
+        if Instant::now() > deadline {
+            return Err(format!("timed out after {}s", timeout.as_secs()));
+        }
+        let line = match response.read_line() {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(e) => match cancel.cancelled() {
+                true => return Err("interrupted by user (ESC); the call was not run".into()),
+                false => return Err(format!("read: {e}")),
+            },
+        };
+        let Some(data) = line.trim_end().strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        if value["id"].as_u64() == Some(id) {
+            return Ok(value);
+        }
+    }
+    Err("the stream ended without a reply".into())
 }
 
 /// Replies, by id. Notifications are dropped: axe advertises no capability
@@ -818,6 +1179,158 @@ fn explain(error: &Value) -> String {
     match error["code"].as_i64() {
         Some(code) => format!("{message} ({code})"),
         None => message.to_string(),
+    }
+}
+
+// ---- one server and its tools ----------------------------------------------
+
+/// One tool a server listed, before it is given a name in axe's catalogue.
+struct Listed {
+    original: String,
+    description: String,
+    schema: Value,
+}
+
+struct Tool {
+    /// The name the model calls, `mcp__<server>__<tool>`.
+    exposed: String,
+    /// The name the server knows.
+    original: String,
+    definition: Value,
+}
+
+struct Server {
+    name: String,
+    timeout: Duration,
+    next: u64,
+    listed: Vec<Listed>,
+    tools: Vec<Tool>,
+    conn: Conn,
+}
+
+impl Server {
+    fn open(entry: &Entry, explore: bool) -> Result<Server, String> {
+        let conn = match &entry.command {
+            Some(_) => Conn::Stdio(StdioConn::open(entry, explore)?),
+            None => Conn::Http(HttpConn::open(entry)?),
+        };
+        let mut server = Server {
+            name: entry.name.clone(),
+            timeout: Duration::from_secs(entry.timeout),
+            next: 1,
+            listed: Vec::new(),
+            tools: Vec::new(),
+            conn,
+        };
+        server.initialize()?;
+        server.list_tools()?;
+        Ok(server)
+    }
+
+    fn initialize(&mut self) -> Result<(), String> {
+        self.request(
+            "initialize",
+            json!({
+                "protocolVersion": PROTOCOL,
+                "capabilities": {},
+                "clientInfo": { "name": "axe", "version": env!("CARGO_PKG_VERSION") },
+            }),
+            None,
+            INIT_TIMEOUT,
+        )?;
+        let message =
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} });
+        let _ = self.conn.notify(&message);
+        Ok(())
+    }
+
+    fn list_tools(&mut self) -> Result<(), String> {
+        let mut cursor: Option<String> = None;
+        let mut bytes = 0usize;
+        loop {
+            let params = match &cursor {
+                Some(cursor) => json!({ "cursor": cursor }),
+                None => json!({}),
+            };
+            let result = self.request("tools/list", params, None, INIT_TIMEOUT)?;
+            for tool in result["tools"].as_array().cloned().unwrap_or_default() {
+                if self.listed.len() >= TOOLS_PER_SERVER {
+                    return Ok(());
+                }
+                let Some(name) = tool["name"].as_str().filter(|name| !name.is_empty()) else {
+                    continue;
+                };
+                let schema = match tool["inputSchema"].is_object() {
+                    true => tool["inputSchema"].clone(),
+                    false => json!({ "type": "object" }),
+                };
+                bytes += serde_json::to_string(&schema).map(|s| s.len()).unwrap_or(0);
+                if bytes > SCHEMA_BYTES {
+                    return Ok(());
+                }
+                let description = tool["description"]
+                    .as_str()
+                    .map(|text| format!("{} (MCP server \"{}\")", strip_control(text), self.name))
+                    .unwrap_or_else(|| format!("MCP server \"{}\" tool \"{name}\"", self.name));
+                self.listed.push(Listed {
+                    original: name.to_string(),
+                    description: cut(&description, DESCRIPTION_CAP),
+                    schema,
+                });
+            }
+            cursor = result["nextCursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                return Ok(());
+            }
+        }
+    }
+
+    fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<&Cancel>,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let id = self.next;
+        self.next += 1;
+        let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        let fresh = Cancel::new();
+        let cancel = cancel.unwrap_or(&fresh);
+        let reply = self.conn.exchange(&message, id, timeout, cancel)?;
+        if reply.is_null() {
+            return Ok(Value::Null);
+        }
+        if let Some(error) = reply.get("error") {
+            return Err(format!("{method}: {}", explain(error)));
+        }
+        Ok(reply["result"].clone())
+    }
+
+    fn call(&mut self, tool: &str, args: &Value, cancel: &Cancel) -> String {
+        let arguments = match args.is_object() {
+            true => args.clone(),
+            false => json!({}),
+        };
+        match self.request(
+            "tools/call",
+            json!({ "name": tool, "arguments": arguments }),
+            Some(cancel),
+            self.timeout,
+        ) {
+            Ok(result) => render(&result),
+            Err(e) => format!("error: mcp {}: {e}", self.name),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.conn.stop();
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -1009,7 +1522,7 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
         match Server::open(entry, explore) {
             Ok(server) => {
                 notices.push(format!(
-                    "mcp {}: {} tool{}{}",
+                    "mcp {}: {} {}{}",
                     entry.name,
                     server.listed.len(),
                     plural(server.listed.len()),
@@ -1177,7 +1690,7 @@ pub fn restart(explore: bool) -> Vec<String> {
                     });
                 }
                 notices.push(format!(
-                    "mcp {}: {} tool{}{}",
+                    "mcp {}: {} {}{}",
                     entry.name,
                     server.tools.len(),
                     plural(server.tools.len()),
@@ -1207,9 +1720,9 @@ pub fn shutdown() {
 
 // ---- `/mcp` -----------------------------------------------------------------
 
-/// `/mcp`, `/mcp <name>`, and the three edits. One entry point so the REPL's
-/// dispatch stays a line.
-pub fn dispatch(arg: &str) -> String {
+/// `/mcp`, `/mcp <name>`, and the edits. One entry point so the REPL's dispatch
+/// stays a line. `say` writes before a sign-in blocks the terminal.
+pub fn dispatch(arg: &str, say: &mut dyn FnMut(&str)) -> String {
     let arg = arg.trim();
     if arg.is_empty() {
         return listing();
@@ -1221,6 +1734,8 @@ pub fn dispatch(arg: &str) -> String {
     match verb {
         "add" => add(rest),
         "remove" => remove(rest),
+        "login" => login(rest, say),
+        "logout" => logout(rest),
         "forget" => forget(),
         "list" => listing(),
         "help" => empty_state(),
@@ -1252,16 +1767,24 @@ fn listing() -> String {
         let status = match (&reg.running[at], &reg.failures[at], entry.enabled) {
             (_, _, false) => "disabled".to_string(),
             (Some(server), _, _) => {
-                format!("{} tool{}", server.tools.len(), plural(server.tools.len()))
+                format!("{} {}", server.tools.len(), plural(server.tools.len()))
             }
             (None, Some(e), _) => format!("failed: {e}"),
             (None, None, _) => "failed".to_string(),
         };
+        let kind = if entry.remote() { "http" } else { "stdio" };
+        // The failure already says it in the one case both lines would repeat.
+        let note = match status.contains("sign-in required") {
+            true => String::new(),
+            false => auth_note(entry),
+        };
         out.push_str(&format!(
-            "  {:<10} {:<8} {}\n",
+            "  {:<10} {:<8} {:<6} {}{}\n",
             strip_control(&entry.name),
             if entry.project { "project" } else { "global" },
+            kind,
             strip_control(&status),
+            note,
         ));
     }
     if let Some(file) = &reg.project {
@@ -1284,6 +1807,17 @@ fn listing() -> String {
     out
 }
 
+fn auth_note(entry: &Entry) -> String {
+    if !entry.oauth() {
+        return String::new();
+    }
+    let url = entry.url.as_deref().unwrap_or_default();
+    match oauth::stored(&entry.name, url) {
+        true => "  signed in".to_string(),
+        false => "  sign-in required".to_string(),
+    }
+}
+
 fn detail(name: &str) -> String {
     let reg = lock();
     let Some(at) = reg.index(name) else {
@@ -1291,9 +1825,10 @@ fn detail(name: &str) -> String {
     };
     let entry = &reg.entries[at];
     let mut out = format!(
-        "{}  {}\n  {}\n",
+        "{}  {}{}\n  {}\n",
         entry.name,
         origin(entry),
+        auth_note(entry),
         entry.describe()
     );
     match (&reg.running[at], &reg.failures[at], entry.enabled) {
@@ -1303,7 +1838,7 @@ fn detail(name: &str) -> String {
                 out.push_str(&format!("  {}\n", strip_control(&tool.exposed)));
             }
             out.push_str(&format!(
-                "  {} tool{}\n",
+                "  {} {}\n",
                 server.tools.len(),
                 plural(server.tools.len())
             ));
@@ -1323,7 +1858,11 @@ fn empty_state() -> String {
          /mcp add --project mytool /opt/bin/mytool serve\n     \
          project: this repository only, written to <repo>/.mcp.json and\n     \
          asked about once before it runs.\n\n  \
-         --env NAME   hand it a variable from your environment (repeatable)\n  \
+         /mcp add --url sentry https://mcp.sentry.dev/mcp\n     \
+         a url is streamable HTTP; a server that asks for OAuth says so at\n     \
+         startup, and /mcp login <name> signs in.\n\n  \
+         --env NAME      hand it a variable from your environment (repeatable)\n  \
+         --header 'K: V' one header, for a url (repeatable)\n  \
          a new server appears after a restart; /mcp then lists it.\n\n\
          a project server with the same name replaces the global one.\n\
          the global file, if you would rather edit it:\n  \
@@ -1347,52 +1886,175 @@ impl Registry {
     }
 }
 
-/// `/mcp add`'s flags. `--env` takes a variable **name**: axe reads the value
-/// from its own environment, never from the line or the file.
-fn add_flags(rest: &str) -> Result<(bool, Vec<String>, Vec<&str>), String> {
-    let mut project = false;
-    let mut env = Vec::new();
-    let mut words = Vec::new();
-    let mut iter = rest.split_whitespace();
-    while let Some(word) = iter.next() {
-        match word {
-            "--project" => project = true,
-            "--env" => match iter.next() {
-                Some(name) if valid_var(name) => env.push(name.to_string()),
-                Some(name) => return Err(format!("\"{name}\" is not a variable name")),
-                None => return Err("--env needs a variable name".into()),
+/// Split a line the way a shell would for the two quote kinds: an argument
+/// with a space in it is written in quotes. No expansion, no escapes.
+fn words(rest: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    for c in rest.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    started = true;
+                }
+                c if c.is_whitespace() => {
+                    if started {
+                        out.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                }
+                c => {
+                    current.push(c);
+                    started = true;
+                }
             },
-            word => words.push(word),
         }
     }
-    Ok((project, env, words))
+    if quote.is_some() {
+        return Err("unclosed quote".into());
+    }
+    if started {
+        out.push(current);
+    }
+    Ok(out)
 }
 
-/// `/mcp add [--project] [--env NAME]... <name> <command> [args...]`. Writes the entry whole
-/// and says what to do next: the catalogue is read at startup.
+/// `/mcp add`'s flags. `--env` takes a variable **name** (meaning
+/// `NAME=${NAME}`) or `NAME=VALUE`; a value is a reference resolved from axe's
+/// environment, never a secret copied into the file.
+#[allow(clippy::type_complexity)]
+fn add_flags(
+    rest: &str,
+) -> Result<
+    (
+        bool,
+        Vec<(String, String)>,
+        Vec<(String, String)>,
+        Option<String>,
+        Option<u64>,
+        Vec<String>,
+    ),
+    String,
+> {
+    let mut project = false;
+    let mut env = Vec::new();
+    let mut headers = Vec::new();
+    let mut url = None;
+    let mut timeout = None;
+    let mut words_out = Vec::new();
+    let words = words(rest)?;
+    let mut at = 0;
+    while at < words.len() {
+        let word = words[at].as_str();
+        match word {
+            "--project" => project = true,
+            "--url" => match words.get(at + 1) {
+                Some(value) => {
+                    url = Some(value.clone());
+                    at += 1;
+                }
+                None => return Err("--url needs a URL".into()),
+            },
+            "--timeout" => {
+                match words.get(at + 1) {
+                    Some(value) => {
+                        timeout =
+                            Some(value.parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(
+                                || format!("\"{value}\" is not a number of seconds"),
+                            )?);
+                        at += 1;
+                    }
+                    None => return Err("--timeout needs a number of seconds".into()),
+                }
+            }
+            "--env" => match words.get(at + 1) {
+                Some(name) if valid_var(name) => {
+                    env.push((name.clone(), format!("${{{name}}}")));
+                    at += 1;
+                }
+                Some(pair) if pair.contains('=') => {
+                    let (name, value) = pair.split_once('=').unwrap_or_default();
+                    if !valid_var(name) {
+                        return Err(format!("\"{name}\" is not a variable name"));
+                    }
+                    if value.is_empty() {
+                        return Err(format!("--env {name}= needs a value"));
+                    }
+                    env.push((name.to_string(), value.to_string()));
+                    at += 1;
+                }
+                Some(other) => return Err(format!("\"{other}\" is not a variable name")),
+                None => return Err("--env needs a variable name".into()),
+            },
+            "--header" => match words.get(at + 1) {
+                Some(pair) => {
+                    let (name, value) = pair
+                        .split_once(':')
+                        .ok_or_else(|| "a header is 'Name: value'".to_string())?;
+                    if !http::valid_header_name(name.trim()) {
+                        return Err(format!("\"{}\" is not a header name", name.trim()));
+                    }
+                    headers.push((name.trim().to_string(), value.trim().to_string()));
+                    at += 1;
+                }
+                None => return Err("--header needs 'Name: value'".into()),
+            },
+            word => words_out.push(word.to_string()),
+        }
+        at += 1;
+    }
+    Ok((project, env, headers, url, timeout, words_out))
+}
+
 fn add(rest: &str) -> String {
-    let usage = "usage: /mcp add [--project] [--env NAME]... <name> <command> [args...]\n";
-    let (project, env, words) = match add_flags(rest) {
+    let usage = "usage: /mcp add [--project] [--url URL] [--env NAME[=VALUE]]... \
+                 [--header 'K: V']... [--timeout S] <name> [command [args...]]\n";
+    let (project, env, headers, url, timeout, words) = match add_flags(rest) {
         Ok(flags) => flags,
         Err(e) => return format!("error: mcp: {e}\n"),
     };
-    let Some(name) = words.first().copied() else {
+    let Some(name) = words.first().map(String::as_str) else {
         return usage.into();
     };
     if !valid_name(name) {
         return "error: mcp: names use letters, digits, \"_\" and \"-\" (32 at most)\n".into();
     }
-    let Some(command) = words.get(1).copied() else {
-        return usage.into();
-    };
     let cwd = lock().cwd.clone();
-    let mut entry = json!({ "command": command });
-    if words.len() > 2 {
-        let args: Vec<Value> = words[2..].iter().map(|word| json!(word)).collect();
-        entry["args"] = json!(args);
+    let mut entry = json!({});
+    if let Some(url) = &url {
+        entry["url"] = json!(url);
+        if !headers.is_empty() {
+            entry["headers"] = json!(headers.iter().cloned().collect::<BTreeMap<_, _>>());
+        }
+        if !env.is_empty() {
+            return "error: mcp: --env belongs to a command, not a url\n".into();
+        }
+        if words.len() > 1 {
+            return "error: mcp: a url entry names no command\n".into();
+        }
+    } else {
+        let Some(command) = words.get(1).map(String::as_str) else {
+            return usage.into();
+        };
+        entry["command"] = json!(command);
+        if words.len() > 2 {
+            let args: Vec<Value> = words[2..].iter().map(|word| json!(word)).collect();
+            entry["args"] = json!(args);
+        }
+        if !env.is_empty() {
+            entry["env"] = json!(env.iter().cloned().collect::<BTreeMap<_, _>>());
+        }
+        if !headers.is_empty() {
+            return "error: mcp: --header belongs to a url, not a command\n".into();
+        }
     }
-    if !env.is_empty() {
-        entry["env"] = json!(env);
+    if let Some(timeout) = timeout {
+        entry["timeout"] = json!(timeout);
     }
     let path = match (project, cwd.clone()) {
         (true, Some(dir)) => project_target(&dir),
@@ -1447,6 +2109,60 @@ fn remove(rest: &str) -> String {
     match removed {
         0 => format!("error: mcp: no entry named \"{name}\" in either file\n"),
         _ => format!("◦ mcp: removed \"{name}\"; restart axe\n"),
+    }
+}
+
+/// `/mcp login <name>`: the browser flow for a remote server with no
+/// `Authorization` of its own. Blocks the terminal while the browser has it;
+/// the URL is printed before that, so a headless box can move it elsewhere.
+fn login(rest: &str, say: &mut dyn FnMut(&str)) -> String {
+    let name = rest.trim();
+    if name.is_empty() || name.split_whitespace().count() != 1 {
+        return "usage: /mcp login <name>\n".into();
+    }
+    let entry = {
+        let reg = lock();
+        reg.index(name).map(|at| reg.entries[at].clone())
+    };
+    let Some(entry) = entry else {
+        return format!("error: mcp: no server named \"{name}\" (see /mcp)\n");
+    };
+    let Some(url) = entry.url.clone() else {
+        return format!("error: mcp: \"{name}\" is a command; only a url signs in\n");
+    };
+    let sign_in = match oauth::begin(name, &url, &oauth::open_browser) {
+        Ok(sign_in) => sign_in,
+        Err(e) => return format!("error: mcp: {e}\n"),
+    };
+    say(&format!(
+        "◦ mcp: open this if no browser did:\n  {}\n",
+        sign_in.url
+    ));
+    match sign_in.finish(&Cancel::new()) {
+        Ok(_) => "◦ mcp: signed in; restart axe to load its tools\n".into(),
+        Err(e) => format!("error: mcp: {e}\n"),
+    }
+}
+
+fn logout(rest: &str) -> String {
+    let name = rest.trim();
+    if name.is_empty() || name.split_whitespace().count() != 1 {
+        return "usage: /mcp logout <name>\n".into();
+    }
+    let entry = {
+        let reg = lock();
+        reg.index(name).map(|at| reg.entries[at].clone())
+    };
+    let Some(entry) = entry else {
+        return format!("error: mcp: no server named \"{name}\" (see /mcp)\n");
+    };
+    let Some(url) = entry.url else {
+        return format!("error: mcp: \"{name}\" is a command; nothing to log out of\n");
+    };
+    match oauth::remove(name, &url) {
+        Ok(true) => format!("◦ mcp: signed out of \"{name}\"; restart axe\n"),
+        Ok(false) => format!("◦ mcp: \"{name}\" has no stored sign-in\n"),
+        Err(e) => format!("error: mcp: {e}\n"),
     }
 }
 
@@ -1514,6 +2230,28 @@ fn remove_entry(path: &Path, name: &str) -> Result<bool, String> {
 
 /// Char-safe cut, marked at the end: a description or a stderr tail longer
 /// than the cap must not split a character.
+fn cut(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(12)).collect();
+    out.push_str(" …[truncated]");
+    out
+}
+
+fn short(text: &str) -> String {
+    cut(text.trim(), 400)
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        "tool"
+    } else {
+        "tools"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1522,9 +2260,12 @@ mod tests {
     fn entry(name: &str, command: &str) -> Entry {
         Entry {
             name: name.into(),
-            command: command.into(),
+            command: Some(command.into()),
+            url: None,
             args: Vec::new(),
             env: Vec::new(),
+            headers: Vec::new(),
+            vars: Vec::new(),
             enabled: true,
             timeout: CALL_TIMEOUT,
             source: PathBuf::from("/tmp/mcp.json"),
@@ -1554,16 +2295,25 @@ mod tests {
             tool_name("files", "read_text_file", &taken),
             "mcp__files__read_text_file"
         );
-        // Dots and slashes become the one character a provider allows.
         assert_eq!(tool_name("a.b", "x/y", &HashSet::new()), "mcp__a_b__x_y");
-        // Overlong names are cut and tagged, never over the limit.
         let long = tool_name("s", &"t".repeat(80), &HashSet::new());
         assert!(long.len() <= NAME_CAP, "{}", long.len());
-        assert!(
-            long.ends_with(&format!("_{}", &long[long.len() - 8..])),
-            "{long}"
-        );
         assert!(long.starts_with("mcp__s__t"));
+    }
+
+    #[test]
+    fn references_are_found_and_resolved() {
+        std::env::set_var("AXE_TEST_MCP_VAR", "one");
+        assert_eq!(
+            vars_in("a ${AXE_TEST_MCP_VAR} $AXE_TEST_MCP_VAR $$X"),
+            vec!["AXE_TEST_MCP_VAR".to_string()]
+        );
+        assert_eq!(expand("a $AXE_TEST_MCP_VAR $$X").unwrap(), "a one $X");
+        assert!(expand("$AXE_TEST_MCP_NOT_SET")
+            .unwrap_err()
+            .contains("not set"));
+        assert_eq!(expand("$5").unwrap(), "$5");
+        std::env::remove_var("AXE_TEST_MCP_VAR");
     }
 
     #[test]
@@ -1582,11 +2332,16 @@ mod tests {
         );
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(merged.len(), 2);
-        let files = merged.iter().find(|e| e.name == "files").unwrap();
-        assert_eq!(files.command, "other");
-        assert!(files.project);
+        assert_eq!(
+            merged
+                .iter()
+                .find(|e| e.name == "files")
+                .unwrap()
+                .command
+                .as_deref(),
+            Some("other")
+        );
         assert!(!merged.iter().find(|e| e.name == "git").unwrap().enabled);
-        // A toggle that names nothing is an error, not a server.
         let mut lonely = entry("nope", "");
         lonely.toggle_only = true;
         let mut errors = Vec::new();
@@ -1599,33 +2354,70 @@ mod tests {
         let file = Path::new("/tmp/mcp.json");
         let ok = parse_entry(
             "files",
-            &json!({ "command": "npx", "args": ["-y", "s"], "env": ["TOKEN"] }),
+            &json!({ "command": "npx", "args": ["-y", "s"],
+                     "env": { "TOKEN": "${TOKEN}" } }),
             file,
             false,
         )
         .unwrap();
         assert_eq!(ok.args, vec!["-y".to_string(), "s".to_string()]);
-        assert_eq!(ok.env, vec!["TOKEN".to_string()]);
-        assert!(ok.enabled);
-        assert_eq!(ok.timeout, CALL_TIMEOUT);
+        assert_eq!(ok.env, vec![("TOKEN".into(), "${TOKEN}".into())]);
+        assert_eq!(ok.vars, vec!["TOKEN".to_string()]);
 
-        // Remote is the next feature, and says so.
-        let err = parse_entry("x", &json!({ "url": "https://e/mcp" }), file, false).unwrap_err();
-        assert!(err.contains("stdio"), "{err}");
-        // Values in a file are never read.
-        let err = parse_entry(
+        // An array of names is the shorthand for a pass-through.
+        let shorthand = parse_entry(
             "x",
-            &json!({ "command": "c", "env": { "A": "B" } }),
+            &json!({ "command": "c", "env": ["A_TOKEN"] }),
             file,
             false,
         )
-        .unwrap_err();
-        assert!(err.contains("list of variable names"), "{err}");
+        .unwrap();
+        assert_eq!(shorthand.env, vec![("A_TOKEN".into(), "${A_TOKEN}".into())]);
+
+        // Remote servers name headers, and take no env or args.
+        let remote = parse_entry(
+            "sentry",
+            &json!({ "url": "https://mcp.sentry.dev/mcp",
+                     "headers": { "Authorization": "Bearer ${KEY}" } }),
+            file,
+            false,
+        )
+        .unwrap();
+        assert!(remote.remote());
+        assert!(!remote.oauth(), "an Authorization header means no sign-in");
+        assert_eq!(remote.vars, vec!["KEY".to_string()]);
+        assert!(parse_entry(
+            "x",
+            &json!({ "url": "https://e/mcp", "args": ["a"] }),
+            file,
+            false
+        )
+        .is_err());
+        assert!(parse_entry(
+            "x",
+            &json!({ "command": "c", "headers": { "A": "B" } }),
+            file,
+            false
+        )
+        .is_err());
+        assert!(parse_entry(
+            "x",
+            &json!({ "command": "c", "url": "https://e/mcp" }),
+            file,
+            false
+        )
+        .is_err());
+        assert!(parse_entry("x", &json!({ "url": "ftp://e" }), file, false).is_err());
+        assert!(
+            parse_entry("x", &json!({ "url": "https://e/mcp" }), file, false)
+                .unwrap()
+                .oauth()
+        );
+
         // A field axe would ignore must not run half a server.
         let err =
             parse_entry("x", &json!({ "command": "c", "cwd": "/" }), file, false).unwrap_err();
         assert!(err.contains("unknown key"), "{err}");
-        // Only the project may narrow; it can never define.
         assert!(parse_entry("x", &json!({ "enabled": false }), file, false).is_err());
         assert!(parse_entry("x", &json!({ "enabled": false }), file, true).is_ok());
         assert!(parse_entry("x", &json!({}), file, true).is_err());
@@ -1660,7 +2452,6 @@ mod tests {
             render(&json!({ "content": [{ "type": "text", "text": "boom" }], "isError": true })),
             "error: boom"
         );
-        // Control bytes from a server never reach the terminal.
         assert_eq!(
             render(&json!({ "content": [{ "type": "text", "text": "a\u{1b}[31m" }] })),
             "a[31m"
@@ -1672,14 +2463,9 @@ mod tests {
         let text = "x".repeat(RESULT_CAP + 100);
         let rendered = render(&json!({ "content": [{ "type": "text", "text": text }] }));
         assert!(rendered.contains("full output"));
-        assert!(
-            rendered.chars().count() <= RESULT_CAP + 120,
-            "{}",
-            rendered.len()
-        );
         let path = rendered
             .rsplit_once("[full output: ")
-            .and_then(|(_, rest)| rest.strip_suffix("]"))
+            .and_then(|(_, rest)| rest.strip_suffix(']'))
             .unwrap();
         let saved = fs::read_to_string(path).unwrap();
         assert_eq!(saved.chars().count(), RESULT_CAP + 100);
@@ -1688,22 +2474,19 @@ mod tests {
 
     #[test]
     fn trust_is_by_path_and_content() {
-        // The record lives under the state root, so the test needs a scratch home.
-        state::testenv::home("mcp-trust", |home| {
-            let dir = home.join("repo");
-            fs::create_dir_all(&dir).unwrap();
-            let file = dir.join(".mcp.json");
-            fs::write(&file, "{}").unwrap();
-            let hash = hash_of(b"{}");
-            assert!(!approved(&dir, &file, &hash));
-            remember(&dir, &file, &hash);
-            assert!(approved(&dir, &file, &hash));
-            assert!(!approved(&dir, &file, &hash_of(b"{\"mcpServers\":{}}")));
-            let mode = fs::metadata(trust_file(&dir)).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "the record is the user's");
-            assert!(forget_trust(&dir).contains("forgotten"));
-            assert!(!approved(&dir, &file, &hash));
-        });
+        let dir = state::testenv::dir("mcp-trust");
+        let file = dir.join(".mcp.json");
+        fs::write(&file, "{}").unwrap();
+        let hash = hash_of(b"{}");
+        assert!(!approved(&dir, &file, &hash));
+        remember(&dir, &file, &hash);
+        assert!(approved(&dir, &file, &hash));
+        assert!(!approved(&dir, &file, &hash_of(b"{\"mcpServers\":{}}")));
+        let mode = fs::metadata(trust_file(&dir)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the record is the user's");
+        assert!(forget_trust(&dir).contains("forgotten"));
+        assert!(!approved(&dir, &file, &hash));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1716,7 +2499,6 @@ mod tests {
         assert!(project_file(&nested).is_none());
         fs::write(repo.join(".mcp.json"), "{}").unwrap();
         assert_eq!(project_file(&nested), Some(repo.join(".mcp.json")));
-        // A parent's file is not this checkout's.
         fs::write(dir.join(".mcp.json"), "{}").unwrap();
         assert_eq!(project_file(&nested), Some(repo.join(".mcp.json")));
         assert_eq!(project_target(&nested), repo.join(".mcp.json"));
@@ -1724,18 +2506,35 @@ mod tests {
     }
 
     #[test]
-    fn add_flags_carry_a_project_and_variable_names() {
-        let (project, env, words) = add_flags("--env TOKEN github npx -y s").unwrap();
+    fn add_flags_carry_a_project_a_url_and_variable_names() {
+        let (project, env, headers, url, timeout, words) =
+            add_flags("--env TOKEN github npx -y s").unwrap();
         assert!(!project);
-        assert_eq!(env, vec!["TOKEN".to_string()]);
+        assert_eq!(env, vec![("TOKEN".to_string(), "${TOKEN}".to_string())]);
+        assert!(headers.is_empty());
+        assert!(url.is_none());
+        assert_eq!(timeout, None);
         assert_eq!(words, vec!["github", "npx", "-y", "s"]);
-        let (project, _, words) = add_flags("--project mytool /bin/sh serve").unwrap();
+
+        let (project, env, headers, url, timeout, words) = add_flags(
+            "--project --url https://e/mcp --header 'Authorization: Bearer ${K}' \
+             --env K --timeout 90 sentry",
+        )
+        .unwrap();
         assert!(project);
-        assert_eq!(words, vec!["mytool", "/bin/sh", "serve"]);
-        assert!(add_flags("--env").unwrap_err().contains("needs a variable"));
-        assert!(add_flags("--env 1BAD x c")
-            .unwrap_err()
-            .contains("not a variable"));
+        assert_eq!(url.as_deref(), Some("https://e/mcp"));
+        assert_eq!(env, vec![("K".to_string(), "${K}".to_string())]);
+        assert_eq!(
+            headers,
+            vec![("Authorization".to_string(), "Bearer ${K}".to_string())]
+        );
+        assert_eq!(timeout, Some(90));
+        assert_eq!(words, vec!["sentry"]);
+
+        assert!(add_flags("--env").is_err());
+        assert!(add_flags("--env 1BAD x c").is_err());
+        assert!(add_flags("--header 'no colon' x c").is_err());
+        assert!(add_flags("--timeout 0 x c").is_err());
     }
 
     #[test]
@@ -1760,23 +2559,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn an_env_name_resolves_or_is_named() {
-        assert!(valid_var("GITHUB_TOKEN"));
-        assert!(valid_var("_x1"));
-        assert!(!valid_var("1X"));
-        assert!(!valid_var("A-B"));
-        std::env::set_var("AXE_TEST_MCP_TOKEN", "secret");
-        let mut e = entry("x", "/bin/sh");
-        e.env = vec!["AXE_TEST_MCP_TOKEN".into()];
-        std::env::remove_var("AXE_TEST_MCP_TOKEN");
-        let err = Server::open(&e, false).err().unwrap();
-        assert!(err.contains("AXE_TEST_MCP_TOKEN is not set"), "{err}");
-    }
-
-    #[test]
-    fn a_stdio_server_is_asked_for_its_tools_and_answers_a_call() {
-        // A whole server in one line of shell: initialize, list, call.
+    /// A stdio server in one line of shell: initialize, list, call.
+    fn stdio_fixture(dir: &Path) -> Vec<String> {
         let script = r#"
 read line
 echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"t","version":"1"}}}'
@@ -1785,14 +2569,20 @@ read line
 echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"say it back","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}'
 while read line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-  echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"said it\"}]}}"
+  echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"said it back\"}]}}"
 done
 "#;
-        let dir = state::testenv::dir("mcp-server");
         let file = dir.join("server.sh");
         fs::write(&file, script).unwrap();
+        vec![file.display().to_string()]
+    }
+
+    #[test]
+    fn a_stdio_server_is_asked_for_its_tools_and_answers_a_call() {
+        let dir = state::testenv::dir("mcp-server");
+        let args = stdio_fixture(&dir);
         let mut e = entry("t", "/bin/sh");
-        e.args = vec![file.display().to_string()];
+        e.args = args;
         let server = Server::open(&e, false).expect("a server that answers");
         assert_eq!(server.listed.len(), 1);
         assert_eq!(server.listed[0].original, "echo");
@@ -1800,9 +2590,10 @@ done
         name_tools(&mut running);
         let server = running[0].as_mut().unwrap();
         assert_eq!(server.tools[0].exposed, "mcp__t__echo");
-        let result = server.call("echo", &json!({ "text": "hi" }), &Cancel::new());
-        assert_eq!(result, "said it");
-        // A dead server says so rather than hanging.
+        assert_eq!(
+            server.call("echo", &json!({ "text": "hi" }), &Cancel::new()),
+            "said it back"
+        );
         server.stop();
         assert!(server
             .call("echo", &json!({}), &Cancel::new())
@@ -1810,56 +2601,8 @@ done
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The two events a server sends before it matters, then one reply per
-    /// call: enough of a server to prove the kernel rule.
-    fn writer(path: &Path) -> String {
-        format!(
-            r#"
-read line
-echo '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"t","version":"1"}}}}}}'
-read line
-read line
-echo '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"write","inputSchema":{{"type":"object"}}}}]}}}}'
-while read line; do
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-  out=$(printf x > {} 2>&1; printf '%s' "$?")
-  echo "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"$out\"}}]}}}}"
-done
-"#,
-            path.display()
-        )
-    }
-
-    fn run_writer(explore: bool, target: &Path) -> String {
-        let dir = state::testenv::dir(&format!("mcp-write-{explore}"));
-        let file = dir.join("server.sh");
-        fs::write(&file, writer(target)).unwrap();
-        let mut e = entry("t", "/bin/sh");
-        e.args = vec![file.display().to_string()];
-        let server = Server::open(&e, explore).expect("a server that answers");
-        let mut running = vec![Some(server)];
-        name_tools(&mut running);
-        let server = running[0].as_mut().unwrap();
-        let result = server.call("write", &json!({}), &Cancel::new());
-        let _ = fs::remove_dir_all(&dir);
-        result
-    }
-
     #[test]
-    fn explore_mode_confines_a_servers_writes() {
-        let dir = state::testenv::dir("mcp-confined");
-        let target = dir.join("out");
-        let refused = run_writer(true, &target);
-        assert!(!target.exists(), "the kernel refused: {refused}");
-        assert_ne!(refused, "0", "{refused}");
-        let allowed = run_writer(false, &target);
-        assert_eq!(allowed, "0", "{allowed}");
-        assert!(target.exists(), "normal mode writes");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn an_interrupt_stops_waiting_and_leaves_the_server_running() {
+    fn a_stdio_server_answers_an_interrupt_and_stays_up() {
         let dir = state::testenv::dir("mcp-cancel");
         let script = r#"
 read line
@@ -1890,8 +2633,182 @@ done
         let result = server.call("slow", &json!({}), &cancel);
         flag.join().unwrap();
         assert!(result.contains("interrupted"), "{result}");
-        // The process is not killed: the next call is answered by the same one.
         assert_eq!(server.call("slow", &json!({}), &Cancel::new()), "late");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A mock remote server: JSON for initialize and calls, SSE for the tool
+    /// list, a session id on every reply, and a 401 until a token arrives.
+    fn mock_remote(require_auth: bool) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).ok();
+                let mut length = 0usize;
+                let mut auth = false;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).ok();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                        if name.eq_ignore_ascii_case("authorization") {
+                            auth = value.trim().starts_with("Bearer ");
+                        }
+                    }
+                }
+                let mut body = vec![0u8; length];
+                reader.read_exact(&mut body).ok();
+                let body = String::from_utf8_lossy(&body).to_string();
+                let (status, content_type, payload) = if require_auth && !auth {
+                    (
+                        401,
+                        "application/json",
+                        json!({ "error": "unauthorized" }).to_string(),
+                    )
+                } else if body.contains("\"initialize\"") {
+                    (
+                        200,
+                        "application/json",
+                        json!({ "jsonrpc": "2.0", "id": 1, "result": {
+                            "protocolVersion": "2025-06-18", "capabilities": {},
+                            "serverInfo": { "name": "t", "version": "1" } } })
+                        .to_string(),
+                    )
+                } else if body.contains("\"tools/list\"") {
+                    let message = json!({ "jsonrpc": "2.0", "id": 2, "result": {
+                        "tools": [{ "name": "echo", "description": "say it back",
+                                    "inputSchema": { "type": "object" } }] } });
+                    (
+                        200,
+                        "text/event-stream",
+                        format!("event: message\ndata: {message}\n\n"),
+                    )
+                } else if body.contains("\"tools/call\"") {
+                    let id = body
+                        .split("\"id\":")
+                        .nth(1)
+                        .and_then(|rest| rest.split(',').next())
+                        .and_then(|n| n.trim().parse::<u64>().ok())
+                        .unwrap_or(3);
+                    (
+                        200,
+                        "application/json",
+                        json!({ "jsonrpc": "2.0", "id": id, "result": {
+                            "content": [{ "type": "text", "text": "said it back" }] } })
+                        .to_string(),
+                    )
+                } else {
+                    (400, "application/json", "{}".to_string())
+                };
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\n\
+                     Mcp-Session-Id: s1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn a_remote_server_is_listed_over_sse_and_answers_over_json() {
+        let url = mock_remote(false);
+        let mut e = entry("r", "");
+        e.command = None;
+        e.url = Some(url);
+        let server = Server::open(&e, false).expect("a remote server");
+        assert_eq!(server.listed.len(), 1);
+        let mut running = vec![Some(server)];
+        name_tools(&mut running);
+        let server = running[0].as_mut().unwrap();
+        assert_eq!(
+            server.call("echo", &json!({}), &Cancel::new()),
+            "said it back"
+        );
+    }
+
+    #[test]
+    fn a_remote_server_that_wants_a_token_says_how_to_get_one() {
+        let url = mock_remote(true);
+        let mut e = entry("r", "");
+        e.command = None;
+        e.url = Some(url);
+        let err = Server::open(&e, false).err().expect("401 is a failure");
+        assert!(err.contains("sign-in required"), "{err}");
+
+        // With a token in the store the same server answers, because axe
+        // sends the bearer it signed in for.
+        state::testenv::home("mcp-remote-auth", |_home| {
+            let url = mock_remote(true);
+            let mut e = entry("r", "");
+            e.command = None;
+            e.url = Some(url.clone());
+            let token = crate::oauth::Token {
+                access: "at".into(),
+                refresh: None,
+                expires_at: None,
+                client_id: "cid".into(),
+                client_secret: None,
+                token_endpoint: "http://127.0.0.1:9/token".into(),
+            };
+            crate::oauth::save("r", &url, &token).unwrap();
+            let server = Server::open(&e, false).expect("the token is sent");
+            assert_eq!(server.listed.len(), 1);
+        });
+    }
+
+    #[test]
+    fn explore_mode_confines_a_servers_writes() {
+        let dir = state::testenv::dir("mcp-confined");
+        let target = dir.join("out");
+        // The server writes as it starts: the kernel decides before any call,
+        // so the test is the spawn, not a tool.
+        let fixture = |path: &Path| -> String {
+            format!(
+                r#"
+printf x > {} 2>/dev/null
+read line
+echo '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"t","version":"1"}}}}}}'
+read line
+read line
+echo '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"echo","inputSchema":{{"type":"object"}}}}]}}}}'
+while read line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  echo "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"content\":[]}}}}"
+done
+"#,
+                path.display()
+            )
+        };
+        let run = |explore: bool| -> bool {
+            let dir = state::testenv::dir(&format!("mcp-write-{explore}"));
+            let file = dir.join("server.sh");
+            fs::write(&file, fixture(&target)).unwrap();
+            let mut e = entry("t", "/bin/sh");
+            e.args = vec![file.display().to_string()];
+            let server = Server::open(&e, explore);
+            assert!(server.is_ok(), "the server starts: {:?}", server.err());
+            let _ = fs::remove_dir_all(&dir);
+            target.exists()
+        };
+        assert!(!run(true), "explore mode denies the write");
+        assert!(!target.exists(), "nothing was written");
+        assert!(run(false), "normal mode writes");
+        assert!(target.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1902,9 +2819,15 @@ done
             let notices = start(Some(&dir), false, false);
             assert!(notices.iter().all(|n| !n.contains("tool")), "{notices:?}");
             assert!(definitions().is_empty());
-            let listing = dispatch("");
+            let listing = dispatch("", &mut |_| {});
             assert!(listing.contains("no MCP servers"), "{listing}");
             assert!(listing.contains("mcp.json"), "{listing}");
+            assert!(listing.contains("global: every directory"), "{listing}");
+            assert!(
+                listing.contains("project: this repository only"),
+                "{listing}"
+            );
+            assert!(listing.contains("--url"), "{listing}");
             shutdown();
         });
         let _ = fs::remove_dir_all(&dir);

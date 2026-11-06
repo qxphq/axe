@@ -27,7 +27,7 @@ pub struct State {
 }
 
 /// `$XDG_STATE_HOME` or `$HOME/.local/state`, then `axe`.
-fn root() -> PathBuf {
+pub(crate) fn root() -> PathBuf {
     if let Ok(dir) = env::var("XDG_STATE_HOME") {
         if !dir.is_empty() {
             return PathBuf::from(dir).join("axe");

@@ -188,78 +188,94 @@ a task matches.
 ## MCP servers
 
 axe can run [MCP](https://modelcontextprotocol.io) servers and add their tools
-beside `read` and `bash`. Stdio servers only, tools only: resources, prompts and
-the HTTP transport are not implemented, and no server is configured by default.
-
-Two files, in the `mcpServers` shape other clients use. **Global** is yours
-and applies everywhere; **project** travels with a checkout and has to be
-approved.
+beside `read` and `bash`. Two transports, tools only — resources, prompts and
+`tools/list_changed` are not implemented — and no server is configured by
+default.
 
 | | global | project |
 | --- | --- | --- |
 | file | `~/.config/axe/mcp.json` (or `$XDG_CONFIG_HOME/axe/mcp.json`) | `<repo>/.mcp.json`: the nearest at or above cwd, never past the repository root |
 | applies to | every directory | that checkout only |
 | written by | `/mcp add <name> ...` | `/mcp add --project <name> ...` |
-| approval | none: it is your file | once per file, per content hash; the start lists the commands and variables |
+| approval | none: it is your file | once per file, per content hash; the question lists the commands and the variables they read |
 | precedence | — | a project server replaces a global one of the same name |
-
-A project entry with no `command` may only switch a global one's `enabled`, so
-a repository can narrow what runs but never define it.
-
-The approval is once per file, and the question lists every command, argument
-and variable name it would hand over. The answer is remembered in the project's
-state directory against the file's content hash, so an edit asks again;
-`/mcp forget` clears it. A file that only sets `enabled` runs nothing and needs
-no approval. A piped run asks nothing and runs no project server.
 
 ```json
 { "mcpServers": {
     "github": { "command": "npx",
                 "args": ["-y", "@modelcontextprotocol/server-github"],
-                "env": ["GITHUB_TOKEN"] },
-    "docs": { "command": "/opt/mcp-docs", "enabled": false, "timeout": 120 } } }
+                "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" } },
+    "sentry": { "url": "https://mcp.sentry.dev/mcp" },
+    "grep":   { "url": "https://mcp.grep.app",
+                "headers": { "Authorization": "Bearer ${GREP_KEY}" } },
+    "docs":   { "command": "/opt/mcp-docs", "enabled": false, "timeout": 120 } } }
 ```
 
 | key | meaning |
 | --- | --- |
-| `command` | the program; a `/` means a path, otherwise `PATH` |
-| `args` | strings; `~` is your home directory |
-| `env` | variable **names**, never values: axe passes them from its own environment, and a missing one is reported by name |
+| `command` | a program axe starts and speaks to over its stdin/stdout |
+| `url` | a streamable-HTTP endpoint; an entry is a command or a url, not both |
+| `args` | strings for a command; `~` is your home directory |
+| `env` | for a command: name → value, or an array of names as shorthand |
+| `headers` | for a url: name → value |
 | `enabled` | `false` keeps the entry and starts nothing |
 | `timeout` | seconds per call; 60 by default |
 
-`type` may be `"stdio"`; `url` is refused with the reason. Unknown keys are
-errors.
+Values are strings with `$NAME` and `${NAME}` expanded from axe's own
+environment at start, `$$` for a literal `$`. That is how a committed file
+names a secret without holding one: the value is a reference, and the variable
+only has to exist in the shell that started axe. A missing one is reported by
+name and the server does not start half-configured. `type` may name `stdio`,
+`http` or `streamable-http`; unknown keys are errors. A project entry replaces
+a global server of the same name, but an entry with no `command`/`url` may only
+switch a global one's `enabled` — a repository can narrow what runs, never
+define it.
+
+A `url` entry is streamable HTTP: axe POSTs JSON-RPC, accepts a JSON body or an
+SSE stream, echoes `Mcp-Session-Id`, sends `MCP-Protocol-Version`, and DELETEs
+the session when it closes. A server that answers 401 without an
+`Authorization` header is asking for OAuth: axe runs the discovery
+(`.well-known/oauth-protected-resource`, then the authorization server's
+metadata), registers itself dynamically, signs in with PKCE S256 through a
+loopback callback, and keeps the tokens in
+`$XDG_STATE_HOME/axe/mcp-auth.json` (or `~/.local/state/axe/mcp-auth.json`),
+owner-only, keyed by name and URL. Access tokens refresh when they expire; a
+401 retries once with a refreshed token before it says `sign-in required:
+/mcp login <name>`. A project entry may name a URL — it cannot choose where a
+credential goes, because there is no such key.
 
 Tools are named `mcp__<server>__<tool>` and carry the server's own schema and
 description. They are read once at startup, because the catalogue is part of
 the cached prompt prefix: an edit needs a restart, and `/mcp` says when a file
-changed. At most 128 tools and 256 KiB of schema per server, 4 MiB per
-message from the server, and 30 000 characters per result with the whole text in a temporary file the
+changed. At most 128 tools and 256 KiB of schema per server, 4 MiB per message,
+and 30 000 characters per result with the whole text in a temporary file the
 result names. The model gets text: an image or a resource is `[image omitted]`.
-ESC stops waiting and tells the server; a server that exits answers with what it
-printed.
+ESC stops waiting (the process keeps its server; an HTTP request is closed); a
+server that exits answers with what it printed.
 
 ```
 $ /mcp
 mcp servers
-  github     global   26 tools
-  proj       project  4 tools
+  github     global   stdio  26 tools
+  sentry     global   http   12 tools  signed in
+  proj       project  stdio  4 tools
   /home/anon/repo/.mcp.json: approved
 ```
 
-`/mcp <name>` shows one server's tools. `/mcp add [--project] [--env NAME]...
-<name> <command> [args...]`, `/mcp remove <name>` and `/mcp forget` edit the
-files. `--env` hands over one of your variables by name; `add` splits on
-spaces, so an argument that contains one is a file edit. The startup
-line is the proof that it worked: `mcp github: 26 tools (global)`.
+`/mcp <name>` shows one server's tools. `/mcp add [--project] [--url URL]
+[--env NAME[=VALUE]]... [--header 'K: V']... [--timeout S] <name> [command
+[args...]]`, `/mcp remove <name>`, `/mcp login <name>`, `/mcp logout <name>` and
+`/mcp forget` edit the files and the token store. The startup line is the proof
+that it worked: `mcp github: 26 tools (global)`.
 
-In explore mode a server is confined like `bash`: it writes only to the scratch
-directory and the project's `plan/`, and the `io_uring` rule applies. Exec is
-not confined — a server starts its own runtime, and the leading-word allowlist
-is a convenience for `bash`, not the boundary. A running process cannot be
-narrowed or widened, so `/explore` restarts every server; the names the model
-was given stay the same, and one that fails then answers with an error.
+In explore mode a stdio server is confined like `bash`: it writes only to the
+scratch directory and the project's `plan/`, and the `io_uring` rule applies.
+Exec is not confined — a server starts its own runtime, and the leading-word
+allowlist is a convenience for `bash`, not the boundary. A running process
+cannot be narrowed or widened, so `/explore` restarts every server; the names
+the model was given stay the same, and one that fails then answers with an
+error. An HTTP server has no process to confine; the network is unconfined in
+both modes anyway.
 
 ## REPL
 
@@ -443,6 +459,7 @@ directory with every byte outside `[A-Za-z0-9._-]` written as `%XX` — so
 | `state.json` | model, thinking levels, thoughts toggle |
 | `history.jsonl` | prompt lines typed here, one JSON string per line; the newest 500 |
 | `mcp-trust.json` | approved project MCP files, by path and content hash |
+| `../mcp-auth.json` | MCP OAuth tokens, by server name and URL (in the state root) |
 | `plan/` | explore mode's writable directory: a plan that outlives the session |
 | `<id>.json` | a session's title, summary, dates and message count |
 | `<id>.jsonl` | the session body: one API message per line, append-only |

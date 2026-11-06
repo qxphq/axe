@@ -32,6 +32,20 @@ pub struct Endpoint {
     pub prefix: String,
 }
 
+impl Endpoint {
+    /// `scheme://host[:port]`: the origin discovery URLs hang off.
+    pub fn origin(&self) -> String {
+        let (scheme, default) = match self.scheme {
+            Scheme::Http => ("http", 80),
+            Scheme::Https => ("https", 443),
+        };
+        match self.port {
+            port if port == default => format!("{scheme}://{}", self.host),
+            port => format!("{scheme}://{}:{port}", self.host),
+        }
+    }
+}
+
 /// Stops an in-flight request: the socket is shut down so a blocked read
 /// returns at once, and the flag lets the turn loop stop between requests. A
 /// turn owns one, so a stale request can never stop the next turn.
@@ -151,6 +165,11 @@ pub fn split_url(url: &str) -> Result<(Endpoint, String), String> {
         },
         target,
     ))
+}
+
+/// An RFC 9110 token: what may name a header field.
+pub(crate) fn valid_header_name(name: &str) -> bool {
+    valid_name(name)
 }
 
 /// An RFC 9110 token: what may name a header field.
@@ -371,6 +390,9 @@ pub struct Response {
     pub status: u16,
     pub content_type: Option<String>,
     pub location: Option<String>,
+    /// Every response header, names lowercased. Transport details such as
+    /// `Mcp-Session-Id` and the OAuth challenge live here.
+    pub headers: Vec<(String, String)>,
     reader: BufReader<BodyReader<BufReader<Stream>>>,
 }
 
@@ -490,7 +512,13 @@ pub fn request_with_timeout(
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     if let Some(b) = body {
-        head.push_str("Content-Type: application/json\r\n");
+        // A caller that sets its own type (OAuth's form posts) keeps it.
+        if !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        {
+            head.push_str("Content-Type: application/json\r\n");
+        }
         head.push_str(&format!("Content-Length: {}\r\n", b.len()));
     }
     head.push_str("\r\n");
@@ -518,6 +546,7 @@ pub fn request_with_timeout(
     let mut chunked = false;
     let mut content_type = None;
     let mut location = None;
+    let mut headers_out: Vec<(String, String)> = Vec::new();
     loop {
         let line = read_line(&mut reader)?;
         let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -527,6 +556,7 @@ pub fn request_with_timeout(
         if let Some((name, value)) = trimmed.split_once(':') {
             let name = name.trim().to_ascii_lowercase();
             let value = value.trim();
+            headers_out.push((name.clone(), value.to_string()));
             if name == "content-length" {
                 content_length = value.parse::<u64>().ok();
             } else if name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked")
@@ -555,6 +585,7 @@ pub fn request_with_timeout(
         status,
         content_type,
         location,
+        headers: headers_out,
         reader: BufReader::new(BodyReader {
             inner: reader,
             state,
