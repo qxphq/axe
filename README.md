@@ -120,6 +120,10 @@ Secrets belong in the environment: `api_key_env` is read at startup. A provider
 whose variable is unset is skipped, not retried. A literal `api_key` in the
 config is rejected — the file is not the place for a secret.
 
+MCP servers are a second input file, `mcp.json` beside this one, read the same
+way and never part of it; see [MCP servers](#mcp-servers). `config.json` itself
+is still never written.
+
 ## Instructions
 
 The built-in prompt is the working directory and a short numbered list of
@@ -170,6 +174,76 @@ keeps a skill out of the model's catalogue while `/skill:name` still works.
 The catalogue is a section of the system prompt listing each visible skill's
 name, description and absolute `SKILL.md` path; the model reads the file when
 a task matches.
+
+## MCP servers
+
+axe can run [MCP](https://modelcontextprotocol.io) servers and add their tools
+beside `read` and `bash`. Stdio servers only, tools only: resources, prompts and
+the HTTP transport are not implemented, and no server is configured by default.
+
+Two files, in the `mcpServers` shape other clients use:
+
+| file | scope |
+| --- | --- |
+| `~/.config/axe/mcp.json` (or `$XDG_CONFIG_HOME/axe/mcp.json`) | every directory |
+| `<repo>/.mcp.json` | that checkout: the nearest file at or above cwd, never past the repository root |
+
+A project file is code a repository shipped, so it runs only after one approval
+per file: the start lists every command, argument and variable and asks once.
+The answer is remembered in the project's state directory against the file's
+content hash, so an edit asks again; `/mcp forget` clears it. A file that only
+sets `enabled` runs nothing and needs no approval. A piped run asks nothing and
+runs no project server.
+
+```json
+{ "mcpServers": {
+    "github": { "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": ["GITHUB_TOKEN"] },
+    "docs": { "command": "/opt/mcp-docs", "enabled": false, "timeout": 120 } } }
+```
+
+| key | meaning |
+| --- | --- |
+| `command` | the program; a `/` means a path, otherwise `PATH` |
+| `args` | strings; `~` is your home directory |
+| `env` | variable **names**, never values: axe passes them from its own environment, and a missing one is reported by name |
+| `enabled` | `false` keeps the entry and starts nothing |
+| `timeout` | seconds per call; 60 by default |
+
+`type` may be `"stdio"`; `url` is refused with the reason. Unknown keys are
+errors. A project entry replaces a global server of the same name, but an entry
+with no `command` may only switch a global one's `enabled` — a repository can
+narrow what runs, never define it.
+
+Tools are named `mcp__<server>__<tool>` and carry the server's own schema and
+description. They are read once at startup, because the catalogue is part of
+the cached prompt prefix: an edit needs a restart, and `/mcp` says when a file
+changed. At most 128 tools and 256 KiB of schema per server, 4 MiB per
+message from the server, and 30 000 characters per result with the whole text in a temporary file the
+result names. The model gets text: an image or a resource is `[image omitted]`.
+ESC stops waiting and tells the server; a server that exits answers with what it
+printed.
+
+```
+$ /mcp
+mcp servers
+  github     global   26 tools
+  proj       project  4 tools
+  /home/anon/repo/.mcp.json: approved
+```
+
+`/mcp <name>` shows one server's tools. `/mcp add <name> <command> [args...]
+[--project]`, `/mcp remove <name>` and `/mcp forget` edit the files; `add`
+splits on spaces, so an argument that contains one is a file edit. The startup
+line is the proof that it worked: `mcp github: 26 tools (global)`.
+
+In explore mode a server is confined like `bash`: it writes only to the scratch
+directory and the project's `plan/`, and the `io_uring` rule applies. Exec is
+not confined — a server starts its own runtime, and the leading-word allowlist
+is a convenience for `bash`, not the boundary. A running process cannot be
+narrowed or widened, so `/explore` restarts every server; the names the model
+was given stay the same, and one that fails then answers with an error.
 
 ## REPL
 
@@ -320,6 +394,10 @@ knows which side it is on.
 | `fetch(url, start?, chars?)` | read a web page as text; explore mode only |
 | `web_search(query, count?)` | ranked results; explore mode only |
 
+An MCP server's tools join the same array as `mcp__<server>__<tool>`; see
+[MCP servers](#mcp-servers). The seven above are always axe's own and never
+move behind a server.
+
 `read` returns lines without numbering. `bash` starts every call in the working
 directory, so `cd` is pointless; output is truncated, not streamed.
 `fetch` takes 1 MiB off the wire at most and gives the model at most 50 000
@@ -338,6 +416,7 @@ directory with every byte outside `[A-Za-z0-9._-]` written as `%XX` — so
 | --- | --- |
 | `state.json` | model, thinking levels, thoughts toggle |
 | `history.jsonl` | prompt lines typed here, one JSON string per line; the newest 500 |
+| `mcp-trust.json` | approved project MCP files, by path and content hash |
 | `plan/` | explore mode's writable directory: a plan that outlives the session |
 | `<id>.json` | a session's title, summary, dates and message count |
 | `<id>.jsonl` | the session body: one API message per line, append-only |
@@ -427,9 +506,15 @@ message says so: a missing binary and a denied one read differently, and a
 denied write comes back with the two directories that would have been allowed
 and the toggle that lifts both.
 
+An MCP server is a program axe starts itself, and in explore mode it gets the
+same two writable directories and the same `io_uring` rule. Its exec is not
+confined: the allowlist is a convenience for `bash`, and a server starts its own
+runtime (`npx`, `uvx`) that a leading-word check would refuse.
+
 A command child inherits a minimal environment — `PATH`, `HOME`, `LANG`,
 `LC_ALL`, `TERM`, `TMPDIR`, `USER`, `SHELL` — not axe's own. Provider and
-search tokens stay in the parent's memory.
+search tokens stay in the parent's memory. A server gets those plus the
+variables its entry names.
 
 Known residuals: writes through an inherited file descriptor, metadata such as
 `chmod` outside the scratch directory, and `fetch`/`web_search`, which run in
@@ -451,7 +536,9 @@ cloned repository's instructions, a file, or text you paste in can talk the
 model into running something. Use normal mode only in directories you trust.
 The project's `AGENTS.md` and its skills are read at startup and go into the
 prompt; axe asks nothing and gates nothing, so the directory you start it in is
-the whole decision.
+the whole decision. Its `.mcp.json` is the one exception — a server is code, not
+text, so the file needs one approval per content hash, and the prompt shows
+every command and every variable it would hand over.
 `bash` runs as you and reaches the network as you do, and `fetch` and
 `web_search` are refused here, so in normal mode a command is the only way to
 the network and nothing stands between it and the internet.

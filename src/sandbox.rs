@@ -205,6 +205,25 @@ pub fn shell(command: &str, read_only: bool) -> Result<Command, String> {
     imp::shell(command, read_only)
 }
 
+/// A program axe starts itself, with the confinement the mode allows: an MCP
+/// server. Read-only keeps the write rule (scratch, the plan directory,
+/// `/dev/null`) and the filter that closes `io_uring`, and leaves exec alone:
+/// the allowlist is a convenience for `bash`, and a server starts its own
+/// runtime (`npx`, `uvx`) the leading-word list would refuse.
+pub fn server(
+    program: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    read_only: bool,
+) -> Result<Command, String> {
+    imp::server(program, args, env, read_only)
+}
+
+/// First `name` on PATH, canonicalised, for a caller that must exec it.
+pub(crate) fn resolve_program(name: &str) -> Option<PathBuf> {
+    resolve(name)
+}
+
 /// Best effort, at exit: a static's `Drop` never runs.
 pub fn cleanup() {
     if let Some(Some(dir)) = SCRATCH.get() {
@@ -506,7 +525,9 @@ mod imp {
         }
     }
 
-    fn build(abi: i32, shell: &Path) -> Result<Ruleset, String> {
+    /// Every right axe's explore mode handles. `EXECUTE` is part of it: a
+    /// ruleset that handles it and grants it to nothing refuses every exec.
+    fn rights(abi: i32) -> u64 {
         let mut fs = FS_EXECUTE
             | FS_WRITE_FILE
             | FS_REMOVE_DIR
@@ -524,6 +545,12 @@ mod imp {
         if abi >= 3 {
             fs |= FS_TRUNCATE;
         }
+        fs
+    }
+
+    /// The ruleset with `handled_access_fs` only: one shape for both the
+    /// `bash` ruleset and the write-only one an MCP server gets.
+    fn create(fs: u64) -> Result<Ruleset, String> {
         let attr = RulesetAttr {
             handled_access_fs: fs,
         };
@@ -547,7 +574,12 @@ mod imp {
         }
         // SAFETY: `fd` is a fresh non-negative descriptor returned by the
         // call above; `OwnedFd` takes ownership and closes it exactly once.
-        let set = Ruleset(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
+        Ok(Ruleset(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }))
+    }
+
+    fn build(abi: i32, shell: &Path) -> Result<Ruleset, String> {
+        let fs = rights(abi);
+        let set = create(fs)?;
 
         let mut binaries: Vec<PathBuf> = COMMANDS.iter().filter_map(|name| resolve(name)).collect();
         binaries.push(shell.to_path_buf());
@@ -578,6 +610,75 @@ mod imp {
             allow(&set, fs & !FS_EXECUTE, plan)?;
         }
         Ok(set)
+    }
+
+    /// The ruleset an MCP server gets in explore mode: the same two writable
+    /// directories, and nothing said about exec, so a server may start its own
+    /// runtime.
+    fn writeset(abi: i32) -> Result<Ruleset, String> {
+        let fs = rights(abi) & !FS_EXECUTE;
+        let set = create(fs)?;
+        allow(
+            &set,
+            FS_WRITE_FILE | (fs & FS_TRUNCATE),
+            Path::new("/dev/null"),
+        )?;
+        allow(&set, fs, scratch_dir()?)?;
+        if let Some(plan) = super::plan() {
+            allow(&set, fs, plan)?;
+        }
+        Ok(set)
+    }
+
+    fn ruleset_writes() -> Result<Option<&'static Ruleset>, String> {
+        let Some(abi) = abi() else {
+            return Ok(None);
+        };
+        static SET: OnceLock<Result<Ruleset, String>> = OnceLock::new();
+        match SET.get_or_init(|| writeset(abi)) {
+            Ok(set) => Ok(Some(set)),
+            Err(e) => Err(e.clone()),
+        }
+    }
+
+    pub fn server(
+        program: &Path,
+        args: &[String],
+        env: &[(String, String)],
+        read_only: bool,
+    ) -> Result<Command, String> {
+        let audit_arch = if read_only { TARGET } else { None };
+        if read_only && audit_arch.is_none() {
+            return Err(
+                "sandbox: MCP servers are unavailable on this architecture in explore mode".into(),
+            );
+        }
+        let rules = if read_only {
+            ruleset_writes()?.map(|set| set.0.as_raw_fd())
+        } else {
+            None
+        };
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        confine_env(&mut cmd, read_only)?;
+        for (name, value) in env {
+            cmd.env(name, value);
+        }
+        // SAFETY: as `shell`'s closure: only fixed syscalls, before any user
+        // program runs, on state inherited from the parent.
+        unsafe {
+            cmd.pre_exec(move || {
+                no_new_privs()?;
+                if let Some(audit_arch) = audit_arch {
+                    seccomp(audit_arch)?;
+                }
+                if let Some(fd) = rules {
+                    restrict(fd)?;
+                }
+                Ok(())
+            });
+        }
+        Ok(cmd)
     }
 
     fn allow(set: &Ruleset, access: u64, path: &Path) -> Result<(), String> {
@@ -730,6 +831,49 @@ mod imp {
         Ok(cmd)
     }
 
+    /// A program axe starts itself: same write rule, and no exec rule, so the
+    /// server may start its own runtime.
+    pub fn server(
+        program: &Path,
+        args: &[String],
+        env: &[(String, String)],
+        read_only: bool,
+    ) -> Result<Command, String> {
+        let mut cmd = Command::new(SANDBOX_EXEC);
+        cmd.arg("-p").arg(writes_profile(read_only)?).arg(program);
+        cmd.args(args);
+        confine_env(&mut cmd, read_only)?;
+        for (name, value) in env {
+            cmd.env(name, value);
+        }
+        Ok(cmd)
+    }
+
+    /// `(allow default)` outside explore mode; the write deny and the two
+    /// grants inside it.
+    fn writes_profile(read_only: bool) -> Result<&'static str, String> {
+        if !read_only {
+            return profile(false);
+        }
+        static EXPLORE: OnceLock<Result<String, String>> = OnceLock::new();
+        match EXPLORE.get_or_init(build_writes) {
+            Ok(profile) => Ok(profile.as_str()),
+            Err(e) => Err(e.clone()),
+        }
+    }
+
+    fn build_writes() -> Result<String, String> {
+        let mut profile = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
+        profile.push_str(&format!(
+            "(allow file-write* (subpath {}) (literal \"/dev/null\"))\n",
+            quote(scratch_dir()?)
+        ));
+        if let Some(plan) = super::plan() {
+            profile.push_str(&format!("(allow file-write* (subpath {}))\n", quote(plan)));
+        }
+        Ok(profile)
+    }
+
     fn profile(read_only: bool) -> Result<&'static str, String> {
         static NORMAL: OnceLock<String> = OnceLock::new();
         static EXPLORE: OnceLock<Result<String, String>> = OnceLock::new();
@@ -793,6 +937,7 @@ mod imp {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod imp {
+    use std::path::Path;
     use std::process::Command;
 
     pub fn notice() -> Option<String> {
@@ -801,6 +946,15 @@ mod imp {
 
     pub fn shell(_command: &str, _read_only: bool) -> Result<Command, String> {
         Err("sandbox: this platform has no sandbox; bash is unavailable".into())
+    }
+
+    pub fn server(
+        _program: &Path,
+        _args: &[String],
+        _env: &[(String, String)],
+        _read_only: bool,
+    ) -> Result<Command, String> {
+        Err("sandbox: this platform has no sandbox; MCP servers are unavailable".into())
     }
 }
 

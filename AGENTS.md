@@ -11,9 +11,11 @@ invariants a change must not break.
    (crossterm backend), `unicode-width`, and `libc` on Linux. Crypto and terminal
    geometry are not hand-rolled; compression is the host's `gzip`, never a crate.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
-   panes, subagents, MCP, or permission layer until the REPL is genuinely
-   insufficient. One feature per change.
-3. **Small surface.** Nineteen modules; a new module needs a separate concern,
+   panes, subagents, or permission layer until the REPL is genuinely
+   insufficient. MCP servers are the one addition on that list: they are the
+   only way to give the model a capability axe will never build in, and they
+   are additive — no built-in tool moves behind one. One feature per change.
+3. **Small surface.** Twenty modules; a new module needs a separate concern,
    not a line count.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` +
    SSE only. Express differences as config (`base_url`, `models_url`,
@@ -32,7 +34,10 @@ invariants a change must not break.
    replayed on resume; `/compact` appends a marked summary and the loader starts
    from the last marker, so the bytes stay and the request shrinks.
 7. **Tools are dumb.** `read`, `write`, `edit`, `bash`, `about`, `fetch`,
-   `web_search`. No `glob`, `grep`, or `list`; `bash` + `rg`/`fd` covers them.
+   `web_search`, plus whatever an MCP server contributes as
+   `mcp__<server>__<tool>`. No `glob`, `grep`, or `list`; `bash` + `rg`/`fd`
+   covers them. The built-in seven never become a server: their confinement,
+   caps and schemas are axe's.
    `about` returns the compiled-in `README.md`: documentation, not a code path.
    `fetch`/`web_search` are HTTP(S) GET with the body reduced to text and
    labelled untrusted; both are refused outside explore mode. `curl` is on
@@ -43,7 +48,9 @@ invariants a change must not break.
 8. **No approval prompts.** Bash runs unprompted by explicit user decision. Do not
    add a permission layer without being asked. A directory's `AGENTS.md` and its
    skills also load without a question: a trust prompt gates text the model could
-   read anyway, so it buys nothing but friction.
+   read anyway, so it buys nothing but friction. The one exception is a
+   project's `.mcp.json`: it names a program, not text, so the start asks once
+   per content hash, and the question lists every command and variable name.
 9. **Real cwd, relative paths.** `current_dir()` at startup, used for the prompt and
    every relative path. Never hardcode directories.
 10. **One config file, and it is input.** `~/.config/axe/config.json` (respects
@@ -51,6 +58,10 @@ invariants a change must not break.
     `api_key_env`; never commit keys or read another app's auth store. Axe never
     writes it: the per-directory state and sessions live under
     `~/.local/state/axe/projects/<escaped cwd>/` (respects `XDG_STATE_HOME`).
+    MCP servers are a second input, `mcp.json` beside it and `.mcp.json` in a
+    project, in the ecosystem's `mcpServers` shape. `env` there is variable
+    names, never values; the binary writes those files only through an explicit
+    `/mcp add`/`remove`/`forget`.
     Config `model` is the seed: the selection a directory starts on is its own
     `state.json`, then `<state tree>/default.json` (what `/model -g` writes),
     then the config.
@@ -109,6 +120,10 @@ invariants a change must not break.
     Normal mode keeps only `no_new_privs` and the scrubbed environment. The
     network is confined in neither mode: a child connects where the user
     connects, `!cmd` included. A leading-word check is never a substitute.
+    An MCP server gets the same two writable directories in explore mode and
+    the same `io_uring` rule, and keeps exec: the allowlist is a convenience
+    for `bash`, and `npx`/`uvx` start a runtime a leading-word check would
+    refuse. A process cannot be narrowed, so `/explore` restarts every server.
 16. **One version, in `Cargo.toml`.** `env!("CARGO_PKG_VERSION")` is the banner
     and `--version`; `flake.nix` reads the same file. The `ship` skill bumps it
     per semver (pre-1.0: patch for a fix, minor for a capability, a breaking
@@ -170,7 +185,10 @@ invariants a change must not break.
   and the body read on `/skill:` activation.
 - `sandbox.rs` — the only `unsafe`: seccomp, Landlock, Seatbelt, exec allowlist,
   and the two directories explore mode may write: the session's scratch and the
-  project's plan.
+  project's plan. The write-only ruleset an MCP server gets is built here too.
+- `mcp.rs` — MCP servers over stdio: the two config files and their merge, the
+  project file's approval record, the process and its reader thread, tool names,
+  the fixed catalogue, `/mcp`, and the restart a mode flip needs.
 
 ## Conventions
 
@@ -192,6 +210,15 @@ invariants a change must not break.
 - Tool names and descriptions are part of the prompt. Change them deliberately.
 - `README.md` is the user-facing contract and the GitHub page. It ships through
   `about`, so keep it factual and in the same commit as the behavior it describes.
+- MCP: a server's tools are read once, at startup, because tool schemas are the
+  cached prefix — a restart is the boundary, and `/mcp` says when a file
+  changed. Names are `mcp__<server>__<tool>`, sanitized and hash-suffixed past
+  64 characters, so a server can never shadow a built-in or another server's
+  tool. A project entry may replace a global one by name, but an entry with no
+  `command` may only switch `enabled`: a repository narrows what runs, never
+  defines it. The file is code, so it needs one approval per content hash
+  (`mcp-trust.json` in the project's state directory), and the prompt shows the
+  commands and variable names it is handing over.
 - Skills: a directory with `SKILL.md` is the unit; only the frontmatter is read at
   startup, the body on demand. The catalogue is appended last in the system
   prompt, after the instructions, so the part above it stays byte-identical.
@@ -210,9 +237,10 @@ invariants a change must not break.
   logged; resume rebuilds them. A title and summary are generated once, after the
   first answer; failing that, the first request stands in. The project directory
   also holds `plan/`, the one writable path explore mode keeps across sessions,
-  and `history.jsonl`, the prompt lines typed there: one JSON string per line,
-  the newest 500, the same `0600`. A blank, a leading space and a repeat of the
-  newest are not steps.
+  `history.jsonl`, the prompt lines typed there: one JSON string per line,
+  the newest 500, the same `0600`, and `mcp-trust.json`, the approved project
+  MCP files by path and content hash. A blank, a leading space and a repeat of
+  the newest are not steps.
 - `!cmd` is the user's shell. It runs through `tools::execute`, its output joins
   the history as a `user` message, no turn follows, and explore-mode write
   confinement does not apply.
@@ -268,6 +296,16 @@ and `show:`. Normal mode is a `!cmd` line, which does not loop. Examples:
 The first two deny on the kernel: an unwritable path, an exec outside the
 allowlist. A `!cmd` line is the escape hatch, and the harness reads an argument
 starting with `!` as tmux keys, so prefix it with a space: `' !make'`.
+
+MCP is checked with a project file that names `sh` and a fixture server: the
+first start asks, `y` runs it, `!Escape`/`show:` after a `tool:mcp__t__echo:{}`
+turn reads the answer, and a second start asks nothing because the hash matches.
+A tool you have not configured is absent from the array, not refused.
+
+```sh
+mkdir -p w/.git && printf '{"mcpServers":{"t":{"command":"/bin/sh","args":["/abs/srv.sh"]}}}\n' > w/.mcp.json
+./harness.py --work w --scroll 300 --timeout 12 'y' '/mcp'
+```
 
 The mid-turn queue is checked by queueing a line while a slow call runs, and
 letting the mock answer it: the second argument lands during the tool call, and

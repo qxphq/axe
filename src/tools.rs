@@ -157,22 +157,25 @@ static DEFINITIONS: OnceLock<Value> = OnceLock::new();
 
 pub fn definitions() -> &'static Value {
     DEFINITIONS.get_or_init(|| {
-        Value::Array(
-            SPECS
-                .iter()
-                .map(|spec| {
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": spec.name,
-                            "description": spec.description,
-                            "parameters": serde_json::from_str::<Value>(spec.parameters)
-                                .expect("tool schema"),
-                        }
-                    })
+        let mut all: Vec<Value> = SPECS
+            .iter()
+            .map(|spec| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": spec.name,
+                        "description": spec.description,
+                        "parameters": serde_json::from_str::<Value>(spec.parameters)
+                            .expect("tool schema"),
+                    }
                 })
-                .collect(),
-        )
+            })
+            .collect();
+        // A server's tools join the same array. `mcp::start` runs at startup,
+        // before the first turn and therefore before this first call: the
+        // catalogue is fixed for the session and never rebuilt.
+        all.extend(crate::mcp::definitions());
+        Value::Array(all)
     })
 }
 
@@ -236,6 +239,10 @@ pub fn execute(name: &str, args: &str, cancel: &Cancel, mode: Mode) -> String {
         "web_search" => "error: explore mode: web_search is only available in explore mode".into(),
         "write" => write(&args),
         "edit" => edit(&args),
+        // A server's tools are named `mcp__<server>__<tool>`; the model calls
+        // them like any other, and the mode decides nothing here — the server
+        // was confined when it was started.
+        name if name.starts_with("mcp__") => crate::mcp::call(name, &args, cancel),
         other => format!("error: unknown tool: {other}"),
     }
 }

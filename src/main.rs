@@ -7,6 +7,7 @@ mod config;
 mod editor;
 mod http;
 mod markdown;
+mod mcp;
 mod prompt;
 mod render;
 mod sandbox;
@@ -60,6 +61,8 @@ fn main() {
     // The scratch directory is the one thing a session creates outside the
     // terminal; a static's `Drop` never runs, so this is the hook.
     sandbox::cleanup();
+    // MCP servers are ours: nothing outlives the session that started it.
+    mcp::shutdown();
     if let Err(e) = result {
         eprintln!("axe: {}", strip_control(&e));
         std::process::exit(1);
@@ -224,6 +227,17 @@ fn run() -> Result<(), String> {
     } else {
         tools::Mode::Normal
     };
+    // MCP servers are read once, like the instructions: their tools join the
+    // tool catalogue, and the catalogue is part of the request's cached prefix.
+    // A project's file is code the repository shipped, so it runs only after
+    // one approval; the prompt here is the only question a start asks.
+    for line in mcp::start(cwd.as_deref(), ui::is_interactive(), mode.explore()) {
+        if ui::is_interactive() {
+            println!("{}", strip_control(&line));
+        } else {
+            eprintln!("axe: {}", strip_control(&line));
+        }
+    }
     let messages: Vec<Value> = vec![
         json!({ "role": "system", "content": system }),
         mode_note(mode),
@@ -577,6 +591,8 @@ enum Command {
     Thinking(Option<String>),
     Thoughts,
     Explore,
+    /// `/mcp [add|remove|forget|name]`: the servers and their tools.
+    Mcp(String),
     /// A chooser in the interactive run, a numbered list when piped.
     Sessions(Option<String>),
     /// Replace the history with a summary of itself.
@@ -641,6 +657,7 @@ fn parse_command(line: &str) -> Command {
         "/thinking" => return Command::Thinking(None),
         "/thoughts" => return Command::Thoughts,
         "/explore" => return Command::Explore,
+        "/mcp" => return Command::Mcp(String::new()),
         "/sessions" => return Command::Sessions(None),
         "/skills" => return Command::Skills,
         _ => {}
@@ -648,6 +665,9 @@ fn parse_command(line: &str) -> Command {
     if let Some(rest) = input.strip_prefix("/model ") {
         let (scope, spec) = model_arg(rest);
         return Command::Model(spec, scope);
+    }
+    if let Some(rest) = input.strip_prefix("/mcp ") {
+        return Command::Mcp(rest.trim().to_string());
     }
     if let Some(rest) = input.strip_prefix("/thinking ") {
         return Command::Thinking(Some(rest.trim().to_string()));
@@ -699,6 +719,7 @@ const COMMANDS: &[&str] = &[
     "/exit",
     "/explore",
     "/help",
+    "/mcp",
     "/model",
     "/new",
     "/quit",
@@ -723,6 +744,7 @@ const HELP: &str = "/model [id]    list the models, or switch to one for this di
                     /sessions [q]  list, search and resume sessions\n\
                     /compact       replace the history with a summary of itself\n\
                     /skills        list loaded skills (project, global, config)\n\
+                    /mcp [name]    list MCP servers, or one server's tools\n\
                     /skill:name [request]  load a skill's instructions and run a turn\n\
                     /new           start a new session\n\
                     /explore       toggle explore mode (read-only shell)\n\
@@ -737,6 +759,7 @@ fn help_text() -> String {
     format!(
         "{HELP}\nconfig: {}\n\
          keys: providers, model, explore_by_default, search, thinking, system, agents, skills\n\
+         mcp: mcp.json in the same directory, and .mcp.json in a project (/mcp)\n\
          provider keys: base_url, api_key_env, models_url, session_header, thinking",
         config::path().display()
     )
@@ -1527,6 +1550,11 @@ impl Session {
             "Explore: {}\n",
             if self.mode.explore() { "on" } else { "off" }
         ));
+        // A running server cannot be narrowed or widened, so flipping the mode
+        // restarts them under the new rules. The tool names stay what they are.
+        for line in mcp::restart(self.mode.explore()) {
+            console.output(&format!("{line}\n"));
+        }
     }
 
     /// The messages every history starts with: the built system prompt and the
@@ -2113,6 +2141,10 @@ impl Session {
             }
             Command::Explore => {
                 self.toggle_explore(console);
+                Cmd::Continue
+            }
+            Command::Mcp(rest) => {
+                console.output(&mcp::dispatch(&rest));
                 Cmd::Continue
             }
             Command::Sessions(query) => {
