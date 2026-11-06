@@ -191,19 +191,26 @@ axe can run [MCP](https://modelcontextprotocol.io) servers and add their tools
 beside `read` and `bash`. Stdio servers only, tools only: resources, prompts and
 the HTTP transport are not implemented, and no server is configured by default.
 
-Two files, in the `mcpServers` shape other clients use:
+Two files, in the `mcpServers` shape other clients use. **Global** is yours
+and applies everywhere; **project** travels with a checkout and has to be
+approved.
 
-| file | scope |
-| --- | --- |
-| `~/.config/axe/mcp.json` (or `$XDG_CONFIG_HOME/axe/mcp.json`) | every directory |
-| `<repo>/.mcp.json` | that checkout: the nearest file at or above cwd, never past the repository root |
+| | global | project |
+| --- | --- | --- |
+| file | `~/.config/axe/mcp.json` (or `$XDG_CONFIG_HOME/axe/mcp.json`) | `<repo>/.mcp.json`: the nearest at or above cwd, never past the repository root |
+| applies to | every directory | that checkout only |
+| written by | `/mcp add <name> ...` | `/mcp add --project <name> ...` |
+| approval | none: it is your file | once per file, per content hash; the start lists the commands and variables |
+| precedence | — | a project server replaces a global one of the same name |
 
-A project file is code a repository shipped, so it runs only after one approval
-per file: the start lists every command, argument and variable and asks once.
-The answer is remembered in the project's state directory against the file's
-content hash, so an edit asks again; `/mcp forget` clears it. A file that only
-sets `enabled` runs nothing and needs no approval. A piped run asks nothing and
-runs no project server.
+A project entry with no `command` may only switch a global one's `enabled`, so
+a repository can narrow what runs but never define it.
+
+The approval is once per file, and the question lists every command, argument
+and variable name it would hand over. The answer is remembered in the project's
+state directory against the file's content hash, so an edit asks again;
+`/mcp forget` clears it. A file that only sets `enabled` runs nothing and needs
+no approval. A piped run asks nothing and runs no project server.
 
 ```json
 { "mcpServers": {
@@ -222,9 +229,7 @@ runs no project server.
 | `timeout` | seconds per call; 60 by default |
 
 `type` may be `"stdio"`; `url` is refused with the reason. Unknown keys are
-errors. A project entry replaces a global server of the same name, but an entry
-with no `command` may only switch a global one's `enabled` — a repository can
-narrow what runs, never define it.
+errors.
 
 Tools are named `mcp__<server>__<tool>` and carry the server's own schema and
 description. They are read once at startup, because the catalogue is part of
@@ -243,9 +248,10 @@ mcp servers
   /home/anon/repo/.mcp.json: approved
 ```
 
-`/mcp <name>` shows one server's tools. `/mcp add <name> <command> [args...]
-[--project]`, `/mcp remove <name>` and `/mcp forget` edit the files; `add`
-splits on spaces, so an argument that contains one is a file edit. The startup
+`/mcp <name>` shows one server's tools. `/mcp add [--project] [--env NAME]...
+<name> <command> [args...]`, `/mcp remove <name>` and `/mcp forget` edit the
+files. `--env` hands over one of your variables by name; `add` splits on
+spaces, so an argument that contains one is a file edit. The startup
 line is the proof that it worked: `mcp github: 26 tools (global)`.
 
 In explore mode a server is confined like `bash`: it writes only to the scratch

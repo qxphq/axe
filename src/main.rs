@@ -853,7 +853,7 @@ fn help_text() -> String {
     format!(
         "{HELP}\nconfig: {}\n\
          config keys: providers, model, explore_by_default, search, thinking, system, agents, skills\n\
-         mcp: mcp.json in the same directory, and .mcp.json in a project (/mcp)\n\
+         mcp: mcp.json is global, <repo>/.mcp.json is per project (/mcp)\n\
          provider keys: base_url, api_key_env, models_url, session_header, thinking",
         config::path().display()
     )

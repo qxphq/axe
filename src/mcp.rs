@@ -1317,16 +1317,17 @@ fn detail(name: &str) -> String {
 fn empty_state() -> String {
     format!(
         "no MCP servers.\n\n\
-         axe starts MCP servers over stdio and adds their tools to its own.\n  \
-         global   {}   (\"mcpServers\")\n  \
-         project  <repo>/.mcp.json  (approved once per file)\n\n\
-         paste this into the global file and restart axe:\n  \
-         \"mcpServers\": {{\n    \
-         \"github\": {{ \"command\": \"npx\",\n                \
-         \"args\": [\"-y\", \"@modelcontextprotocol/server-github\"],\n                \
-         \"env\": [\"GITHUB_TOKEN\"] }}\n  }}\n\n\
-         /mcp add <name> <command> [args...] [--project]  add one here\n\
-         /mcp <name>   one server's tools\n",
+         add one with the command that starts it:\n  \
+         /mcp add github npx -y @modelcontextprotocol/server-github\n     \
+         global: every directory.\n\n  \
+         /mcp add --project mytool /opt/bin/mytool serve\n     \
+         project: this repository only, written to <repo>/.mcp.json and\n     \
+         asked about once before it runs.\n\n  \
+         --env NAME   hand it a variable from your environment (repeatable)\n  \
+         a new server appears after a restart; /mcp then lists it.\n\n\
+         a project server with the same name replaces the global one.\n\
+         the global file, if you would rather edit it:\n  \
+         {}\n",
         global_path().display()
     )
 }
@@ -1346,38 +1347,57 @@ impl Registry {
     }
 }
 
-/// `/mcp add <name> <command> [args...] [--project]`. Writes the entry whole
-/// and says what to do next: the catalogue is read at startup.
-fn add(rest: &str) -> String {
+/// `/mcp add`'s flags. `--env` takes a variable **name**: axe reads the value
+/// from its own environment, never from the line or the file.
+fn add_flags(rest: &str) -> Result<(bool, Vec<String>, Vec<&str>), String> {
     let mut project = false;
-    let mut words: Vec<&str> = Vec::new();
-    for word in rest.split_whitespace() {
-        if word == "--project" {
-            project = true;
-        } else {
-            words.push(word);
+    let mut env = Vec::new();
+    let mut words = Vec::new();
+    let mut iter = rest.split_whitespace();
+    while let Some(word) = iter.next() {
+        match word {
+            "--project" => project = true,
+            "--env" => match iter.next() {
+                Some(name) if valid_var(name) => env.push(name.to_string()),
+                Some(name) => return Err(format!("\"{name}\" is not a variable name")),
+                None => return Err("--env needs a variable name".into()),
+            },
+            word => words.push(word),
         }
     }
+    Ok((project, env, words))
+}
+
+/// `/mcp add [--project] [--env NAME]... <name> <command> [args...]`. Writes the entry whole
+/// and says what to do next: the catalogue is read at startup.
+fn add(rest: &str) -> String {
+    let usage = "usage: /mcp add [--project] [--env NAME]... <name> <command> [args...]\n";
+    let (project, env, words) = match add_flags(rest) {
+        Ok(flags) => flags,
+        Err(e) => return format!("error: mcp: {e}\n"),
+    };
     let Some(name) = words.first().copied() else {
-        return "usage: /mcp add <name> <command> [args...] [--project]\n".into();
+        return usage.into();
     };
     if !valid_name(name) {
         return "error: mcp: names use letters, digits, \"_\" and \"-\" (32 at most)\n".into();
     }
     let Some(command) = words.get(1).copied() else {
-        return "usage: /mcp add <name> <command> [args...] [--project]\n".into();
+        return usage.into();
     };
     let cwd = lock().cwd.clone();
-    let (path, entry) = match (project, cwd.clone()) {
-        (true, Some(dir)) => (project_target(&dir), {
-            let args: Vec<Value> = words[2..].iter().map(|w| json!(w)).collect();
-            json!({ "command": command, "args": args })
-        }),
+    let mut entry = json!({ "command": command });
+    if words.len() > 2 {
+        let args: Vec<Value> = words[2..].iter().map(|word| json!(word)).collect();
+        entry["args"] = json!(args);
+    }
+    if !env.is_empty() {
+        entry["env"] = json!(env);
+    }
+    let path = match (project, cwd.clone()) {
+        (true, Some(dir)) => project_target(&dir),
         (true, None) => return "error: mcp: no working directory for a project file\n".into(),
-        (false, _) => {
-            let args: Vec<Value> = words[2..].iter().map(|w| json!(w)).collect();
-            (global_path(), json!({ "command": command, "args": args }))
-        }
+        (false, _) => global_path(),
     };
     match write_entry(&path, name, &entry) {
         Ok(()) => {
@@ -1701,6 +1721,21 @@ mod tests {
         assert_eq!(project_file(&nested), Some(repo.join(".mcp.json")));
         assert_eq!(project_target(&nested), repo.join(".mcp.json"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_flags_carry_a_project_and_variable_names() {
+        let (project, env, words) = add_flags("--env TOKEN github npx -y s").unwrap();
+        assert!(!project);
+        assert_eq!(env, vec!["TOKEN".to_string()]);
+        assert_eq!(words, vec!["github", "npx", "-y", "s"]);
+        let (project, _, words) = add_flags("--project mytool /bin/sh serve").unwrap();
+        assert!(project);
+        assert_eq!(words, vec!["mytool", "/bin/sh", "serve"]);
+        assert!(add_flags("--env").unwrap_err().contains("needs a variable"));
+        assert!(add_flags("--env 1BAD x c")
+            .unwrap_err()
+            .contains("not a variable"));
     }
 
     #[test]
