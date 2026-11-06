@@ -32,7 +32,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::{cursor, execute, terminal};
 use ratatui::layout::{Alignment, Position, Rect, Size};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as Outline, Borders, Paragraph, Widget};
@@ -41,6 +41,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::editor::Buffer;
 use crate::markdown;
+use crate::render::Paint;
 use crate::text::clip;
 
 /// Blank cells at each screen edge: nothing is written against the border.
@@ -58,18 +59,21 @@ const PROMPT_EDGE: u16 = 1;
 /// Blank cells of the box at the left and right of its text, so the text does
 /// not sit against the line.
 const PROMPT_PAD: usize = 1;
+/// Every color here is `render::Paint`'s, so the screen and a pipe cannot
+/// disagree about what a thing looks like. These name them by what they mean
+/// on the screen; the table says which color that is.
+///
 /// The prompt's cyan, for the rows a list has marked and for what the session
 /// is talking to.
-const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan);
-/// Explore mode's box: the outline says the tool set is read-only.
-const EXPLORE_STYLE: Style = Style::new().fg(Color::Yellow);
+const PROMPT_STYLE: Style = Paint::Cyan.style();
 /// Marker for an already committed line in the transcript.
 const MARK: &str = "█";
-const DIM: Style = Style::new().add_modifier(Modifier::DIM);
-const ERROR_STYLE: Style = Style::new().fg(Color::Red);
+const DIM: Style = Paint::Dim.style();
+const ERROR_STYLE: Style = Paint::Red.style();
 /// A caution, never a failure: a question waiting for an answer, a tool set
-/// that cannot write, a window that is nearly full.
-const CAUTION: Style = Style::new().fg(Color::Yellow);
+/// that cannot write, a window that is nearly full. Also explore mode's box,
+/// which says the tool set is read-only.
+const CAUTION: Style = Paint::Yellow.style();
 
 /// The cells between two pieces of the info row.
 pub const SEP: &str = "  ·  ";
@@ -103,12 +107,12 @@ pub enum Info {
 impl Info {
     fn style(self) -> Style {
         match self {
-            Info::Title => Style::new(),
+            Info::Title => Paint::Plain.style(),
             Info::Selection => PROMPT_STYLE,
-            Info::Level => Style::new().fg(Color::Magenta),
+            Info::Level => Paint::Magenta.style(),
             Info::Fill(None) => DIM,
             Info::Fill(Some(full)) => match full {
-                ..70 => Style::new().fg(Color::Green),
+                ..70 => Paint::Green.style(),
                 70..90 => CAUTION,
                 _ => ERROR_STYLE,
             },
@@ -1348,11 +1352,7 @@ impl Screen {
                 let outline = Outline::default()
                     .borders(Borders::ALL)
                     .border_set(symbols::border::PLAIN)
-                    .border_style(if self.explore {
-                        EXPLORE_STYLE
-                    } else {
-                        PROMPT_STYLE
-                    });
+                    .border_style(if self.explore { CAUTION } else { PROMPT_STYLE });
                 // Clipped by the screen as well as by the part: a terminal too
                 // short for the box it asks for crops it instead of asking the
                 // buffer for a row it does not have.
@@ -2179,6 +2179,7 @@ impl<W: Write> Backend for Tail<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
 
     #[test]
     fn clip_counts_cells_not_chars() {

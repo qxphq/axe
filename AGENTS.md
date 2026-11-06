@@ -201,12 +201,14 @@ invariants a change must not break.
   writer's, and consecutive tool calls are one block.
 - Markdown is the model's and the user's, never the binary's. Blocks are laid out
   when they end; the live row says what the turn is doing, not the unfinished line.
-- Style comes from `Paint` in `main.rs`, rendered as cells or ANSI.
+- Style comes from `Paint` in `render.rs`, rendered as cells or ANSI: it is the
+  only table of what a thing looks like, and `Info` names a variant rather than
+  defining one.
 - Colors are the terminal's, never axe's: named ANSI only (`Color::Cyan`,
   `Color::Red`, …), never `Rgb`, `Indexed`, or a hex value of our own. The
   user's theme decides what each one is, so axe needs no theme and lands in the
-  shell's colors wherever it runs. A new color is a new `Paint` variant or an
-  `Info` style, and it has to mean something.
+  shell's colors wherever it runs. A new color is a new `Paint` variant, and it
+  has to mean something.
 - Tool names and descriptions are part of the prompt. Change them deliberately.
 - `README.md` is the user-facing contract and the GitHub page. It ships through
   `about`, so keep it factual and in the same commit as the behavior it describes.

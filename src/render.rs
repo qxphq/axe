@@ -19,10 +19,11 @@ pub enum Paint {
     Yellow,
     Green,
     Red,
+    Magenta,
 }
 
 impl Paint {
-    pub fn style(self) -> Style {
+    pub const fn style(self) -> Style {
         match self {
             Paint::Plain => Style::new(),
             Paint::Dim => Style::new().add_modifier(Modifier::DIM),
@@ -30,6 +31,7 @@ impl Paint {
             Paint::Yellow => Style::new().fg(Color::Yellow),
             Paint::Green => Style::new().fg(Color::Green),
             Paint::Red => Style::new().fg(Color::Red),
+            Paint::Magenta => Style::new().fg(Color::Magenta),
         }
     }
 
