@@ -239,8 +239,8 @@ struct Frame {
     /// The line waiting for the turn boundary: one row, never more, and none at
     /// all while nothing is waiting.
     queued: Rect,
-    /// The prompt. It scrolls inside these rows, so a buffer longer than the
-    /// three rows it composes in does not move anything.
+    /// The prompt. It grows with what was typed: one row per line, as many as
+    /// the terminal can show, and only what no longer fits scrolls inside it.
     prompt: Rect,
     /// What the turn is doing on the left, what the session points at on the
     /// right, or the one question that outranks both.
@@ -262,30 +262,33 @@ impl Frame {
     /// `at` putting it where the terminal has it.
     ///
     /// The height follows `shown`, not the terminal: a prompt that wraps asks
-    /// for a row and gets it, and gives it back when the line is done. A
-    /// chooser is the one part sized by the screen — it is a window over the
-    /// transcript, and its rows are committed when it closes.
+    /// for a row and gets it, and gives it back when the line is done. Only a
+    /// prompt taller than the screen is clamped, and then the rows above the
+    /// window are scrollback's. A chooser is the one part sized by the screen —
+    /// it is a window over the transcript, and its rows are committed when it
+    /// closes.
     fn layout(height: u16, mode: Mode, shown: Shown) -> Frame {
         let height = height.max(1);
-        // The prompt composes in up to three rows and scrolls inside them: one
-        // row is always there, because a prompt with no row is no prompt. The
-        // box around it takes a row above and a row below.
-        let prompt_rows = shown.prompt.clamp(1, 3) + 2 * PROMPT_EDGE;
+        // The box is as tall as the prompt wrapped to: a line break the user
+        // typed is a row they asked to see. One row is always there, because a
+        // prompt with no row is no prompt, and the box takes a row above it and
+        // a row below.
+        let prompt_rows = shown.prompt.max(1).saturating_add(2 * PROMPT_EDGE);
         let queued_rows = u16::from(shown.queued);
         // Blank row, prompt, blank row, status row, blank row under it: the
         // frame carries them whether or not it has anything to say, so the
         // prompt has a row of its own above it, the status never touches the
         // prompt, and neither touches the bottom edge.
-        let fixed = queued_rows + prompt_rows + 4;
+        let fixed = queued_rows.saturating_add(prompt_rows).saturating_add(4);
         // The transcript keeps its own rows on a short terminal, whatever is
         // asking for space.
-        let room = height.saturating_sub(fixed + MIN_TRANSCRIPT);
+        let room = height.saturating_sub(fixed.saturating_add(MIN_TRANSCRIPT));
         let list_rows = match mode {
             Mode::Idle => shown.hints.min((height / 12).clamp(1, 4)).min(room),
             // A header, then entries: a chooser is worth at least two rows.
             Mode::Choosing => (height / 3).clamp(2, 10).min(room),
         };
-        let rows = (fixed + list_rows).min(height);
+        let rows = fixed.saturating_add(list_rows).min(height);
         let area = Rect::new(0, 0, 0, rows);
         // Top down: the parts are laid end to end, so a part that is not shown
         // takes its row out of the frame and not out of the blank row above the
@@ -2466,12 +2469,12 @@ mod tests {
         // asks for are the rows it uses; the blank row above it stays.
         screen.insert_text(&"word ".repeat(40));
         screen.draw().unwrap();
-        assert_eq!(screen.frame().prompt.height, 5);
-        assert_eq!(screen.term.area().height, 9);
+        assert_eq!(screen.frame().prompt.height, 8);
+        assert_eq!(screen.term.area().height, 12);
     }
 
     #[test]
-    fn a_prompt_past_its_three_rows_scrolls_the_window_the_cursor_sits_in() {
+    fn the_prompt_grows_with_its_lines_and_the_cursor_stays_in_the_box() {
         let mut screen = Screen::test_screen(40, 10);
         for line in ["one", "two", "three"] {
             typed(&mut screen, line);
@@ -2479,10 +2482,10 @@ mod tests {
         }
         typed(&mut screen, "four");
         screen.draw().unwrap();
-        // Four lines, three of them shown: the box stops growing, and the
-        // window starts one row down so the cursor's line is the last in it.
+        // Four lines, four rows of box: it grows with them instead of
+        // scrolling inside three.
         let frame = screen.frame();
-        assert_eq!(frame.prompt.height, 5);
+        assert_eq!(frame.prompt.height, 6);
         let row = |screen: &Screen, y: u16| -> String {
             let at = y as usize * 40;
             screen.test_buffer().content[at..at + 40]
@@ -2490,14 +2493,44 @@ mod tests {
                 .map(|cell| cell.symbol())
                 .collect()
         };
-        assert!(row(&screen, frame.prompt.y + 1).contains("two"));
-        assert!(row(&screen, frame.prompt.y + 2).contains("three"));
-        assert!(row(&screen, frame.prompt.y + 3).contains("four"));
-        // The cursor is a row of the window, not of the buffer: past the third
-        // line it used to walk down the border and out of the box.
+        for (n, line) in ["one", "two", "three", "four"].iter().enumerate() {
+            assert!(
+                row(&screen, frame.prompt.y + 1 + n as u16).contains(line),
+                "row {n} of the box is not {line}"
+            );
+        }
+        // The cursor is the window's row, not the buffer's: the row it sits on
+        // is inside the box, never on the border below it.
         let cursor = screen.term.cursor();
-        assert_eq!(cursor.y, frame.prompt.y + 3);
+        assert_eq!(cursor.y, frame.prompt.y + 4);
         assert_eq!(cursor.x, 3 + 4);
+    }
+
+    #[test]
+    fn a_prompt_taller_than_the_terminal_scrolls_inside_its_rows() {
+        let mut screen = Screen::test_screen(40, 10);
+        for n in 1..=10 {
+            typed(&mut screen, &format!("l{n}"));
+            screen.apply_key(ctrl('j'));
+        }
+        screen.draw().unwrap();
+        // The box takes what the terminal can give and no more: the rows above
+        // its window are the scrollback's, and the cursor's line is the last.
+        let frame = screen.frame();
+        assert_eq!(frame.prompt.height, 7);
+        let row = |screen: &Screen, y: u16| -> String {
+            let at = y as usize * 40;
+            screen.test_buffer().content[at..at + 40]
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect()
+        };
+        // Ten lines and the empty row after the last break, five of them
+        // shown: l7 to l10 and the line being typed.
+        assert!(row(&screen, frame.prompt.y + 1).contains("l7"));
+        assert!(row(&screen, frame.prompt.y + 5).trim_end().ends_with('│'));
+        let cursor = screen.term.cursor();
+        assert_eq!(cursor.y, frame.prompt.y + 5);
     }
 
     #[test]
@@ -3026,10 +3059,10 @@ mod tests {
         check(&mut screen, 9, height);
         screen.take();
         check(&mut screen, 7, height);
-        // A prompt that wraps asks for the rows it fills, up to the three it
-        // composes in.
+        // A prompt that wraps asks for the rows it fills, one per line, and
+        // the terminal is the only thing that stops it.
         screen.insert_text(&"word ".repeat(40));
-        check(&mut screen, 9, height);
+        check(&mut screen, 12, height);
         screen.take();
         check(&mut screen, 7, height);
         // A chooser is a window over the transcript, so it is the one part the

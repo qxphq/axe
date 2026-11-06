@@ -264,9 +264,10 @@ outline is yellow, so the read-only tool set shows at the line you are typing
 and not only in the info row beside it. The outline is the only thing drawn —
 the text keeps the theme's own foreground and background — because a filled
 block that wide reads as a slab of color rather than as a prompt. Enter submits;
-Ctrl+J or Alt+Enter starts a new line. Typing a slash word lists the matching
-commands in
-the rows above the prompt — as many as the terminal's height allows, up to four
+Ctrl+J or Alt+Enter starts a new line, and the box grows with every row it
+takes: the terminal is the only limit, and a prompt taller than the screen
+scrolls inside it. Typing a slash word lists the matching commands in the
+rows above the prompt — as many as the terminal's height allows, up to four
 — the first one marked. ↓ and ↑ move the mark and leave the line as typed,
 wrapping at both ends; Enter runs the marked row and Tab puts it on the line, so
 a step never rewrites the prompt by itself. The rule does not depend on where the

@@ -71,10 +71,11 @@ invariants a change must not break.
     scrollback. The only owned region is an inline live frame at the bottom
     (candidate list, queued row, a blank row, the wrapped prompt, a blank row,
     status, a blank row), and it is as tall as what it shows and no taller —
-    `ui::Frame::layout` takes the rows the prompt wrapped to (up to the three
-    it composes in), the queued line, and the candidates — so the blank rows
-    around the prompt are the frame's own and an idle prompt sits one blank row
-    under the last block, not under rows kept for a list that is not there.
+    `ui::Frame::layout` takes the rows the prompt wrapped to (as many as the
+    terminal can spare, and no more), the queued line, and the candidates — so
+    the blank rows around the prompt are the frame's own and an idle prompt
+    sits one blank row under the last block, not under rows kept for a list
+    that is not there.
     Nothing is written against the bottom edge, and the status keeps a blank row
     above it however many rows the prompt fills. A chooser is the
     entries, and when it closes without resuming its rows are committed to
