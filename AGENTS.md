@@ -8,16 +8,15 @@ invariants a change must not break.
 
 1. **Dependencies are debt.** Prefer `std`; a crate must be strictly necessary and
    widely maintained. Current: `serde_json`, `rustls`, `webpki-roots`, `ratatui`
-   (crossterm backend), `unicode-width`, `ring`, and `libc` on Linux. `ring` is
-   already in the tree through rustls's provider; it is named directly only for
-   OAuth's SHA-256 and randomness. Crypto and terminal geometry are not
-   hand-rolled; compression is the host's `gzip`, never a crate.
+   (crossterm backend), `unicode-width`, and `libc` on Linux. Crypto and
+   terminal geometry are not hand-rolled; compression is the host's `gzip`,
+   never a crate.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
    panes, subagents, or permission layer until the REPL is genuinely
    insufficient. MCP servers are the one addition on that list: they are the
    only way to give the model a capability axe will never build in, and they
    are additive — no built-in tool moves behind one. One feature per change.
-3. **Small surface.** Twenty-one modules; a new module needs a separate concern,
+3. **Small surface.** Twenty modules; a new module needs a separate concern,
    not a line count.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` +
    SSE only. Express differences as config (`base_url`, `models_url`,
@@ -65,9 +64,7 @@ invariants a change must not break.
     `url` (streamable HTTP), and values that may be `$NAME`/`${NAME}`
     references to axe's environment, expanded when the server starts. The
     binary writes those files only through an explicit
-    `/mcp add`/`remove`/`forget`. OAuth tokens are state, not config:
-    `mcp-auth.json` in the state root, keyed by name and URL, written by
-    `/mcp login` and removed by `/mcp logout`.
+    `/mcp add`/`remove`/`forget`.
     Config `model` is the seed: the selection a directory starts on is its own
     `state.json`, then `<state tree>/default.json` (what `/model -g` writes),
     then the config.
@@ -200,12 +197,9 @@ invariants a change must not break.
   project's plan. The write-only ruleset an MCP server gets is built here too.
 - `mcp.rs` — MCP servers: the two config files and their merge, the project
   file's approval record, both transports (a process with its reader thread, or
-  streamable HTTP with session ids and SSE), the bearer a remote request
+  streamable HTTP with session ids and SSE), the headers a remote request
   carries, tool names, the fixed catalogue, `/mcp`, and the restart a mode flip
   needs.
-- `oauth.rs` — the OAuth a remote server may ask for: protected-resource and
-  authorization-server discovery, dynamic registration, PKCE S256, the loopback
-  callback, refresh, and the token store in the state root.
 
 ## Conventions
 
@@ -237,10 +231,9 @@ invariants a change must not break.
   `command`/`url` may only switch `enabled`: a repository narrows what runs,
   never defines it. The file is code, so it needs one approval per content hash
   (`mcp-trust.json` in the project's state directory), and the prompt shows the
-  commands and the `$NAME` variables each entry reads. A remote entry with no
-  `Authorization` header signs in through OAuth; axe never sends a token to a
-  server the entry did not name, and a project file has no key to choose a
-  credential destination.
+  commands and the `$NAME` variables each entry reads. A remote entry
+  authenticates with the bearer its own `headers` name; axe never sends a
+  token to a server the entry did not name, and reads no other auth store.
 - Skills: a directory with `SKILL.md` is the unit; only the frontmatter is read at
   startup, the body on demand. The catalogue is appended last in the system
   prompt, after the instructions, so the part above it stays byte-identical.
@@ -264,9 +257,8 @@ invariants a change must not break.
   also holds `plan/`, the one writable path explore mode keeps across sessions,
   `history.jsonl`, the prompt lines typed there: one JSON string per line,
   the newest 500, the same `0600`, and `mcp-trust.json`, the approved project
-  MCP files by path and content hash. The state root also holds `mcp-auth.json`,
-  the OAuth tokens, `0600`, keyed by server name and URL. A blank, a leading
-  space and a repeat of the newest are not steps.
+  MCP files by path and content hash. A blank, a leading space and a repeat of
+  the newest are not steps.
 - `!cmd` is the user's shell. It runs through `tools::execute`, its output joins
   the history as a `user` message, no turn follows, and explore-mode write
   confinement does not apply. It leaves the line a call leaves — `render`'s

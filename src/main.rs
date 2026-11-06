@@ -8,7 +8,6 @@ mod editor;
 mod http;
 mod markdown;
 mod mcp;
-mod oauth;
 mod prompt;
 mod render;
 mod sandbox;
@@ -831,7 +830,7 @@ const HELP: &str = "/model [id]    list the models, or switch to one for this di
                     /sessions [q]  list, search and resume sessions\n\
                     /compact       replace the history with a summary of itself\n\
                     /skills        list loaded skills (project, global, config)\n\
-                    /mcp [name]    MCP servers: list, add, remove, login, logout\n\
+                    /mcp [name]    MCP servers: list, add, remove, forget\n\
                     /skill:name [request]  load a skill's instructions and run a turn\n\
                     /new           start a new session\n\
                     /explore       toggle explore mode (read-only shell)\n\
@@ -2254,14 +2253,7 @@ impl Session {
                 Cmd::Continue
             }
             Command::Mcp(rest) => {
-                // A sign-in prints its link before it blocks the terminal, so
-                // the closure writes as it goes, not after the command returns.
-                let mut said = String::new();
-                let answer = mcp::dispatch(&rest, &mut |text| said.push_str(text));
-                if !said.is_empty() {
-                    console.output(&said);
-                }
-                console.output(&answer);
+                console.output(&mcp::dispatch(&rest));
                 Cmd::Continue
             }
             Command::Sessions(query) => {

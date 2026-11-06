@@ -232,16 +232,9 @@ define it.
 
 A `url` entry is streamable HTTP: axe POSTs JSON-RPC, accepts a JSON body or an
 SSE stream, echoes `Mcp-Session-Id`, sends `MCP-Protocol-Version`, and DELETEs
-the session when it closes. A server that answers 401 without an
-`Authorization` header is asking for OAuth: axe runs the discovery
-(`.well-known/oauth-protected-resource`, then the authorization server's
-metadata), registers itself dynamically, signs in with PKCE S256 through a
-loopback callback, and keeps the tokens in
-`$XDG_STATE_HOME/axe/mcp-auth.json` (or `~/.local/state/axe/mcp-auth.json`),
-owner-only, keyed by name and URL. Access tokens refresh when they expire; a
-401 retries once with a refreshed token before it says `sign-in required:
-/mcp login <name>`. A project entry may name a URL — it cannot choose where a
-credential goes, because there is no such key.
+the session when it closes. Authentication is the bearer token a `headers`
+entry names: axe sends nothing it was not given and reads no other auth store.
+A 401 is the server's answer, reported as such.
 
 Tools are named `mcp__<server>__<tool>` and carry the server's own schema and
 description. They are read once at startup, because the catalogue is part of
@@ -256,16 +249,15 @@ server that exits answers with what it printed.
 $ /mcp
 mcp servers
   github     global   stdio  26 tools
-  sentry     global   http   12 tools  signed in
+  sentry     global   http   12 tools
   proj       project  stdio  4 tools
   /home/anon/repo/.mcp.json: approved
 ```
 
 `/mcp <name>` shows one server's tools. `/mcp add [--project] [--url URL]
 [--env NAME[=VALUE]]... [--header 'K: V']... [--timeout S] <name> [command
-[args...]]`, `/mcp remove <name>`, `/mcp login <name>`, `/mcp logout <name>` and
-`/mcp forget` edit the files and the token store. The startup line is the proof
-that it worked: `mcp github: 26 tools (global)`.
+[args...]]`, `/mcp remove <name>` and `/mcp forget` edit the files. The startup
+line is the proof that it worked: `mcp github: 26 tools (global)`.
 
 In explore mode a stdio server is confined like `bash`: it writes only to the
 scratch directory and the project's `plan/`, and the `io_uring` rule applies.
@@ -463,7 +455,6 @@ directory with every byte outside `[A-Za-z0-9._-]` written as `%XX` — so
 | `state.json` | model, thinking levels, thoughts toggle |
 | `history.jsonl` | prompt lines typed here, one JSON string per line; the newest 500 |
 | `mcp-trust.json` | approved project MCP files, by path and content hash |
-| `../mcp-auth.json` | MCP OAuth tokens, by server name and URL (in the state root) |
 | `plan/` | explore mode's writable directory: a plan that outlives the session |
 | `<id>.json` | a session's title, summary, dates and message count |
 | `<id>.jsonl` | the session body: one API message per line, append-only |

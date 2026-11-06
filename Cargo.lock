@@ -10,11 +10,10 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "axe"
-version = "0.20.2"
+version = "0.21.0"
 dependencies = [
  "libc",
  "ratatui",
- "ring",
  "rustls",
  "serde_json",
  "unicode-width 0.2.0",

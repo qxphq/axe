@@ -32,20 +32,6 @@ pub struct Endpoint {
     pub prefix: String,
 }
 
-impl Endpoint {
-    /// `scheme://host[:port]`: the origin discovery URLs hang off.
-    pub fn origin(&self) -> String {
-        let (scheme, default) = match self.scheme {
-            Scheme::Http => ("http", 80),
-            Scheme::Https => ("https", 443),
-        };
-        match self.port {
-            port if port == default => format!("{scheme}://{}", self.host),
-            port => format!("{scheme}://{}:{port}", self.host),
-        }
-    }
-}
-
 /// Stops an in-flight request: the socket is shut down so a blocked read
 /// returns at once, and the flag lets the turn loop stop between requests. A
 /// turn owns one, so a stale request can never stop the next turn.
@@ -391,7 +377,7 @@ pub struct Response {
     pub content_type: Option<String>,
     pub location: Option<String>,
     /// Every response header, names lowercased. Transport details such as
-    /// `Mcp-Session-Id` and the OAuth challenge live here.
+    /// `Mcp-Session-Id` live here.
     pub headers: Vec<(String, String)>,
     reader: BufReader<BodyReader<BufReader<Stream>>>,
 }
@@ -521,7 +507,7 @@ pub fn request_with_timeout(
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     if let Some(b) = body {
-        // A caller that sets its own type (OAuth's form posts) keeps it.
+        // A caller that sets its own type keeps it.
         if !headers
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))

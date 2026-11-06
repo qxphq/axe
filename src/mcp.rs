@@ -24,7 +24,6 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use crate::http::{self, Cancel};
-use crate::oauth;
 use crate::state;
 use crate::text::{strip_control, truncate};
 
@@ -115,16 +114,6 @@ impl Entry {
         self.url.is_some()
     }
 
-    /// Whether a remote server signs in: axe sends no `Authorization` of its
-    /// own when the entry already names one.
-    fn oauth(&self) -> bool {
-        self.remote()
-            && !self
-                .headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-    }
-
     fn describe(&self) -> String {
         if self.toggle_only {
             return if self.enabled {
@@ -137,9 +126,6 @@ impl Entry {
             let mut line = url.clone();
             for (name, _) in &self.headers {
                 line.push_str(&format!("  header: {name}"));
-            }
-            if self.oauth() {
-                line.push_str("  (sign-in)");
             }
             return line;
         }
@@ -674,14 +660,10 @@ struct StdioConn {
 }
 
 struct HttpConn {
-    name: String,
-    url: String,
     ep: http::Endpoint,
     session: Option<String>,
     /// Configured headers, values already expanded.
     headers: Vec<(String, String)>,
-    /// No `Authorization` of its own: axe signs in and sends the bearer token.
-    oauth: bool,
 }
 
 enum Conn {
@@ -911,12 +893,9 @@ impl HttpConn {
             ));
         }
         Ok(HttpConn {
-            name: entry.name.clone(),
-            url,
             ep,
             session: None,
             headers,
-            oauth: entry.oauth(),
         })
     }
 
@@ -968,12 +947,7 @@ impl HttpConn {
     }
 
     fn notify(&mut self, message: &Value) -> Result<(), String> {
-        let mut headers = self.base_headers();
-        if self.oauth {
-            if let Some(token) = oauth::access(&self.name, &self.url, &Cancel::new())? {
-                headers.push(("authorization".to_string(), format!("Bearer {token}")));
-            }
-        }
+        let headers = self.base_headers();
         let cancel = Cancel::new();
         let response = self.post(&message.to_string(), &headers, INIT_TIMEOUT, &cancel)?;
         if let Some(session) = header(&response, "mcp-session-id") {
@@ -990,38 +964,23 @@ impl HttpConn {
         cancel: &Cancel,
     ) -> Result<Value, String> {
         let body = message.to_string();
-        let mut refreshed = false;
-        loop {
-            let mut headers = self.base_headers();
-            if self.oauth {
-                if let Some(token) = oauth::access(&self.name, &self.url, cancel)? {
-                    headers.push(("authorization".to_string(), format!("Bearer {token}")));
-                }
-            }
-            let mut response = self.post(&body, &headers, timeout, cancel)?;
-            if let Some(session) = header(&response, "mcp-session-id") {
-                self.session = Some(session);
-            }
-            if self.oauth && response.status == 401 && !refreshed {
-                refreshed = true;
-                if oauth::reauthenticate(&self.name, &self.url, cancel)?.is_some() {
-                    continue;
-                }
-                return Err(format!("sign-in required: /mcp login {}", self.name));
-            }
-            if !(200..300).contains(&response.status) {
-                let text = response.read_all().unwrap_or_default();
-                let message = short(&text);
-                return Err(match message.is_empty() {
-                    true => format!("HTTP {}", response.status),
-                    false => format!("HTTP {}: {message}", response.status),
-                });
-            }
-            if response.status == 202 {
-                return Ok(Value::Null);
-            }
-            return reply(&mut response, id, timeout, cancel);
+        let headers = self.base_headers();
+        let mut response = self.post(&body, &headers, timeout, cancel)?;
+        if let Some(session) = header(&response, "mcp-session-id") {
+            self.session = Some(session);
         }
+        if !(200..300).contains(&response.status) {
+            let text = response.read_all().unwrap_or_default();
+            let message = short(&text);
+            return Err(match message.is_empty() {
+                true => format!("HTTP {}", response.status),
+                false => format!("HTTP {}: {message}", response.status),
+            });
+        }
+        if response.status == 202 {
+            return Ok(Value::Null);
+        }
+        reply(&mut response, id, timeout, cancel)
     }
 
     /// Best effort: tell the server the session is over.
@@ -1031,11 +990,6 @@ impl HttpConn {
         };
         let mut headers = self.base_headers();
         headers.push(("mcp-session-id".to_string(), session));
-        if self.oauth {
-            if let Ok(Some(token)) = oauth::access(&self.name, &self.url, &Cancel::new()) {
-                headers.push(("authorization".to_string(), format!("Bearer {token}")));
-            }
-        }
         let cancel = Cancel::new();
         let _ = http::request_with_timeout(
             &self.ep,
@@ -1721,8 +1675,8 @@ pub fn shutdown() {
 // ---- `/mcp` -----------------------------------------------------------------
 
 /// `/mcp`, `/mcp <name>`, and the edits. One entry point so the REPL's dispatch
-/// stays a line. `say` writes before a sign-in blocks the terminal.
-pub fn dispatch(arg: &str, say: &mut dyn FnMut(&str)) -> String {
+/// stays a line.
+pub fn dispatch(arg: &str) -> String {
     let arg = arg.trim();
     if arg.is_empty() {
         return listing();
@@ -1734,8 +1688,6 @@ pub fn dispatch(arg: &str, say: &mut dyn FnMut(&str)) -> String {
     match verb {
         "add" => add(rest),
         "remove" => remove(rest),
-        "login" => login(rest, say),
-        "logout" => logout(rest),
         "forget" => forget(),
         "list" => listing(),
         "help" => empty_state(),
@@ -1773,18 +1725,12 @@ fn listing() -> String {
             (None, None, _) => "failed".to_string(),
         };
         let kind = if entry.remote() { "http" } else { "stdio" };
-        // The failure already says it in the one case both lines would repeat.
-        let note = match status.contains("sign-in required") {
-            true => String::new(),
-            false => auth_note(entry),
-        };
         out.push_str(&format!(
-            "  {:<10} {:<8} {:<6} {}{}\n",
+            "  {:<10} {:<8} {:<6} {}\n",
             strip_control(&entry.name),
             if entry.project { "project" } else { "global" },
             kind,
             strip_control(&status),
-            note,
         ));
     }
     if let Some(file) = &reg.project {
@@ -1807,17 +1753,6 @@ fn listing() -> String {
     out
 }
 
-fn auth_note(entry: &Entry) -> String {
-    if !entry.oauth() {
-        return String::new();
-    }
-    let url = entry.url.as_deref().unwrap_or_default();
-    match oauth::stored(&entry.name, url) {
-        true => "  signed in".to_string(),
-        false => "  sign-in required".to_string(),
-    }
-}
-
 fn detail(name: &str) -> String {
     let reg = lock();
     let Some(at) = reg.index(name) else {
@@ -1825,10 +1760,9 @@ fn detail(name: &str) -> String {
     };
     let entry = &reg.entries[at];
     let mut out = format!(
-        "{}  {}{}\n  {}\n",
+        "{}  {}\n  {}\n",
         entry.name,
         origin(entry),
-        auth_note(entry),
         entry.describe()
     );
     match (&reg.running[at], &reg.failures[at], entry.enabled) {
@@ -1859,8 +1793,7 @@ fn empty_state() -> String {
          project: this repository only, written to <repo>/.mcp.json and\n     \
          asked about once before it runs.\n\n  \
          /mcp add --url sentry https://mcp.sentry.dev/mcp\n     \
-         a url is streamable HTTP; a server that asks for OAuth says so at\n     \
-         startup, and /mcp login <name> signs in.\n\n  \
+         a url is streamable HTTP; --header carries its bearer token.\n\n  \
          --env NAME      hand it a variable from your environment (repeatable)\n  \
          --header 'K: V' one header, for a url (repeatable)\n  \
          a new server appears after a restart; /mcp then lists it.\n\n\
@@ -2112,60 +2045,6 @@ fn remove(rest: &str) -> String {
     }
 }
 
-/// `/mcp login <name>`: the browser flow for a remote server with no
-/// `Authorization` of its own. Blocks the terminal while the browser has it;
-/// the URL is printed before that, so a headless box can move it elsewhere.
-fn login(rest: &str, say: &mut dyn FnMut(&str)) -> String {
-    let name = rest.trim();
-    if name.is_empty() || name.split_whitespace().count() != 1 {
-        return "usage: /mcp login <name>\n".into();
-    }
-    let entry = {
-        let reg = lock();
-        reg.index(name).map(|at| reg.entries[at].clone())
-    };
-    let Some(entry) = entry else {
-        return format!("error: mcp: no server named \"{name}\" (see /mcp)\n");
-    };
-    let Some(url) = entry.url.clone() else {
-        return format!("error: mcp: \"{name}\" is a command; only a url signs in\n");
-    };
-    let sign_in = match oauth::begin(name, &url, &oauth::open_browser) {
-        Ok(sign_in) => sign_in,
-        Err(e) => return format!("error: mcp: {e}\n"),
-    };
-    say(&format!(
-        "◦ mcp: open this if no browser did:\n  {}\n",
-        sign_in.url
-    ));
-    match sign_in.finish(&Cancel::new()) {
-        Ok(_) => "◦ mcp: signed in; restart axe to load its tools\n".into(),
-        Err(e) => format!("error: mcp: {e}\n"),
-    }
-}
-
-fn logout(rest: &str) -> String {
-    let name = rest.trim();
-    if name.is_empty() || name.split_whitespace().count() != 1 {
-        return "usage: /mcp logout <name>\n".into();
-    }
-    let entry = {
-        let reg = lock();
-        reg.index(name).map(|at| reg.entries[at].clone())
-    };
-    let Some(entry) = entry else {
-        return format!("error: mcp: no server named \"{name}\" (see /mcp)\n");
-    };
-    let Some(url) = entry.url else {
-        return format!("error: mcp: \"{name}\" is a command; nothing to log out of\n");
-    };
-    match oauth::remove(name, &url) {
-        Ok(true) => format!("◦ mcp: signed out of \"{name}\"; restart axe\n"),
-        Ok(false) => format!("◦ mcp: \"{name}\" has no stored sign-in\n"),
-        Err(e) => format!("error: mcp: {e}\n"),
-    }
-}
-
 fn forget() -> String {
     let cwd = lock().cwd.clone();
     match cwd {
@@ -2384,7 +2263,6 @@ mod tests {
         )
         .unwrap();
         assert!(remote.remote());
-        assert!(!remote.oauth(), "an Authorization header means no sign-in");
         assert_eq!(remote.vars, vec!["KEY".to_string()]);
         assert!(parse_entry(
             "x",
@@ -2408,11 +2286,6 @@ mod tests {
         )
         .is_err());
         assert!(parse_entry("x", &json!({ "url": "ftp://e" }), file, false).is_err());
-        assert!(
-            parse_entry("x", &json!({ "url": "https://e/mcp" }), file, false)
-                .unwrap()
-                .oauth()
-        );
 
         // A field axe would ignore must not run half a server.
         let err =
@@ -2642,7 +2515,7 @@ done
     }
 
     /// A mock remote server: JSON for initialize and calls, SSE for the tool
-    /// list, a session id on every reply, and a 401 until a token arrives.
+    /// list, a session id on every reply, and a 401 until a bearer arrives.
     fn mock_remote(require_auth: bool) -> String {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
@@ -2746,33 +2619,21 @@ done
     }
 
     #[test]
-    fn a_remote_server_that_wants_a_token_says_how_to_get_one() {
+    fn a_remote_server_gets_the_bearer_its_headers_name() {
         let url = mock_remote(true);
         let mut e = entry("r", "");
         e.command = None;
         e.url = Some(url);
         let err = Server::open(&e, false).err().expect("401 is a failure");
-        assert!(err.contains("sign-in required"), "{err}");
+        assert!(err.contains("401"), "{err}");
 
-        // With a token in the store the same server answers, because axe
-        // sends the bearer it signed in for.
-        state::testenv::home("mcp-remote-auth", |_home| {
-            let url = mock_remote(true);
-            let mut e = entry("r", "");
-            e.command = None;
-            e.url = Some(url.clone());
-            let token = crate::oauth::Token {
-                access: "at".into(),
-                refresh: None,
-                expires_at: None,
-                client_id: "cid".into(),
-                client_secret: None,
-                token_endpoint: "http://127.0.0.1:9/token".into(),
-            };
-            crate::oauth::save("r", &url, &token).unwrap();
-            let server = Server::open(&e, false).expect("the token is sent");
-            assert_eq!(server.listed.len(), 1);
-        });
+        let url = mock_remote(true);
+        let mut e = entry("r", "");
+        e.command = None;
+        e.url = Some(url);
+        e.headers = vec![("Authorization".into(), "Bearer at".into())];
+        let server = Server::open(&e, false).expect("the header is sent");
+        assert_eq!(server.listed.len(), 1);
     }
 
     #[test]
@@ -2823,7 +2684,7 @@ done
             let notices = start(Some(&dir), false, false);
             assert!(notices.iter().all(|n| !n.contains("tool")), "{notices:?}");
             assert!(definitions().is_empty());
-            let listing = dispatch("", &mut |_| {});
+            let listing = dispatch("");
             assert!(listing.contains("no MCP servers"), "{listing}");
             assert!(listing.contains("mcp.json"), "{listing}");
             assert!(listing.contains("global: every directory"), "{listing}");
