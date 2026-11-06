@@ -46,7 +46,11 @@ binary from source, without the release pipeline.
 axe              # in the directory you want it to work on
 axe < prompts    # without a terminal: plain-text lines in, transcript out
 axe --version    # prints the version and exits; no config, no network
+axe --help       # prints the usage and exits; no config, no network
 ```
+
+An argument that is neither is named and exits with the usage, rather than being
+ignored: a flag that does nothing would read as a setting that did nothing.
 
 Without a terminal the line comes from stdin and stdout carries the model's
 text: no splash, no selection, no prompt and no notice, so `axe < prompts` is a
@@ -119,6 +123,10 @@ define falls back to its default.
 Secrets belong in the environment: `api_key_env` is read at startup. A provider
 whose variable is unset is skipped, not retried. A literal `api_key` in the
 config is rejected — the file is not the place for a secret.
+
+The splash is printed before any provider is asked for its model list, and each
+one that answers adds a `name: N models` line, so a slow or silent network reads
+as work rather than as a blank terminal.
 
 MCP servers are a second input file, `mcp.json` beside this one, read the same
 way and never part of it; see [MCP servers](#mcp-servers). `config.json` itself
@@ -307,7 +315,7 @@ the file.
 | `/compact` | summarize the session and continue from the summary |
 | `/skills` | list loaded skills, where they came from, and what the model sees |
 | `/skill:name [request]` | load a skill's instructions and run a turn |
-| `/help` | list the commands, the config path and its keys |
+| `/help` | list the commands, the key bindings, the config path and its keys |
 | `/exit`, `/quit` | quit |
 
 The area under the transcript is as tall as it has to be: a blank row above the
@@ -326,8 +334,10 @@ are committed when it closes.
 
 Recent sessions for the directory are offered at startup as a chooser: Up and
 Down move, Enter resumes, Esc closes it, and typing starts a new session and
-takes the list with it. `/sessions` opens the same list, where typing filters it
-and Enter on an empty line resumes the selection.
+takes the list with it. A directory with nothing to resume gets one dim line
+instead: the mode, `/help`, and the two keys nothing else on screen names — `↑`
+for this directory's history and Tab for completion. `/sessions` opens the same
+list, where typing filters it and Enter on an empty line resumes the selection.
 
 | key | what it does |
 | --- | --- |

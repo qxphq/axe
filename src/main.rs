@@ -48,14 +48,65 @@ struct Provider {
     models: Vec<api::ModelInfo>,
 }
 
+/// What the arguments ask for. A flag that answers a question is decided before
+/// the config, the network or the terminal: none of the three can contribute to
+/// it, and all three can fail.
+#[derive(Debug, PartialEq)]
+enum Cli {
+    Run,
+    Version,
+    Help,
+    /// An argument axe does not take. Ignored, it would look like a setting
+    /// that did nothing; named, it is the usage line.
+    Unknown(String),
+}
+
+fn cli(mut args: impl Iterator<Item = String>) -> Cli {
+    match args.next() {
+        None => Cli::Run,
+        Some(arg) => match arg.as_str() {
+            "--version" | "-V" => Cli::Version,
+            "--help" | "-h" => Cli::Help,
+            _ => Cli::Unknown(arg),
+        },
+    }
+}
+
+/// `--help`: what the binary does with and without a terminal, and where the
+/// config lives. The manual is `README.md`, which `about` hands the model.
+fn usage() -> String {
+    format!(
+        "usage: axe [--version | --help]
+
+  axe            interactive session in the working directory
+  axe < prompts  one request per line; stdout is the model's text
+  --version      print the version and exit
+  --help         print this and exit
+
+config: {}
+commands: /help inside a session; the model reads the README with `about`
+",
+        config::path().display()
+    )
+}
+
 fn main() {
-    // Answered before anything else: no config, no network, no terminal.
-    if std::env::args()
-        .skip(1)
-        .any(|arg| arg == "--version" || arg == "-V")
-    {
-        println!("axe {}", env!("CARGO_PKG_VERSION"));
-        return;
+    match cli(std::env::args().skip(1)) {
+        // Answered before anything else: no config, no network, no terminal.
+        Cli::Version => {
+            println!("axe {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Cli::Help => {
+            print!("{}", usage());
+            return;
+        }
+        Cli::Unknown(arg) => {
+            eprintln!("axe: unknown argument: {}", strip_control(&arg));
+            eprint!("\n{}", usage());
+            std::process::exit(2);
+        }
+        Cli::Run => {}
     }
     let result = run();
     // The scratch directory is the one thing a session creates outside the
@@ -131,6 +182,33 @@ fn run() -> Result<(), String> {
             plural(project_skills)
         ));
     }
+    // The mode is history, not prompt: the config decides where a session
+    // starts, and the note below tells the model which side it is on.
+    let mode = if cfg.explore_by_default {
+        tools::Mode::Explore
+    } else {
+        tools::Mode::Normal
+    };
+    // The directory's sessions: archive the old bodies before the listing so
+    // the markers match what a chooser will resume. Read before the banner, so
+    // a directory with no sessions gets the line that says where to start.
+    let mut startup = Vec::new();
+    if let Some(dir) = &cwd {
+        sessions::archive_old(dir, sessions::KEEP);
+        startup = sessions::list(dir);
+        startup.truncate(15);
+    }
+    if startup.is_empty() {
+        notices.push(first_run_note(mode).to_string());
+    }
+    // The splash comes before the first provider is asked for anything: it
+    // needs nothing from one, and a provider that is slow or silent must not
+    // leave the terminal blank. A piped run prints neither the splash, the
+    // selection nor these notices: stdout is the transcript, and nobody asked
+    // who is answering.
+    if ui::is_interactive() {
+        banner(&notices);
+    }
     let mut providers = Vec::new();
     let sid = session_id();
 
@@ -163,14 +241,30 @@ fn run() -> Result<(), String> {
         };
 
         match api::list_models(&models_ep, models_path, key.as_deref(), &headers) {
-            Ok(models) if !models.is_empty() => providers.push(Provider {
-                name: pc.name.clone(),
-                cfg: pc.clone(),
-                ep,
-                key,
-                headers,
-                models,
-            }),
+            Ok(models) if !models.is_empty() => {
+                // One line per provider as it answers, so a slow network reads
+                // as work rather than as a dead terminal. A run without a
+                // terminal says nothing here: stdout is the transcript.
+                if ui::is_interactive() {
+                    println!(
+                        " {}",
+                        Paint::Dim.ansi(&format!(
+                            "{}: {} model{}",
+                            strip_control(&pc.name),
+                            models.len(),
+                            plural(models.len())
+                        ))
+                    );
+                }
+                providers.push(Provider {
+                    name: pc.name.clone(),
+                    cfg: pc.clone(),
+                    ep,
+                    key,
+                    headers,
+                    models,
+                });
+            }
             Ok(_) => eprintln!("{}: no models", strip_control(&pc.name)),
             Err(e) => eprintln!("{}: {}", strip_control(&pc.name), strip_control(&e)),
         }
@@ -202,13 +296,6 @@ fn run() -> Result<(), String> {
             .map(|(_, level)| level.clone())
     });
     validate_level(&providers[provider].cfg, thinking.as_deref());
-    // An interactive run carries the selection in the live region's last row
-    // and opens with a splash. A piped run prints neither: stdin is a pipe, so
-    // nobody asked who is answering, and stdout is the transcript — the splash,
-    // the selection and the notices would be noise in the middle of an answer.
-    if ui::is_interactive() {
-        banner(&notices);
-    }
 
     // Built once. The mode lives in the history, not here, so a toggle leaves
     // the prefix byte-identical and the provider's cache intact. The project's
@@ -220,13 +307,6 @@ fn run() -> Result<(), String> {
         cfg.system.as_deref(),
         Some(skills_section.as_str()).filter(|text| !text.is_empty()),
     );
-    // The mode is history, not prompt: the config decides where a session
-    // starts, and the note below tells the model which side it is on.
-    let mode = if cfg.explore_by_default {
-        tools::Mode::Explore
-    } else {
-        tools::Mode::Normal
-    };
     // MCP servers are read once, like the instructions: their tools join the
     // tool catalogue, and the catalogue is part of the request's cached prefix.
     // A project's file is code the repository shipped, so it runs only after
@@ -243,14 +323,6 @@ fn run() -> Result<(), String> {
         mode_note(mode),
     ];
 
-    // The directory's sessions: archive the old bodies before the listing so
-    // the markers match what a chooser will resume.
-    let mut startup = Vec::new();
-    if let Some(dir) = &cwd {
-        sessions::archive_old(dir, sessions::KEEP);
-        startup = sessions::list(dir);
-        startup.truncate(15);
-    }
     let store = cwd
         .as_deref()
         .map(|dir| Store::fresh(sessions::dir(dir), &sid));
@@ -749,8 +821,16 @@ const HELP: &str = "/model [id]    list the models, or switch to one for this di
                     /new           start a new session\n\
                     /explore       toggle explore mode (read-only shell)\n\
                     !cmd           run a shell command; its output joins the context\n\
-                    /help          list the commands and the config keys\n\
-                    /exit, /quit   quit\n";
+                    /help          list the commands, the keys and the config\n\
+                    /exit, /quit   quit\n\
+                    \n\
+                    Tab            complete a command or a path token\n\
+                    ↑ ↓            walk the candidates, then this directory's history\n\
+                    Ctrl+R         search that history\n\
+                    Shift+Tab      toggle explore mode\n\
+                    Esc            close a chooser; twice, stop the running turn\n\
+                    Ctrl+J, Alt+Enter  new line\n\
+                    Ctrl+D         end input\n";
 
 /// `/help`: the command list, then where the config is read from and the keys
 /// it takes. The path is resolved rather than written out, because
@@ -758,7 +838,7 @@ const HELP: &str = "/model [id]    list the models, or switch to one for this di
 fn help_text() -> String {
     format!(
         "{HELP}\nconfig: {}\n\
-         keys: providers, model, explore_by_default, search, thinking, system, agents, skills\n\
+         config keys: providers, model, explore_by_default, search, thinking, system, agents, skills\n\
          mcp: mcp.json in the same directory, and .mcp.json in a project (/mcp)\n\
          provider keys: base_url, api_key_env, models_url, session_header, thinking",
         config::path().display()
@@ -2744,6 +2824,25 @@ fn percent(used: u64, ctx: u64) -> String {
 /// the terminal's margin-to-margin width on a narrow window.
 const LOGO: &[&str] = &[" ▄▄▄  ▄▄ ▄▄ ▄▄▄▄▄", "██▀██ ▀█▄█▀ ██▄▄", "██▀██ ██ ██ ██▄▄▄"];
 
+/// What `/sessions` says where this directory has none, with a terminal and
+/// without one: a session is what the first request starts, and the empty list
+/// is the only place that has to say so.
+const NO_SESSIONS: &str =
+    "no sessions in this directory\n  one begins with the first request; /new starts another\n";
+
+/// The one line a directory with no sessions gets. The box's colour and the
+/// `read-only` piece say what the mode is; neither says where to start, and the
+/// keys that open the rest of the interface are named nowhere else on screen. A
+/// directory with sessions to resume gets the chooser instead, whose header
+/// carries its own keys.
+fn first_run_note(mode: tools::Mode) -> &'static str {
+    if mode.explore() {
+        "read-only: /explore to write · /help · ↑ history · Tab completes"
+    } else {
+        "/help · ↑ history · Tab completes"
+    }
+}
+
 fn banner(notes: &[String]) {
     // One leading blank: the same margin `ui::Screen` keeps on both edges.
     println!();
@@ -2997,6 +3096,52 @@ mod tests {
         let text = help_text();
         assert!(text.contains(&*config::path().to_string_lossy()));
         assert!(text.contains("explore_by_default"));
+    }
+
+    #[test]
+    fn the_cli_answers_before_it_runs() {
+        let args = |line: &str| {
+            line.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(cli(args("").into_iter()), Cli::Run);
+        for flag in ["--version", "-V"] {
+            assert_eq!(cli(args(flag).into_iter()), Cli::Version, "{flag}");
+        }
+        for flag in ["--help", "-h"] {
+            assert_eq!(cli(args(flag).into_iter()), Cli::Help, "{flag}");
+        }
+        // Anything else is named, not ignored: a flag that does nothing reads
+        // as a setting that did nothing.
+        for arg in ["--nope", "notes.txt"] {
+            assert_eq!(
+                cli(args(arg).into_iter()),
+                Cli::Unknown(arg.to_string()),
+                "{arg}"
+            );
+        }
+        let text = usage();
+        for needle in ["--version", "--help", "< prompts", "commands:"] {
+            assert!(text.contains(needle), "{needle} missing from usage");
+        }
+        assert!(text.contains(&*config::path().to_string_lossy()));
+    }
+
+    #[test]
+    fn help_names_the_keys_and_a_new_directory_is_told_where_to_start() {
+        // The prompt is the only place a user learns these without the README.
+        for needle in ["Tab", "Ctrl+R", "Shift+Tab", "keys"] {
+            assert!(HELP.contains(needle), "{needle} missing from HELP");
+        }
+        let explore = first_run_note(tools::Mode::Explore);
+        assert!(explore.contains("/explore"), "{explore}");
+        for note in [explore, first_run_note(tools::Mode::Normal)] {
+            assert!(note.contains("/help") && note.contains("Tab"), "{note}");
+        }
+        // Normal mode has no write tool to explain, so the note must not name
+        // the toggle that would turn one on.
+        assert!(!first_run_note(tools::Mode::Normal).contains("/explore"));
     }
 
     #[test]
