@@ -161,8 +161,9 @@ impl Sink for PlainSink {
     fn reasoning(&mut self, _text: &str) {}
 }
 
-/// Lines typed during a turn, waiting for the boundary that lets them join it.
-/// One slot: while a line is pending the prompt refuses a second one.
+/// Lines typed during a turn, waiting for the boundary that lets them join it:
+/// a queue, drained whole at each boundary, so nothing typed is lost to a round
+/// already streaming.
 pub type Queue = Arc<Mutex<VecDeque<String>>>;
 
 /// What a turn's queue holds now, oldest first. Empty without a queue, and

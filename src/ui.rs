@@ -7,11 +7,13 @@
 //! keeps them apart:
 //!
 //! *The frame is as tall as what it shows.* Its rows are the prompt's wrapped
-//! lines, the queued line, the candidates, and the status with its two blank
-//! rows — `Frame::layout` — so an idle prompt sits directly under the last
-//! block. A chooser is the exception: it owns a window of the terminal's size
-//! while it is open. Reserved rows that show nothing are rows taken from the
-//! transcript for good, which is why the frame follows its content.
+//! lines, the queued lines with the hint that takes them back, the candidates,
+//! and the status with its two blank rows — `Frame::layout` — so an idle prompt
+//! sits directly under the last block, and a queue keeps a blank row above it
+//! so it never reads as that block's last row. A chooser is the exception: it
+//! owns a window of the terminal's size while it is open. Reserved rows that
+//! show nothing are rows taken from the transcript for good, which is why the
+//! frame follows its content.
 //!
 //! *A block goes where the transcript ends.* A terminal appends rows at the
 //! bottom and cannot take them back, so a frame that shrank leaves blank rows
@@ -69,6 +71,9 @@ const PROMPT_STYLE: Style = Paint::Cyan.style();
 /// Marker for an already committed line in the transcript.
 const MARK: &str = "█";
 const DIM: Style = Paint::Dim.style();
+/// Under the queued lines: the key that takes them back, and nothing else. The
+/// one hint the frame carries that is not a candidate.
+const RECALL_HINT: &str = "↑ to edit";
 const ERROR_STYLE: Style = Paint::Red.style();
 /// A caution, never a failure: a question waiting for an answer, a tool set
 /// that cannot write, a window that is nearly full. Also explore mode's box,
@@ -159,6 +164,9 @@ pub enum Action {
     MenuStep(isize),
     /// Enter on an empty line with a chooser open.
     MenuAccept,
+    /// Up with lines waiting for the boundary: the caller takes them back into
+    /// the prompt, and clears the queue.
+    Recall,
     /// Esc with a chooser open.
     MenuCancel,
     /// End of input.
@@ -236,8 +244,8 @@ enum Mode {
 struct Frame {
     /// Candidates, or a chooser's header and its entries. Blank when unused.
     list: Rect,
-    /// The line waiting for the turn boundary: one row, never more, and none at
-    /// all while nothing is waiting.
+    /// The lines waiting for the turn boundary: a blank row, a row each, and
+    /// the row that says Up takes them back. None at all while nothing waits.
     queued: Rect,
     /// The prompt. It grows with what was typed: one row per line, as many as
     /// the terminal can show, and only what no longer fits scrolls inside it.
@@ -248,12 +256,14 @@ struct Frame {
 }
 
 /// The rows the frame asks for above its own: the prompt's wrapped rows, the
-/// queued line, and the candidates. Clamped by `Frame::layout`, which decides
-/// how many of them the terminal can spare.
+/// queued lines with their hint, and the candidates. Clamped by
+/// `Frame::layout`, which decides how many of them the terminal can spare.
 #[derive(Clone, Copy, Default)]
 struct Shown {
     prompt: u16,
-    queued: bool,
+    /// How many lines are waiting, not the rows they ask for: the blank row
+    /// above them and the hint row below are the layout's.
+    queued: u16,
     hints: u16,
 }
 
@@ -274,7 +284,18 @@ impl Frame {
         // prompt with no row is no prompt, and the box takes a row above it and
         // a row below.
         let prompt_rows = shown.prompt.max(1).saturating_add(2 * PROMPT_EDGE);
-        let queued_rows = u16::from(shown.queued);
+        // A blank row, a row per waiting line, and the row that says Up takes
+        // them back: a message waiting for the boundary is its own thing, and
+        // one flush under the transcript would read as the last line of the
+        // block above it. The queue gives way first — the prompt, the status
+        // and the transcript keep their rows — and what does not fit is the
+        // oldest, since the newest lines are the ones a user is watching.
+        let wanted = shown.queued.saturating_add(2);
+        let queued_rows = if shown.queued == 0 {
+            0
+        } else {
+            wanted.min(height.saturating_sub(prompt_rows.saturating_add(4)))
+        };
         // Blank row, prompt, blank row, status row, blank row under it: the
         // frame carries them whether or not it has anything to say, so the
         // prompt has a row of its own above it, the status never touches the
@@ -493,10 +514,11 @@ pub struct Screen {
     /// info row cleared: the status is metadata and can be cut, this cannot.
     /// The ESC offer is the only one.
     alert: Option<String>,
-    /// The line submitted mid-turn, waiting for the boundary. Its own row,
-    /// above the prompt: the queue grows where the user is about to type, and
-    /// a queued line that scrolls away silently looks like the Enter was lost.
-    queued: Option<String>,
+    /// The lines submitted mid-turn, waiting for the boundary: one row each,
+    /// above the prompt, oldest first. They grow where the user is about to
+    /// type, and a queued line that scrolls away silently looks like the Enter
+    /// was lost.
+    queued: Vec<String>,
     /// Right half of the row under the prompt, permanent: what this session is
     /// pointed at. Set by the caller, which owns the model, the thinking level
     /// and the window, and colored here.
@@ -592,7 +614,7 @@ impl Screen {
             ed: Buffer::default(),
             status: String::new(),
             alert: None,
-            queued: None,
+            queued: Vec::new(),
             info: Vec::new(),
             explore: false,
             commands: Vec::new(),
@@ -691,8 +713,9 @@ impl Screen {
         self.dirty = true;
     }
 
-    pub fn set_queued(&mut self, line: Option<&str>) {
-        self.queued = line.map(str::to_string);
+    pub fn set_queued(&mut self, lines: &[String]) {
+        self.queued.clear();
+        self.queued.extend_from_slice(lines);
         self.dirty = true;
     }
 
@@ -868,6 +891,10 @@ impl Screen {
             KeyCode::Home => self.ed.cursor = 0,
             KeyCode::End => self.ed.cursor = self.ed.len(),
             KeyCode::Tab => self.complete(),
+            // A queue on screen is what Up is worth: it is the line ahead, and
+            // the hint under the stack says so. An empty queue leaves the
+            // arrows on the history they always walked.
+            KeyCode::Up if !self.queued.is_empty() => return Action::Recall,
             KeyCode::Up => self.arrow(true),
             KeyCode::Down => self.arrow(false),
             KeyCode::BackTab => return Action::Explore,
@@ -1003,7 +1030,7 @@ impl Screen {
         };
         Shown {
             prompt: u16::try_from(prompt).unwrap_or(u16::MAX),
-            queued: self.queued.is_some(),
+            queued: u16::try_from(self.queued.len()).unwrap_or(u16::MAX),
             hints: u16::try_from(hints).unwrap_or(u16::MAX),
         }
     }
@@ -1182,7 +1209,7 @@ impl Screen {
         self.menu = None;
         self.status.clear();
         self.alert = None;
-        self.queued = None;
+        self.queued.clear();
         match &mut self.term {
             Term::Real(term) => {
                 // `terminal::Clear(All)` only reaches the screen; what scrolled
@@ -1387,15 +1414,27 @@ impl Screen {
                     }
                     .intersection(screen),
                 );
-                let label = match &queued {
-                    // One row: a queued message's own line breaks would be lost.
-                    Some(line) => clip(&format!("Queued: {}", line.replace('\n', " ")), cols),
-                    None => String::new(),
-                };
-                frame.render_widget(
-                    Paragraph::new(Line::styled(label, DIM)),
-                    line(layout.queued.y),
-                );
+                // One row per waiting line, oldest first, under the blank row
+                // that keeps the stack off the transcript; the hint under them
+                // says what takes them back. A terminal too short for the stack
+                // keeps the newest lines, and the hint always.
+                let shown_rows = layout.queued.height.saturating_sub(2) as usize;
+                let hidden = queued.len().saturating_sub(shown_rows);
+                for (i, waiting) in queued[hidden..].iter().enumerate() {
+                    // One row each: a queued message's own line breaks would be
+                    // lost.
+                    let label = clip(&format!("Queued: {}", waiting.replace('\n', " ")), cols);
+                    frame.render_widget(
+                        Paragraph::new(Line::styled(label, DIM)),
+                        line(layout.queued.y + 1 + i as u16),
+                    );
+                }
+                if !queued.is_empty() {
+                    frame.render_widget(
+                        Paragraph::new(Line::styled(RECALL_HINT, DIM)),
+                        line(layout.queued.bottom().saturating_sub(1)),
+                    );
+                }
                 // One row for the question, whole: the info row is metadata
                 // and comes back when the question is answered.
                 match &alert {
@@ -2280,7 +2319,7 @@ mod tests {
             (Info::Selection, "p/m".to_string()),
             (Info::Level, "default".to_string()),
         ]);
-        screen.set_queued(Some("later"));
+        screen.set_queued(&["later".to_string()]);
         screen.draw().unwrap();
         let text: Vec<String> = screen
             .test_buffer()
@@ -2305,6 +2344,63 @@ mod tests {
         assert!(text.contains("Thinking…"), "{text}");
         assert!(text.contains("p/m  ·  default"), "{text}");
         assert!(text.contains("Queued: later"), "{text}");
+        // The queued line keeps a blank row above it: a message waiting for the
+        // boundary is not the transcript's last line.
+        let row = screen.frame().queued.y;
+        let above: String = (0..40)
+            .map(|x| screen.test_buffer()[(x, row)].symbol().to_string())
+            .collect();
+        assert_eq!(above.trim(), "", "{above:?}");
+        let label: String = (0..40)
+            .map(|x| screen.test_buffer()[(x, row + 1)].symbol().to_string())
+            .collect();
+        assert!(label.contains("Queued: later"), "{label:?}");
+    }
+
+    #[test]
+    fn the_queue_stacks_one_row_a_line_and_up_takes_it_back() {
+        let mut screen = Screen::test_screen(40, 16);
+        screen.set_history(vec!["older".to_string()]);
+        screen.set_queued(&["one".to_string(), "two".to_string()]);
+        screen.draw().unwrap();
+        let frame = screen.frame();
+        let row = |screen: &Screen, y: u16| -> String {
+            (0..40)
+                .map(|x| screen.test_buffer()[(x, y)].symbol().to_string())
+                .collect()
+        };
+        // Oldest first, under the blank row, with the hint under them all.
+        assert_eq!(row(&screen, frame.queued.y).trim(), "");
+        assert!(row(&screen, frame.queued.y + 1).contains("Queued: one"));
+        assert!(row(&screen, frame.queued.y + 2).contains("Queued: two"));
+        assert!(row(&screen, frame.queued.y + 3).contains("↑ to edit"));
+        // Up is the queue while lines wait, and the history once they are gone.
+        assert!(matches!(
+            press(&mut screen, KeyCode::Up, KeyModifiers::NONE),
+            Action::Recall
+        ));
+        screen.set_queued(&[]);
+        press(&mut screen, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "older");
+    }
+
+    #[test]
+    fn a_queue_taller_than_the_screen_keeps_the_newest_lines_and_the_hint() {
+        let mut screen = Screen::test_screen(40, 10);
+        let lines: Vec<String> = (1..=6).map(|n| format!("m{n}")).collect();
+        screen.set_queued(&lines);
+        screen.draw().unwrap();
+        let frame = screen.frame();
+        let row = |screen: &Screen, y: u16| -> String {
+            (0..40)
+                .map(|x| screen.test_buffer()[(x, y)].symbol().to_string())
+                .collect()
+        };
+        // Blank, the newest line, the hint: the row that says how to get the
+        // rest back is the last one to give way.
+        assert_eq!(frame.queued.height, 3);
+        assert!(row(&screen, frame.queued.y + 1).contains("Queued: m6"));
+        assert!(row(&screen, frame.queued.y + 2).contains("↑ to edit"));
     }
 
     #[test]
@@ -3202,7 +3298,7 @@ mod tests {
         screen.text("stale paragraph");
         screen.set_menu("Header", vec!["one".into()], false);
         screen.set_status("Thinking…");
-        screen.set_queued(Some("later"));
+        screen.set_queued(&["later".to_string()]);
         screen.reset();
         // The screen above the frame is gone, so the frame stands at the bottom
         // of the terminal again, not where the last block walked it to.

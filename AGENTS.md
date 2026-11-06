@@ -75,10 +75,10 @@ invariants a change must not break.
     session headers). No speculative fixes; reproduce first.
 12. **A scrolling REPL, not a TUI.** No alt-screen: the transcript is
     scrollback. The only owned region is an inline live frame at the bottom
-    (candidate list, queued row, a blank row, the wrapped prompt, a blank row,
-    status, a blank row), and it is as tall as what it shows and no taller —
+    (candidate list, a blank row, the queued lines and the row that hints at
+    `↑`, a blank row, the wrapped prompt, a blank row, status, a blank row), and it is as tall as what it shows and no taller —
     `ui::Frame::layout` takes the rows the prompt wrapped to (as many as the
-    terminal can spare, and no more), the queued line, and the candidates — so
+    terminal can spare, and no more), the queued lines, and the candidates — so
     the blank rows around the prompt are the frame's own and an idle prompt
     sits one blank row under the last block, not under rows kept for a list
     that is not there.
@@ -154,7 +154,8 @@ invariants a change must not break.
   `push` appends to both, and the bytes the info row's fill is estimated from
   are counted there.
 - `ui.rs` — the screen: the live frame (`Frame`, a layout from what the frame
-  shows — the prompt's rows, the queued line, the candidates — and from the mode
+  shows — the prompt's rows, the queued lines, the candidates — and from the
+  mode
   for a chooser, put in place by `settle`), key mapping, completion, the chooser,
   `write` for transcript blocks (wrapped here, since a clipped line would be
   lost) and the `slack` it places them by. The info row is pieces (`Info`), each
@@ -245,11 +246,14 @@ invariants a change must not break.
   prompt, after the instructions, so the part above it stays byte-identical.
   Project roots stop at the repository root; without a `.git`, only cwd counts.
 - A line typed during a turn joins it at the next round boundary: the turn's
-  thread drains a one-slot queue there and appends it to the history, so the
+  thread drains the queue there and appends every line to the history, so the
   model reads it while it works instead of after the last round. A round already
   streaming cannot see it, and a command — `/model`, `/sessions`, `!cmd` — needs
   the session and the screen, so it waits for the turn to end and is dispatched
-  by the REPL loop like any line typed while idle.
+  by the REPL loop like any line typed while idle. The frame stacks the waiting
+  lines, one row each, under a blank row and over the hint; `↑` takes every line
+  the turn has not read back onto the prompt, above what was typed, and empties
+  the queue.
 - Sessions: `<id>.json` is the mutable sidecar; `<id>.jsonl` is append-only; bodies
   older than `sessions::KEEP` are gzipped. The sidecar stays readable, so listing
   and search work without unpacking. A compacted body carries a marked summary
@@ -333,7 +337,13 @@ mkdir -p w/.git && printf '{"mcpServers":{"t":{"command":"/bin/sh","args":["/abs
 The mid-turn queue is checked by queueing a line while a slow call runs, and
 letting the mock answer it: the second argument lands during the tool call, and
 the reply ends the turn instead of the `tool:` loop it would otherwise be
-(`!Space` arguments hold the harness open until the boundary passes).
+(`!Space` arguments hold the harness open until the boundary passes). `!Up`
+during the same call takes the lines back instead: they land on the prompt, and
+the turn ends without reading them.
+
+```sh
+./harness.py --wait 1 --scroll 20 'tool:bash:{"command":"python3 -c \"import time;time.sleep(6)\""}' hello '!Up' '!Escape' '!Escape' --expect '│ hello'
+```
 
 ```sh
 ./harness.py --wait 1 'tool:bash:{"command":"python3 -c \"import time;time.sleep(6)\""}' 'text:done' '!Space' '!Space' '!Space' '!Space' '!Space' '!Space' '!Space' '!Space' '!Space' --expect done

@@ -348,11 +348,13 @@ the file.
 
 The area under the transcript is as tall as it has to be: a blank row above the
 prompt, the prompt's rows, a blank row, the status, and a blank row under it,
-with the queued line and the candidates on top of that. The blank rows around
-the prompt are the frame's own, so the prompt keeps one above it and one below
-it whatever is shown. The status says what the turn is doing — thinking, running
-a command, responding — and is blank only when nothing is in flight, so a wait
-on the provider is never a silent row. A glyph leads the states that a user
+with the candidates on top of that. A queue is a blank row, one row per waiting
+line, and the `↑ to edit` row under them, so it never reads as the transcript's
+last. The blank rows around the prompt are
+the frame's own, so the prompt keeps one above it and one below it whatever is
+shown. The status says what the turn is doing — thinking, running a command,
+responding — and is blank only when nothing is in flight, so a wait on the
+provider is never a silent row. A glyph leads the states that a user
 interrupts or waits on: `⋯` waiting for the provider and then thinking, `▸`
 responding, `▷` a command running, `▣` compacting, `×` interrupting — and `×`
 also marks a compaction that was cancelled and `◦` leads the notices axe prints
@@ -373,7 +375,7 @@ list, where typing filters it and Enter on an empty line resumes the selection.
 | Enter | submit the marked candidate when a list is under the prompt, else the line |
 | Ctrl+J, Alt+Enter | new line |
 | Tab | complete a command or a path token: put the marked candidate on the line without submitting it |
-| ↑ ↓ | move the mark over the candidates above the prompt, walk the history when there is no list, or move in a chooser |
+| ↑ ↓ | move the mark over the candidates above the prompt, walk the history when there is no list, or move in a chooser; ↑ with lines waiting takes them back |
 | Shift+Tab | toggle explore mode |
 | Esc | close a chooser; twice to interrupt the running turn |
 | Ctrl+C | clear the prompt line |
@@ -385,10 +387,13 @@ list, where typing filters it and Enter on an empty line resumes the selection.
 | Ctrl+Y / Ctrl+T / Alt+T | yank / transpose characters / transpose words |
 
 Turns run in the background: the prompt stays live while the model answers, and
-a line typed meanwhile is queued. It joins the turn at the next round boundary —
-after the tool calls the last answer asked for have run, before the next request
-— so the model reads it while it is still working rather than after it is done.
-A command (`/model`, `/sessions`, `!cmd`) needs the prompt and the session, so it
+the lines typed meanwhile are queued, one row each above the prompt. Each joins
+the turn at the next round boundary — after the tool calls the last answer asked
+for have run, before the next request — so the model reads it while it is still
+working rather than after it is done. `↑` takes them all back into the prompt, in
+order and above whatever was typed, and empties the queue: a line the turn has
+already read cannot be called back, and its echo stays in the transcript. A
+command (`/model`, `/sessions`, `!cmd`) needs the prompt and the session, so it
 waits for the turn to end. Interrupting takes two presses: the first puts
 the offer on the row under the prompt, any other key withdraws it, and the
 second stops the turn — which then says so in the transcript, because a cut

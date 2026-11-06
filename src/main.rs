@@ -841,6 +841,7 @@ const HELP: &str = "/model [id]    list the models, or switch to one for this di
                     \n\
                     Tab            complete a command or a path token\n\
                     ↑ ↓            walk the candidates, then this directory's history\n\
+                    ↑ with a queue take the waiting lines back to the prompt\n\
                     Ctrl+R         search that history\n\
                     Shift+Tab      toggle explore mode\n\
                     Esc            close a chooser; twice, stop the running turn\n\
@@ -888,10 +889,10 @@ impl Session {
         // that missed every round boundary. It is dispatched exactly like a
         // line typed while idle, which is why slash commands are handled in
         // this loop and not only where they are parsed.
-        let mut pending: Option<String> = None;
+        let mut pending: VecDeque<String> = VecDeque::new();
         loop {
             self.poll_naming(Some(&mut screen));
-            let (line, was_queued) = match pending.take() {
+            let (line, was_queued) = match pending.pop_front() {
                 Some(line) => (line, true),
                 None => {
                     // The title request lands while this loop blocks on keys:
@@ -948,17 +949,13 @@ impl Session {
                 Cmd::Exit => break,
                 Cmd::Continue => {}
                 Cmd::Turn(input) => {
-                    pending = self.messages_turn(&input, &tx, &rx, &mut screen)?;
+                    pending.extend(self.messages_turn(&input, &tx, &rx, &mut screen)?);
                 }
-                Cmd::Shell(command) => {
-                    pending = self.shell(&command, &mut screen, &rx);
-                }
-                Cmd::Compact => {
-                    pending = self.compact(&mut Console::Screen {
-                        screen: &mut screen,
-                        rx: &rx,
-                    });
-                }
+                Cmd::Shell(command) => pending.extend(self.shell(&command, &mut screen, &rx)),
+                Cmd::Compact => pending.extend(self.compact(&mut Console::Screen {
+                    screen: &mut screen,
+                    rx: &rx,
+                })),
             }
             self.flush_warnings(Some(&mut screen));
         }
@@ -1829,14 +1826,18 @@ impl Session {
         tx: &Sender<Event>,
         rx: &Receiver<Event>,
         screen: &mut ui::Screen,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Vec<String>, String> {
         self.record(json!({ "role": "user", "content": input }));
         // The first request is the session's name until the model gives it one:
         // show it now, not once the turn is over.
         screen.set_info(self.info());
 
         let cancel = http::Cancel::new();
-        let mut queued: Option<String> = None;
+        // The lines waiting for a boundary, oldest first, and the count of
+        // those Up took back after the turn had read them: their echo is still
+        // owed, and it must not take a waiting line off the frame with it.
+        let mut queued: Vec<Pending> = Vec::new();
+        let mut awaiting = 0usize;
         // A line typed while this turn runs, handed to the turn's own thread so
         // that it joins the history at the next round boundary instead of after
         // the last one. A command cannot go that way and waits for the end.
@@ -1949,7 +1950,7 @@ impl Session {
                                     done = true;
                                 }
                                 ui::Action::Submit => {
-                                    if !screen.is_empty() && queued.is_none() {
+                                    if !screen.is_empty() {
                                         // Queue without echoing here: the
                                         // transcript shows the line where the
                                         // model saw it, which is the round
@@ -1960,14 +1961,28 @@ impl Session {
                                         // between rounds; a command needs the
                                         // session and the screen, so it stays
                                         // for the boundary in the REPL loop.
-                                        if let Command::Turn(input) = parse_command(&line) {
-                                            if let Ok(mut lines) = queue.lock() {
-                                                lines.push_back(input);
+                                        let turn = match parse_command(&line) {
+                                            Command::Turn(input) => {
+                                                if let Ok(mut lines) = queue.lock() {
+                                                    lines.push_back(input);
+                                                }
+                                                true
                                             }
-                                        }
-                                        queued = Some(line);
-                                        screen.set_queued(queued.as_deref());
+                                            _ => false,
+                                        };
+                                        queued.push(Pending { line, turn });
+                                        show_queue(screen, &queued);
                                     }
+                                }
+                                // Up: the waiting lines come back to the
+                                // prompt, above what was typed, and the frame
+                                // lets go of them.
+                                ui::Action::Recall => {
+                                    let (kept, read) = take_back(&queue, &queued);
+                                    awaiting += read;
+                                    queued.clear();
+                                    show_queue(screen, &queued);
+                                    recall_lines(screen, &kept);
                                 }
                                 // The turn already captured its tool set and its
                                 // history prefix; the switch is applied at the
@@ -1984,10 +1999,18 @@ impl Session {
                         Event::Paste(text) => screen.insert_text(&text),
                         // The turn took a queued line into its history: it is
                         // no longer pending, and it belongs in the transcript
-                        // at the point the model saw it.
+                        // at the point the model saw it. The queue is read
+                        // oldest first, which is the row the frame drops.
                         Event::User(line) => {
-                            queued = None;
-                            screen.set_queued(None);
+                            // The turn read the oldest line still on the frame.
+                            // One Up took back was read too, so only its echo
+                            // is due.
+                            if awaiting > 0 {
+                                awaiting -= 1;
+                            } else if let Some(at) = queued.iter().position(|entry| entry.turn) {
+                                queued.remove(at);
+                                show_queue(screen, &queued);
+                            }
                             screen.echo_user(&line);
                         }
                         // Model text, already spaced by the sink: everything up
@@ -2090,7 +2113,6 @@ impl Session {
             // the cost.
             screen.error("Turn interrupted — the reply is partial\n");
         }
-        screen.set_queued(None);
         // A turn that reported nothing (interrupted, or a provider that does
         // not count) leaves the estimate in charge rather than a stale number.
         self.used = used;
@@ -2115,10 +2137,10 @@ impl Session {
         }
         // A request typed while the turn's last round was already in flight
         // never reached a boundary: it is the next turn, like any other line
-        // that arrived too late for one. A command line never entered the
-        // queue, and there is only ever one line pending.
-        let leftover = queue.lock().ok().and_then(|mut lines| lines.pop_front());
-        Ok(leftover.or(queued))
+        // that arrived too late for one, and a command line never entered the
+        // queue at all. The REPL runs them in the order they were typed.
+        show_queue(screen, &[]);
+        Ok(queued.into_iter().map(|entry| entry.line).collect())
     }
 
     fn turn(&mut self, sink: &mut dyn Sink, cancel: &http::Cancel) -> Result<(), String> {
@@ -2505,6 +2527,62 @@ fn spawn_input(tx: Sender<Event>) {
     });
 }
 
+/// A line submitted mid-turn, waiting for the round boundary that lets it join
+/// the turn. `turn` says the model will read it, which is what Up can take
+/// back; a command waits for the turn's end instead and never enters the turn's
+/// own queue.
+struct Pending {
+    line: String,
+    turn: bool,
+}
+
+/// The queue as the frame draws it: the waiting lines, oldest first.
+fn show_queue(screen: &mut ui::Screen, queue: &[Pending]) {
+    let lines: Vec<String> = queue.iter().map(|entry| entry.line.clone()).collect();
+    screen.set_queued(&lines);
+}
+
+/// What Up takes back: the command lines, which never went to the turn, and the
+/// lines the turn has not drained yet — draining its queue here is what makes
+/// them unsent. The rest were read, and only their echo is borrowed: the count
+/// comes back for the caller to swallow.
+fn take_back(queue: &Queue, queued: &[Pending]) -> (Vec<String>, usize) {
+    let unsent = queue
+        .lock()
+        .map(|mut lines| lines.drain(..).count())
+        .unwrap_or(0);
+    let waiting = queued.iter().filter(|entry| entry.turn).count();
+    let read = waiting.saturating_sub(unsent);
+    let mut kept = Vec::new();
+    let mut seen = 0;
+    for entry in queued {
+        if !entry.turn {
+            kept.push(entry.line.clone());
+            continue;
+        }
+        seen += 1;
+        if seen > read {
+            kept.push(entry.line.clone());
+        }
+    }
+    (kept, read)
+}
+
+/// Put waiting lines back on the prompt, above whatever was typed: they came
+/// first, so the turn would have read them first.
+fn recall_lines(screen: &mut ui::Screen, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let mut text = lines.join("\n");
+    if !screen.is_empty() {
+        let typed = screen.take();
+        text.push('\n');
+        text.push_str(&typed);
+    }
+    screen.insert_text(&text);
+}
+
 /// How often the idle prompt looks for work that finished off the UI thread.
 const IDLE: Duration = Duration::from_millis(100);
 
@@ -2599,6 +2677,8 @@ fn readline(
                     return Some(Input::Cancel);
                 }
                 ui::Action::Eof => return None,
+                // A queue belongs to a turn, and none is running here.
+                ui::Action::Recall => {}
                 ui::Action::None => {
                     screen.repaint();
                 }
@@ -3689,6 +3769,45 @@ mod tests {
     }
 
     #[test]
+    fn up_takes_back_only_the_lines_the_turn_has_not_read() {
+        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
+        let queued = [
+            Pending {
+                line: "read".into(),
+                turn: true,
+            },
+            Pending {
+                line: "/help".into(),
+                turn: false,
+            },
+            Pending {
+                line: "waiting".into(),
+                turn: true,
+            },
+        ];
+        queue.lock().unwrap().push_back("waiting".into());
+        let (kept, read) = take_back(&queue, &queued);
+        assert_eq!(kept, vec!["/help", "waiting"]);
+        assert_eq!(read, 1, "one line was read and its echo is still owed");
+        assert!(queue.lock().unwrap().is_empty(), "the rest is taken back");
+    }
+
+    #[test]
+    fn a_recalled_queue_lands_above_what_was_typed() {
+        let mut screen = ui::Screen::test_screen(40, 10);
+        screen.insert_text("typed");
+        recall_lines(&mut screen, &["one".to_string(), "two".to_string()]);
+        // The waiting lines came first, so they would have been read first.
+        assert_eq!(screen.take(), "one\ntwo\ntyped");
+        // Nothing typed: the queue is the whole line, and nothing is inserted
+        // for an empty one.
+        recall_lines(&mut screen, &["only".to_string()]);
+        assert_eq!(screen.take(), "only");
+        recall_lines(&mut screen, &[]);
+        assert!(screen.is_empty());
+    }
+
+    #[test]
     fn a_turn_streams_into_the_screen_and_the_history() {
         let server = Server::new(vec![sse(&[
             r#"{"choices":[{"delta":{"content":"hel"}}]}"#,
@@ -3704,7 +3823,7 @@ mod tests {
         let leftover = session
             .messages_turn("say hello", &tx, &rx, &mut screen)
             .unwrap();
-        assert!(leftover.is_none());
+        assert!(leftover.is_empty());
         assert_eq!(session.messages[2]["content"], "say hello");
         assert_eq!(session.messages[3]["role"], "assistant");
         assert_eq!(session.messages[3]["content"], "hello\n");
@@ -3747,7 +3866,7 @@ mod tests {
         let leftover = session
             .messages_turn("do it", &tx, &rx, &mut screen)
             .unwrap();
-        assert!(leftover.is_none());
+        assert!(leftover.is_empty());
         assert_eq!(session.messages.len(), 3, "only the request was recorded");
         let rows = screen.transcript();
         assert!(rows.iter().any(|row| row.contains("it broke")), "{rows:?}");
