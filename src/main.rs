@@ -177,9 +177,17 @@ fn run() -> Result<(), String> {
         return Err("no models available".into());
     }
 
-    // The directory's own choice wins; a directory with no state starts on the
-    // config's `model`, which is the explicit default.
-    let (provider, model) = resolve(&providers, state.model.as_deref().or(cfg.model.as_deref()));
+    // The directory's own choice wins, then the state root's default, then the
+    // config's `model`, which is the seed for a machine that has picked none.
+    let global = state::load_default();
+    let (provider, model) = resolve(
+        &providers,
+        state
+            .model
+            .as_deref()
+            .or(global.as_deref())
+            .or(cfg.model.as_deref()),
+    );
     // Thinking level follows the model: it is remembered per `provider/id`,
     // first for this directory, then for the config, and turned into request
     // fields by `thinking_body`.
@@ -562,7 +570,9 @@ enum Command {
     Help,
     New,
     /// None lists and opens the picker; Some is a `provider/id` or bare model id.
-    Model(Option<String>),
+    /// The scope says whose selection it becomes: this directory's, or the
+    /// default every directory without one starts on.
+    Model(Option<String>, Scope),
     /// None prints the current level; Some sets it.
     Thinking(Option<String>),
     Thoughts,
@@ -579,6 +589,44 @@ enum Command {
     Unknown(String),
 }
 
+/// Whose selection a `/model` line becomes.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Scope {
+    /// This directory's state file.
+    Dir,
+    /// The state root's `default.json`, which a directory with no pin follows.
+    Global,
+}
+
+/// Split `/model`'s argument into a scope and the rest. `-g`/`--global` is a
+/// flag only as a whole word, so a model id that starts with it stays a model.
+fn model_arg(rest: &str) -> (Scope, Option<String>) {
+    let rest = rest.trim();
+    for flag in ["--global", "-g"] {
+        if let Some(after) = rest.strip_prefix(flag) {
+            if after.is_empty() || after.starts_with(char::is_whitespace) {
+                let spec = after.trim();
+                return (
+                    Scope::Global,
+                    if spec.is_empty() {
+                        None
+                    } else {
+                        Some(spec.to_string())
+                    },
+                );
+            }
+        }
+    }
+    (
+        Scope::Dir,
+        if rest.is_empty() {
+            None
+        } else {
+            Some(rest.to_string())
+        },
+    )
+}
+
 fn parse_command(line: &str) -> Command {
     let input = line.trim();
     if input.is_empty() {
@@ -589,7 +637,7 @@ fn parse_command(line: &str) -> Command {
         "/help" => return Command::Help,
         "/new" => return Command::New,
         "/compact" => return Command::Compact,
-        "/model" => return Command::Model(None),
+        "/model" => return Command::Model(None, Scope::Dir),
         "/thinking" => return Command::Thinking(None),
         "/thoughts" => return Command::Thoughts,
         "/explore" => return Command::Explore,
@@ -598,7 +646,8 @@ fn parse_command(line: &str) -> Command {
         _ => {}
     }
     if let Some(rest) = input.strip_prefix("/model ") {
-        return Command::Model(Some(rest.trim().to_string()));
+        let (scope, spec) = model_arg(rest);
+        return Command::Model(spec, scope);
     }
     if let Some(rest) = input.strip_prefix("/thinking ") {
         return Command::Thinking(Some(rest.trim().to_string()));
@@ -667,7 +716,8 @@ fn safe_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-const HELP: &str = "/model [id]    list the models, or switch to one\n\
+const HELP: &str = "/model [id]    list the models, or switch to one for this directory\n\
+                    /model -g [id] set the default a directory without one starts on\n\
                     /thinking [l]  show or set thinking level (off, low, medium, high)\n\
                     /thoughts      show or hide the model's reasoning\n\
                     /sessions [q]  list, search and resume sessions\n\
@@ -889,9 +939,9 @@ impl Session {
     }
 
     /// Switch model: reset the fill count, remember the level for the new
-    /// `provider/id` (state first, then config), persist the selection, and
-    /// return the new info row.
-    fn set_model(&mut self, provider: usize, id: String) -> Vec<(ui::Info, String)> {
+    /// `provider/id` (state first, then config), persist the selection under
+    /// `scope`, and return the new info row.
+    fn set_model(&mut self, provider: usize, id: String, scope: Scope) -> Vec<(ui::Info, String)> {
         self.provider = provider;
         self.model = id;
         // The count belonged to the old model's window.
@@ -905,19 +955,42 @@ impl Session {
                 .find(|(name, _)| name == &spec)
                 .map(|(level, _)| level.clone())
         });
-        self.state.set_model(&spec);
-        if let Err(e) = self.state.save() {
-            self.warn(format!("state: {e}"));
+        match scope {
+            Scope::Dir => {
+                self.state.set_model(&spec);
+                if let Err(e) = self.state.save() {
+                    self.warn(format!("state: {e}"));
+                }
+            }
+            // A global default only reaches a directory that pins no model, so
+            // this one's pin goes: otherwise the new default would never apply
+            // here and the command would read as a no-op.
+            Scope::Global => match state::save_default(&spec) {
+                Err(e) => self.warn(e),
+                Ok(()) => {
+                    if self.state.model.take().is_some() {
+                        if let Err(e) = self.state.save() {
+                            self.warn(format!("state: {e}"));
+                        }
+                    }
+                }
+            },
         }
         self.info()
     }
 
     /// Apply a model choice and say so: the info row, and the line the
     /// transcript keeps.
-    fn choose_model(&mut self, provider: usize, id: String, console: &mut Console) {
-        let info = self.set_model(provider, id);
+    fn choose_model(&mut self, provider: usize, id: String, scope: Scope, console: &mut Console) {
+        let info = self.set_model(provider, id, scope);
         console.output(&format!("{}\n", ui::info_text(&info)));
         console.info(info);
+        if scope == Scope::Global {
+            console.output(&format!(
+                "◦ default model: {} (a directory without one starts here)\n",
+                self.spec()
+            ));
+        }
     }
 
     /// Apply a thinking level and remember it for this `provider/id`.
@@ -1266,8 +1339,15 @@ impl Session {
     }
 
     /// `/model`: a chooser over every provider's models, opened on the one in
-    /// use. Typing narrows the list, Enter switches, Esc closes.
-    fn browse_models(&mut self, screen: &mut ui::Screen, rx: &Receiver<Event>, query: &str) {
+    /// use. Typing narrows the list, Enter switches, Esc closes. The pick
+    /// becomes the selection `scope` names.
+    fn browse_models(
+        &mut self,
+        screen: &mut ui::Screen,
+        rx: &Receiver<Event>,
+        query: &str,
+        scope: Scope,
+    ) {
         let items: Vec<(String, String)> = self
             .providers
             .iter()
@@ -1283,14 +1363,18 @@ impl Session {
             })
             .collect();
         let on = items.iter().position(|(spec, _)| *spec == self.spec());
-        let Some(index) = choose(screen, rx, "Models", &items, on, query) else {
+        let header = match scope {
+            Scope::Dir => "Models",
+            Scope::Global => "Default model",
+        };
+        let Some(index) = choose(screen, rx, header, &items, on, query) else {
             return;
         };
         let Some((provider, id)) = find(&self.providers, &items[index].0) else {
             return;
         };
         let mut console = Console::Screen { screen, rx };
-        self.choose_model(provider, id, &mut console);
+        self.choose_model(provider, id, scope, &mut console);
     }
 
     /// `/thinking`: a chooser over the levels this provider configures. A
@@ -1975,21 +2059,23 @@ impl Session {
                 console.output("◦ New session\n");
                 Cmd::Continue
             }
-            Command::Model(None) => {
-                match console {
-                    Console::Screen { screen, rx } => self.browse_models(screen, rx, ""),
-                    Console::Stdout => console.output(&models(&self.providers)),
-                }
-                Cmd::Continue
-            }
-            Command::Model(Some(spec)) => {
-                match find(&self.providers, &spec) {
-                    Some((provider, id)) => self.choose_model(provider, id, console),
-                    // On a screen an argument that names no model is a search,
-                    // not a mistake: the chooser opens narrowed to it.
+            Command::Model(spec, scope) => {
+                match spec {
                     None => match console {
-                        Console::Screen { screen, rx } => self.browse_models(screen, rx, &spec),
-                        Console::Stdout => console.error(&format!("unknown model: {spec}")),
+                        Console::Screen { screen, rx } => self.browse_models(screen, rx, "", scope),
+                        Console::Stdout => console.output(&models(&self.providers)),
+                    },
+                    Some(spec) => match find(&self.providers, &spec) {
+                        Some((provider, id)) => self.choose_model(provider, id, scope, console),
+                        // On a screen an argument that names no model is a
+                        // search, not a mistake: the chooser opens narrowed to
+                        // it.
+                        None => match console {
+                            Console::Screen { screen, rx } => {
+                                self.browse_models(screen, rx, &spec, scope)
+                            }
+                            Console::Stdout => console.error(&format!("unknown model: {spec}")),
+                        },
                     },
                 }
                 Cmd::Continue
@@ -2766,10 +2852,28 @@ mod tests {
     #[test]
     fn parses_commands_once() {
         assert_eq!(parse_command("  "), Command::Empty);
-        assert_eq!(parse_command("/model"), Command::Model(None));
+        assert_eq!(parse_command("/model"), Command::Model(None, Scope::Dir));
         assert_eq!(
             parse_command("/model a/b"),
-            Command::Model(Some("a/b".into()))
+            Command::Model(Some("a/b".into()), Scope::Dir)
+        );
+        // `-g`/`--global` is a flag as a whole word; a spec that merely starts
+        // with it is still a spec, and a search still narrows the chooser.
+        assert_eq!(
+            parse_command("/model -g"),
+            Command::Model(None, Scope::Global)
+        );
+        assert_eq!(
+            parse_command("/model --global a/b"),
+            Command::Model(Some("a/b".into()), Scope::Global)
+        );
+        assert_eq!(
+            parse_command("/model -g  open/code"),
+            Command::Model(Some("open/code".into()), Scope::Global)
+        );
+        assert_eq!(
+            parse_command("/model -gpt"),
+            Command::Model(Some("-gpt".into()), Scope::Dir)
         );
         assert_eq!(parse_command("/thinking"), Command::Thinking(None));
         assert_eq!(
@@ -3017,7 +3121,7 @@ mod tests {
             warning: None,
             skills: Vec::new(),
         };
-        let info = ui::info_text(&session.set_model(0, "m".into()));
+        let info = ui::info_text(&session.set_model(0, "m".into(), Scope::Dir));
         assert!(info.contains("p/m"), "{info}");
         assert_eq!(session.used, None);
         assert_eq!(session.state.model.as_deref(), Some("p/m"));
@@ -3025,6 +3129,41 @@ mod tests {
         assert!(session.picks.is_empty());
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0]["content"].as_str(), Some("s"));
+    }
+
+    #[test]
+    fn a_global_choice_becomes_the_default_and_drops_the_directorys_pin() {
+        state::testenv::home("model-default", |home| {
+            let cwd = home.join("work");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let mut session = Session {
+                state: state::load(&cwd),
+                providers: vec![test_provider()],
+                provider: 0,
+                model: "m".into(),
+                thinking: None,
+                mode: tools::Mode::Explore,
+                used: None,
+                messages: Vec::new(),
+                bytes: 0,
+                sid: "abc".into(),
+                store: None,
+                startup: Vec::new(),
+                picks: Vec::new(),
+                naming: None,
+                warning: None,
+                skills: Vec::new(),
+            };
+            session.set_model(0, "m".into(), Scope::Dir);
+            assert_eq!(state::load(&cwd).model.as_deref(), Some("p/m"));
+
+            // The default a directory with no pin starts on; this directory's
+            // pin would shadow it, so it goes.
+            session.set_model(0, "m".into(), Scope::Global);
+            assert_eq!(state::load_default().as_deref(), Some("p/m"));
+            assert_eq!(state::load(&cwd).model, None);
+            assert!(session.warning.is_none());
+        });
     }
 
     #[test]
@@ -3825,7 +3964,7 @@ mod tests {
             context: Some(1),
         });
         let mut screen = ui::Screen::test_screen(60, 20);
-        session.browse_models(&mut screen, &rx, "p/n");
+        session.browse_models(&mut screen, &rx, "p/n", Scope::Dir);
         assert_eq!(session.model, "n");
         assert_eq!(screen.menu_selected(), 0, "the chooser closed");
 
@@ -3833,7 +3972,7 @@ mod tests {
         let (tx, rx) = events();
         tx.send(down(KeyCode::Enter)).unwrap();
         let mut screen = ui::Screen::test_screen(60, 20);
-        session.browse_models(&mut screen, &rx, "nothing-matches");
+        session.browse_models(&mut screen, &rx, "nothing-matches", Scope::Dir);
         assert!(session.model == "n", "the earlier choice stands");
     }
 

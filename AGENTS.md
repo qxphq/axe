@@ -51,7 +51,9 @@ invariants a change must not break.
     `api_key_env`; never commit keys or read another app's auth store. Axe never
     writes it: the per-directory state and sessions live under
     `~/.local/state/axe/projects/<escaped cwd>/` (respects `XDG_STATE_HOME`).
-    Config `model` is the default for a directory with no state.
+    Config `model` is the seed: the selection a directory starts on is its own
+    `state.json`, then `<state tree>/default.json` (what `/model -g` writes),
+    then the config.
 11. **Verify against reality.** Test against `mock.py` (chunked SSE, keep-alive,
     session headers). No speculative fixes; reproduce first.
 12. **A scrolling REPL, not a TUI.** No alt-screen: the transcript is
@@ -153,8 +155,9 @@ invariants a change must not break.
 - `http.rs` — URL parsing, HTTP/1.1 over `TcpStream`/rustls, body decoding
   (`Content-Length`, chunked, EOF), line/body caps and timeouts.
 - `config.rs` — load and validate the config; resolve the `agents` file.
-- `state.rs` — per-directory state: the cwd key, load, an atomic write, and the
-  prompt history file `Up` and Ctrl+R walk.
+- `state.rs` — per-directory state: the cwd key, load, an atomic write, the
+  prompt history file `Up` and Ctrl+R walk, and `default.json`, the model a
+  directory without a selection starts on.
 - `sessions.rs` — meta sidecar and append-only JSONL body per session; listing,
   search, system gzip for old bodies, UTC stamp, and the compaction marker a
   body continues from.

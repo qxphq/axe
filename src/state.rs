@@ -1,5 +1,6 @@
-//! The per-directory state file: the cwd key, load, and an atomic write.
-//! Sessions live under the same project directory.
+//! The per-directory state file: the cwd key, load, and an atomic write, plus
+//! the global default model one level up. Sessions live under the same project
+//! directory.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -76,6 +77,45 @@ pub fn project(cwd: &Path) -> PathBuf {
 /// `<state>/axe/projects/<key>/state.json`.
 fn file(cwd: &Path) -> PathBuf {
     project(cwd).join("state.json")
+}
+
+/// `<state>/axe/default.json`: the selection a directory that pins none starts
+/// on. It lives here, not in the config, because the config is read-only input.
+fn default_file() -> PathBuf {
+    root().join("default.json")
+}
+
+/// The global default model, `provider/id`. Best effort: a missing or broken
+/// file is no default, never a failed start.
+pub fn load_default() -> Option<String> {
+    let file = default_file();
+    let raw = fs::read_to_string(&file).ok()?;
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(v) => v["model"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        Err(e) => {
+            eprintln!("axe: cannot parse {}: {e}", file.display());
+            None
+        }
+    }
+}
+
+/// Write the global default whole, through a temporary like `State::save`.
+pub fn save_default(spec: &str) -> Result<(), String> {
+    let file = default_file();
+    let Some(dir) = file.parent() else {
+        return Ok(());
+    };
+    private_dir(dir).map_err(|e| format!("cannot save the default model: {e}"))?;
+    let value = serde_json::json!({ "model": spec });
+    let text = serde_json::to_string_pretty(&value)
+        .map(|text| format!("{text}\n"))
+        .map_err(|e| format!("cannot save the default model: {e}"))?;
+    let tmp = file.with_extension("json.tmp");
+    write_private(&tmp, &text).map_err(|e| format!("cannot save the default model: {e}"))?;
+    fs::rename(&tmp, &file).map_err(|e| format!("cannot save the default model: {e}"))
 }
 
 /// Prompt lines remembered for this directory.
@@ -470,6 +510,25 @@ mod tests {
         // The read pruned the file it read.
         assert!(fs::metadata(&path).unwrap().len() < HISTORY_BYTES);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_global_default_roundtrips_and_a_broken_one_is_none() {
+        testenv::home("default-model", |home| {
+            assert!(load_default().is_none(), "no file is no default");
+            save_default("p/m").unwrap();
+            assert_eq!(load_default().as_deref(), Some("p/m"));
+            let mode =
+                |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&default_file()), 0o600);
+            assert_eq!(mode(&home.join("state/axe")), 0o700);
+
+            fs::write(default_file(), "{ not json").unwrap();
+            assert!(load_default().is_none());
+            // An empty spec is no default either.
+            fs::write(default_file(), r#"{"model": ""}"#).unwrap();
+            assert!(load_default().is_none());
+        });
     }
 
     #[test]

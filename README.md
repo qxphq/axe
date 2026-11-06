@@ -67,12 +67,13 @@ same file. The `ship` skill bumps it with the change.
 
 `~/.config/axe/config.json`, or `$XDG_CONFIG_HOME/axe/config.json`. It is
 created with an example on first run and never rewritten afterwards: what you
-pick in one directory is state, not config.
+pick in one directory is state, not config, and so is `/model -g`'s default —
+the state tree holds it.
 
 | key | meaning |
 | --- | --- |
 | `providers` | name → entry; or a top-level `base_url` for `local` |
-| `model` | `provider/id` used by a directory that has no state yet |
+| `model` | `provider/id` a directory starts on when neither it nor the state root has picked one |
 | `explore_by_default` | start sessions in explore mode; default `true` |
 | `search.brave` | Brave token via `api_key_env`; unset → DuckDuckGo |
 | `thinking` | default level per `provider/id` for a fresh directory |
@@ -192,6 +193,8 @@ they open a chooser over what they pick from — every provider's models, or the
 levels this one configures — opened on the one in use, walked with the arrows,
 narrowed by typing, closed with Esc, and applied on Enter. `/model dee` is the
 same chooser, already narrowed, and `/model provider/id` sets one directly.
+`/model -g` (or `--global`) is the same chooser for the global default, and
+`/model -g provider/id` sets that directly.
 
  A line starting with `!` is your own shell: it runs through the same tool,
 its output joins the history as a user message, and no turn follows — the model
@@ -221,6 +224,7 @@ the file.
 | command | what it does |
 | --- | --- |
 | `/model [id]` | switch to a model; bare, a chooser over every provider's models, narrowed by typing; without a terminal it only lists |
+| `/model -g [id]` | set the global default: the model a directory that pins none starts on; same chooser, same narrowing; the directory's own choice is dropped so it follows |
 | `/thinking [level]` | show or set the thinking level; bare, a chooser over the levels the provider configures |
 | `/thoughts` | show or hide the model's reasoning |
 | `/explore` | toggle explore mode (also Shift+Tab) |
@@ -338,6 +342,11 @@ directory with every byte outside `[A-Za-z0-9._-]` written as `%XX` — so
 | `<id>.json` | a session's title, summary, dates and message count |
 | `<id>.jsonl` | the session body: one API message per line, append-only |
 | `<id>.jsonl.gz` | a body older than the 30 most recent, gzipped |
+
+`$XDG_STATE_HOME/axe/default.json` (or `~/.local/state/axe/default.json`)
+holds the global default model: what `/model -g` writes, and what a directory
+whose `state.json` names no model follows, before the config's `model`. The
+config is never written.
 
 Directories are `0700` and files `0600`: a session is plaintext, readable by
 its owner only. Use a container, a separate user, or full-disk encryption when
