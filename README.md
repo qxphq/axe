@@ -337,13 +337,14 @@ the file.
 | `/help` | list the commands, the key bindings, the config path and its keys |
 | `/exit`, `/quit` | quit |
 
-The area under the transcript is as tall as it has to be: a blank row above the
-prompt, the prompt's rows, a blank row, the status, and a blank row under it,
-with the candidates on top of that. A queue is a blank row, one row per waiting
-line, and the `↑ to edit` row under them, so it never reads as the transcript's
-last. The blank rows around the prompt are
-the frame's own, so the prompt keeps one above it and one below it whatever is
-shown. The status says what the turn is doing — thinking, running a command,
+The area under the transcript is as tall as it has to be: a blank row, the
+candidates or a chooser's header and entries, a blank row, the queued lines and
+their hint, a blank row, the prompt's rows, a blank row, the status, and a blank
+row under it.
+The frame's first row is blank whatever it shows, so nothing it draws touches
+the block above it, and a queue never reads as the transcript's last line. The
+prompt keeps a blank row above and below it whatever else is shown. The status
+says what the turn is doing — thinking, running a command,
 responding — and is blank only when nothing is in flight, so a wait on the
 provider is never a silent row. A glyph leads the states that a user
 interrupts or waits on: `⋯` waiting for the provider and then thinking, `▸`

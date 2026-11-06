@@ -72,16 +72,18 @@ invariants a change must not break.
     session headers). No speculative fixes; reproduce first.
 12. **A scrolling REPL, not a TUI.** No alt-screen: the transcript is
     scrollback. The only owned region is an inline live frame at the bottom
-    (candidate list, a blank row, the queued lines and the row that hints at
-    `↑`, a blank row, the wrapped prompt, a blank row, status, a blank row), and it is as tall as what it shows and no taller —
-    `ui::Frame::layout` takes the rows the prompt wrapped to (as many as the
-    terminal can spare, and no more), the queued lines, and the candidates — so
-    the blank rows around the prompt are the frame's own and an idle prompt
-    sits one blank row under the last block, not under rows kept for a list
-    that is not there.
+    (a blank row, the candidate list or a chooser's header and entries, a blank
+    row, the queued lines and the row that hints at `↑`, a blank row, the
+    wrapped prompt, a blank row, status, a blank row), and it is as tall as
+    what it shows and no taller — `ui::Frame::layout` takes the rows the prompt
+    wrapped to (as many as the terminal can spare, and no more), the queued
+    lines, and the candidates. Its first row is blank whatever it draws, so
+    nothing in the frame touches the transcript; the blank row above an idle
+    prompt is that same row, not a special case.
     Nothing is written against the bottom edge, and the status keeps a blank row
-    above it however many rows the prompt fills. A chooser is the
-    entries, and when it closes without resuming its rows are committed to
+    above it however many rows the prompt fills. A chooser is the one part the
+    terminal sizes: its header and entries take the rows, and when it closes
+    without resuming its rows are committed to
     scrollback — except startup's chooser, whose list vanishes on the first
     typed key: typing is the choice of a new session. A terminal appends rows
     at the bottom and cannot take them back, so a frame that shrinks leaves
