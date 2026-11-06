@@ -1105,7 +1105,7 @@ impl Session {
         console.info(info);
         if scope == Scope::Global {
             console.output(&format!(
-                "◦ default model: {} (a directory without one starts here)\n",
+                "◦ Default model: {} (a directory without one starts here)\n",
                 self.spec()
             ));
         }
@@ -1121,7 +1121,7 @@ impl Session {
             self.warn(format!("state: {e}"));
         }
         let label = thinking_label(&self.providers[self.provider].cfg, &self.thinking);
-        console.output(&format!("thinking: {label}\n"));
+        console.output(&format!("Thinking: {label}\n"));
     }
 
     fn finalize_session(&mut self) {
@@ -1597,7 +1597,7 @@ impl Session {
         console.explore(self.mode.explore());
         console.info(self.info());
         console.output(&format!(
-            "explore: {}\n",
+            "Explore: {}\n",
             if self.mode.explore() { "on" } else { "off" }
         ));
         // A running server cannot be narrowed or widened, so flipping the mode
@@ -2206,7 +2206,7 @@ impl Session {
                         Console::Screen { screen, rx } if levels.len() > 1 => {
                             self.browse_levels(screen, rx, "")
                         }
-                        _ => console.output(&format!("thinking: {label}\n")),
+                        _ => console.output(&format!("Thinking: {label}\n")),
                     }
                     return Cmd::Continue;
                 }
@@ -2222,7 +2222,7 @@ impl Session {
                     self.warn(format!("state: {e}"));
                 }
                 console.output(&format!(
-                    "thoughts: {}\n",
+                    "Thoughts: {}\n",
                     if self.state.thoughts { "on" } else { "off" }
                 ));
                 Cmd::Continue
@@ -3872,6 +3872,43 @@ mod tests {
             session.dispatch("a request", &mut console),
             Cmd::Turn(request) if request == "a request"
         ));
+    }
+
+    #[test]
+    fn a_label_is_capital_and_its_value_is_not() {
+        // A command leaves one line naming the setting, capital, then its
+        // state: lowercase would read as prose, which a notice is not.
+        state::testenv::home("label-capitals", |_home| {
+            let mut session = bare_session();
+            let mut screen = ui::Screen::test_screen(80, 12);
+            let (_tx, rx) = std::sync::mpsc::channel();
+            {
+                let mut console = Console::Screen {
+                    screen: &mut screen,
+                    rx: &rx,
+                };
+                session.dispatch("/explore", &mut console);
+                session.dispatch("/thoughts", &mut console);
+                // Both `/thinking` arms: the bare line and a level that
+                // `choose_level` applies.
+                session.dispatch("/thinking", &mut console);
+                session.dispatch("/thinking off", &mut console);
+                session.dispatch("/model -g m", &mut console);
+            }
+            let rows = screen.transcript();
+            for line in [
+                "Explore: off",
+                "Thoughts: on",
+                "Thinking: default (not set)",
+                "Thinking: off",
+                "◦ Default model: p/m",
+            ] {
+                assert!(
+                    rows.iter().any(|row| row.contains(line)),
+                    "{line}: {rows:?}"
+                );
+            }
+        });
     }
 
     #[test]

@@ -357,7 +357,7 @@ interrupts or waits on: `⋯` waiting for the provider and then thinking, `▸`
 responding, `▷` a command running, `▣` compacting, `×` interrupting — and `×`
 also marks a compaction that was cancelled and `◦` leads the notices axe prints
 about itself (`Resumed:`, `New session`, `compacted N messages`,
-`nothing to compact`, `default model:`). A chooser is the one part sized by the
+`nothing to compact`, `Default model:`). A chooser is the one part sized by the
 terminal — a window over the transcript, whose rows are committed when it
 closes.
 
