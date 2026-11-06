@@ -91,6 +91,10 @@ pub fn info_text(parts: &[(Info, String)]) -> String {
 pub enum Info {
     /// The session's name. Prose, so it keeps the terminal's default color.
     Title,
+    /// The directory the session runs in: the second thing about the session
+    /// itself, so it sits next to the name and stays out of the way — dim, the
+    /// color of what is only there to be read.
+    Dir,
     /// `provider/model`: the same cyan as the prompt, because it is the same
     /// thing, what this session is talking to.
     Selection,
@@ -108,6 +112,7 @@ impl Info {
     fn style(self) -> Style {
         match self {
             Info::Title => Paint::Plain.style(),
+            Info::Dir => DIM,
             Info::Selection => PROMPT_STYLE,
             Info::Level => Paint::Magenta.style(),
             Info::Fill(None) => DIM,
@@ -2357,6 +2362,7 @@ mod tests {
         let mut screen = Screen::test_screen(100, 12);
         screen.set_info([
             (Info::Title, "t".to_string()),
+            (Info::Dir, "w".to_string()),
             (Info::Selection, "p/m".to_string()),
             (Info::Level, "high".to_string()),
             (Info::Fill(Some(93)), "93%".to_string()),
@@ -2364,24 +2370,27 @@ mod tests {
         ]);
         screen.draw().unwrap();
         let layout = screen.frame();
-        let cells: Vec<(String, Color)> = (0..100u16)
+        let cells: Vec<(String, Color, Modifier)> = (0..100u16)
             .map(|x| {
                 let cell = &screen.test_buffer()[(x, layout.status.y)];
-                (cell.symbol().to_string(), cell.fg)
+                (cell.symbol().to_string(), cell.fg, cell.modifier)
             })
-            .filter(|(symbol, _)| symbol != " ")
+            .filter(|(symbol, ..)| symbol != " ")
             .collect();
         // Each piece carries one color of its own: the name is the terminal's
-        // default, the selection is the prompt's cyan, the level magenta, a
-        // nearly full window red, a mode that cannot write yellow.
-        let color = |first: &str| {
-            let (_, fg) = cells
+        // default, the selection the prompt's cyan, the level magenta, a nearly
+        // full window red, a mode that cannot write yellow. The directory is
+        // dim instead: it is context, not a thing the session is pointed at.
+        let find = |first: &str| {
+            cells
                 .iter()
-                .find(|(symbol, _)| symbol == first)
-                .unwrap_or_else(|| panic!("{first} is not on the row: {cells:?}"));
-            *fg
+                .find(|(symbol, ..)| symbol == first)
+                .unwrap_or_else(|| panic!("{first} is not on the row: {cells:?}"))
         };
+        let color = |first: &str| find(first).1;
         assert_eq!(color("t"), Color::Reset);
+        assert_eq!(color("w"), Color::Reset);
+        assert!(find("w").2.contains(Modifier::DIM));
         assert_eq!(color("p"), Color::Cyan);
         assert_eq!(color("h"), Color::Magenta);
         assert_eq!(color("9"), Color::Red);

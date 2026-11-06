@@ -372,12 +372,14 @@ second stops the turn — which then says so in the transcript, because a cut
 reply reads like a finished one.
 
 The row under the prompt is what the turn is doing on the left, and on the right
-the session's name, the provider/model and thinking level, and how much of the
-context window the history fills. Each piece on the right carries its own color,
-and every color is one of the terminal's own ANSI names, so the theme decides
-what it actually is: the name in the default foreground, the provider/model in
-the prompt's cyan, the thinking level in magenta, the window green until it is
-70% full, yellow to 90%, then red, and `read-only` in yellow. The right side
+the session's name, the directory it runs in, the provider/model and thinking
+level, and how much of the context window the history fills. Each piece on the
+right carries its own color, and every color is one of the terminal's own ANSI
+names, so the theme decides what it actually is: the name in the default
+foreground, the directory dim, with the home directory written `~`, the
+provider/model in the prompt's cyan, the thinking level in magenta, the window
+green until it is 70% full, yellow to 90%, then red, and `read-only` in yellow.
+The right side
 takes whatever the status leaves, so a wide row clips nothing; only a status
 long enough to fill the row holds it to half, so what the turn is doing is never
 pushed out, and a title that does not fit is the piece that clips. The name is

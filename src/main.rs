@@ -1522,6 +1522,13 @@ impl Session {
         if let Some(title) = self.title() {
             parts.push((ui::Info::Title, title));
         }
+        // Where it runs, then what it talks to: the directory is the session's
+        // own setting and sits left of the model it names. A session with no
+        // working directory has nothing to say here.
+        let dir = dir_label(&self.state.cwd);
+        if !dir.is_empty() {
+            parts.push((ui::Info::Dir, dir));
+        }
         parts.push((
             ui::Info::Selection,
             place(&self.providers, self.provider, &self.model),
@@ -2798,6 +2805,26 @@ fn place(providers: &[Provider], provider: usize, model: &str) -> String {
     format!("{}/{}", providers[provider].name, model)
 }
 
+/// The directory a session runs in, as the info row says it: the home
+/// directory is written `~`, which is the one part of the path that never has
+/// to be read twice.
+fn dir_label(cwd: &std::path::Path) -> String {
+    let text = cwd.display().to_string();
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let home = home.display().to_string();
+    if home.is_empty() || !text.starts_with(&home) {
+        return text;
+    }
+    match &text[home.len()..] {
+        "" => "~".to_string(),
+        // At a boundary: `/home/anonette` is not under `/home/anon`.
+        rest if rest.starts_with('/') => format!("~{rest}"),
+        _ => text,
+    }
+}
+
 fn level(thinking: &Option<String>) -> String {
     thinking.clone().unwrap_or_else(|| "default".to_string())
 }
@@ -3600,6 +3627,33 @@ mod tests {
             "{}",
             info_text(&session)
         );
+    }
+
+    #[test]
+    fn the_info_row_names_the_directory_left_of_the_model() {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let mut session = bare_session();
+        session.state.cwd = home.join("work");
+        let text = info_text(&session);
+        assert!(text.starts_with("~/work  ·  p/m"), "{text}");
+        // The home directory itself is the one path with nothing after the `~`,
+        // and a path outside it keeps its own name.
+        session.state.cwd = home.clone();
+        let text = info_text(&session);
+        assert!(text.starts_with("~  ·  p/m"), "{text}");
+        session.state.cwd = std::path::PathBuf::from("/tmp/x");
+        let text = info_text(&session);
+        assert!(text.starts_with("/tmp/x  ·  p/m"), "{text}");
+        // A session with no working directory has nothing to say: the row
+        // starts at the model, with no empty piece and no stray separator.
+        session.state.cwd = std::path::PathBuf::new();
+        let text = info_text(&session);
+        assert!(text.starts_with("p/m"), "{text}");
+        // A sibling whose name starts with the home path is not under it.
+        let sibling = std::path::PathBuf::from(format!("{}-old", home.display()));
+        assert_eq!(dir_label(&sibling), sibling.display().to_string());
     }
 
     use crate::http::support::{reply, sse, Server};
