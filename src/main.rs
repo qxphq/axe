@@ -192,19 +192,11 @@ fn run() -> Result<(), String> {
     });
     validate_level(&providers[provider].cfg, thinking.as_deref());
     // An interactive run carries the selection in the live region's last row
-    // and opens with a splash; a piped run owns no row and no screen, so the
-    // banner is the only place the selection can appear.
+    // and opens with a splash. A piped run prints neither: stdin is a pipe, so
+    // nobody asked who is answering, and stdout is the transcript — the splash,
+    // the selection and the notices would be noise in the middle of an answer.
     if ui::is_interactive() {
         banner(&notices);
-    } else {
-        // One leading blank: the same margin `ui::Screen` keeps on both edges.
-        println!(
-            " {}",
-            terminal_text(&selection(&providers, provider, &model, &thinking))
-        );
-        for notice in &notices {
-            println!(" {}", terminal_text(notice));
-        }
     }
 
     // Built once. The mode lives in the history, not here, so a toggle leaves
@@ -809,17 +801,28 @@ impl Session {
     }
 
     /// No tty: the kernel edits the line and the turn prints as it streams.
+    /// Nothing is printed to ask for a line — the input is a pipe, and stdout
+    /// belongs to the answers.
     fn run_piped(mut self) -> Result<(), String> {
-        while let Some(line) = ui::cooked_line("❯ ") {
+        // Whether the answer is the run's first block: it then starts at the
+        // top of stdout. Any other line may have printed, and closes the
+        // question — a command, a `!cmd`, a blank line no one can see.
+        let mut opening = true;
+        while let Some(line) = ui::cooked_line() {
             let cmd = match line.trim() {
                 "" => Cmd::Continue,
                 _ => self.dispatch(&line, &mut Console::Stdout),
             };
+            let turning = matches!(&cmd, Cmd::Turn(_));
             match cmd {
                 Cmd::Exit => break,
                 Cmd::Continue => {}
                 Cmd::Turn(input) => {
-                    let mut sink = PlainSink::default();
+                    let mut sink = if std::mem::take(&mut opening) {
+                        PlainSink::flush_top()
+                    } else {
+                        PlainSink::default()
+                    };
                     let cancel = http::Cancel::new();
                     self.record(json!({ "role": "user", "content": input }));
                     if let Err(e) = self.turn(&mut sink, &cancel) {
@@ -839,6 +842,9 @@ impl Session {
                 Cmd::Compact => {
                     self.compact(&mut Console::Stdout);
                 }
+            }
+            if !turning {
+                opening = false;
             }
             self.flush_warnings(None);
         }
@@ -2581,20 +2587,6 @@ fn validate_level(provider: &config::ProviderConfig, level: Option<&str>) {
     }
 }
 
-fn selection(
-    providers: &[Provider],
-    provider: usize,
-    model: &str,
-    thinking: &Option<String>,
-) -> String {
-    format!(
-        "{}{}{}",
-        place(providers, provider, model),
-        ui::SEP,
-        level(thinking)
-    )
-}
-
 /// `provider/model`, the pair that answers a turn.
 fn place(providers: &[Provider], provider: usize, model: &str) -> String {
     format!("{}/{}", providers[provider].name, model)
@@ -2982,7 +2974,6 @@ mod tests {
             resolve(std::slice::from_ref(&provider), Some("missing")),
             (0, "m".into())
         );
-        assert_eq!(selection(&[provider], 0, "m", &None), "p/m  ·  default");
     }
 
     fn test_provider() -> Provider {

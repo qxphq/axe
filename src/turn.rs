@@ -52,9 +52,22 @@ pub struct PlainSink {
     /// writer's, and `ui::separated` decides where it goes, so stdout and the
     /// screen space the transcript the same way.
     last: Option<ui::Block>,
+    /// The next block starts at the top, dropping the blank row a reply carries
+    /// to separate it from what came before: on a run's first answer there is
+    /// nothing above it.
+    flush_top: bool,
 }
 
 impl PlainSink {
+    /// The sink for the first answer of a run, whose block sits flush at the
+    /// top of stdout.
+    pub fn flush_top() -> Self {
+        PlainSink {
+            flush_top: true,
+            ..PlainSink::default()
+        }
+    }
+
     fn write(&mut self, lines: Vec<Line<'static>>, block: ui::Block) {
         if lines.is_empty() {
             return;
@@ -72,6 +85,9 @@ impl PlainSink {
         }
         let mut done = String::new();
         self.out.push(&buf, &mut done);
+        if std::mem::take(&mut self.flush_top) {
+            trim_top(&mut done);
+        }
         print!("{done}");
         io::stdout().flush().ok();
     }
@@ -84,6 +100,14 @@ impl PlainSink {
         }
         self.md.flush(0, &mut lines);
         self.write(lines, ui::Block::Text);
+    }
+}
+
+/// The one blank row `TextSink` puts before a reply is the row between two
+/// blocks. A run's first block has nothing above it, so that row is dropped.
+fn trim_top(done: &mut String) {
+    if done.starts_with('\n') {
+        done.remove(0);
     }
 }
 
@@ -105,8 +129,11 @@ impl Sink for PlainSink {
 
     fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str), error: Option<&str>) {
         self.flush();
+        // A tool call is the harness's account of the turn, not the answer: a
+        // piped run keeps stdout for the model's text and puts this on stderr,
+        // where it is visible when asked for and never inside the answer.
         if self.last.is_some() && ui::separated(self.last, ui::Block::Tool) {
-            println!();
+            eprintln!();
         }
         self.last = Some(ui::Block::Tool);
         let mut line = String::new();
@@ -115,11 +142,11 @@ impl Sink for PlainSink {
         }
         line.push(' ');
         line.push_str(&mark.0.ansi(mark.1));
-        println!("{line}");
+        eprintln!("{line}");
         if let Some(error) = error {
-            println!("    {}", Paint::Red.ansi(error));
+            eprintln!("    {}", Paint::Red.ansi(error));
         }
-        io::stdout().flush().ok();
+        io::stderr().flush().ok();
     }
 
     fn end_round(&mut self) {
@@ -642,5 +669,20 @@ mod tests {
         sink.status("ignored");
         sink.end_round();
         assert!(matches!(sink.last, Some(ui::Block::Text)));
+    }
+
+    #[test]
+    fn a_runs_first_block_drops_one_leading_blank_row() {
+        let mut done = "\nhi".to_string();
+        trim_top(&mut done);
+        assert_eq!(done, "hi");
+        // One row is the writer's; a second is the model's own and stays.
+        let mut done = "\n\nhi".to_string();
+        trim_top(&mut done);
+        assert_eq!(done, "\nhi");
+        // Nothing above and nothing to drop.
+        let mut done = "hi".to_string();
+        trim_top(&mut done);
+        assert_eq!(done, "hi");
     }
 }

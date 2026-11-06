@@ -2094,18 +2094,13 @@ pub(crate) fn split(text: &str) -> Vec<&str> {
 }
 
 /// Read one line with cooked input. Used when stdin or stdout is not a tty:
-/// there is no terminal to own, so the kernel does the editing.
-pub fn cooked_line(prompt: &str) -> Option<String> {
-    print!("{prompt}");
-    io::stdout().flush().ok();
+/// there is no terminal to own, so the kernel does the editing, and nothing is
+/// printed — there is no prompt to close, and a read that finds the end must
+/// not leave a row open.
+pub fn cooked_line() -> Option<String> {
     let mut line = String::new();
     if io::BufRead::read_line(&mut io::stdin().lock(), &mut line).ok()? == 0 {
         return None;
-    }
-    // With a tty the kernel echoed the line, Enter included, so the prompt line
-    // is already terminated. Without one nothing was echoed: close it here.
-    if !io::stdin().is_terminal() {
-        println!();
     }
     Some(line.trim_end_matches(['\n', '\r']).to_string())
 }
@@ -3467,9 +3462,9 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_that_is_not_a_terminal_is_one_cooked_line() {
+    fn a_read_that_finds_the_end_is_no_line_and_prints_nothing() {
         // The test binary's stdin is at its end, so the line is over.
-        assert!(cooked_line("prompt> ").is_none());
+        assert!(cooked_line().is_none());
     }
 
     #[test]

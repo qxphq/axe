@@ -48,8 +48,11 @@ axe < prompts    # without a terminal: plain-text lines in, transcript out
 axe --version    # prints the version and exits; no config, no network
 ```
 
-Without a terminal the line comes from stdin and the transcript goes to stdout:
-the same commands, the same turns, one line at a time. Nothing that needs a
+Without a terminal the line comes from stdin and stdout carries the model's
+text: no splash, no selection, no prompt and no notice, so `axe < prompts` is a
+filter. A tool call is axe's own account of the turn and goes to stderr, so
+`axe < prompts 2>/dev/null` is the answers alone; what a line explicitly asks
+for (`!cmd`, `/sessions`, `/model`) still prints to stdout. Nothing that needs a
 screen exists there — `/sessions` prints a numbered list to resume from, and the
 startup chooser does not appear.
 

@@ -79,7 +79,9 @@ invariants a change must not break.
     us is repainted even when no state changed. No caller draws for a state
     change, so work that finishes off the UI thread cannot strand the row.
     Startup banner and piped output run before/without a `Screen`; a stray
-    `print!` while it exists is a rendering bug. Only `Screen::write` and
+    `print!` while it exists is a rendering bug. A piped run has no prompt,
+    splash or notice — stdout is the model's text (and what a line asked for),
+    and the harness's own lines, tool calls included, go to stderr. Only `Screen::write` and
     `Screen::settle` write rows above the frame, and a block goes where the
     transcript *ends* — `slack` counts the blank rows a frame that changed left
     above it, and `write` fills them from the top — so a block is always under
