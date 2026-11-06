@@ -306,13 +306,19 @@ message and decision exact. Sections: task, what has been done, files changed, c
 decisions and constraints, open questions, next step. Under 800 words.";
 
 /// One tool-less completion for `/compact`. The summary is text, not a turn.
+///
+/// No `max_tokens`: a cap small enough for a summary of 800 words is small
+/// enough for a thinking model to spend on reasoning before it writes a word,
+/// and then the answer that arrives is empty. The prompt sets the length;
+/// `finish_reason` is what tells a cut-off reply from a silent one.
 fn compact_request(
     provider: &Provider,
     model: &str,
+    level: Option<&str>,
     messages: &[Value],
     cancel: &http::Cancel,
-) -> Result<String, String> {
-    let extra = json!({ "max_tokens": 2000, "temperature": 0 });
+) -> Result<api::Reply, String> {
+    let extra = tool_less_extra(provider, level, 0.0);
     api::stream_chat(
         &provider.ep,
         provider.key.as_deref(),
@@ -325,7 +331,44 @@ fn compact_request(
         |_| {},
         |_| {},
     )
-    .map(|reply| reply.text)
+}
+
+/// The body of a request that has no tools and no turn: the session's thinking
+/// level, so the provider does not think on terms of its own, and the
+/// temperature the caller wants.
+fn tool_less_extra(provider: &Provider, level: Option<&str>, temperature: f64) -> Value {
+    let mut extra = provider
+        .cfg
+        .thinking_body(level)
+        .unwrap_or_else(|| json!({}));
+    if let Some(body) = extra.as_object_mut() {
+        body.insert("temperature".into(), json!(temperature));
+    }
+    extra
+}
+
+/// What a reply that carried no text did instead, for the one place axe asks
+/// for text it cannot show: `/compact`. The finish reason is the difference
+/// between an answer cut off and a model that said nothing.
+fn no_text(reply: &api::Reply) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(reason) = &reply.finish_reason {
+        parts.push(format!("finish reason: {reason}"));
+    }
+    if let Some(usage) = &reply.usage {
+        parts.push(format!("{} completion tokens", usage.completion));
+    }
+    if !reply.reasoning.trim().is_empty() {
+        parts.push(format!(
+            "{} chars of reasoning",
+            reply.reasoning.chars().count()
+        ));
+    }
+    if parts.is_empty() {
+        "the provider sent no text".to_string()
+    } else {
+        parts.join(", ")
+    }
 }
 
 /// The conversation as one plain-text transcript for the summarizing request.
@@ -383,8 +426,15 @@ fn cut(text: &str, head: usize, tail: usize) -> String {
 }
 
 /// One small completion, without tools. The session header stays: providers
-/// that require it would refuse the request otherwise.
-fn title_request(provider: &Provider, model: &str, user: &str, assistant: &str) -> Option<String> {
+/// that require it would refuse the request otherwise. Like `/compact` it sends
+/// no `max_tokens`, so a thinking model cannot spend the answer's budget.
+fn title_request(
+    provider: &Provider,
+    model: &str,
+    level: Option<&str>,
+    user: &str,
+    assistant: &str,
+) -> Option<String> {
     let messages = vec![
         json!({
             "role": "system",
@@ -398,7 +448,7 @@ fn title_request(provider: &Provider, model: &str, user: &str, assistant: &str) 
             "content": format!("User: {user}\nAssistant: {assistant}"),
         }),
     ];
-    let extra = json!({ "max_tokens": 200, "temperature": 0.3 });
+    let extra = tool_less_extra(provider, level, 0.3);
     let cancel = http::Cancel::new();
     api::stream_chat(
         &provider.ep,
@@ -1067,10 +1117,11 @@ impl Session {
         }
         let provider = self.providers[self.provider].clone();
         let model = self.model.clone();
+        let level = self.thinking.clone();
         let fallback = sessions::fallback(&self.messages);
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let named = title_request(&provider, &model, &user, &assistant)
+            let named = title_request(&provider, &model, level.as_deref(), &user, &assistant)
                 .as_deref()
                 .and_then(parse_naming)
                 .unwrap_or(fallback);
@@ -1117,9 +1168,15 @@ impl Session {
         }
         let model = self.model.clone();
         let provider = &self.providers[self.provider];
-        let named = title_request(provider, &model, &user, &assistant)
-            .as_deref()
-            .and_then(parse_naming);
+        let named = title_request(
+            provider,
+            &model,
+            self.thinking.as_deref(),
+            &user,
+            &assistant,
+        )
+        .as_deref()
+        .and_then(parse_naming);
         let (title, summary) = named.unwrap_or_else(|| sessions::fallback(&self.messages));
         if title.is_empty() {
             return;
@@ -1503,14 +1560,16 @@ impl Session {
         let cancel = http::Cancel::new();
         let provider = &self.providers[self.provider];
         let model = self.model.clone();
+        let level = self.thinking.clone();
         let mut queued = None;
         let result = match console {
             Console::Screen { screen, rx } => {
                 screen.set_status("▣ Compacting");
                 screen.repaint();
                 let result = thread::scope(|scope| {
-                    let handle =
-                        scope.spawn(|| compact_request(provider, &model, &request, &cancel));
+                    let handle = scope.spawn(|| {
+                        compact_request(provider, &model, level.as_deref(), &request, &cancel)
+                    });
                     let (joined, line) = pump(screen, rx, &cancel, handle);
                     queued = line;
                     joined.unwrap_or_else(|| Err("compaction thread panicked".into()))
@@ -1518,12 +1577,14 @@ impl Session {
                 screen.set_status("");
                 result
             }
-            Console::Stdout => compact_request(provider, &model, &request, &cancel),
+            Console::Stdout => {
+                compact_request(provider, &model, level.as_deref(), &request, &cancel)
+            }
         };
 
         match result {
-            Ok(text) if !text.trim().is_empty() => {
-                let summary = text.trim().to_string();
+            Ok(reply) if !reply.text.trim().is_empty() => {
+                let summary = reply.text.trim().to_string();
                 let replaced = self.messages.len().saturating_sub(2) as u64;
                 let content = format!("{COMPACT_NOTE}\n\n{summary}");
                 self.messages = self.base_messages();
@@ -1541,7 +1602,10 @@ impl Session {
                 }
                 console.output(&format!("◦ compacted {replaced} messages into 1 summary\n"));
             }
-            Ok(_) => console.error("compaction: the model returned nothing"),
+            Ok(reply) => console.error(&format!(
+                "compaction: the model returned nothing ({})",
+                no_text(&reply)
+            )),
             Err(_) if cancel.cancelled() => console.output("× Compaction cancelled\n"),
             Err(e) => console.error(&e),
         }
@@ -3480,6 +3544,52 @@ mod tests {
     }
 
     #[test]
+    fn a_compaction_asks_at_the_sessions_thinking_level_and_with_no_cap() {
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"the summary"}}]}"#,
+            "[DONE]",
+        ])]);
+        let mut session = session_at(&server);
+        session.record(json!({ "role": "assistant", "content": "an answer" }));
+        session.thinking = Some("high".into());
+        session.providers[0].cfg.thinking =
+            vec![("high".into(), json!({ "reasoning_effort": "high" }))];
+        let mut console = Console::Stdout;
+
+        assert!(session.compact(&mut console).is_none());
+        let body = server.text();
+        assert!(body.contains(r#""reasoning_effort":"high""#), "{body}");
+        assert!(body.contains(r#""temperature":0.0"#), "{body}");
+        assert!(!body.contains("max_tokens"), "{body}");
+    }
+
+    #[test]
+    fn a_reply_without_text_names_what_it_did_instead() {
+        let reply = api::Reply {
+            text: String::new(),
+            reasoning: "thought".into(),
+            calls: Vec::new(),
+            usage: Some(api::Usage {
+                prompt: 900,
+                completion: 2000,
+            }),
+            finish_reason: Some("length".into()),
+        };
+        assert_eq!(
+            no_text(&reply),
+            "finish reason: length, 2000 completion tokens, 7 chars of reasoning"
+        );
+
+        let bare = api::Reply {
+            reasoning: String::new(),
+            usage: None,
+            finish_reason: None,
+            ..reply
+        };
+        assert_eq!(no_text(&bare), "the provider sent no text");
+    }
+
+    #[test]
     fn a_session_with_nothing_answered_has_nothing_to_compact() {
         let mut session = bare_session();
         let mut console = Console::Stdout;
@@ -3498,7 +3608,7 @@ mod tests {
             ep: server.ep.clone(),
             ..test_provider()
         };
-        let text = title_request(&provider, "m", "the request", "the answer").unwrap();
+        let text = title_request(&provider, "m", None, "the request", "the answer").unwrap();
         assert_eq!(
             parse_naming(&text),
             Some(("A short title".to_string(), "One sentence.".to_string()))

@@ -28,6 +28,9 @@ pub struct Reply {
     /// Tokens the provider counted for this round, when it reports them: the
     /// whole request, so it is how full the window was.
     pub usage: Option<Usage>,
+    /// Why the stream ended: `stop`, `length`, `tool_calls`. A reply with no
+    /// text can only be explained by this and the token count.
+    pub finish_reason: Option<String>,
 }
 
 pub struct Usage {
@@ -174,6 +177,7 @@ struct Assembler {
     reasoning: String,
     partials: Vec<(String, String, String)>,
     usage: Option<Usage>,
+    finish_reason: Option<String>,
 }
 
 impl Assembler {
@@ -200,7 +204,13 @@ impl Assembler {
             });
         }
 
-        let delta = &chunk["choices"][0]["delta"];
+        let choice = &chunk["choices"][0];
+        // The chunk that ends a choice carries the reason and no delta. Some
+        // servers send an empty string rather than omitting it.
+        if let Some(reason) = choice["finish_reason"].as_str().filter(|r| !r.is_empty()) {
+            self.finish_reason = Some(reason.to_string());
+        }
+        let delta = &choice["delta"];
         // Providers disagree on the key; any non-empty delta means the model is
         // still reasoning and no answer has started.
         let reasoning = delta["reasoning_content"]
@@ -256,6 +266,7 @@ impl Assembler {
             reasoning: self.reasoning,
             calls,
             usage: self.usage,
+            finish_reason: self.finish_reason,
         }
     }
 }
@@ -323,6 +334,32 @@ mod tests {
         assert_eq!(reply.calls[0].name, "read");
         assert_eq!(reply.calls[0].arguments, "{\"path\":\"x\"}");
         assert_eq!(reply.usage.unwrap().prompt, 7);
+        assert!(reply.finish_reason.is_none());
+    }
+
+    #[test]
+    fn the_reason_a_choice_ended_is_kept() {
+        let mut a = Assembler::default();
+        let mut on_text = |_: &str| {};
+        let mut on_reasoning = |_: &str| {};
+        a.absorb(
+            &serde_json::json!({"choices":[{"delta":{},"finish_reason":"length"}]}),
+            &mut on_text,
+            &mut on_reasoning,
+        )
+        .unwrap();
+        assert_eq!(a.finish().finish_reason.as_deref(), Some("length"));
+
+        // The empty string some servers send instead of omitting the field is
+        // not a reason.
+        let mut b = Assembler::default();
+        b.absorb(
+            &serde_json::json!({"choices":[{"delta":{"content":"x"},"finish_reason":""}]}),
+            &mut on_text,
+            &mut on_reasoning,
+        )
+        .unwrap();
+        assert!(b.finish().finish_reason.is_none());
     }
 
     #[test]

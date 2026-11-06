@@ -595,6 +595,7 @@ mod tests {
             reasoning: "thought".into(),
             calls: Vec::new(),
             usage: None,
+            finish_reason: None,
         };
         let message = assistant_message(&reply);
         assert_eq!(message["content"], "answer");
