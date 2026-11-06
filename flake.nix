@@ -19,8 +19,12 @@
           cargoLock.lockFile = ./Cargo.lock;
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
-          # `sessions::gzip_roundtrip` shells out to the host's gzip.
-          nativeCheckInputs = [ pkgs.gzip ];
+
+          # No test run in the sandbox: `cargo test` is the gate CI and the
+          # developer run, and a build that repeats it rebuilds the test
+          # profile on every machine and fails on whatever the sandbox lacks
+          # (an unwritable home, the host's gzip, /bin/sh).
+          doCheck = false;
 
           # Axe shells out to sh, git, rg, fd and gzip. A minimal server has
           # none of them, so the wrapper pins them instead of the config.
