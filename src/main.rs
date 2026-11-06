@@ -1106,7 +1106,7 @@ impl Session {
             self.warn(format!("state: {e}"));
         }
         let label = thinking_label(&self.providers[self.provider].cfg, &self.thinking);
-        console.output(&format!("◦ thinking: {label}\n"));
+        console.output(&format!("thinking: {label}\n"));
     }
 
     fn finalize_session(&mut self) {
@@ -1372,12 +1372,12 @@ impl Session {
     /// search, Enter on an empty line resumes the selected row, Esc closes.
     fn browse_sessions(&mut self, screen: &mut ui::Screen, rx: &Receiver<Event>, query: &str) {
         if self.state.cwd.as_os_str().is_empty() {
-            screen.output("sessions need a working directory\n");
+            screen.error("axe: sessions need a working directory\n");
             return;
         }
         let metas = sessions::list(&self.state.cwd);
         if metas.is_empty() {
-            screen.output("No sessions in this directory.\n");
+            screen.output(NO_SESSIONS);
             return;
         }
         let mut query = query.trim().to_string();
@@ -1393,7 +1393,7 @@ impl Session {
                     .collect()
             };
             if found.is_empty() {
-                screen.output(&format!("◦ No sessions match {query:?}\n"));
+                screen.output(&format!("no sessions match {query:?}\n"));
                 query.clear();
                 continue;
             }
@@ -1524,7 +1524,7 @@ impl Session {
 
         let all = sessions::list(&self.state.cwd);
         if all.is_empty() {
-            println!("no sessions");
+            print!("{NO_SESSIONS}");
             self.picks.clear();
             return;
         }
@@ -1550,6 +1550,9 @@ impl Session {
             }
             println!("{:>2}) {}", at + 1, terminal_text(&row));
         }
+        // The numbers are useless without the line that says what to do with
+        // one, and a run without a terminal cannot arrow its way out.
+        println!("resume with /sessions <n>, or search with /sessions <query>");
     }
 
     /// The live region's last row: what this session is pointed at, how much of
@@ -1627,7 +1630,7 @@ impl Session {
         console.explore(self.mode.explore());
         console.info(self.info());
         console.output(&format!(
-            "Explore: {}\n",
+            "explore: {}\n",
             if self.mode.explore() { "on" } else { "off" }
         ));
         // A running server cannot be narrowed or widened, so flipping the mode
@@ -1678,7 +1681,18 @@ impl Session {
             }
         }
         if out.is_empty() {
-            out.push_str("no skills\n");
+            // The empty list is the one place that has to say how a skill is
+            // made, where axe looks, and that the start is when it is read.
+            out.push_str(&format!(
+                "no skills\n  \
+                 project  .agents/skills/<name>/SKILL.md, in the repository\n  \
+                 global   {}/skills/ and ~/.agents/skills/<name>/SKILL.md\n  \
+                 name and description load at startup, the body on /skill:<name>\n",
+                config::path()
+                    .parent()
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_else(|| ".".to_string())
+            ));
         }
         // Names, descriptions and paths come from a repository: a terminal
         // must not interpret them.
@@ -2163,8 +2177,17 @@ impl Session {
                 Cmd::Continue
             }
             Command::New => {
+                // Read before the reset: the screen is wiped at the boundary, so
+                // this line is the only record of what was just saved.
+                let saved = self.title().filter(|title| !title.trim().is_empty());
                 self.new_session(console.screen());
-                console.output("◦ New session\n");
+                match saved {
+                    Some(title) => console.output(&format!(
+                        "◦ New session (saved: {})\n",
+                        strip_control(&title)
+                    )),
+                    None => console.output("◦ New session\n"),
+                }
                 Cmd::Continue
             }
             Command::Model(spec, scope) => {
@@ -2214,7 +2237,7 @@ impl Session {
                     self.warn(format!("state: {e}"));
                 }
                 console.output(&format!(
-                    "Thoughts: {}\n",
+                    "thoughts: {}\n",
                     if self.state.thoughts { "on" } else { "off" }
                 ));
                 Cmd::Continue
@@ -2246,7 +2269,11 @@ impl Session {
                         }
                     },
                     None => {
-                        console.error(&format!("unknown skill: {name} (see /skills)"));
+                        // A skill is read at startup, so one written this
+                        // session is not in the list yet: say so where it is hit.
+                        console.error(&format!(
+                            "unknown skill: {name} (/skills lists what loaded; a new skill needs a restart)"
+                        ));
                         Cmd::Continue
                     }
                 }
@@ -2628,7 +2655,8 @@ fn choose(
     loop {
         let found = narrow(items, &query);
         if found.is_empty() {
-            screen.output(&format!("No {title} match {query:?}\n"));
+            // The header is prose for a title; the sentence needs it lower.
+            screen.output(&format!("no {} match {query:?}\n", title.to_lowercase()));
             query.clear();
             continue;
         }
@@ -4226,7 +4254,7 @@ mod tests {
             session.browse_sessions(&mut screen, &rx, "");
             let rows = screen.transcript();
             assert!(
-                rows.iter().any(|row| row.contains("No sessions")),
+                rows.iter().any(|row| row.contains("no sessions")),
                 "{rows:?}"
             );
 

@@ -57,8 +57,8 @@ text: no splash, no selection, no prompt and no notice, so `axe < prompts` is a
 filter. A tool call is axe's own account of the turn and goes to stderr, so
 `axe < prompts 2>/dev/null` is the answers alone; what a line explicitly asks
 for (`!cmd`, `/sessions`, `/model`) still prints to stdout. Nothing that needs a
-screen exists there — `/sessions` prints a numbered list to resume from, and the
-startup chooser does not appear.
+screen exists there — `/sessions` prints a numbered list and the line that says
+how to resume one, and the startup chooser does not appear.
 
 The working directory is what the prompt shows, what `AGENTS.md` is looked up
 from, and the key under which the session is remembered.
@@ -154,7 +154,9 @@ A skill is a directory containing `SKILL.md`: YAML frontmatter (`name`,
 `description`) followed by instructions. axe implements the Agent Skills
 format (`agentskills.io`); relative references in the body resolve against the
 skill's directory. Only the name and description are loaded at startup — the
-body is read when the skill is used.
+body is read when the skill is used. A `SKILL.md` written during a session is
+therefore picked up on the next start, which is what `/skills` and an unknown
+`/skill:name` say.
 
 Locations, highest precedence first:
 
@@ -310,7 +312,7 @@ the file.
 | `/thinking [level]` | show or set the thinking level; bare, a chooser over the levels the provider configures |
 | `/thoughts` | show or hide the model's reasoning |
 | `/explore` | toggle explore mode (also Shift+Tab) |
-| `/new` | start a new session, naming the old one and clearing the screen |
+| `/new` | start a new session, naming the one it left and clearing the screen |
 | `/sessions [query]` | browse or search this directory's sessions |
 | `/compact` | summarize the session and continue from the summary |
 | `/skills` | list loaded skills, where they came from, and what the model sees |
@@ -327,10 +329,10 @@ a command, responding — and is blank only when nothing is in flight, so a wait
 on the provider is never a silent row. A glyph leads the states that a user
 interrupts or waits on: `⋯` thinking, `▸` responding, `▷` a command running,
 `▣` compacting, `×` interrupting — and `×` also marks a compaction that was
-cancelled and `◦` every notice axe prints about itself (`Resumed:`, `New
-session`, `compacted N messages`, `No sessions match`, `thinking:`). A chooser is
-the one part sized by the terminal — a window over the transcript, whose rows
-are committed when it closes.
+cancelled and `◦` leads the notices axe prints about itself (`Resumed:`, `New
+session`, `compacted N messages`, `nothing to compact`,
+`default model:`). A chooser is the one part sized by the terminal — a window
+over the transcript, whose rows are committed when it closes.
 
 Recent sessions for the directory are offered at startup as a chooser: Up and
 Down move, Enter resumes, Esc closes it, and typing starts a new session and
