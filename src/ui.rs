@@ -414,6 +414,16 @@ impl Term {
         }
     }
 
+    /// Where the last draw left the cursor. The prompt owns it while a frame is
+    /// up, so a test reads the box's rows from here.
+    #[cfg(test)]
+    fn cursor(&mut self) -> Position {
+        match self {
+            Term::Real(term) => term.get_cursor_position().unwrap_or_default(),
+            Term::Test(term) => term.get_cursor_position().unwrap_or_default(),
+        }
+    }
+
     /// Draw dense rows at an absolute screen position above the viewport: the
     /// rows a shrunk frame left blank. Nothing above the frame is in the
     /// terminal's back buffer, so this goes through the backend, which is what
@@ -1224,7 +1234,11 @@ impl Screen {
         let edge = 2 * PROMPT_EDGE;
         let text_rows = layout.prompt.height.saturating_sub(edge).max(1);
         let first = (crow as usize + 1).saturating_sub(text_rows as usize);
-        let visible = &rows[first.min(rows.len())..];
+        // The window the cursor sits in, never more rows than the box has: a
+        // buffer longer than the box scrolls inside it, so the rows above the
+        // window are as far up as the box is tall.
+        let end = (first + text_rows as usize).min(rows.len());
+        let visible = &rows[first..end];
         let top = layout.prompt_top(visible.len() as u16 + edge);
         // A chooser's rows are its header and its entries; the window follows
         // the selection so the one the next step takes is on screen. Zero
@@ -1399,8 +1413,10 @@ impl Screen {
                 }
                 // A failed `settle` can leave the layout taller than the
                 // screen it was drawn into; the cursor is the one thing that
-                // cannot be clipped by a rect.
-                let row = (top + PROMPT_EDGE + crow).min(screen.bottom().saturating_sub(1));
+                // cannot be clipped by a rect. It is the frame's row, not the
+                // buffer's: the window it scrolls in starts at `first`.
+                let row = (top + PROMPT_EDGE + crow - first as u16)
+                    .min(screen.bottom().saturating_sub(1));
                 frame.set_cursor_position(Position::new(
                     screen.x + margin + PROMPT_EDGE + pad.len() as u16 + ccol,
                     row,
@@ -2452,6 +2468,36 @@ mod tests {
         screen.draw().unwrap();
         assert_eq!(screen.frame().prompt.height, 5);
         assert_eq!(screen.term.area().height, 9);
+    }
+
+    #[test]
+    fn a_prompt_past_its_three_rows_scrolls_the_window_the_cursor_sits_in() {
+        let mut screen = Screen::test_screen(40, 10);
+        for line in ["one", "two", "three"] {
+            typed(&mut screen, line);
+            screen.apply_key(ctrl('j'));
+        }
+        typed(&mut screen, "four");
+        screen.draw().unwrap();
+        // Four lines, three of them shown: the box stops growing, and the
+        // window starts one row down so the cursor's line is the last in it.
+        let frame = screen.frame();
+        assert_eq!(frame.prompt.height, 5);
+        let row = |screen: &Screen, y: u16| -> String {
+            let at = y as usize * 40;
+            screen.test_buffer().content[at..at + 40]
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect()
+        };
+        assert!(row(&screen, frame.prompt.y + 1).contains("two"));
+        assert!(row(&screen, frame.prompt.y + 2).contains("three"));
+        assert!(row(&screen, frame.prompt.y + 3).contains("four"));
+        // The cursor is a row of the window, not of the buffer: past the third
+        // line it used to walk down the border and out of the box.
+        let cursor = screen.term.cursor();
+        assert_eq!(cursor.y, frame.prompt.y + 3);
+        assert_eq!(cursor.x, 3 + 4);
     }
 
     #[test]
