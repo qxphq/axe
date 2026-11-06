@@ -35,7 +35,7 @@ use serde_json::{json, Value};
 use prompt::{mode_note, system_with_instructions};
 use render::{call_line, detail, failed, line_of, mark, plain_text, shell_line, Paint};
 use store::{history_bytes, weight, Live, Store, COMPACT_NOTE};
-use text::{strip_control, terminal_text};
+use text::{head_tail, plural, strip_control, terminal_text};
 use turn::{PlainSink, Queue, Sink, TextSink};
 
 #[derive(Clone)]
@@ -471,13 +471,16 @@ fn compaction_prompt(messages: &[Value], budget: usize) -> String {
             } else {
                 (2000, 500)
             };
-            lines.push(format!("{role}: {}", cut(text, head, tail)));
+            lines.push(format!("{role}: {}", head_tail(text, head, tail)));
         }
         if let Some(calls) = message["tool_calls"].as_array() {
             for call in calls {
                 let name = call["function"]["name"].as_str().unwrap_or("");
                 let args = call["function"]["arguments"].as_str().unwrap_or("");
-                lines.push(format!("{role}: calls {name} {}", cut(args, 300, 100)));
+                lines.push(format!(
+                    "{role}: calls {name} {}",
+                    head_tail(args, 300, 100)
+                ));
             }
         }
     }
@@ -497,18 +500,6 @@ fn compaction_prompt(messages: &[Value], budget: usize) -> String {
         out.push('\n');
     }
     out
-}
-
-/// `text` cut to `head` chars from the front and `tail` from the end, marked
-/// where it was cut.
-fn cut(text: &str, head: usize, tail: usize) -> String {
-    let count = text.chars().count();
-    if count <= head + tail + 1 {
-        return text.to_string();
-    }
-    let front: String = text.chars().take(head).collect();
-    let back: String = text.chars().skip(count - tail).collect();
-    format!("{front}…[cut]…{back}")
 }
 
 /// One small completion, without tools. The session header stays: providers
@@ -2907,14 +2898,6 @@ fn banner(notes: &[String]) {
     println!();
 }
 
-fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
-}
-
 fn session_id() -> String {
     let mut bytes = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -2973,7 +2956,7 @@ fn resolve(providers: &[Provider], spec: Option<&str>) -> (usize, String) {
 mod tests {
     use super::*;
 
-    use crate::render::summarize;
+    use crate::text::oneline;
 
     /// The info row as one line: the screen joins the pieces, and so does
     /// anything that asserts on them.
@@ -3113,7 +3096,7 @@ mod tests {
         assert!(prompt.len() < 1500);
         assert!(prompt.contains("newest"));
         // Short text is left alone.
-        assert_eq!(cut("abc", 2, 2), "abc");
+        assert_eq!(head_tail("abc", 2, 2), "abc");
     }
 
     #[test]
@@ -3185,7 +3168,7 @@ mod tests {
         assert_eq!(mark("bash", "exit: 0\n").1, "✓");
         assert_eq!(mark("bash", "exit: 1\n").1, "✗");
         assert_eq!(detail("exit: 1\nboom\nmore"), "boom…");
-        assert_eq!(summarize("a\nb", 10), "a…");
+        assert_eq!(oneline("a\nb", 10), "a…");
     }
 
     #[test]

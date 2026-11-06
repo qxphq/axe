@@ -41,6 +41,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::editor::Buffer;
 use crate::markdown;
+use crate::text::clip;
 
 /// Blank cells at each screen edge: nothing is written against the border.
 const PAD: u16 = 1;
@@ -1941,31 +1942,6 @@ fn info_line(parts: &[(Info, String)], width: usize) -> Line<'static> {
         spans.push(Span::styled(text, kind.style()));
     }
     Line::from(spans)
-}
-
-/// Fit text into `width` cells. The selection row is the only row whose length
-/// the user controls (`model` ids and thinking levels), so a narrow terminal
-/// gets an ellipsis instead of a word cut in half.
-fn clip(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if text.width() <= width {
-        return text.to_string();
-    }
-    let limit = width.saturating_sub(1);
-    let mut out = String::new();
-    let mut used = 0;
-    for c in text.chars() {
-        let cells = c.width().unwrap_or(1);
-        if used + cells > limit {
-            break;
-        }
-        out.push(c);
-        used += cells;
-    }
-    out.push('…');
-    out
 }
 
 /// The area with `pad` blank cells taken off the left and right edges.

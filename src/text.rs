@@ -9,6 +9,7 @@
 use std::io::{self, IsTerminal};
 
 use ratatui::style::{Color, Modifier, Style};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Drop control bytes, keeping the two that lay text out. Content is never
 /// trusted to be text: a page that carries ESC would otherwise paint.
@@ -45,6 +46,66 @@ pub fn truncate(text: String, max: usize) -> String {
     let head: String = text.chars().take(head_len).collect();
     let tail: String = text.chars().skip(total - tail_len).collect();
     format!("{head}{marker}{tail}")
+}
+
+/// The suffix a count takes: `format!("{n} item{}", plural(n))`.
+pub fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// Fit text into `width` cells, ending with an ellipsis when it did not fit.
+/// The one cap for text the user controls — a model id, a path, a title — so a
+/// narrow row loses its tail rather than a word's second half.
+pub fn clip(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let limit = width.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let cells = c.width().unwrap_or(1);
+        if used + cells > limit {
+            break;
+        }
+        out.push(c);
+        used += cells;
+    }
+    out.push('…');
+    out
+}
+
+/// The first line of `text`, capped at `max` cells, marked when anything was
+/// dropped: a command or a tool call is one transcript line, whatever its
+/// argument held.
+pub fn oneline(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or("");
+    let cut = line.width() > max;
+    let mut out = clip(line, max);
+    if !cut && text.lines().count() > 1 {
+        out.push('…');
+    }
+    out
+}
+
+/// Keep both ends of `text`, `head` chars from the front and `tail` from the
+/// back, marked where it was cut: the error is at the end and the command at
+/// the start.
+pub fn head_tail(text: &str, head: usize, tail: usize) -> String {
+    let count = text.chars().count();
+    if count <= head + tail + 1 {
+        return text.to_string();
+    }
+    let front: String = text.chars().take(head).collect();
+    let back: String = text.chars().skip(count - tail).collect();
+    format!("{front}…[cut]…{back}")
 }
 
 /// A styled span as an ANSI string, for the paths that have no screen. The

@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 
 use crate::api;
+use crate::text;
 
 /// A style this binary uses for transcript text. Two renderers read it: the
 /// screen's cells, and ANSI escapes when there is no screen.
@@ -72,7 +73,7 @@ pub(crate) fn shell_line(command: &str, explore: bool) -> Vec<(Paint, String)> {
         (Paint::Plain, "  ".to_string()),
         (paint, "▷".to_string()),
         (Paint::Plain, " ".to_string()),
-        (paint, summarize(command, 120)),
+        (paint, text::oneline(command, 120)),
     ]
 }
 
@@ -101,7 +102,7 @@ pub(crate) fn call_line(call: &api::ToolCall, explore: bool) -> Vec<(Paint, Stri
     let mut parts = Vec::new();
     for key in ["path", "file", "pattern", "url", "query"] {
         if let Some(s) = v[key].as_str() {
-            parts.push(summarize(s, 120));
+            parts.push(text::oneline(s, 120));
         }
     }
     // A partial read is only reproducible with its window, so echo it. `fetch`
@@ -183,16 +184,7 @@ pub(crate) fn detail(result: &str) -> String {
         Some(rest) => rest.split_once('\n').map(|(_, body)| body).unwrap_or(""),
         None => result,
     };
-    summarize(body.trim_start_matches('\n'), 120)
-}
-
-pub(crate) fn summarize(text: &str, max: usize) -> String {
-    let line = text.lines().next().unwrap_or("");
-    let mut out: String = line.chars().take(max).collect();
-    if line.chars().count() > max || text.lines().count() > 1 {
-        out.push('…');
-    }
-    out
+    text::oneline(body.trim_start_matches('\n'), 120)
 }
 
 #[cfg(test)]

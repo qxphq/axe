@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 
 use crate::http::Cancel;
 use crate::state;
-use crate::text::{strip_control, truncate};
+use crate::text::{clip, plural, strip_control, truncate};
 
 /// The revision axe speaks and the versions it understands. A server answers
 /// with the one it will use; axe does not check it, the shapes it needs are in
@@ -577,7 +577,7 @@ impl Server {
                     .unwrap_or_else(|| format!("MCP server \"{}\" tool \"{name}\"", self.name));
                 self.listed.push(Listed {
                     original: name.to_string(),
-                    description: cut(&description, DESCRIPTION_CAP),
+                    description: clip(&description, DESCRIPTION_CAP),
                     schema,
                 });
             }
@@ -701,7 +701,7 @@ impl Server {
         let mut out = "the server exited".to_string();
         if !tail.is_empty() {
             out.push_str(": ");
-            out.push_str(&cut(&strip_control(&tail), 800));
+            out.push_str(&clip(&strip_control(&tail), 800));
         }
         out
     }
@@ -1009,7 +1009,7 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
         match Server::open(entry, explore) {
             Ok(server) => {
                 notices.push(format!(
-                    "mcp {}: {} {}{}",
+                    "mcp {}: {} tool{}{}",
                     entry.name,
                     server.listed.len(),
                     plural(server.listed.len()),
@@ -1177,7 +1177,7 @@ pub fn restart(explore: bool) -> Vec<String> {
                     });
                 }
                 notices.push(format!(
-                    "mcp {}: {} {}{}",
+                    "mcp {}: {} tool{}{}",
                     entry.name,
                     server.tools.len(),
                     plural(server.tools.len()),
@@ -1252,7 +1252,7 @@ fn listing() -> String {
         let status = match (&reg.running[at], &reg.failures[at], entry.enabled) {
             (_, _, false) => "disabled".to_string(),
             (Some(server), _, _) => {
-                format!("{} {}", server.tools.len(), plural(server.tools.len()))
+                format!("{} tool{}", server.tools.len(), plural(server.tools.len()))
             }
             (None, Some(e), _) => format!("failed: {e}"),
             (None, None, _) => "failed".to_string(),
@@ -1303,7 +1303,7 @@ fn detail(name: &str) -> String {
                 out.push_str(&format!("  {}\n", strip_control(&tool.exposed)));
             }
             out.push_str(&format!(
-                "  {} {}\n",
+                "  {} tool{}\n",
                 server.tools.len(),
                 plural(server.tools.len())
             ));
@@ -1494,24 +1494,6 @@ fn remove_entry(path: &Path, name: &str) -> Result<bool, String> {
 
 /// Char-safe cut, marked at the end: a description or a stderr tail longer
 /// than the cap must not split a character.
-fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        "tool"
-    } else {
-        "tools"
-    }
-}
-
-fn cut(text: &str, max: usize) -> String {
-    let count = text.chars().count();
-    if count <= max {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max.saturating_sub(12)).collect();
-    out.push_str(" …[truncated]");
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use crate::http::Cancel;
 use crate::sandbox;
-use crate::text::truncate;
+use crate::text::{plural, truncate};
 
 struct Spec {
     name: &'static str,
@@ -566,14 +566,6 @@ fn read_output(file: &mut File, max: u64) -> String {
         let _ = file.seek(SeekFrom::Start(0));
         let _ = file.read_to_end(&mut bytes);
         String::from_utf8_lossy(&bytes).into_owned()
-    }
-}
-
-fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
     }
 }
 
