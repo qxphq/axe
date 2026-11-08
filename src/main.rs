@@ -1481,7 +1481,8 @@ impl Session {
 
     /// `/compact`: ask the model to summarize the session, then continue from
     /// the summary. The body is not rewritten — the summary is appended as a
-    /// marked user message and the loader starts replay from it.
+    /// marked user message and the loader starts replay from it. It is printed
+    /// once, under the notice, because it is what the model now carries.
     ///
     /// A line submitted while the request runs comes back like `shell`'s: the
     /// prompt stays live, and nothing typed is lost.
@@ -1555,6 +1556,7 @@ impl Session {
                     screen.set_info(self.info());
                 }
                 console.output(&format!("◦ compacted {replaced} messages into 1 summary\n"));
+                console.text(&summary);
             }
             Ok(reply) => console.error(&format!(
                 "compaction: the model returned nothing ({})",
@@ -2127,6 +2129,23 @@ impl Console<'_> {
                 print!("{}", terminal_text(text));
                 if !text.ends_with('\n') {
                     println!();
+                }
+            }
+        }
+    }
+
+    /// The model's words when no turn is around them: `/compact`'s summary is
+    /// markdown like an answer, written as its own block; a pipe renders it the
+    /// same way it renders a turn's text.
+    fn text(&mut self, text: &str) {
+        match self {
+            Console::Screen { screen, .. } => {
+                screen.text(text);
+                screen.flush();
+            }
+            Console::Stdout => {
+                for line in markdown::document(text, 0) {
+                    println!("{}", markdown::ansi(&line));
                 }
             }
         }

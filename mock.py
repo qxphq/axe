@@ -23,7 +23,8 @@ The reply is chosen by the last user message:
 
 A request whose system prompt starts with "You name conversations" is a title
 request: the mock answers `plain:TITLE: ...\nSUMMARY: ...` regardless of the
-last user message.
+last user message. One that starts with "You summarize" is `/compact`: the
+answer is a fixed `plain:## Task\n\nMock summary of the session.`.
 
 Usage: mock.py [port]
 """
@@ -177,6 +178,10 @@ class Handler(BaseHTTPRequestHandler):
                 break
         if system.startswith("You name conversations"):
             reply = "plain:TITLE: Mock session title\nSUMMARY: A mock conversation about session replay."
+        elif system.startswith("You summarize"):
+            # `/compact`: a fixed summary, so a test can read the block it
+            # prints without depending on the transcript it summarized.
+            reply = "plain:## Task\n\nMock summary of the session."
         else:
             for message in reversed(request.get("messages", [])):
                 if message.get("role") == "user":

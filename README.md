@@ -482,12 +482,15 @@ first answer, and fall back to the first request if that fails.
 
 `/compact` replaces the history with a summary of it. The body is not rewritten:
 the summary is appended as a marked message, and reading a body starts from the
-last marker, so replay matches what the live session sent. What came before the
-marker stays on disk and `/sessions` search still finds it. The summary keeps
-the system prompt and the current mode note; a session that has been compacted
-lists the messages the model still has, not the bytes in the file. The summary
-and the naming request are the only ones axe sends without tools, and they run
-at the session's thinking level with no output cap: a cap small enough for the
+last marker, so replay matches what the live session sent. The summary is
+printed in the transcript when it is made — a block of its own, under the notice
+that records the compaction — so what the model now carries is readable; a
+resume does not print it again. What came before the marker stays on disk and
+`/sessions` search still finds it. The summary keeps the system prompt and the
+current mode note; a session that has been compacted lists the messages the
+model still has, not the bytes in the file. The summary and the naming request
+are the only ones axe sends without tools, and they run at the session's
+thinking level with no output cap: a cap small enough for the
 answer is one a thinking model can spend on reasoning before it writes a word.
 A compaction that comes back empty reports what the reply did instead — the
 reason the stream ended and the tokens it took — which is the difference between

@@ -260,11 +260,14 @@ invariants a change must not break.
   older than `sessions::KEEP` are gzipped. The sidecar stays readable, so listing
   and search work without unpacking. A compacted body carries a marked summary
   and the loader returns the messages from the last marker on, with the marker's
-  key stripped: the marker is a file record, never a request field. The system prompt and mode notes are never
-  logged; resume rebuilds them. A title and summary are generated once, after the
-  first answer; failing that, the first request stands in. The project directory
-  also holds `plan/`, the one writable path explore mode keeps across sessions,
-  `history.jsonl`, the prompt lines typed there: one JSON string per line,
+  key stripped: the marker is a file record, never a request field. The summary
+  reaches the transcript once, as its own block under the notice that records
+  it; a resume starts from it without printing it again. The system prompt and
+  mode notes are never logged; resume rebuilds them. A title and summary are
+  generated once, after the first answer; failing that, the first request
+  stands in. The project directory also holds `plan/`, the one writable path
+  explore mode keeps across sessions, `history.jsonl`, the prompt lines typed
+  there: one JSON string per line,
   the newest 500, the same `0600`, and `mcp-trust.json`, the approved project
   MCP files by path and content hash. A blank, a leading space and a repeat of
   the newest are not steps.
@@ -309,6 +312,14 @@ those pages on loopback and sets `AXE_FETCH_ALLOW_LOCAL=1`; that variable is a
 calling the same tool, so end it with `!Escape` and read the result with `show:`;
 the first line says which engine answered. `BRAVE_SEARCH_API_KEY` selects Brave;
 unset means DuckDuckGo, and a bogus value exercises the fallback.
+
+`/compact` needs a history to summarize: one turn, then the command. The mock
+answers a request whose system prompt starts with "You summarize" with a fixed
+markdown summary, which the transcript carries under the notice.
+
+```sh
+./harness.py --wait 1 'text:hi' '/compact' --expect 'Mock summary of the session'
+```
 
 Skills are checked with a `.agents/skills/<name>/SKILL.md` under `--work DIR`:
 `/skills` lists it and `/skill:name` runs the body. The sandbox is checked the
