@@ -182,6 +182,20 @@ class Tmux:
         self.run("send-keys", "-t", self.session, "-l", "--", text, check=True)
         self.run("send-keys", "-t", self.session, "Enter", check=True)
 
+    def resize(self, cols, rows):
+        # A detached session has no client to resize, so the window is resized
+        # directly and the pane follows: the same signal a split sends.
+        self.run(
+            "resize-window",
+            "-t",
+            self.session,
+            "-x",
+            str(cols),
+            "-y",
+            str(rows),
+            check=True,
+        )
+
     def send_keys(self, keys):
         self.run("send-keys", "-t", self.session, *keys, check=True)
 
@@ -263,7 +277,10 @@ def settle(tmux, wait, timeout, scroll, ansi):
 def main():
     ap = argparse.ArgumentParser(
         description="Run axe against mock.py in a pty and print the screen.",
-        epilog="An argument starting with ! is sent as tmux keys, not as a turn.",
+        epilog=(
+            "An argument starting with ! is sent as tmux keys, not as a turn; "
+            "@resize:COLSxROWS resizes the pane like a terminal does."
+        ),
     )
     ap.add_argument("turns", nargs="*", metavar="ARG")
     ap.add_argument("--bin", default=str(DEFAULT_BIN), help="axe binary")
@@ -344,6 +361,8 @@ def main():
         for arg in args.turns:
             if arg.startswith("!"):
                 tmux.send_keys(arg[1:].split())
+            elif arg.startswith("@resize:"):
+                tmux.resize(*parse_size(arg[len("@resize:") :]))
             else:
                 tmux.send_literal(arg)
             settle(tmux, args.wait, args.timeout, args.scroll, args.ansi)

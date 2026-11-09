@@ -578,6 +578,10 @@ pub struct Screen {
     /// State changed since the last frame. The loops paint; the setters only
     /// mark, so a change made while nobody is drawing cannot be lost.
     dirty: bool,
+    /// The terminal size the last frame was drawn at. A resize reflows the
+    /// pane and moves the text under the frame, which is what makes the rows
+    /// above it stop being known blank.
+    size: Option<Size>,
 }
 
 impl Screen {
@@ -647,6 +651,7 @@ impl Screen {
             menu: None,
             restored: false,
             dirty: true,
+            size: None,
         }
     }
 
@@ -1225,6 +1230,7 @@ impl Screen {
         self.thought = markdown::Stream::new();
         self.last = None;
         self.slack = 0;
+        self.size = None;
         self.menu = None;
         self.status.clear();
         self.alert = None;
@@ -1264,6 +1270,13 @@ impl Screen {
         // before reading the size. A failure only delays it to the next draw.
         let _ = self.term.autoresize();
         let size = self.term.size()?;
+        // A resize reflows the pane: the terminal rewraps the transcript, so
+        // the rows above the frame are no longer known blank, and the area it
+        // derives for the frame comes from a cursor the reflow moved. Claim no
+        // slack; `settle` puts the frame back on the bottom.
+        if self.size.is_some_and(|last| last != size) {
+            self.slack = 0;
+        }
         let width = size.width;
         let margin = PAD.min(width.saturating_sub(1));
         let cols = (width as usize).saturating_sub(2 * margin as usize);
@@ -1486,6 +1499,7 @@ impl Screen {
             .map(|_| ());
         if frame.is_ok() {
             self.dirty = false;
+            self.size = Some(size);
         }
         frame
     }
@@ -1513,7 +1527,12 @@ impl Screen {
         let size = self.term.size()?;
         let height = height.min(size.height).max(1);
         let area = self.term.area();
-        if area.height == height {
+        // `top` is where the frame belongs: the screen bottom less its rows. A
+        // resize derives the area from the cursor, which the terminal moves
+        // with a reflowed pane, so the frame can be left above the bottom while
+        // its height stays the same.
+        let top = size.height - height;
+        if area.height == height && area.y == top {
             return Ok(());
         }
         if height > area.height {
@@ -1525,7 +1544,6 @@ impl Screen {
         }
         // An inline area starts at the cursor row and this one's bottom is the
         // screen's, so the cursor goes where the new top has to be.
-        let top = size.height - height;
         self.term.set_cursor_position(Position::new(0, top))?;
         self.term.reshape(height)?;
         // Blank the whole region and force a full repaint.
@@ -3225,6 +3243,52 @@ mod tests {
         check(&mut screen, 8 + (height / 3).clamp(2, 10), height);
         screen.clear_menu(false);
         check(&mut screen, 7, height);
+    }
+
+    #[test]
+    fn a_resize_leaves_the_frame_on_the_bottom() {
+        let mut screen = Screen::test_screen(40, 24);
+        screen.echo_user("a question");
+        screen.output("an answer");
+        screen.draw().unwrap();
+        assert_eq!(screen.term.area().top(), 24 - 7);
+        // A pane the terminal reflowed moves the text under the frame, and the
+        // cursor with it. ratatui derives the inline area from that cursor, so
+        // the frame is left above the bottom of the screen unless it is settled
+        // again; the height it shows has not changed, so only the top says so.
+        let reflow = |screen: &mut Screen, cols: u16, cursor: u16| {
+            match &mut screen.term {
+                Term::Test(term) => {
+                    term.backend_mut().resize(cols, 24);
+                    term.backend_mut()
+                        .set_cursor_position(Position::new(0, cursor))
+                        .unwrap();
+                }
+                Term::Real(_) => unreachable!(),
+            }
+            screen.invalidate();
+            screen.draw().unwrap();
+        };
+        reflow(&mut screen, 39, 16);
+        assert_eq!(screen.term.area().top(), 24 - 7);
+        // Nothing of the old frame is left above it.
+        let box_top = screen.term.area().top() + 1;
+        let rows: Vec<String> = screen
+            .test_buffer()
+            .content
+            .chunks(39)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        assert!(rows[box_top as usize].starts_with(" ┌"), "{:?}", rows);
+        assert!(
+            !rows[..box_top as usize].iter().any(|row| row.contains('┌')),
+            "an old prompt row survived the resize: {rows:?}"
+        );
+        // The other way: a reflow that moves the cursor up the screen leaves the
+        // frame above the bottom with blank rows under it.
+        reflow(&mut screen, 38, 14);
+        assert_eq!(screen.term.area().top(), 24 - 7);
+        assert_eq!(screen.term.area().height, 7);
     }
 
     #[test]

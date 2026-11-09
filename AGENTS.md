@@ -96,8 +96,11 @@ invariants a change must not break.
     dirty; `Screen::repaint()` paints only then, and the loops call it —
     `readline` on entry, on every key and on its idle tick, the turn and shell
     loops once per drained batch; a resize invalidates first, so the area under
-    us is repainted even when no state changed. No caller draws for a state
-    change, so work that finishes off the UI thread cannot strand the row.
+    us is repainted even when no state changed. It also settles the frame back
+    on the bottom — a reflow moves the text, and the inline area comes from the
+    cursor it moved — and drops `slack`, because no row above the frame is
+    known blank any more. No caller draws for a state change, so work that
+    finishes off the UI thread cannot strand the row.
     Startup banner and piped output run before/without a `Screen`; a stray
     `print!` while it exists is a rendering bug. A piped run has no prompt,
     splash or notice — stdout is the model's text (and what a line asked for),
@@ -301,6 +304,9 @@ python3 and tmux. `--work DIR` keeps one directory and its state; `--wait` and
 `--timeout` bound idling; `--bin` selects the binary; `--ansi`/`--scroll` control
 the dump, and `--expect`/`--refute` make it an assertion. See `harness.py --help`
 and `mock.py` for fixtures and replies.
+
+`@resize:COLSxROWS` resizes the pane between steps, which is what a terminal
+split does; it is how the frame's re-anchoring is checked.
 
 `fetch:PAGE` has the mock call `fetch` on a fixture page (plain, inject, big,
 image, redirect, latin1, slow); `PAGE@START+CHARS` sets paging. The harness serves
