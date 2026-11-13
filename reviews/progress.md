@@ -1,0 +1,43 @@
+# Review progress — round 1
+
+Check off each review once it has been run, its findings triaged, and its
+confirmed fixes shipped.
+
+Starting a new round: bump the round number in the heading and uncheck every
+box.
+
+## Correctness and invariants
+
+- [ ] [Turn loop and history](turn-and-history.md)
+- [ ] [Sessions and per-directory state](sessions-and-state.md)
+- [ ] [HTTP client, SSE, and the provider contract](http-and-sse.md)
+- [ ] [Concurrency and cancellation](concurrency.md)
+
+## Security and boundaries
+
+- [ ] [Sandbox and confinement](sandbox.md)
+- [ ] [Trust boundaries and secret hygiene](trust-and-secrets.md)
+- [ ] [Web access: fetch and search](web-tools.md)
+
+## Terminal behavior
+
+- [ ] [Frame and transcript](frame-and-transcript.md)
+- [ ] [Prompt editing and completion](prompt-editing.md)
+- [ ] [Rendering and streaming](rendering.md)
+
+## Prompt, tools, and extensions
+
+- [ ] [System prompt and skills](prompt-prefix.md)
+- [ ] [Tool contract](tool-contract.md)
+- [ ] [Config and MCP](config-and-mcp.md)
+
+## Context and cost
+
+- [ ] [Token efficiency and context economics](token-efficiency.md)
+
+## Quality and delivery
+
+- [ ] [LLM ergonomics and documentation freshness](llm-ergonomics.md)
+- [ ] [Test coverage and test quality](test-coverage.md)
+- [ ] [Release and packaging](release-and-packaging.md)
+- [ ] [Performance and snappiness](performance-and-snappiness.md)
