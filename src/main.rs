@@ -24,6 +24,7 @@ mod ui;
 mod web;
 
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -122,11 +123,13 @@ fn main() {
         Cli::Run => {}
     }
     let result = startup::run();
+    // MCP servers are ours: nothing outlives the session that started it. They
+    // go first — a server still alive has the scratch in its write rules and
+    // could put a file back under it.
+    mcp::shutdown();
     // The scratch directory is the one thing a session creates outside the
     // terminal; a static's `Drop` never runs, so this is the hook.
     sandbox::cleanup();
-    // MCP servers are ours: nothing outlives the session that started it.
-    mcp::shutdown();
     if let Err(e) = result {
         eprintln!("axe: {}", strip_control(&e));
         std::process::exit(1);
@@ -629,6 +632,12 @@ fn help_text() -> String {
 
 // ---- the session ----
 
+/// Whether the line loop is done: nothing a finished turn handed back, and no
+/// input thread left to send another line.
+fn done(pending: &VecDeque<String>, input_ended: bool) -> bool {
+    pending.is_empty() && input_ended
+}
+
 impl Session {
     /// One line at a time from a terminal we own. Keys arrive on the channel, so
     /// a turn in flight never blocks the prompt.
@@ -650,7 +659,7 @@ impl Session {
             );
         }
         let (tx, rx) = mpsc::channel();
-        spawn_input(tx.clone());
+        let input = spawn_input(tx.clone());
 
         // A line submitted mid-turn arrives here when the turn could not take
         // it: a command, which needs the session and the screen, or a request
@@ -662,6 +671,11 @@ impl Session {
             self.poll_naming(Some(&mut screen));
             let (line, was_queued) = match pending.pop_front() {
                 Some(line) => (line, true),
+                // A line a finished turn handed back is still the user's; the
+                // prompt is only reached while input is still there, and a
+                // turn or a command that consumed the `Eof` event must not
+                // leave the loop waiting for a key no thread can send.
+                None if done(&pending, input.load(Ordering::SeqCst)) => break,
                 None => {
                     // The title request lands while this loop blocks on keys:
                     // the idle tick applies it and repaints the row.
@@ -1463,6 +1477,7 @@ impl Session {
             joined.unwrap_or_else(|| "error: shell thread panicked".into())
         });
         screen.set_status("");
+        screen.set_alert(None);
         screen.insert(
             vec![line_of(&shell_echo(command, &result))],
             ui::Block::Tool,
@@ -1537,6 +1552,7 @@ impl Session {
                     joined.unwrap_or_else(|| Err("compaction thread panicked".into()))
                 });
                 screen.set_status("");
+                screen.set_alert(None);
                 result
             }
             Console::Stdout => {
@@ -1999,6 +2015,9 @@ impl Held {
                 return true;
             }
             Event::Eof => {
+                // Nothing more can arrive: the stream stops here, and a cut
+                // reply must not read like a finished one.
+                self.interrupted = true;
                 cancel.cancel();
                 return true;
             }
@@ -2034,6 +2053,9 @@ impl Held {
         }
         match screen.apply_key(key) {
             ui::Action::Eof => {
+                // End of input stops the turn it meets, and says so: the reply
+                // it cuts is partial.
+                self.interrupted = true;
                 cancel.cancel();
                 return true;
             }
@@ -3570,6 +3592,76 @@ mod tests {
         );
         assert!(!rows.iter().any(|row| row.contains("exit:")), "{rows:?}");
         assert!(rows.iter().any(|row| row.contains("sous")), "{rows:?}");
+    }
+
+    #[test]
+    fn one_escape_offers_and_two_stop_a_command() {
+        // One press asks, and the work is left alone.
+        let cancel = http::Cancel::new();
+        let (tx, rx) = events();
+        tx.send(down(KeyCode::Esc)).unwrap();
+        let mut screen = ui::Screen::test_screen(60, 20);
+        thread::scope(|scope| {
+            let handle = scope.spawn(|| 1u32);
+            let (joined, queued) = pump(&mut screen, &rx, &cancel, handle);
+            assert_eq!(joined, Some(1));
+            assert!(queued.is_none());
+        });
+        assert!(!cancel.cancelled(), "one press offers, it does not stop");
+        drop(tx);
+
+        // A key between the presses withdraws the offer.
+        let cancel = http::Cancel::new();
+        let (tx, rx) = events();
+        tx.send(down(KeyCode::Esc)).unwrap();
+        tx.send(down(KeyCode::Char('q'))).unwrap();
+        tx.send(down(KeyCode::Esc)).unwrap();
+        let mut screen = ui::Screen::test_screen(60, 20);
+        thread::scope(|scope| {
+            let handle = scope.spawn(|| 1u32);
+            pump(&mut screen, &rx, &cancel, handle);
+        });
+        assert!(!cancel.cancelled(), "the typing withdrew the offer");
+        drop(tx);
+
+        // Two presses in a row stop it.
+        let cancel = http::Cancel::new();
+        let (tx, rx) = events();
+        tx.send(down(KeyCode::Esc)).unwrap();
+        tx.send(down(KeyCode::Esc)).unwrap();
+        let mut screen = ui::Screen::test_screen(60, 20);
+        thread::scope(|scope| {
+            let handle = scope.spawn(|| 1u32);
+            pump(&mut screen, &rx, &cancel, handle);
+        });
+        assert!(cancel.cancelled());
+        drop(tx);
+    }
+
+    #[test]
+    fn the_line_loop_stops_only_with_nothing_left_and_no_input() {
+        let mut pending = VecDeque::new();
+        assert!(!done(&pending, false), "input is still there");
+        assert!(done(&pending, true), "nothing queued and no input: done");
+        pending.push_back("line".to_string());
+        assert!(
+            !done(&pending, true),
+            "a line a turn handed back still runs"
+        );
+        assert!(!done(&pending, false));
+    }
+
+    #[test]
+    fn end_of_input_stops_a_turn_and_says_so() {
+        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
+        let cancel = http::Cancel::new();
+        let mut screen = ui::Screen::test_screen(60, 20);
+        let mut held = Held::default();
+        let mut used = None;
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(held.event(Event::Key(key), &mut screen, &queue, &cancel, &mut used));
+        assert!(cancel.cancelled(), "the running request is stopped");
+        assert!(held.interrupted, "and the cut reply is announced");
     }
 
     #[test]

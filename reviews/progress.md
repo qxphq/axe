@@ -11,7 +11,7 @@ box.
 - [x] [Turn loop and history](turn-and-history.md)
 - [x] [Sessions and per-directory state](sessions-and-state.md)
 - [x] [HTTP client, SSE, and the provider contract](http-and-sse.md)
-- [ ] [Concurrency and cancellation](concurrency.md)
+- [x] [Concurrency and cancellation](concurrency.md)
 
 ## Security and boundaries
 

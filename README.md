@@ -387,13 +387,15 @@ working rather than after it is done. `↑` takes them all back into the prompt,
 order and above whatever was typed, and empties the queue: a line the turn has
 already read cannot be called back, and its echo stays in the transcript. A
 command (`/model`, `/sessions`, `!cmd`) needs the prompt and the session, so it
-waits for the turn to end. Interrupting takes two presses: the first puts
-the offer on the row under the prompt, any other key withdraws it, and the
-second stops the turn — which then says so in the transcript, because a cut
-reply reads like a finished one. A reply the provider cut at its own limit, or
-one whose stream died before its end, gets the same line beneath it: the text
-that arrived is the model's and stays in the session, and the line says the
-round was not whole.
+waits for the turn to end. Interrupting takes two presses — for a turn, a
+`!cmd` and a `/compact` alike: the first puts the offer on the row under the
+prompt, any other key withdraws it, and the second stops what is running. A
+stopped turn says so in the transcript, because a cut reply reads like a
+finished one; a stopped command shows its own words, and a cancelled compaction
+its notice. Ctrl+D in the prompt stops a running turn the same way. A reply the
+provider cut at its own limit, or one whose stream died before its end, gets
+the same line beneath it: the text that arrived is the model's and stays in the
+session, and the line says the round was not whole.
 
 The row under the prompt is what the turn is doing on the left, and on the right
 the session's name, the directory it runs in, the provider/model and thinking

@@ -1663,10 +1663,11 @@ pub fn restart(explore: bool) -> Vec<String> {
     notices
 }
 
-/// At exit: no server outlives the session that started it.
+/// At exit: no server outlives the session that started it. The registry is
+/// taken through `lock`, which recovers a poison a panicking call may have
+/// left behind — a failed cleanup must not be the way a server survives.
 pub fn shutdown() {
-    let reg = registry();
-    let Ok(mut reg) = reg.lock() else { return };
+    let mut reg = lock();
     for server in reg.running.iter_mut().flatten() {
         server.stop();
     }
@@ -2512,6 +2513,44 @@ done
         assert!(result.contains("interrupted"), "{result}");
         assert_eq!(server.call("slow", &json!({}), &Cancel::new()), "late");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_poisoned_registry_still_stops_its_servers() {
+        // The environmental lock serialises this with the one test that reads
+        // the process-wide registry for its emptiness.
+        state::testenv::home("mcp-poison", |home| {
+            let dir = home.join("srv");
+            fs::create_dir_all(&dir).unwrap();
+            let args = stdio_fixture(&dir);
+            let mut e = entry("t", "/bin/sh");
+            e.args = args;
+            let server = Server::open(&e, false).expect("a server that answers");
+            {
+                let mut reg = lock();
+                reg.running.push(Some(server));
+            }
+
+            // A panic inside the lock leaves it poisoned, which is what a
+            // panicking call would do; cleanup must still reach the servers.
+            let _ = std::panic::catch_unwind(|| {
+                let _held = lock();
+                panic!("poison the registry");
+            });
+            assert!(registry().lock().is_err(), "the lock is poisoned");
+
+            shutdown();
+            let mut reg = lock();
+            let mut server = reg.running.pop().flatten().expect("the server is ours");
+            drop(reg);
+            match &mut server.conn {
+                Conn::Stdio(conn) => assert!(
+                    conn.child.try_wait().ok().flatten().is_some(),
+                    "the server was stopped"
+                ),
+                Conn::Http(_) => panic!("the fixture is stdio"),
+            }
+        });
     }
 
     /// A mock remote server: JSON for initialize and calls, SSE for the tool

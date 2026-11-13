@@ -2,7 +2,9 @@
 //! chooser, and the queue the frame draws while a turn runs. What a line means
 //! is the session's business; this module produces lines and paints the frame.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -138,8 +140,15 @@ fn plain(key: KeyEvent, c: char) -> bool {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
-/// The terminal's keys. Nothing else may read stdin.
-pub(crate) fn spawn_input(tx: Sender<Event>) {
+/// Whether the input thread has ended. The `Eof` event says so once, but a
+/// turn can consume it; the flag is what a line loop reads afterwards.
+pub(crate) type Ended = Arc<AtomicBool>;
+
+/// The terminal's keys. Nothing else may read stdin. The flag comes back set
+/// when the thread has stopped, before its `Eof` reaches the channel.
+pub(crate) fn spawn_input(tx: Sender<Event>) -> Ended {
+    let ended: Ended = Arc::new(AtomicBool::new(false));
+    let flag = ended.clone();
     thread::spawn(move || {
         use ratatui::crossterm::event::{poll, read, Event as TermEvent};
         let mut report = CursorReport::default();
@@ -185,8 +194,10 @@ pub(crate) fn spawn_input(tx: Sender<Event>) {
                 Err(_) => break,
             }
         }
+        flag.store(true, Ordering::SeqCst);
         let _ = tx.send(Event::Eof);
     });
+    ended
 }
 
 /// A line submitted mid-turn, waiting for the round boundary that lets it join
@@ -249,8 +260,8 @@ pub(crate) fn recall_lines(screen: &mut ui::Screen, lines: &[String]) {
 pub(crate) const IDLE: Duration = Duration::from_millis(100);
 
 /// Wait for work another thread is doing while the prompt stays live: keys are
-/// folded into the line, Esc asks the cancel for it, and the loop ends when the
-/// work is finished. What the thread joined to comes back with the one line
+/// folded into the line, Esc asks first and stops on the second press, and the
+/// loop ends when the work is finished. What the thread joined to comes back with the one line
 /// typed while it ran — a panic is `None`, and the caller names it.
 ///
 /// `!cmd` and `/compact` wait the same way, which is why this is one function:
@@ -262,23 +273,37 @@ pub(crate) fn pump<T>(
     handle: thread::ScopedJoinHandle<'_, T>,
 ) -> (Option<T>, Option<String>) {
     let mut queued: Option<String> = None;
+    // The same offer the prompt makes during a turn: one ESC asks, any other
+    // key withdraws it, the second ESC stops the work.
+    let mut armed = false;
     loop {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(Event::Key(key)) if key.code == KeyCode::Esc => {
-                cancel.cancel();
-                screen.set_status("× Interrupting");
+                armed = !armed;
+                if armed {
+                    screen.set_alert(Some("× press ESC again to interrupt"));
+                } else {
+                    cancel.cancel();
+                    screen.set_alert(Some("× Interrupting"));
+                }
                 screen.repaint();
             }
-            Ok(Event::Key(key)) => match screen.apply_key(key) {
-                ui::Action::Submit if !screen.is_empty() && queued.is_none() => {
-                    queued = Some(screen.take());
+            Ok(Event::Key(key)) => {
+                if armed {
+                    armed = false;
+                    screen.set_alert(None);
                 }
-                ui::Action::Eof => {
-                    cancel.cancel();
-                    break;
+                match screen.apply_key(key) {
+                    ui::Action::Submit if !screen.is_empty() && queued.is_none() => {
+                        queued = Some(screen.take());
+                    }
+                    ui::Action::Eof => {
+                        cancel.cancel();
+                        break;
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             Ok(Event::Paste(text)) => screen.insert_text(&text),
             Ok(Event::Resize) => screen.invalidate(),
             Ok(Event::Eof) => {
