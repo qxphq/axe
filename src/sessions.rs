@@ -2,14 +2,15 @@
 //!
 //! One directory per project holds a meta file and an append-only log for each
 //! session. The meta is rewritten as the title and count change; the log is
-//! never rewritten, so a crash can only leave an unfinished tail line. Old
+//! never rewritten, so a crash can only leave one unfinished line, which the
+//! loader skips. Old
 //! bodies are gzipped in place by the host's `gzip`: the meta stays readable,
 //! so listings and search keep working without unpacking anything, and a host
 //! without gzip leaves the bodies plain.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -171,7 +172,8 @@ impl Log {
     pub fn open(dir: &Path, id: &str) -> Result<Log, String> {
         state::private_dir(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let path = log_path(dir, id);
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
+            .read(true)
             .create(true)
             .append(true)
             .mode(0o600)
@@ -181,6 +183,23 @@ impl Log {
         // local users until it is tightened here.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+        // A kill mid-append leaves the last line unfinished. The next message
+        // starts a line of its own: appended to the fragment, both are lost
+        // when the body is next read.
+        let len = file
+            .metadata()
+            .map_err(|e| format!("read {}: {e}", path.display()))?
+            .len();
+        if len > 0 {
+            let mut last = [0u8; 1];
+            file.seek(SeekFrom::End(-1))
+                .and_then(|_| file.read_exact(&mut last))
+                .map_err(|e| format!("read {}: {e}", path.display()))?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")
+                    .map_err(|e| format!("append session: {e}"))?;
+            }
+        }
         Ok(Log { file })
     }
 
@@ -239,26 +258,32 @@ pub fn load_messages(
     }
 
     let file = File::open(&plain).map_err(|e| format!("open {}: {e}", plain.display()))?;
+    let mut reader = BufReader::new(file);
     let mut messages = Vec::new();
     let mut marker = None;
-    for line in BufReader::new(file).lines() {
-        let line = match line {
-            Ok(line) => line,
+    let mut damaged = false;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
             Err(e) => {
                 warnings.push(format!("read {}: {e}", plain.display()));
                 break;
             }
-        };
-        if line.trim().is_empty() {
+        }
+        // A kill mid-append leaves a line with no message in it. It is
+        // skipped, not the end: the session resumed after it, so everything
+        // appended since is still this session's.
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim();
+        if text.is_empty() {
             continue;
         }
-        let message: Value = match serde_json::from_str(&line) {
-            Ok(message) => message,
-            // A kill mid-append leaves one partial line, always last.
-            Err(_) => {
-                warnings.push(format!("skipping a damaged line in {}", plain.display()));
-                break;
-            }
+        let Ok(message) = serde_json::from_str::<Value>(text) else {
+            damaged = true;
+            continue;
         };
         match message["role"].as_str() {
             Some("user" | "assistant" | "tool") => {
@@ -269,6 +294,9 @@ pub fn load_messages(
             }
             _ => continue,
         }
+    }
+    if damaged {
+        warnings.push(format!("skipping a damaged line in {}", plain.display()));
     }
     // A compacted body continues from its last summary. What came before stays
     // on disk — the body is append-only — and out of the request, so replay
@@ -314,8 +342,14 @@ pub fn archive_old(cwd: &Path, keep: usize) {
         eprintln!("axe: gzip not found: old session bodies stay plain");
         return;
     }
-    for mut meta in old {
-        if meta.archived {
+    for listed in old {
+        let Ok(mut meta) = Meta::load(&dir, &listed.id) else {
+            continue;
+        };
+        // A session another instance touched since the listing is live: a
+        // resume bumps `updated`, an append the count. Its body is not ours
+        // to move.
+        if meta.archived || !unchanged(&listed, &meta) {
             continue;
         }
         let plain = log_path(&dir, &meta.id);
@@ -347,11 +381,33 @@ fn compress(dir: &Path, meta: &Meta, plain: &Path, gz: &Path) -> Result<(), Stri
         fs::remove_file(plain).map_err(|e| format!("remove {}: {e}", plain.display()))?;
         return Ok(());
     }
+    let before = fingerprint(plain)?;
     let tmp = dir.join(format!("{}.jsonl.gz.tmp", meta.id));
     gzip(&[OsStr::new("-nc"), plain.as_os_str()], &tmp)?;
+    // A running axe appended while we compressed: the copy is stale, and
+    // removing the body would take that message with it. The body stays plain
+    // and the next start tries again.
+    if fingerprint(plain)? != before {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "{} changed while it was compressed",
+            plain.display()
+        ));
+    }
     fs::rename(&tmp, gz).map_err(|e| format!("write {}: {e}", gz.display()))?;
     fs::remove_file(plain).map_err(|e| format!("remove {}: {e}", plain.display()))?;
     Ok(())
+}
+
+/// Whether the sidecar a listing produced still describes the same session.
+fn unchanged(listed: &Meta, fresh: &Meta) -> bool {
+    listed.updated == fresh.updated && listed.messages == fresh.messages
+}
+
+/// What a body was before it was compressed: its size and its change time.
+fn fingerprint(path: &Path) -> Result<(u64, Option<SystemTime>), String> {
+    let meta = fs::metadata(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok((meta.len(), meta.modified().ok()))
 }
 
 /// Compression is the host's: `gzip` is essential on Debian, in every BSD base
@@ -685,6 +741,57 @@ mod tests {
             warnings.iter().any(|w| w.contains("damaged")),
             "{warnings:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_damaged_line_does_not_end_the_replay() {
+        let dir = crate::state::testenv::dir("sessions-damaged-middle");
+        let mut meta = Meta::new("abc123");
+        meta.save(&dir).unwrap();
+        let path = log_path(&dir, "abc123");
+        // A kill mid-append: the last line is half a message.
+        let one = json!({ "role": "user", "content": "one" }).to_string();
+        let cut = r#"{"role":"assistant","content":"tw"#;
+        std::fs::write(&path, format!("{one}\n{cut}")).unwrap();
+
+        // The next session starts its line of its own, so the message it
+        // writes is not swallowed by the fragment.
+        let mut log = Log::open(&dir, "abc123").unwrap();
+        log.append(&json!({ "role": "user", "content": "three" }))
+            .unwrap();
+        drop(log);
+
+        let mut warnings = Vec::new();
+        let body = load_messages(&dir, &mut meta, &mut warnings).unwrap();
+        assert_eq!(body.len(), 2, "{body:?}");
+        assert_eq!(body[1]["content"], "three");
+        assert!(
+            warnings.iter().any(|w| w.contains("damaged")),
+            "{warnings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_body_that_grew_is_not_the_one_that_was_compressed() {
+        let dir = crate::state::testenv::dir("sessions-fingerprint");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("body.jsonl");
+        std::fs::write(&path, "one\n").unwrap();
+        let before = fingerprint(&path).unwrap();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        assert_ne!(fingerprint(&path).unwrap(), before);
+
+        // The sidecar comparison: a resume bumps `updated`, an append the count.
+        let listed = Meta::new("abc123");
+        assert!(unchanged(&listed, &listed.clone()));
+        let mut resumed = listed.clone();
+        resumed.updated += 1;
+        assert!(!unchanged(&listed, &resumed));
+        let mut appended = listed.clone();
+        appended.messages += 1;
+        assert!(!unchanged(&listed, &appended));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

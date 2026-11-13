@@ -9,7 +9,7 @@ box.
 ## Correctness and invariants
 
 - [x] [Turn loop and history](turn-and-history.md)
-- [ ] [Sessions and per-directory state](sessions-and-state.md)
+- [x] [Sessions and per-directory state](sessions-and-state.md)
 - [ ] [HTTP client, SSE, and the provider contract](http-and-sse.md)
 - [ ] [Concurrency and cancellation](concurrency.md)
 

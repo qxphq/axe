@@ -473,15 +473,21 @@ Directories are `0700` and files `0600`: a session is plaintext, readable by
 its owner only. Use a container, a separate user, or full-disk encryption when
 the local account is not the right boundary.
 
-The active body is append-only, so a crash can only leave an unfinished last
-line. Archiving gzips and removes it; resuming unpacks it back to plain. On a
-host without `gzip` nothing is archived — bodies stay plain, and a body already
-archived elsewhere cannot be resumed there.
+The active body is append-only, so a crash can only leave one unfinished line:
+it is skipped when the body is read, and the next message starts a line of its
+own, so nothing written after the crash is lost to the next resume. Archiving
+gzips and removes it; resuming unpacks it back to plain. On a host without
+`gzip` nothing is archived — bodies stay plain, and a body already archived
+elsewhere cannot be resumed there.
 Listing and search read the sidecar, which stays plain: an archived body still
 answers from its title and summary. Resuming one unpacks it back to plain. The
 system prompt and mode notes are not logged; resume rebuilds them from the
 current instructions and mode. Titles and summaries are generated after the
 first answer, and fall back to the first request if that fails.
+
+A session body belongs to one running axe. Two instances in one directory share
+the selection last-write-wins, and an archive pass skips a body another
+instance has touched since it was listed.
 
 `/compact` replaces the history with a summary of it. The body is not rewritten:
 the summary is appended as a marked message, and reading a body starts from the

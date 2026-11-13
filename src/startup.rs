@@ -185,11 +185,11 @@ pub(crate) fn run() -> Result<(), String> {
     let global = state::load_default();
     let (provider, model) = resolve(
         &providers,
-        state
-            .model
-            .as_deref()
-            .or(global.as_deref())
-            .or(cfg.model.as_deref()),
+        [
+            state.model.as_deref(),
+            global.as_deref(),
+            cfg.model.as_deref(),
+        ],
     );
     // Thinking level follows the model: it is remembered per `provider/id`,
     // first for this directory, then for the config, and turned into request
@@ -463,12 +463,88 @@ pub(crate) fn find(providers: &[Provider], spec: &str) -> Option<(usize, String)
     None
 }
 
-pub(crate) fn resolve(providers: &[Provider], spec: Option<&str>) -> (usize, String) {
-    if let Some(spec) = spec {
+/// The first configured choice a provider actually offers: the directory's
+/// pin, then the state root's default, then the config's seed. A choice that
+/// names nothing is reported and passed over — a pin for a model that went
+/// away must not keep a directory off its default — and with none left, the
+/// first model of the first provider.
+pub(crate) fn resolve(providers: &[Provider], picks: [Option<&str>; 3]) -> (usize, String) {
+    let mut any = false;
+    for spec in picks.iter().flatten().copied() {
+        any = true;
         if let Some(hit) = find(providers, spec) {
             return hit;
         }
-        eprintln!("axe: model {spec:?} not available, using default");
+        eprintln!("axe: model {spec:?} not available");
     }
-    (0, providers[0].models[0].id.clone())
+    let first = (0, providers[0].models[0].id.clone());
+    if any {
+        eprintln!(
+            "axe: no configured model is available, using {}",
+            place(providers, first.0, &first.1)
+        );
+    }
+    first
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(name: &str, models: &[&str]) -> Provider {
+        Provider {
+            name: name.to_string(),
+            cfg: config::ProviderConfig {
+                name: name.to_string(),
+                base_url: "http://p".into(),
+                api_key_env: None,
+                models_url: None,
+                session_header: None,
+                thinking: Vec::new(),
+            },
+            ep: http::parse_url("http://p").expect("endpoint"),
+            key: None,
+            headers: Vec::new(),
+            models: models
+                .iter()
+                .map(|id| api::ModelInfo {
+                    id: id.to_string(),
+                    context: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_choice_that_names_nothing_passes_to_the_next_source() {
+        let providers = vec![
+            provider("p", &["p/one", "p/two"]),
+            provider("q", &["q/one"]),
+        ];
+        // The directory's pin, when a provider still offers it.
+        assert_eq!(
+            resolve(&providers, [Some("q/one"), None, None]),
+            (1, "q/one".to_string())
+        );
+        // A pin for a model that went away is passed over for the default,
+        // not for the first model the first provider happens to list.
+        assert_eq!(
+            resolve(&providers, [Some("gone/x"), Some("p/two"), None]),
+            (0, "p/two".to_string())
+        );
+        // The default is passed over too, for the config's seed.
+        assert_eq!(
+            resolve(&providers, [None, Some("gone/x"), Some("q/one")]),
+            (1, "q/one".to_string())
+        );
+        // Nothing resolves: the first model of the first provider.
+        assert_eq!(
+            resolve(&providers, [Some("gone/x"), None, Some("gone/y")]),
+            (0, "p/one".to_string())
+        );
+        assert_eq!(
+            resolve(&providers, [None, None, None]),
+            (0, "p/one".to_string())
+        );
+    }
 }

@@ -5,7 +5,8 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -41,9 +42,12 @@ pub(crate) fn root() -> PathBuf {
 /// as `%XX`, so `/home/anon/axe` becomes `%2Fhome%2Fanon%2Faxe`. Reversible,
 /// and injective because `%` is escaped too.
 fn key(cwd: &Path) -> String {
-    let path = cwd.to_string_lossy();
+    // The path's own bytes: `to_string_lossy` would give two directories whose
+    // names differ only in a byte that is not UTF-8 the same key, and one
+    // state file, one session list and one history for both.
+    let path = cwd.as_os_str().as_bytes();
     let mut key = String::with_capacity(path.len() * 2);
-    for byte in path.bytes() {
+    for &byte in path {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') {
             key.push(byte as char);
         } else {
@@ -54,7 +58,7 @@ fn key(cwd: &Path) -> String {
     // with its hash: a deep path degrades into a hash instead of a failed save.
     if key.len() > 200 {
         key.truncate(160);
-        key.push_str(&format!("-{:016x}", fnv1a(path.as_bytes())));
+        key.push_str(&format!("-{:016x}", fnv1a(path)));
     }
     key
 }
@@ -244,7 +248,12 @@ fn write_history_file(path: &Path, lines: &[String]) -> io::Result<()> {
 /// Create `dir` and the axe-owned directories above it, all `0700`: a
 /// directory's state and its sessions are private to the user.
 pub fn private_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
+    // Born private: `create_dir_all` would take the umask and leave the chain
+    // listable until the chmods below ran.
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
     set_mode(dir, 0o700)?;
     let root = root();
     let mut at = dir.parent();
@@ -424,6 +433,14 @@ mod tests {
     fn key_is_reversible_and_safe() {
         assert_eq!(key(Path::new("/home/anon/axe")), "%2Fhome%2Fanon%2Faxe");
         assert!(!key(Path::new("/a/../b")).contains('/'));
+        // The key is the path's bytes, so a byte that is not UTF-8 still tells
+        // two directories apart. `to_string_lossy` would give them one key.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let a = Path::new(OsStr::from_bytes(b"/tmp/x\xff"));
+        let b = Path::new(OsStr::from_bytes(b"/tmp/x\xfe"));
+        assert_ne!(key(a), key(b));
+        assert_eq!(key(a), "%2Ftmp%2Fx%FF");
     }
 
     #[test]

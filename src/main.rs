@@ -2546,11 +2546,14 @@ mod tests {
             Some((0, "m".into()))
         );
         assert_eq!(
-            startup::resolve(std::slice::from_ref(&provider), Some("p/m")),
+            startup::resolve(std::slice::from_ref(&provider), [Some("p/m"), None, None]),
             (0, "m".into())
         );
         assert_eq!(
-            startup::resolve(std::slice::from_ref(&provider), Some("missing")),
+            startup::resolve(
+                std::slice::from_ref(&provider),
+                [Some("missing"), Some("p/m"), None]
+            ),
             (0, "m".into())
         );
     }

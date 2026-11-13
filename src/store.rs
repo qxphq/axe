@@ -97,15 +97,19 @@ impl Store {
     }
 
     fn try_record(&mut self, message: &Value) -> Result<(), String> {
-        if self.log.is_none() {
-            self.log = Some(sessions::Log::open(&self.dir, &self.id)?);
-        }
+        // The sidecar goes first. A body with no sidecar is a session no
+        // listing can name, while a sidecar with no body is a resume that says
+        // which file is missing; a crash may leave the second, never the first.
         if self.meta.is_none() {
             let mut meta = sessions::Meta::new(&self.id);
             if let Some(summary) = user_summary(message) {
                 meta.summary = summary;
             }
+            meta.save(&self.dir)?;
             self.meta = Some(meta);
+        }
+        if self.log.is_none() {
+            self.log = Some(sessions::Log::open(&self.dir, &self.id)?);
         }
         let meta = self.meta.as_mut().expect("just created");
         self.log.as_mut().expect("just opened").append(message)?;
@@ -363,5 +367,21 @@ mod tests {
         store.record(&json!({ "role": "user", "content": "two" }));
         assert!(store.take_warning().is_none(), "and not again");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_body_that_cannot_be_opened_leaves_a_named_session() {
+        let dir = crate::state::testenv::dir("store-order");
+        // The body's own path is a directory: the sidecar can be written, the
+        // log cannot be opened.
+        std::fs::create_dir_all(dir.join("abc123.jsonl")).unwrap();
+        let mut store = Store::fresh(dir.clone(), "abc123");
+        store.record(&json!({ "role": "user", "content": "one" }));
+        assert!(store.take_warning().is_some(), "the failure is reported");
+        // The sidecar reached the disk, so a listing can name the session and
+        // a resume says which file is missing. The body is never the orphan.
+        assert!(sessions::Meta::load(&dir, "abc123").is_ok());
+        assert_eq!(store.meta.as_ref().unwrap().messages, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
