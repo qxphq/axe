@@ -450,10 +450,21 @@ mod imp {
                 "explore mode: bash is unavailable: no seccomp filter for this architecture".into(),
             );
         }
-        abi().is_none().then(|| {
-            "sandbox: Landlock is unavailable, so explore mode's bash is unconfined: any \
-             command runs and anything is writable"
-                .to_string()
+        let Some(abi) = abi() else {
+            return Some(
+                "sandbox: Landlock is unavailable, so explore mode's bash is unconfined: any \
+                 command runs and anything is writable"
+                    .to_string(),
+            );
+        };
+        // The truncation right arrived with ABI 3: below it `truncate(2)` and
+        // `ftruncate(2)` are not mediated at all, so a file outside the two
+        // writable directories can still be emptied.
+        (abi < 3).then(|| {
+            format!(
+                "sandbox: this kernel's Landlock (ABI {abi}) cannot deny truncation, so explore \
+                 mode's bash can still empty a file outside its writable directories"
+            )
         })
     }
 

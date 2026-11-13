@@ -6,13 +6,13 @@
 use std::io::Read;
 
 use ratatui::crossterm::terminal;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::api;
 use crate::config;
 use crate::http;
 use crate::mcp;
-use crate::prompt::{mode_note, system_with_instructions};
+use crate::prompt::system_with_instructions;
 use crate::render::Paint;
 use crate::sandbox;
 use crate::sessions;
@@ -32,10 +32,13 @@ pub(crate) fn run() -> Result<(), String> {
     // providers, and never re-read mid-session.
     web::set_brave_key(cfg.search.brave_key.clone());
     // Confinement is announced before anything runs, once, next to the
-    // provider lines: weaker than promised must never be silent.
-    if let Some(note) = sandbox::init() {
-        eprintln!("axe: {}", strip_control(&note));
+    // provider lines: weaker than promised must never be silent — for the user
+    // hearing it now or the model reading the history it joins.
+    let sandbox_note = sandbox::init();
+    if let Some(note) = &sandbox_note {
+        eprintln!("axe: {}", strip_control(note));
     }
+    super::note_sandbox(sandbox_note.clone());
     // Instructions are read once at startup, before any request: the system
     // prompt is a stable prefix and must not change mid-session.
     // Order: config `agents`, then the project's AGENTS.md, then `system`.
@@ -224,10 +227,11 @@ pub(crate) fn run() -> Result<(), String> {
             eprintln!("axe: {}", strip_control(&line));
         }
     }
-    let messages: Vec<Value> = vec![
+    let messages = super::base_history(
         json!({ "role": "system", "content": system }),
-        mode_note(mode),
-    ];
+        mode,
+        sandbox_note.as_deref(),
+    );
 
     let store = cwd
         .as_deref()

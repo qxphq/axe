@@ -122,7 +122,9 @@ invariants a change must not break.
     `plan/` under the state tree, which survives exit so a plan outlives the
     session; neither is executable — and exec outside a fixed allowlist
     (Landlock/Seatbelt, plus seccomp denying `io_uring_setup`, which Landlock
-    cannot mediate); it degrades with one startup line. The allowlist is a
+    cannot mediate); it degrades with one startup line, which the history
+    carries too, because the model must not be told a rule the kernel is not
+    holding. The allowlist is a
     convenience guard, not the containment: it carries the common inspection and
     tooling set, interpreters and package managers included, and leaves out
     daemons that write through another process (`docker`, `systemctl`), setuid,
@@ -335,12 +337,15 @@ and `show:`. Normal mode is a `!cmd` line, which does not loop. Examples:
 ```sh
 ./harness.py --scroll 400 'tool:bash:{"command":"head -n 1 tmux.conf"}' '!Escape' 'show:'
 ./harness.py --scroll 400 'tool:bash:{"command":"echo x > /tmp/p"}' '!Escape' 'show:'
-./harness.py --scroll 400 'tool:bash:{"command":"python3 -c pass"}' '!Escape' 'show:'
+./harness.py --scroll 400 'tool:bash:{"command":"tmux -V"}' '!Escape' 'show:'
 ```
 
-The first two deny on the kernel: an unwritable path, an exec outside the
-allowlist. A `!cmd` line is the escape hatch, and the harness reads an argument
-starting with `!` as tmux keys, so prefix it with a space: `' !make'`.
+The first is the allow — `head` is on the list, and its work is still write-
+confined. The other two deny on the kernel: an unwritable path, and an exec
+outside the allowlist — interpreters are on that list deliberately (their
+mutation is a write), so the deny needs a name the list does not carry. A
+`!cmd` line is the escape hatch, and the harness reads an argument starting
+with `!` as tmux keys, so prefix it with a space: `' !make'`.
 
 MCP is checked with a project file that names `sh` and a fixture server: the
 first start asks, `y` runs it, `!Escape`/`show:` after a `tool:mcp__t__echo:{}`

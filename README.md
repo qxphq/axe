@@ -548,7 +548,9 @@ domain, and still cannot write outside the two writable directories. So `git ls-
 reaches an https remote in explore mode, while `git fetch` does not, because the
 repository is not writable there, and an `ssh` remote does not, because the
 transport execs `ssh`. It degrades with one line at startup on a kernel without
-Landlock.
+Landlock, and with one on a kernel whose Landlock is older than ABI 3 (Linux
+6.2), where truncation is not mediated at all; that line joins the session's
+history too, so the model is told which rules the kernel is actually holding.
 
 The network is not confined, in either mode: a command connects where you
 connect, private ranges included. `io_uring_setup` is the only syscall denied,
@@ -571,9 +573,10 @@ A command child inherits a minimal environment — `PATH`, `HOME`, `LANG`,
 search tokens stay in the parent's memory. A server gets those plus the
 variables its entry names.
 
-Known residuals: writes through an inherited file descriptor, metadata such as
-`chmod` outside the scratch directory, and `fetch`/`web_search`, which run in
-axe's own process by design. In explore mode, code loaded by an allowed program
+Known residuals: writes through an inherited file descriptor, truncation on a
+kernel whose Landlock predates ABI 3, metadata such as `chmod` outside the
+scratch directory, and `fetch`/`web_search`, which run in axe's own process by
+design. In explore mode, code loaded by an allowed program
 (`LD_PRELOAD`, the loader) runs too, inside the same write confinement.
 
 ## Trust and security

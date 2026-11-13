@@ -632,6 +632,29 @@ fn help_text() -> String {
 
 // ---- the session ----
 
+/// What the sandbox said about itself at startup, when it is weaker than the
+/// mode note promises. The terminal hears it once; the history carries it too,
+/// so the model is never told a confinement the kernel is not enforcing.
+static SANDBOX_NOTE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Keep the startup line for the histories built later: `resume`, `/new` and
+/// `/compact` all rebuild from `base_history`.
+pub(crate) fn note_sandbox(text: Option<String>) {
+    if let Some(text) = text {
+        let _ = SANDBOX_NOTE.set(text);
+    }
+}
+
+/// The messages a history starts with: the built system prompt, the current
+/// mode note, and the sandbox's own caveat when it has one.
+pub(crate) fn base_history(system: Value, mode: tools::Mode, sandbox: Option<&str>) -> Vec<Value> {
+    let mut messages = vec![system, mode_note(mode)];
+    if let Some(note) = sandbox {
+        messages.push(json!({ "role": "user", "content": note }));
+    }
+    messages
+}
+
 /// Whether the line loop is done: nothing a finished turn handed back, and no
 /// input thread left to send another line.
 fn done(pending: &VecDeque<String>, input_ended: bool) -> bool {
@@ -1393,15 +1416,16 @@ impl Session {
         }
     }
 
-    /// The messages every history starts with: the built system prompt and the
-    /// current mode note. The prefix itself is never rewritten.
+    /// The messages every history starts with: the built system prompt, the
+    /// current mode note, and the sandbox's caveat when it has one. The prefix
+    /// itself is never rewritten.
     fn base_messages(&self) -> Vec<Value> {
         let system = self
             .messages
             .first()
             .cloned()
             .unwrap_or_else(|| json!({ "role": "system", "content": tools::system_prompt() }));
-        vec![system, mode_note(self.mode)]
+        base_history(system, self.mode, SANDBOX_NOTE.get().map(String::as_str))
     }
 
     /// The lines Tab completes: the slash commands, and `/skill:<name>` for
@@ -2830,6 +2854,21 @@ mod tests {
         session.bytes = history_bytes(&session.messages);
         assert!(session.bytes < grown);
         assert_eq!(session.bytes, history_bytes(&session.messages));
+    }
+
+    #[test]
+    fn a_weaker_sandbox_joins_the_history() {
+        let system = json!({ "role": "system", "content": "s" });
+        let held = base_history(system.clone(), tools::Mode::Explore, None);
+        assert_eq!(held.len(), 2, "the prompt and the mode note");
+        let weak = base_history(
+            system,
+            tools::Mode::Explore,
+            Some("sandbox: Landlock is unavailable"),
+        );
+        assert_eq!(weak.len(), 3);
+        assert_eq!(weak[2]["role"], "user");
+        assert_eq!(weak[2]["content"], "sandbox: Landlock is unavailable");
     }
 
     #[test]
