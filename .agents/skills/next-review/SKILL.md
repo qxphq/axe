@@ -13,16 +13,21 @@ queue. The common review contract lives here; briefs define only their scope
 and checks, so do not reintroduce it into a brief. The review is read-only;
 fixes happen only after the user triages the report.
 
-## 0. Confirm the mode
+## 0. The mode
 
-The review runs in explore mode, so the kernel — not this contract — is what
-makes it read-only. Confirm `write` and `edit` are unavailable and `fetch` and
-`web_search` are available. If they are not, stop and ask the user to run
-`/explore`; do not start the review in normal mode.
+The review is read-only by this contract. Explore mode adds the kernel to that
+— the same guarantee enforced instead of promised — and is the better place for
+a review, but it is not required: start where the session already is, and never
+ask the user to run `/explore` for one. In normal mode `write`, `edit` and every
+command that would change the tree are still off the table for the whole
+review; a wider tool array is not permission. The report says which of the two
+held it read-only.
 
-A check that needs a live run outside the sandbox is not something to work
-around. Name the exact command in the report and let the user run it as `!cmd`
-— their shell, not the review's. Never leave explore mode mid-review.
+`fetch` and `web_search` exist only in explore mode: a check that needs them is
+named in the report, not replaced with a shell command. A check that needs a
+live run which writes something (a build, a test, a binary that keeps state) is
+named as the exact `!cmd` for the user's shell; one that writes only under
+`$TMPDIR` may run. Never switch modes mid-review.
 
 ## 1. Pick the review
 
@@ -43,8 +48,9 @@ Follow the brief exactly. Defaults for every review:
   user-facing contract; `AGENTS.md` records the invariants a change must not
   break. Treat both as the map, but verify the code; a doc/code mismatch is
   itself a finding, so say which side is wrong.
-- Do not modify any file. Read, run allowlisted read-only commands, and use
-  `fetch` or `web_search` where the brief needs them.
+- Do not modify any file. Read, run only commands that change nothing in the
+  tree, and use `fetch` or `web_search` where the brief needs them and the
+  session's mode has them.
 - Every finding needs `file:line` (both sides where applicable), the invariant
   or contract it violates, and a concrete failure scenario (inputs → wrong
   outcome, or what breaks or degrades). No style nits and no speculation; drop
@@ -59,8 +65,9 @@ Follow the brief exactly. Defaults for every review:
   question). Close with one verdict line: `All findings objectively fixable —
   no input needed.` or `Input needed — N finding(s); questions above.`
   Describe fixes, no patch code.
-- If a claim needs a measurement or a run the sandbox refuses, say so and give
-  the exact `!` command; never guess a number.
+- If a claim needs a measurement or a run the review cannot make (it would
+  write something, or the mode does not offer the tool), say so and give the
+  exact `!` command; never guess a number.
 
 ## 3. Stop for triage
 
@@ -71,8 +78,9 @@ the user asks.
 
 ## 4. Close out after confirmation
 
-Only after the user asks, and only once the latest mode note says explore mode
-is off:
+Only after the user asks. Writing is the fix phase's business: if the latest
+mode note says explore mode is on, say `/explore off` and wait — the review
+itself never asked for that switch.
 
 1. Implement the confirmed findings only; do not invent speculative changes.
 2. Add a regression test for every behavioral fix, at the layer that owns it:
