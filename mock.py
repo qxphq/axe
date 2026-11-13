@@ -19,6 +19,10 @@ The reply is chosen by the last user message:
                   the reasoning is a line break, since a typed turn cannot
                   carry one
   empty:          no content at all, no calls
+  cut:...         the text, then a finish reason of `length`: a reply the
+                  provider cut at its cap
+  died:...        the text, then the body ends with no `[DONE]`: a stream that
+                  died mid-answer
   plain:...       stream the rest verbatim (used for generated titles)
 
 A request whose system prompt starts with "You name conversations" is a title
@@ -132,6 +136,16 @@ def plan(reply):
             out.append((0.0, frame({"reasoning_content": piece})))
         rest = answer
         kind = "text"
+
+    if kind in ("cut", "died"):
+        out.append((0.0, frame({"role": "assistant", "content": ""})))
+        for piece in wrap(rest, 4):
+            out.append((0.0, frame({"content": piece})))
+        if kind == "cut":
+            out.append((0.0, frame({}, finish="length")))
+            out.append((0.0, b"data: [DONE]\n\n"))
+        # `died` returns here: the body ends without the SSE terminator.
+        return out
 
     text = rest
     if kind == "blank":

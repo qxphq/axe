@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, Write};
+use std::panic::catch_unwind;
 use std::sync::{Arc, Mutex};
 
 use ratatui::text::Line;
@@ -35,6 +36,10 @@ pub trait Sink {
     /// One tool call, finished: the call and its outcome on one line, and the
     /// failure's own words beneath it.
     fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str), error: Option<&str>);
+    /// The round that ended is not an answer the model finished: the provider
+    /// cut it at its limit, or the stream died before the protocol ended it.
+    /// A line of the harness's own, under the text it is about.
+    fn cut(&mut self, why: &str);
     /// A line typed during the turn, which the turn has just appended to the
     /// history. Piped output has no queue, and nothing to say.
     fn user(&mut self, _line: &str) {}
@@ -147,6 +152,13 @@ impl Sink for PlainSink {
         if let Some(error) = error {
             eprintln!("    {}", Paint::Red.ansi(error));
         }
+        io::stderr().flush().ok();
+    }
+
+    fn cut(&mut self, why: &str) {
+        // The account of a round, not the answer: stderr, like a call's line.
+        // `end_round` has already put the text the line is about on stdout.
+        eprintln!("axe: {why}");
         io::stderr().flush().ok();
     }
 
@@ -268,14 +280,28 @@ pub fn run_turn(
             used = Some(count.prompt + count.completion);
         }
         sink.end_round();
-        // A shut-down read can also end the stream without an error. A cut
-        // reply is not an assistant message, and its calls never run.
+        // A shut-down read can also end the stream without an error, and an
+        // interrupt can land between the last chunk and this check. A reply
+        // whose stream had already ended is a whole answer, so the session
+        // keeps what the user can see; one whose stream had not is a cut
+        // reply, and a cut reply is not an assistant message.
         if turn.cancel.cancelled() {
+            if keep_on_cancel(&reply) {
+                history.push(assistant_message(&reply));
+            }
             return Ok(used);
         }
 
+        // What was missing from the round, when something was: a provider
+        // that ended it at its limit, or a stream that died. The text before
+        // the cut is the model's, so it stays in the history with the line
+        // under it that says it is not whole.
+        let cut = reply.cut();
         if reply.calls.is_empty() {
             history.push(assistant_message(&reply));
+            if let Some(why) = cut {
+                sink.cut(why);
+            }
             return Ok(used);
         }
 
@@ -296,6 +322,15 @@ pub fn run_turn(
         let mut message = assistant_message(&reply);
         message["tool_calls"] = json!(calls);
         history.push(message);
+        // A cut round's arguments can be half of what the model meant, so no
+        // call of it runs; each is still answered, as an interrupted one is.
+        if let Some(why) = cut {
+            for message in unanswered(&reply.calls, 0, "the reply was cut") {
+                history.push(message);
+            }
+            sink.cut(why);
+            return Ok(used);
+        }
 
         // An interrupt can land before a call runs or between two of them.
         // Every id the assistant message named still owes a result: a strict
@@ -310,13 +345,19 @@ pub fn run_turn(
             // What is running, while it runs: the finished line appears below
             // once there is a result to put on it.
             sink.status(&plain_text(&echo));
-            let result = tools::execute(&call.name, &call.arguments, turn.cancel, turn.mode);
+            // A tool that panics must still leave a result: the assistant
+            // message above already named the call, and a missing result
+            // outlives the turn in the log.
+            let result = catch_unwind(|| {
+                tools::execute(&call.name, &call.arguments, turn.cancel, turn.mode)
+            })
+            .unwrap_or_else(|_| format!("error: {} panicked; the call was not run", call.name));
             let error = failed(&call.name, &result).then(|| detail(&result));
             sink.echo(&echo, mark(&call.name, &result), error.as_deref());
             history.push(tool_message(&call.id, &result));
             answered += 1;
         }
-        for message in unanswered(&reply.calls, answered) {
+        for message in unanswered(&reply.calls, answered, "interrupted by user (ESC)") {
             history.push(message);
         }
         if answered < reply.calls.len() {
@@ -325,23 +366,26 @@ pub fn run_turn(
     }
 }
 
+/// Whether an interrupted round had already produced the whole answer: the
+/// stream ended and the reply named no call. Anything else is a reply the
+/// interrupt cut, which the history must not keep as if it were finished.
+fn keep_on_cancel(reply: &api::Reply) -> bool {
+    reply.complete && reply.calls.is_empty()
+}
+
 /// A tool result as it goes back into the history.
 fn tool_message(id: &str, content: &str) -> Value {
     json!({ "role": "tool", "tool_call_id": id, "content": content })
 }
 
-/// The calls of an interrupted round that never ran, as results. The provider
-/// wants one per `tool_call_id` before the next request, and a resumed session
-/// replays whatever the log holds, so a gap here outlives the turn.
-fn unanswered(calls: &[api::ToolCall], answered: usize) -> Vec<Value> {
+/// The calls of a round that never ran, as results, under the reason it did
+/// not. The provider wants one per `tool_call_id` before the next request, and
+/// a resumed session replays whatever the log holds, so a gap here outlives
+/// the turn.
+fn unanswered(calls: &[api::ToolCall], answered: usize, why: &str) -> Vec<Value> {
     calls[answered.min(calls.len())..]
         .iter()
-        .map(|call| {
-            tool_message(
-                &call.id,
-                "error: interrupted by user (ESC); the call was not run",
-            )
-        })
+        .map(|call| tool_message(&call.id, &format!("error: {why}; the call was not run")))
         .collect()
 }
 
@@ -431,15 +475,50 @@ mod tests {
             },
         ];
         // A round that ran both owes nothing.
-        assert!(unanswered(&calls, 2).is_empty());
+        assert!(unanswered(&calls, 2, "interrupted").is_empty());
         // One cut short answers the rest, so the next request is accepted.
-        let rest = unanswered(&calls, 1);
+        let rest = unanswered(&calls, 1, "interrupted by user (ESC)");
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0]["role"], "tool");
         assert_eq!(rest[0]["tool_call_id"], "b");
-        assert!(rest[0]["content"].as_str().unwrap().contains("interrupted"));
+        let say = rest[0]["content"].as_str().unwrap();
+        assert!(
+            say.contains("interrupted") && say.contains("not run"),
+            "{say}"
+        );
         // A round interrupted before the first call still answers both.
-        assert_eq!(unanswered(&calls, 0).len(), 2);
+        assert_eq!(unanswered(&calls, 0, "interrupted").len(), 2);
+        // The reason is the round's, not the mechanism's.
+        let cut = unanswered(&calls, 0, "the reply was cut");
+        assert_eq!(cut.len(), 2);
+        assert!(cut[1]["content"].as_str().unwrap().contains("was cut"));
+    }
+
+    /// A reply as the assembler would hand it over, with only the two facts
+    /// `keep_on_cancel` reads to vary.
+    fn reply_with(calls: Vec<api::ToolCall>, complete: bool) -> api::Reply {
+        api::Reply {
+            text: "answer".into(),
+            reasoning: String::new(),
+            calls,
+            usage: None,
+            finish_reason: Some("stop".into()),
+            complete,
+        }
+    }
+
+    #[test]
+    fn a_whole_reply_is_the_one_an_interrupt_keeps() {
+        assert!(keep_on_cancel(&reply_with(Vec::new(), true)));
+        // A stream that had not ended is a cut reply.
+        assert!(!keep_on_cancel(&reply_with(Vec::new(), false)));
+        // A reply with calls still owes results: it is not a whole answer.
+        let call = api::ToolCall {
+            id: "c".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        };
+        assert!(!keep_on_cancel(&reply_with(vec![call], true)));
     }
 
     #[test]
@@ -479,6 +558,9 @@ mod tests {
             let line: String = call.iter().map(|(_, text)| text.as_str()).collect();
             self.seen
                 .push(format!("echo:{line} {} {:?}", mark.1, error));
+        }
+        fn cut(&mut self, why: &str) {
+            self.seen.push(format!("cut:{why}"));
         }
         fn user(&mut self, line: &str) {
             self.seen.push(format!("user:{line}"));
@@ -553,6 +635,120 @@ mod tests {
             sink.seen
         );
         assert_eq!(sink.seen.iter().filter(|e| *e == "round").count(), 2);
+        assert!(sink.seen.iter().all(|e| !e.starts_with("cut:")));
+    }
+
+    /// A turn whose only reply is the fixture, with nothing else to answer.
+    fn one_round(frames: &[&str]) -> (Recorder, Log) {
+        use crate::http::support::{sse, Server};
+
+        let server = Server::new(vec![sse(frames)]);
+        let cancel = Cancel::new();
+        let turn = Turn {
+            ep: &server.ep,
+            key: None,
+            headers: &[],
+            model: "m",
+            extra: None,
+            mode: tools::Mode::Normal,
+            queue: None,
+            cancel: &cancel,
+        };
+        let mut history = log();
+        let mut sink = Recorder::default();
+        run_turn(&turn, &mut history, &mut sink).unwrap();
+        (sink, history)
+    }
+
+    #[test]
+    fn a_reply_the_provider_cut_is_kept_and_says_so() {
+        let (sink, history) = one_round(&[
+            r#"{"choices":[{"delta":{"content":"half an ans"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+            "[DONE]",
+        ]);
+        // What the model wrote before the cut is the user's to see, so the
+        // history keeps it; the line under it says it is not whole.
+        assert_eq!(history.0.len(), 2);
+        assert_eq!(history.0[1]["content"], "half an ans");
+        assert!(
+            sink.seen
+                .contains(&"cut:the reply hit the provider's length limit".to_string()),
+            "{:?}",
+            sink.seen
+        );
+    }
+
+    #[test]
+    fn a_stream_that_dies_without_done_is_a_cut_reply() {
+        let (sink, history) = one_round(&[r#"{"choices":[{"delta":{"content":"half"}}]}"#]);
+        assert_eq!(history.0[1]["content"], "half");
+        assert!(
+            sink.seen
+                .contains(&"cut:the stream ended before the reply did".to_string()),
+            "{:?}",
+            sink.seen
+        );
+    }
+
+    #[test]
+    fn a_cut_call_round_answers_every_call_and_runs_none() {
+        let (sink, history) = one_round(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#,
+        ]);
+        // No `[DONE]`: the arguments may be half of what the model meant, so
+        // the call is answered as not run and never echoed.
+        assert_eq!(history.0.len(), 3);
+        assert_eq!(history.0[1]["tool_calls"][0]["id"], "c1");
+        assert_eq!(history.0[2]["tool_call_id"], "c1");
+        assert!(history.0[2]["content"].as_str().unwrap().contains("cut"));
+        assert!(
+            sink.seen.iter().all(|e| !e.starts_with("echo:")),
+            "{:?}",
+            sink.seen
+        );
+        assert!(
+            sink.seen
+                .contains(&"cut:the stream ended before the reply did".to_string()),
+            "{:?}",
+            sink.seen
+        );
+    }
+
+    #[test]
+    fn a_panicking_tool_still_answers_its_call() {
+        use crate::http::support::{sse, Server};
+
+        let server = Server::new(vec![
+            sse(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"p1","function":{"name":"axe_test_panic","arguments":"{}"}}]}}]}"#,
+                "[DONE]",
+            ]),
+            sse(&[r#"{"choices":[{"delta":{"content":"after"}}]}"#, "[DONE]"]),
+        ]);
+        let cancel = Cancel::new();
+        let turn = Turn {
+            ep: &server.ep,
+            key: None,
+            headers: &[],
+            model: "m",
+            extra: None,
+            mode: tools::Mode::Normal,
+            queue: None,
+            cancel: &cancel,
+        };
+        let mut history = log();
+        let mut sink = Recorder::default();
+        run_turn(&turn, &mut history, &mut sink).unwrap();
+
+        // The id the assistant message named is answered even though the tool
+        // died, and the turn goes on to the round that ends it.
+        assert_eq!(history.0[2]["tool_call_id"], "p1");
+        assert!(history.0[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("panicked"));
+        assert_eq!(history.0[3]["content"], "after");
     }
 
     #[test]
@@ -626,7 +822,8 @@ mod tests {
             reasoning: "thought".into(),
             calls: Vec::new(),
             usage: None,
-            finish_reason: None,
+            finish_reason: Some("stop".into()),
+            complete: true,
         };
         let message = assistant_message(&reply);
         assert_eq!(message["content"], "answer");

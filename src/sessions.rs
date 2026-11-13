@@ -202,6 +202,11 @@ impl Log {
 /// The provider never sees either: the loader strips the key.
 pub const COMPACT: &str = "axe_compact";
 
+/// What the summary message says before the summary. The session's own voice,
+/// not the user's: the places that look for what the user asked skip it, and a
+/// resume starts from it without echoing it as a user line.
+pub const COMPACT_NOTE: &str = "Earlier in this session, before it was compacted:";
+
 /// The summary as the body records it.
 pub fn compacted(content: &str, replaced: u64) -> Value {
     let mut message = json!({ "role": "user", "content": content });
@@ -503,7 +508,11 @@ pub fn fallback(messages: &[Value]) -> (String, String) {
         .iter()
         .filter(|m| m["role"].as_str() == Some("user"))
         .filter_map(|m| m["content"].as_str())
-        .find(|text| !text.starts_with("explore mode:") && !text.starts_with('$'))
+        .find(|text| {
+            !text.starts_with("explore mode:")
+                && !text.starts_with('$')
+                && !text.starts_with(COMPACT_NOTE)
+        })
         .map(|text| collapse(text, 240))
         .unwrap_or_default();
     if user.is_empty() {
@@ -624,6 +633,15 @@ mod tests {
         assert_eq!(title, "fix the parser");
         assert!(summary.contains("Done."));
         assert_eq!(collapse("  a\n b  ", 20), "a b");
+        // A compacted session opens with the summary, which is the session's
+        // own voice: the request it names is the first one after it.
+        let compacted = vec![
+            json!({ "role": "user", "content": format!("{COMPACT_NOTE}\n\nthe summary") }),
+            json!({ "role": "user", "content": "next thing" }),
+        ];
+        let (title, summary) = fallback(&compacted);
+        assert_eq!(title, "next thing");
+        assert!(!summary.contains(COMPACT_NOTE), "{summary}");
     }
 
     #[test]

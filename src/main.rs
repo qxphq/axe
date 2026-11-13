@@ -40,11 +40,12 @@ use repl::{
     choose, narrow, pump, readline, recall_lines, show_queue, spawn_input, take_back, Event, Input,
     Pending,
 };
+use sessions::COMPACT_NOTE;
 use startup::{
     dir_label, find, fullness, level, level_names, models, percent, place, scaled, session_id,
     set_thinking, thinking_label, NO_SESSIONS,
 };
-use store::{history_bytes, weight, Live, Store, COMPACT_NOTE};
+use store::{history_bytes, weight, Live, Store};
 use text::{head_tail, strip_control, terminal_text};
 use turn::{PlainSink, Queue, Sink, TextSink};
 
@@ -986,7 +987,14 @@ impl Session {
             match message["role"].as_str() {
                 Some("user") => {
                     if let Some(text) = message["content"].as_str() {
-                        screen.echo_user(text);
+                        // The compaction summary is the session's own record
+                        // of what it carries, not something the user said. It
+                        // was printed when it was made, under the notice that
+                        // records it; a resume starts from it without printing
+                        // it again.
+                        if !text.starts_with(COMPACT_NOTE) {
+                            screen.echo_user(text);
+                        }
                     }
                 }
                 Some("assistant") => {
@@ -1471,8 +1479,7 @@ impl Session {
         self.used = None;
         self.record(json!({
             "role": "user",
-            "content": format!("$ {command}
-        {result}"),
+            "content": format!("$ {command}\n{result}"),
         }));
         screen.set_info(self.info());
         screen.repaint();
@@ -1538,6 +1545,13 @@ impl Session {
         };
 
         match result {
+            // A summary the provider cut is only part of the session: the
+            // history stays as it was, and the line says why. It is the same
+            // test a turn's answer gets.
+            Ok(reply) if reply.cut().is_some() => console.error(&format!(
+                "compaction: the summary was cut ({}); the session is unchanged",
+                reply.cut().unwrap_or_default()
+            )),
             Ok(reply) if !reply.text.trim().is_empty() => {
                 let summary = reply.text.trim().to_string();
                 let replaced = self.messages.len().saturating_sub(2) as u64;
@@ -1963,6 +1977,12 @@ impl Held {
                     screen.set_status(&text);
                 }
             }
+            // The round is not a whole answer: the line says what cut it, and
+            // the status row belongs to the next round.
+            Event::Cut(why) => {
+                screen.set_status("");
+                screen.error(&format!("axe: {why}\n"));
+            }
             // The area under us changed: paint even if no state did.
             Event::Resize => screen.invalidate(),
             Event::Done(Err(e)) => {
@@ -2238,6 +2258,11 @@ impl Sink for ChannelSink {
         spans.push((Paint::Plain, " ".to_string()));
         spans.push((mark.0, mark.1.to_string()));
         self.send(Event::Echo(spans, error.map(str::to_string)));
+    }
+
+    fn cut(&mut self, why: &str) {
+        self.end_thought();
+        self.send(Event::Cut(why.to_string()));
     }
 
     fn end_round(&mut self) {
@@ -3009,6 +3034,27 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_reply_says_so_in_the_transcript() {
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"half"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+            "[DONE]",
+        ])]);
+        let mut session = session_at(&server);
+        let (tx, rx) = events();
+        let mut screen = ui::Screen::test_screen(60, 20);
+        session.messages_turn("go", &tx, &rx, &mut screen).unwrap();
+        let rows = screen.transcript();
+        assert!(rows.iter().any(|row| row.contains("half")), "{rows:?}");
+        assert!(
+            rows.iter().any(|row| row.contains("length limit")),
+            "the round is not a whole answer and says so: {rows:?}"
+        );
+        // The text before the cut is the model's, so the session keeps it.
+        assert_eq!(session.messages.last().unwrap()["content"], "half");
+    }
+
+    #[test]
     fn a_paste_and_a_resize_reach_the_screen() {
         let server = Server::new(vec![sse(&["[DONE]"])]);
         let mut session = session_at(&server);
@@ -3219,6 +3265,25 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_summary_does_not_replace_the_history() {
+        // The provider ended the summary at its own limit: what came back is
+        // part of a summary, so the session keeps the history it had.
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"half a summary"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+            "[DONE]",
+        ])]);
+        let mut session = session_at(&server);
+        session.record(json!({ "role": "assistant", "content": "an answer" }));
+        let before = session.messages.clone();
+        let mut console = Console::Stdout;
+
+        assert!(session.compact(&mut console).is_none());
+        assert_eq!(session.messages, before, "the session is unchanged");
+        assert_eq!(session.bytes, history_bytes(&before));
+    }
+
+    #[test]
     fn a_compaction_asks_at_the_sessions_thinking_level_and_with_no_cap() {
         let server = Server::new(vec![sse(&[
             r#"{"choices":[{"delta":{"content":"the summary"}}]}"#,
@@ -3249,6 +3314,7 @@ mod tests {
                 completion: 2000,
             }),
             finish_reason: Some("length".into()),
+            complete: true,
         };
         assert_eq!(
             no_text(&reply),
@@ -3376,6 +3442,12 @@ mod tests {
         session.state.thoughts = true;
         session.messages = session.base_messages();
         session.messages[1] = json!({ "role": "user", "content": "explore mode: on" });
+        // A compacted body opens with the summary. It was printed when it was
+        // made; a resume starts from it, so the replay leaves it out.
+        session.messages.push(json!({
+            "role": "user",
+            "content": format!("{COMPACT_NOTE}\n\nthe summary the model carries")
+        }));
         session
             .messages
             .push(json!({ "role": "user", "content": "fix it" }));
@@ -3398,6 +3470,12 @@ mod tests {
         session.replay(&mut screen);
         let rows = screen.transcript();
         assert!(rows.iter().any(|row| row.contains("fix it")), "{rows:?}");
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("the summary the model carries")),
+            "a resume does not print the summary again: {rows:?}"
+        );
         assert!(rows.iter().any(|row| row.contains("looking")), "{rows:?}");
         assert!(rows.iter().any(|row| row.contains("a thought")), "{rows:?}");
         assert!(rows.iter().any(|row| row.contains("read")), "{rows:?}");
@@ -3471,7 +3549,9 @@ mod tests {
         let last = session.messages.last().unwrap();
         assert_eq!(last["role"], "user");
         let content = last["content"].as_str().unwrap();
-        assert!(content.starts_with("$ echo sous"), "{content}");
+        // The header sits on its own line under the command: the same bytes
+        // whether the run had a screen or a pipe.
+        assert!(content.starts_with("$ echo sous\nexit: 0"), "{content}");
         assert!(content.contains("sous"), "{content}");
         assert!(session.used.is_none(), "the count is an estimate again");
         let rows = screen.transcript();

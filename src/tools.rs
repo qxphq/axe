@@ -256,6 +256,10 @@ pub fn execute(name: &str, args: &str, cancel: &Cancel, mode: Mode) -> String {
         // them like any other, and the mode decides nothing here — the server
         // was confined when it was started.
         name if name.starts_with("mcp__") => crate::mcp::call(name, &args, cancel),
+        // A tool that dies where a tool runs, for the turn loop's own test:
+        // every call the model named must still get a result.
+        #[cfg(test)]
+        "axe_test_panic" => panic!("the test tool panicked"),
         other => format!("error: unknown tool: {other}"),
     }
 }

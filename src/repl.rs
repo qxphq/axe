@@ -37,6 +37,9 @@ pub(crate) enum Event {
     Echo(Vec<(Paint, String)>, Option<String>),
     /// A transient label for the status row.
     Status(String),
+    /// The round is not a whole answer: a provider cut or a stream that died.
+    /// The harness's own line, under the text it is about.
+    Cut(String),
     /// Streamed reasoning, before any answer text.
     Thought(String),
     /// A line typed during the turn that the turn has just taken into its

@@ -9,10 +9,6 @@ use serde_json::Value;
 use crate::sessions;
 use crate::turn;
 
-/// What the summary message says before the summary. The session's own voice,
-/// not the user's: `user_summary` and `naming_excerpt` skip it.
-pub(crate) const COMPACT_NOTE: &str = "Earlier in this session, before it was compacted:";
-
 /// What a turn appends to: the live history and, when this directory has one,
 /// the session's log. One `push`, so a message cannot reach the model without
 /// reaching the file, and a resumed session replays the same order.
@@ -78,10 +74,15 @@ impl Store {
     /// must never fail a turn.
     pub(crate) fn record(&mut self, message: &Value) {
         if let Err(e) = self.try_record(message) {
-            if !self.warned {
-                self.warned = true;
-                self.warn(format!("session: {e}"));
-            }
+            self.fail(e);
+        }
+    }
+
+    /// The one report a failed append gets.
+    fn fail(&mut self, e: String) {
+        if !self.warned {
+            self.warned = true;
+            self.warn(format!("session: {e}"));
         }
     }
 
@@ -120,9 +121,14 @@ impl Store {
 
     /// Record a compaction: the marked summary goes into the body, and the
     /// session's message count starts over at it. What came before is still in
-    /// the file; it is no longer part of the session.
+    /// the file; it is no longer part of the session. The count describes the
+    /// body, so a marker that never reached it leaves the session as it was: a
+    /// resume would otherwise replay what the live session had dropped.
     pub(crate) fn compacted(&mut self, message: &Value) {
-        self.record(message);
+        if let Err(e) = self.try_record(message) {
+            self.fail(e);
+            return;
+        }
         if let Some(meta) = self.meta.as_mut() {
             meta.messages = 1;
             if let Err(e) = meta.save(&self.dir) {
@@ -170,7 +176,9 @@ fn user_summary(message: &Value) -> Option<String> {
         return None;
     }
     let text = message["content"].as_str()?;
-    if text.starts_with("explore mode:") || text.starts_with('$') || text.starts_with(COMPACT_NOTE)
+    if text.starts_with("explore mode:")
+        || text.starts_with('$')
+        || text.starts_with(sessions::COMPACT_NOTE)
     {
         return None;
     }
@@ -292,6 +300,26 @@ mod tests {
         assert_eq!(body.len(), 1);
         assert_eq!(body[0]["content"], "summary");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_written_leaves_the_count_alone() {
+        let root = crate::state::testenv::dir("store-compact-fail");
+        let blocked = root.join("blocked");
+        std::fs::write(&blocked, "not a directory").unwrap();
+        let mut store = Store::fresh(blocked.clone(), "abc123");
+        // What the sidecar said before the body became unwritable: without a
+        // marker in the file, that is still what a resume reads.
+        store.meta = Some(sessions::Meta::new("abc123"));
+
+        store.compacted(&sessions::compacted("summary", 2));
+        assert!(store.take_warning().is_some(), "the failure is reported");
+        assert_eq!(
+            store.meta.as_ref().unwrap().messages,
+            0,
+            "the count follows the body"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

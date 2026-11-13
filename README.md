@@ -389,7 +389,10 @@ command (`/model`, `/sessions`, `!cmd`) needs the prompt and the session, so it
 waits for the turn to end. Interrupting takes two presses: the first puts
 the offer on the row under the prompt, any other key withdraws it, and the
 second stops the turn — which then says so in the transcript, because a cut
-reply reads like a finished one.
+reply reads like a finished one. A reply the provider cut at its own limit, or
+one whose stream died before its end, gets the same line beneath it: the text
+that arrived is the model's and stays in the session, and the line says the
+round was not whole.
 
 The row under the prompt is what the turn is doing on the left, and on the right
 the session's name, the directory it runs in, the provider/model and thinking
@@ -494,7 +497,8 @@ thinking level with no output cap: a cap small enough for the
 answer is one a thinking model can spend on reasoning before it writes a word.
 A compaction that comes back empty reports what the reply did instead — the
 reason the stream ended and the tokens it took — which is the difference between
-an answer cut off and a model that said nothing.
+an answer cut off and a model that said nothing. One that comes back cut is
+refused: the history stays as it was, and the line says why.
 
 ## Sandbox
 

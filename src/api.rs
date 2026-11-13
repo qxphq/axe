@@ -36,6 +36,26 @@ pub struct Reply {
     /// Why the stream ended: `stop`, `length`, `tool_calls`. A reply with no
     /// text can only be explained by this and the token count.
     pub finish_reason: Option<String>,
+    /// Whether the stream ended the way the protocol says: `[DONE]`, or a
+    /// finish reason on the choice. Without either, the connection stopped
+    /// mid-answer, and what arrived is only part of one.
+    pub complete: bool,
+}
+
+impl Reply {
+    /// Why the reply is not an answer the model finished, if it is not: the
+    /// provider cut it at its own limit, or the stream died before the
+    /// protocol ended it. `None` is a whole answer.
+    pub fn cut(&self) -> Option<&'static str> {
+        if !self.complete {
+            return Some("the stream ended before the reply did");
+        }
+        match self.finish_reason.as_deref() {
+            Some("length") => Some("the reply hit the provider's length limit"),
+            Some("content_filter") => Some("the provider stopped the reply (content filter)"),
+            _ => None,
+        }
+    }
 }
 
 /// What the provider counted for one request: the whole prompt it read
@@ -153,6 +173,9 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
     }
 
     let mut assembler = Assembler::default();
+    // The stream's own terminator. A close-delimited body ends with the
+    // connection, so only `[DONE]` or a finish reason says the reply is whole.
+    let mut done = false;
     loop {
         let line = match res.read_line() {
             Ok(Some(line)) => line,
@@ -168,6 +191,7 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
         };
         let data = data.trim();
         if data == "[DONE]" {
+            done = true;
             break;
         }
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
@@ -175,7 +199,9 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
         };
         assembler.absorb(&chunk, &mut on_text, &mut on_reasoning)?;
     }
-    Ok(assembler.finish())
+    let mut reply = assembler.finish();
+    reply.complete = done || reply.finish_reason.is_some();
+    Ok(reply)
 }
 
 #[derive(Default)]
@@ -274,6 +300,8 @@ impl Assembler {
             calls,
             usage: self.usage,
             finish_reason: self.finish_reason,
+            // The stream told the reader; only `stream_chat` knows it.
+            complete: false,
         }
     }
 }
@@ -476,7 +504,52 @@ mod tests {
         assert_eq!(reply.calls.len(), 1);
         assert_eq!(reply.calls[0].id, "c1");
         assert_eq!(reply.calls[0].arguments, "{\"path\":\"x\"}");
-        assert_eq!(reply.usage.unwrap().prompt, 5);
+        assert!(reply.complete, "the stream ended with [DONE]");
+        assert!(reply.cut().is_none());
+        assert_eq!(reply.usage.as_ref().unwrap().prompt, 5);
+    }
+
+    #[test]
+    fn a_stream_without_done_is_not_a_whole_reply() {
+        // A close-delimited body ends with the connection: only `[DONE]` or a
+        // finish reason says the answer is whole.
+        let server = crate::http::support::Server::new(vec![crate::http::support::sse(&[
+            r#"{"choices":[{"delta":{"content":"half"}}]}"#,
+        ])]);
+        let cancel = Cancel::new();
+        let reply = stream_chat(
+            &server.ep,
+            None,
+            &[],
+            "m",
+            &[],
+            &serde_json::json!([]),
+            None,
+            &cancel,
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(reply.text, "half");
+        assert!(!reply.complete);
+        assert_eq!(reply.cut(), Some("the stream ended before the reply did"));
+
+        // A reason on the choice ends the stream just as `[DONE]` does; the
+        // reason is what may still say the answer was cut short.
+        let mut whole = Reply {
+            text: "half".into(),
+            reasoning: String::new(),
+            calls: Vec::new(),
+            usage: None,
+            finish_reason: Some("stop".into()),
+            complete: true,
+        };
+        assert!(whole.cut().is_none());
+        whole.finish_reason = Some("length".into());
+        assert_eq!(
+            whole.cut(),
+            Some("the reply hit the provider's length limit")
+        );
     }
 
     #[test]
