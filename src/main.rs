@@ -2487,6 +2487,9 @@ mod tests {
         assert_eq!(scaled(1_000_000), "1.0M");
         assert_eq!(percent(1, 1000), "<1%");
         assert_eq!(percent(50, 100), "50%");
+        // A provider's absurd count is a number to print, not an overflow.
+        assert_eq!(percent(u64::MAX, 1), "1844674407370955161500%");
+        assert_eq!(fullness(u64::MAX, 1), 100);
         assert!(failed("bash", "exit: 1\nboom"));
         assert!(!failed("bash", "exit: 0\nok"));
         assert!(failed("tools", "error: nope"));

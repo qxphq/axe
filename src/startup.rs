@@ -350,10 +350,11 @@ pub(crate) fn scaled(n: u64) -> String {
 }
 
 /// Whole percent, with `<1%` for a history that is started but rounds to zero:
-/// true on a million-token window, and `0%` would read as empty.
+/// true on a million-token window, and `0%` would read as empty. The product is
+/// taken in `u128` because both ends are the provider's numbers.
 pub(crate) fn percent(used: u64, ctx: u64) -> String {
-    let ctx = ctx.max(1);
-    match used * 100 / ctx {
+    let ctx = u128::from(ctx.max(1));
+    match u128::from(used) * 100 / ctx {
         0 if used > 0 => "<1%".to_string(),
         n => format!("{n}%"),
     }

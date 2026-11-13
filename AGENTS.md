@@ -188,8 +188,8 @@ invariants a change must not break.
   renderer. `Stream` feeds it a line at a time and lays a block out when it ends.
 - `api.rs` — model listing, chat request, SSE parsing, tool-call accumulation.
 - `http.rs` — URL parsing, HTTP/1.1 over `TcpStream`/rustls with request bodies
-  and response headers, body decoding (`Content-Length`, chunked, EOF), line
-  and body caps, timeouts, cancellation by closing the socket.
+  and response headers, body decoding (`Content-Length`, chunked, EOF), line,
+  header and body caps, timeouts, cancellation by closing the socket.
 - `config.rs` — load and validate the config; resolve the `agents` file.
 - `state.rs` — per-directory state: the cwd key, load, an atomic write, the
   prompt history file `Up` and Ctrl+R walk, and `default.json`, the model a

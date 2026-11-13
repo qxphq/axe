@@ -192,6 +192,19 @@ fn text(v: &Value, key: &str) -> Option<String> {
 }
 
 fn parse_provider(name: &str, v: &Value) -> Result<ProviderConfig, String> {
+    // The name is the first half of a `provider/id` spec, and that spec is how
+    // a model is found: a name holding the separator (or one a spec cannot
+    // carry) would make the provider's models unpickable, so it is refused at
+    // the file rather than discovered in the chooser.
+    if name.is_empty()
+        || name.contains('/')
+        || name.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!(
+            "provider name {name:?} is not usable: it becomes the provider half of a \
+             \"provider/id\" spec, so it cannot be empty, contain '/', or carry whitespace"
+        ));
+    }
     let base_url =
         text(v, "base_url").ok_or_else(|| format!("provider \"{name}\": missing \"base_url\""))?;
     if v.get("api_key").is_some() {
@@ -369,6 +382,22 @@ mod tests {
         .is_err());
         let cfg = parse_value(&serde_json::json!({ "base_url": "http://p" })).unwrap();
         assert!(cfg.skills.is_empty());
+    }
+
+    #[test]
+    fn a_provider_name_has_to_fit_a_spec() {
+        for bad in ["", "a/b", "a b", "a\tb", " a"] {
+            let err = parse_provider(bad, &serde_json::json!({ "base_url": "http://p" }))
+                .err()
+                .unwrap_or_else(|| panic!("{bad:?} was accepted"));
+            assert!(err.contains("not usable"), "{bad:?}: {err}");
+        }
+        for good in ["local", "opencode-go", "a.b_c-d", "1"] {
+            assert!(
+                parse_provider(good, &serde_json::json!({ "base_url": "http://p" })).is_ok(),
+                "{good:?}"
+            );
+        }
     }
 
     #[test]

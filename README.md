@@ -94,7 +94,8 @@ A provider entry describes the differences between servers, never code paths:
 | `session_header` | header that must carry a stable session id |
 | `thinking` | level name → object merged into the request body |
 
-`{}` as a level leaves the provider default in place.
+`{}` as a level leaves the provider default in place. A provider name is the
+first half of a `provider/id`, so it cannot be empty or hold `/` or whitespace.
 
 ```json
 {

@@ -15,6 +15,10 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 const LINE_MAX: u64 = 1 << 20;
 /// Whole-body cap for model lists and error bodies.
 const BODY_MAX: u64 = 8 << 20;
+/// One response's header block: its lines and their total bytes. The per-line
+/// cap stops one long header; this stops a flood of short ones.
+const HEAD_LINES: usize = 256;
+const HEAD_BYTES: u64 = 1 << 20;
 const CONNECT_SECONDS: u64 = 10;
 const WRITE_SECONDS: u64 = 30;
 
@@ -323,8 +327,11 @@ impl<R: Read> Read for BodyReader<R> {
                 let max = (*remaining).min(buf.len() as u64) as usize;
                 let n = self.inner.read(&mut buf[..max])?;
                 if n == 0 {
-                    *remaining = 0;
-                    return Ok(0);
+                    // The body ended before the length it declared did.
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated body",
+                    ));
                 }
                 *remaining -= n as u64;
                 Ok(n)
@@ -508,6 +515,14 @@ pub fn request_with_timeout(
     {
         head.push_str("Accept: */*\r\n");
     }
+    // No content-coding decoder here, so the one coding the body is read in is
+    // the one asked for: with the field absent a server may pick gzip.
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+    {
+        head.push_str("Accept-Encoding: identity\r\n");
+    }
     if let Some(key) = api_key {
         head.push_str(&format!("Authorization: Bearer {key}\r\n"));
     }
@@ -550,11 +565,16 @@ pub fn request_with_timeout(
     let mut content_type = None;
     let mut location = None;
     let mut headers_out: Vec<(String, String)> = Vec::new();
+    let mut head_bytes = 0u64;
     loop {
         let line = read_line(&mut reader)?;
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
+        }
+        head_bytes += line.len() as u64;
+        if head_bytes > HEAD_BYTES || headers_out.len() >= HEAD_LINES {
+            return Err("response headers too large".into());
         }
         if let Some((name, value)) = trimmed.split_once(':') {
             let name = name.trim().to_ascii_lowercase();
@@ -573,7 +593,11 @@ pub fn request_with_timeout(
         }
     }
 
-    let state = if chunked {
+    let state = if matches!(status, 204 | 304) {
+        // A status that cannot carry a body: a 304 may even name the length of
+        // the representation it stands for, which is not coming.
+        BodyState::Length(0)
+    } else if chunked {
         BodyState::Chunked {
             remaining: 0,
             done: false,
@@ -928,6 +952,11 @@ mod tests {
             "{sent:?}"
         );
         assert!(sent.contains("\r\nx-opencode-session: sid\r\n"), "{sent:?}");
+        // The body is read in one coding, so only that one is accepted.
+        assert!(
+            sent.contains("\r\nAccept-Encoding: identity\r\n"),
+            "{sent:?}"
+        );
         assert!(sent.ends_with("\r\n\r\n"), "{sent:?}");
     }
 
@@ -1113,6 +1142,75 @@ mod tests {
             Arc::ptr_eq(&first, &second),
             "the certificate store is shared"
         );
+    }
+
+    #[test]
+    fn a_header_block_over_the_cap_is_an_error() {
+        // Many short lines: the per-line cap never fires.
+        let many: Vec<(&str, &str)> = (0..300).map(|_| ("X-Flood", "a")).collect();
+        let server = Server::new(vec![reply("200 OK", &many, "")]);
+        let err = request(&server.ep, "GET", "/", None, &[], None, None)
+            .err()
+            .unwrap();
+        assert!(err.contains("headers too large"), "{err}");
+
+        // Few lines, but their bytes are over the block cap.
+        let big = "a".repeat(12_000);
+        let wide: Vec<(&str, &str)> = (0..100).map(|_| ("X-Big", big.as_str())).collect();
+        let server = Server::new(vec![reply("200 OK", &wide, "")]);
+        let err = request(&server.ep, "GET", "/", None, &[], None, None)
+            .err()
+            .unwrap();
+        assert!(err.contains("headers too large"), "{err}");
+    }
+
+    /// A server that writes `head` and then holds the socket open, so a body
+    /// the client wrongly expects would block until its read timeout.
+    fn held(head: &'static str) -> Endpoint {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                stream.write_all(head.as_bytes()).unwrap();
+                std::thread::sleep(Duration::from_millis(600));
+            }
+        });
+        parse_url(&format!("http://127.0.0.1:{port}")).unwrap()
+    }
+
+    #[test]
+    fn a_status_without_a_body_is_not_waited_for() {
+        for head in [
+            // A 204 has no body and no framing.
+            "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n",
+            // A 304 may name the length of what it stands for, not of a body.
+            "HTTP/1.1 304 Not Modified\r\nContent-Length: 50\r\n\r\n",
+        ] {
+            let ep = held(head);
+            let mut res = request_with_timeout(
+                &ep,
+                "GET",
+                "/",
+                None,
+                &[],
+                None,
+                None,
+                None,
+                Duration::from_millis(100),
+            )
+            .unwrap();
+            assert_eq!(res.read_all().unwrap(), "", "{head:?}");
+        }
+    }
+
+    #[test]
+    fn a_body_short_of_its_length_is_an_error() {
+        let server = Server::new(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabc".to_vec(),
+        ]);
+        let mut res = request(&server.ep, "GET", "/", None, &[], None, None).unwrap();
+        let err = res.read_all().err().unwrap();
+        assert!(err.to_string().contains("truncated body"), "{err}");
     }
 
     #[test]

@@ -7,6 +7,11 @@ use serde_json::{json, Value};
 
 use crate::http::{self, Cancel, Endpoint, Response};
 
+/// The most parallel tool calls one round may name. A provider's `index` sizes
+/// an array here, and it is the provider's number: past this the call is
+/// dropped, not trusted.
+const CALLS_MAX: u64 = 8;
+
 /// One row of the provider's model list.
 #[derive(Clone)]
 pub struct ModelInfo {
@@ -259,7 +264,14 @@ impl Assembler {
         }
         if let Some(calls) = delta["tool_calls"].as_array() {
             for call in calls {
-                let index = call["index"].as_u64().unwrap_or(0) as usize;
+                // The array below is sized from a number the provider chose,
+                // so the number is capped: past it the call is dropped and the
+                // round it named stays a request the provider will accept.
+                let index = call["index"].as_u64().unwrap_or(0);
+                if index >= CALLS_MAX {
+                    continue;
+                }
+                let index = index as usize;
                 while self.partials.len() <= index {
                     self.partials
                         .push((String::new(), String::new(), String::new()));
@@ -370,6 +382,37 @@ mod tests {
         assert_eq!(reply.calls[0].arguments, "{\"path\":\"x\"}");
         assert_eq!(reply.usage.unwrap().prompt, 7);
         assert!(reply.finish_reason.is_none());
+    }
+
+    #[test]
+    fn a_call_index_past_the_cap_is_dropped() {
+        let mut a = Assembler::default();
+        let mut on_text = |_: &str| {};
+        let mut on_reasoning = |_: &str| {};
+        // An index is an integer the provider chooses; it must not size the
+        // assembler's array.
+        for index in [1_000_000_000u64, u64::MAX] {
+            a.absorb(
+                &serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":index,"id":"far","function":{"name":"read","arguments":"{}"}}
+                ]}}]}),
+                &mut on_text,
+                &mut on_reasoning,
+            )
+            .unwrap();
+        }
+        a.absorb(
+            &serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                {"index":1,"id":"c1","function":{"name":"about","arguments":"{}"}}
+            ]}}]}),
+            &mut on_text,
+            &mut on_reasoning,
+        )
+        .unwrap();
+        let reply = a.finish();
+        assert_eq!(reply.calls.len(), 1, "only the index the cap allows");
+        assert_eq!(reply.calls[0].id, "c1");
+        assert_eq!(reply.calls[0].name, "about");
     }
 
     #[test]

@@ -277,7 +277,9 @@ pub fn run_turn(
             Err(e) => return Err(e),
         };
         if let Some(count) = &reply.usage {
-            used = Some(count.prompt + count.completion);
+            // The provider's own numbers, added without a ceiling they could
+            // overflow: the fill is a display, not a request.
+            used = Some(count.prompt.saturating_add(count.completion));
         }
         sink.end_round();
         // A shut-down read can also end the stream without an error, and an
@@ -636,6 +638,35 @@ mod tests {
         );
         assert_eq!(sink.seen.iter().filter(|e| *e == "round").count(), 2);
         assert!(sink.seen.iter().all(|e| !e.starts_with("cut:")));
+    }
+
+    #[test]
+    fn a_usage_count_too_large_to_add_is_capped() {
+        use crate::http::support::{sse, Server};
+
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
+            r#"{"usage":{"prompt_tokens":18446744073709551615,"completion_tokens":18446744073709551615}}"#,
+            "[DONE]",
+        ])]);
+        let cancel = Cancel::new();
+        let turn = Turn {
+            ep: &server.ep,
+            key: None,
+            headers: &[],
+            model: "m",
+            extra: None,
+            mode: tools::Mode::Normal,
+            queue: None,
+            cancel: &cancel,
+        };
+        let mut history = log();
+        let mut sink = Recorder::default();
+        // The count is the provider's; adding two of them must not wrap.
+        assert_eq!(
+            run_turn(&turn, &mut history, &mut sink).unwrap(),
+            Some(u64::MAX)
+        );
     }
 
     /// A turn whose only reply is the fixture, with nothing else to answer.
