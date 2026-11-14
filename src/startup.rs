@@ -4,6 +4,7 @@
 //! row and the choosers report it for the session's life.
 
 use std::io::Read;
+use std::thread;
 
 use ratatui::crossterm::terminal;
 use serde_json::{json, Value};
@@ -118,40 +119,39 @@ pub(crate) fn run() -> Result<(), String> {
     if ui::is_interactive() {
         banner(&notices);
     }
-    let mut providers = Vec::new();
     let sid = session_id();
+    let asks = asking(&cfg.providers, &sid)?;
 
-    for pc in &cfg.providers {
-        let ep = http::parse_url(&pc.base_url).map_err(|e| format!("{}: {e}", pc.name))?;
-        let key = pc.resolved_key();
-        if key.is_none() {
-            if let Some(var) = &pc.api_key_env {
-                eprintln!(
-                    "{}: {} is not set, skipping",
-                    strip_control(&pc.name),
-                    strip_control(var)
-                );
-                continue;
+    // A provider's model list is one small GET, and one unreachable host must
+    // not hold back the ones that are up: the fan-out runs in parallel and the
+    // lines are printed afterwards in config order, so a start reads the same
+    // as a serial one.
+    let answers: Vec<Answer> = thread::scope(|scope| {
+        let handles: Vec<_> = asks
+            .iter()
+            .map(|ask| scope.spawn(move || ask.answer()))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Answer::Failed("the listing thread panicked".into()))
+            })
+            .collect()
+    });
+
+    let mut providers = Vec::new();
+    for (ask, answer) in asks.into_iter().zip(answers) {
+        let name = ask.cfg.name.clone();
+        match answer {
+            Answer::Skipped(why) => eprintln!("{}: {}", strip_control(&name), strip_control(&why)),
+            Answer::Failed(e) => eprintln!("{}: {}", strip_control(&name), strip_control(&e)),
+            Answer::Models(models) if models.is_empty() => {
+                eprintln!("{}: no models", strip_control(&name))
             }
-        }
-
-        let mut headers = Vec::new();
-        if let Some(name) = &pc.session_header {
-            headers.push((name.clone(), sid.clone()));
-        }
-
-        let (models_ep, models_path) = match &pc.models_url {
-            Some(url) => {
-                let ep = http::parse_url(url).map_err(|e| format!("{}: {e}", pc.name))?;
-                let path = if ep.prefix.is_empty() { "/models" } else { "" };
-                (ep, path)
-            }
-            None => (ep.clone(), "/models"),
-        };
-
-        match api::list_models(&models_ep, models_path, key.as_deref(), &headers) {
-            Ok(models) if !models.is_empty() => {
-                // One line per provider as it answers, so a slow network reads
+            Answer::Models(models) => {
+                // One line per provider that answers, so a slow network reads
                 // as work rather than as a dead terminal. A run without a
                 // terminal says nothing here: stdout is the transcript.
                 if ui::is_interactive() {
@@ -159,24 +159,23 @@ pub(crate) fn run() -> Result<(), String> {
                         " {}",
                         Paint::Dim.ansi(&format!(
                             "{}: {} model{}",
-                            strip_control(&pc.name),
+                            strip_control(&name),
                             models.len(),
                             plural(models.len())
                         ))
                     );
                 }
+                let fields = request_fields(&ask.cfg, &sid);
                 providers.push(Provider {
-                    name: pc.name.clone(),
-                    cfg: pc.clone(),
-                    ep,
-                    key,
-                    headers,
-                    fields: request_fields(pc, &sid),
+                    name: name.clone(),
+                    cfg: ask.cfg,
+                    ep: ask.ep,
+                    key: ask.key,
+                    headers: ask.headers,
+                    fields,
                     models,
                 });
             }
-            Ok(_) => eprintln!("{}: no models", strip_control(&pc.name)),
-            Err(e) => eprintln!("{}: {}", strip_control(&pc.name), strip_control(&e)),
         }
     }
 
@@ -476,6 +475,80 @@ pub(crate) fn find(providers: &[Provider], spec: &str) -> Option<(usize, String)
 /// names nothing is reported and passed over — a pin for a model that went
 /// away must not keep a directory off its default — and with none left, the
 /// first model of the first provider.
+/// One provider's model list, with everything the request needs: the fan-out
+/// runs it on a thread of its own, so nothing is resolved while it waits.
+struct Ask {
+    cfg: config::ProviderConfig,
+    ep: http::Endpoint,
+    key: Option<String>,
+    headers: Vec<(String, String)>,
+    models_ep: http::Endpoint,
+    models_path: &'static str,
+    /// The provider is not asked at all: its key is named but unset.
+    skipped: Option<String>,
+}
+
+/// What one provider said.
+enum Answer {
+    Models(Vec<api::ModelInfo>),
+    Skipped(String),
+    Failed(String),
+}
+
+impl Ask {
+    fn answer(&self) -> Answer {
+        if let Some(why) = &self.skipped {
+            return Answer::Skipped(why.clone());
+        }
+        match api::list_models(
+            &self.models_ep,
+            self.models_path,
+            self.key.as_deref(),
+            &self.headers,
+        ) {
+            Ok(models) => Answer::Models(models),
+            Err(e) => Answer::Failed(e),
+        }
+    }
+}
+
+/// The asks, one per configured provider. Every URL is parsed here, on the
+/// calling thread: a bad one is a config error and ends the run, not a thread
+/// that fails quietly.
+fn asking(providers: &[config::ProviderConfig], sid: &str) -> Result<Vec<Ask>, String> {
+    let mut asks = Vec::with_capacity(providers.len());
+    for pc in providers {
+        let ep = http::parse_url(&pc.base_url).map_err(|e| format!("{}: {e}", pc.name))?;
+        let key = pc.resolved_key();
+        let mut headers = Vec::new();
+        if let Some(name) = &pc.session_header {
+            headers.push((name.clone(), sid.to_string()));
+        }
+        let (models_ep, models_path) = match &pc.models_url {
+            Some(url) => {
+                let ep = http::parse_url(url).map_err(|e| format!("{}: {e}", pc.name))?;
+                let path = if ep.prefix.is_empty() { "/models" } else { "" };
+                (ep, path)
+            }
+            None => (ep.clone(), "/models"),
+        };
+        let skipped = match (&key, &pc.api_key_env) {
+            (None, Some(var)) => Some(format!("{var} is not set, skipping")),
+            _ => None,
+        };
+        asks.push(Ask {
+            cfg: pc.clone(),
+            ep,
+            key,
+            headers,
+            models_ep,
+            models_path,
+            skipped,
+        });
+    }
+    Ok(asks)
+}
+
 /// The body fields a request carries because of what the provider is, never
 /// what the session is: the id its cache routes by, and the retention flag.
 /// The answer's ceiling is not here — a summary request is deliberately

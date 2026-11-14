@@ -143,9 +143,11 @@ Secrets belong in the environment: `api_key_env` is read at startup. A provider
 whose variable is unset is skipped, not retried. A literal `api_key` in the
 config is rejected — the file is not the place for a secret.
 
-The splash is printed before any provider is asked for its model list, and each
-one that answers adds a `name: N models` line, so a slow or silent network reads
-as work rather than as a blank terminal.
+The splash is printed before any provider is asked for its model list; the
+lists are asked in parallel, and each one that answers adds a `name: N models`
+line, so a slow or silent network reads as work rather than as a blank
+terminal. A provider has 10 s to answer its list — one that does not is skipped
+with a line — and the MCP servers are started the same way, in parallel.
 
 MCP servers are a second input file, `mcp.json` beside this one, read the same
 way and never part of it; see [MCP servers](#mcp-servers). `config.json` itself
@@ -510,9 +512,10 @@ directory with every byte outside `[A-Za-z0-9._-]` written as `%XX` — so
 | `history.jsonl` | prompt lines typed here, one JSON string per line; the newest 500 |
 | `mcp-trust.json` | approved project MCP files, by path and content hash |
 | `plan/` | explore mode's writable directory: a plan that outlives the session |
-| `<id>.json` | a session's title, summary, dates and message count |
-| `<id>.jsonl` | the session body: one API message per line, append-only |
-| `<id>.jsonl.gz` | a body older than the 30 most recent, gzipped |
+| `sessions/` | one pair per session, below |
+| `sessions/<id>.json` | a session's title, summary, dates and message count |
+| `sessions/<id>.jsonl` | the session body: one API message per line, append-only |
+| `sessions/<id>.jsonl.gz` | a body older than the 30 most recent, gzipped |
 
 `$XDG_STATE_HOME/axe/default.json` (or `~/.local/state/axe/default.json`)
 holds the global default model: what `/model -g` writes, and what a directory

@@ -1562,16 +1562,38 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
         ));
     }
 
+    // Each server is a process and a handshake of its own, and one that is
+    // slow must not hold the others back: the fan-out runs in parallel and the
+    // notices are pushed afterwards in entry order.
+    let opened: Vec<Option<Result<Server, String>>> = thread::scope(|scope| {
+        let handles: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .enabled
+                    .then(|| scope.spawn(move || Server::open(entry, explore)))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("the server thread panicked".into()))
+                })
+            })
+            .collect()
+    });
     let mut running = Vec::with_capacity(entries.len());
     let mut failures = Vec::with_capacity(entries.len());
-    for entry in &entries {
-        if !entry.enabled {
-            running.push(None);
-            failures.push(None);
-            continue;
-        }
-        match Server::open(entry, explore) {
-            Ok(server) => {
+    for (entry, opened) in entries.iter().zip(opened) {
+        match opened {
+            None => {
+                running.push(None);
+                failures.push(None);
+            }
+            Some(Ok(server)) => {
                 notices.push(format!(
                     "mcp {}: {} {}{}",
                     entry.name,
@@ -1582,7 +1604,7 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
                 running.push(Some(server));
                 failures.push(None);
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 notices.push(format!("mcp {}: {}{}", entry.name, e, origin(entry)));
                 running.push(None);
                 failures.push(Some(e));

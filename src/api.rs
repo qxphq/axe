@@ -88,6 +88,9 @@ pub fn list_models(
 ) -> Result<Vec<ModelInfo>, String> {
     // A listing is startup: bounded, so one dead provider cannot hold the
     // prompt off the screen for the five minutes a chat request is allowed.
+    // Ten seconds is what an MCP handshake gets: every real answer — a cold
+    // TLS handshake, a proxy roundtrip — is inside it, and a host that accepts
+    // and never speaks is bounded by exactly this number.
     let mut res = http::request_with_timeout(
         ep,
         "GET",
@@ -97,7 +100,7 @@ pub fn list_models(
         None,
         None,
         None,
-        Duration::from_secs(30),
+        Duration::from_secs(10),
     )?;
     let body = res.read_all().map_err(|e| format!("read models: {e}"))?;
     if res.status != 200 {
