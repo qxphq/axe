@@ -230,6 +230,11 @@ invariants a change must not break.
   writer's, and consecutive tool calls are one block.
 - Markdown is the model's and the user's, never the binary's. Blocks are laid out
   when they end; the live row says what the turn is doing, not the unfinished line.
+  A stream lays out the blocks the same text at once would: a blank line ends a
+  block only when the next line cannot continue it, and for a list that is an
+  item at an indent already open. A row wider than the field takes the rows it
+  needs — a code row keeps its indent, and the quote or item it sits in, on
+  every row it takes.
 - Style comes from `Paint` in `render.rs`, rendered as cells or ANSI: it is the
   only table of what a thing looks like, and `Info` names a variant rather than
   defining one.

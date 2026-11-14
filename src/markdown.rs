@@ -1207,10 +1207,16 @@ fn emit(
             }
             Block::Code { lang, content } => {
                 let _ = lang;
+                // A row too wide for the field takes the rows it needs, gutter
+                // and all, the way a paragraph does: left to the screen, the
+                // continuation would start at the terminal's edge and leave the
+                // quote or the item it sits in.
                 for line in content.split('\n') {
-                    let mut spans = gutter.to_vec();
-                    spans.push(Span::styled(line.to_string(), base.patch(CODE)));
-                    out.push(Line::from(spans));
+                    for row in wrap_code(line, inner) {
+                        let mut spans = gutter.to_vec();
+                        spans.push(Span::styled(row, base.patch(CODE)));
+                        out.push(Line::from(spans));
+                    }
                 }
             }
             Block::Blockquote(inner_blocks) => {
@@ -1545,6 +1551,26 @@ fn table(
     }
 }
 
+/// A code row broken at `width` cells. Whitespace is content here, so unlike
+/// `wrap` nothing collapses and no word moves: the row is cut where the cells
+/// run out. 0 is unbounded.
+fn wrap_code(text: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut col = 0;
+    for c in text.chars() {
+        let w = cell_width(c);
+        if width > 0 && col > 0 && col + w > width {
+            rows.push(std::mem::take(&mut row));
+            col = 0;
+        }
+        row.push(c);
+        col += w;
+    }
+    rows.push(row);
+    rows
+}
+
 /// A cell wider than its column loses its tail, not its head.
 fn clip(items: &[Piece], width: usize) -> Vec<Piece> {
     if plain_width(items) <= width {
@@ -1579,13 +1605,16 @@ fn clip(items: &[Piece], width: usize) -> Vec<Piece> {
 // --- Stream ---
 
 /// The document parser, fed a line at a time. Lines are held until the block
-/// they belong to ends: at a blank line, or when the caller flushes because
-/// something else goes into the transcript. A fenced block is opaque, so its
-/// blank lines are content, not boundaries.
+/// they belong to ends: at a blank line whose next line cannot continue it, or
+/// when the caller flushes because something else goes into the transcript. A
+/// fenced block is opaque, so its blank lines are content, not boundaries.
 #[derive(Default)]
 pub struct Stream {
     lines: Vec<String>,
     fence: Option<(char, usize)>,
+    /// Blank lines held since the last one pushed: they may separate two
+    /// blocks, or be a loose list's own gaps.
+    blank: usize,
 }
 
 impl Stream {
@@ -1601,19 +1630,41 @@ impl Stream {
             }
             return;
         }
-        if let Some((ch, n, _)) = fence_open(line) {
-            self.fence = Some((ch, n));
-            self.lines.push(line.to_string());
+        if line.trim().is_empty() {
+            self.blank += 1;
+            // Only a list carries a gap, so only a list waits to find out
+            // whether the next line is its own: any other block has ended.
+            if !open(&self.lines) {
+                self.flush(width, out);
+            }
             return;
         }
-        if line.trim().is_empty() {
-            self.flush(width, out);
-            return;
+        self.separate(line, width, out);
+        if let Some((ch, n, _)) = fence_open(line) {
+            self.fence = Some((ch, n));
         }
         self.lines.push(line.to_string());
     }
 
+    /// Settle the blank lines held before `line`. They join the buffer when it
+    /// still belongs to the same block — the list rule of `parse_blocks`, which
+    /// keeps an item after a gap when a list is already open — and otherwise
+    /// the block ends here, before the new line.
+    fn separate(&mut self, line: &str, width: usize, out: &mut Vec<Line<'static>>) {
+        if self.blank == 0 {
+            return;
+        }
+        if continues(&self.lines, line) {
+            for _ in 0..std::mem::take(&mut self.blank) {
+                self.lines.push(String::new());
+            }
+        } else {
+            self.flush(width, out);
+        }
+    }
+
     pub fn flush(&mut self, width: usize, out: &mut Vec<Line<'static>>) {
+        self.blank = 0;
         if self.lines.is_empty() {
             return;
         }
@@ -1621,6 +1672,29 @@ impl Stream {
         self.fence = None;
         render(&parse_blocks(&text, 0), width, out);
     }
+}
+
+/// Whether the block the buffer holds could still take a line after a blank
+/// one, so the boundary is not known yet: a list item, or content indented
+/// under one.
+fn open(lines: &[String]) -> bool {
+    let Some(last) = lines.iter().rev().find(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    list_item(last).is_some() || last.starts_with([' ', '\t'])
+}
+
+/// Whether a line after a gap still belongs to the block the buffer holds: a
+/// list item at an indent some open item already has, which is what the list
+/// loop of `parse_blocks` accepts across a blank line.
+fn continues(lines: &[String], line: &str) -> bool {
+    let Some((indent, _, _)) = list_item(line) else {
+        return false;
+    };
+    lines
+        .iter()
+        .filter_map(|held| list_item(held))
+        .any(|(open, _, _)| open == indent)
 }
 
 // --- Output for a stream that has no screen ---
@@ -2002,5 +2076,76 @@ mod tests {
         // Too deep to parse is a paragraph when there is text, nothing when not.
         assert!(parse_blocks("deep", 100).len() == 1);
         assert!(parse_blocks("", 100).is_empty());
+    }
+
+    /// A blank line inside a list is the list's own gap, not a block boundary:
+    /// the stream must lay out what the same text at once would be.
+    #[test]
+    fn a_stream_keeps_a_loose_list_whole() {
+        let at_once: Vec<String> = document("- a\n\n- b", 20).iter().map(plain).collect();
+        assert_eq!(at_once, vec!["• a", "• b"], "one list, no gap in it");
+
+        let mut stream = Stream::new();
+        let mut out = Vec::new();
+        for line in ["- a", "", "- b"] {
+            stream.push(line, 20, &mut out);
+        }
+        stream.flush(20, &mut out);
+        assert_eq!(out.iter().map(plain).collect::<Vec<_>>(), at_once);
+
+        // A gap between two paragraphs is still a boundary, and the list after
+        // one is a block of its own. The blank row between two blocks is the
+        // writer's, so the rows here sit next to each other.
+        let mut stream = Stream::new();
+        let mut out = Vec::new();
+        for line in ["text", "", "- a"] {
+            stream.push(line, 20, &mut out);
+        }
+        stream.flush(20, &mut out);
+        assert_eq!(
+            out.iter().map(plain).collect::<Vec<_>>(),
+            vec!["text", "• a"]
+        );
+
+        // A nested item's indent is not the outer item's: a deeper marker after
+        // a gap starts a block of its own, as it does at once.
+        // At once this is two blocks with the writer's blank row between them,
+        // not one list: the deeper marker is no item of the outer one.
+        let at_once: Vec<String> = document("- a\n\n  - b", 20)
+            .iter()
+            .map(plain)
+            .filter(|row| !row.is_empty())
+            .collect();
+        assert_eq!(at_once, vec!["• a", "• b"]);
+        let mut stream = Stream::new();
+        let mut out = Vec::new();
+        for line in ["- a", "", "  - b"] {
+            stream.push(line, 20, &mut out);
+        }
+        stream.flush(20, &mut out);
+        assert_eq!(
+            out.iter().map(plain).collect::<Vec<_>>(),
+            vec!["• a", "• b"],
+            "a block of its own"
+        );
+    }
+
+    /// Code keeps its own whitespace and its block when a row is too wide: the
+    /// rows it takes carry the gutter, so a quoted block stays quoted.
+    #[test]
+    fn a_code_row_wraps_inside_its_block() {
+        let quoted = "> ```\n> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n> ```";
+        let rows: Vec<String> = document(quoted, 12).iter().map(plain).collect();
+        assert!(rows.len() > 1, "{rows:?}");
+        for row in &rows {
+            assert!(text_width(row) <= 12, "{row:?}");
+            assert!(row.starts_with("│ "), "{row:?}");
+        }
+        // Spaces are content in code: nothing collapses, nothing moves.
+        let rows: Vec<String> = document("```\n  a    b\n```", 40)
+            .iter()
+            .map(plain)
+            .collect();
+        assert_eq!(rows, vec!["  a    b"]);
     }
 }
