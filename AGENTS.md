@@ -45,9 +45,13 @@ invariants a change must not break.
    `fetch`/`web_search` are HTTP(S) GET with the body reduced to text and
    labelled untrusted; both are refused outside explore mode. `curl` is on
    explore's allowlist because a command sends what `fetch` cannot. Tool errors
-   are results for the model, not harness failures. Truncate output, timeout
+   are results for the model, not harness failures, and an argument its schema
+   typed is never silently defaulted: absent is the default, a wrong type is an
+   error the model can act on. Truncate output, timeout
    `bash`, cap `fetch` at 1 MiB/50 000 chars and `web_search` at 1 MiB/20
-   results.
+   results; a `bash` or MCP result cut to fit names an owner-only file holding
+   the whole text, so the middle is never reachable only by re-running the
+   command that wrote it.
 8. **No approval prompts.** Bash runs unprompted by explicit user decision. Do not
    add a permission layer without being asked. A directory's `AGENTS.md` and its
    skills also load without a question: a trust prompt gates text the model could

@@ -156,15 +156,18 @@ pub(crate) fn call_line(call: &api::ToolCall, explore: bool) -> Vec<(Paint, Stri
 /// text, either `error: ...` or a non-zero `exit: N`. `read` is the one tool
 /// whose success is arbitrary file content, so a file whose first line begins
 /// `error:` must not read as its own failure: what identifies a `read` failure
-/// is the tool's name in it. Only a file that opens with exactly
-/// `error: read ...` is still misjudged, and no header could tell that apart
-/// without changing the content the model needs.
+/// is one of the shapes the tool itself writes — `error: read ...`,
+/// `error: missing "..."` and `error: "<name>" must be ...`. A file whose first
+/// line is one of those exact shapes is still misjudged, and no header could
+/// tell that apart without changing the content the model needs.
 pub(crate) fn failed(name: &str, result: &str) -> bool {
     if let Some(rest) = result.strip_prefix("exit: ") {
         return rest.lines().next().unwrap_or("").trim() != "0";
     }
     if name == "read" {
-        return result.starts_with("error: read ") || result.starts_with("error: missing \"path\"");
+        return result.starts_with("error: read ")
+            || result.starts_with("error: missing \"path\"")
+            || result.starts_with("error: \"");
     }
     result.starts_with("error:")
 }
@@ -222,6 +225,10 @@ mod tests {
             "error: read src/x.rs: offset 9 is past the end (3 lines)"
         ));
         assert!(failed("read", "error: missing \"path\""));
+        assert!(failed(
+            "read",
+            "error: \"offset\" must be a non-negative integer, got \"12\""
+        ));
         assert_eq!(mark("read", "error: read x: gone").1, "✗");
     }
 

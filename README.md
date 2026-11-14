@@ -451,8 +451,18 @@ An MCP server's tools join the same array as `mcp__<server>__<tool>`; see
 [MCP servers](#mcp-servers). The seven above are always axe's own and never
 move behind a server.
 
-`read` returns lines without numbering. `bash` starts every call in the working
-directory, so `cd` is pointless; output is truncated, not streamed.
+`read` returns lines without numbering, joined with LF: a CRLF file reads as
+LF, and an `edit` copying what it saw has to match the bytes on disk. A window
+over the cap stops after a whole line and names the offset that continues it;
+one line longer than the cap cannot be paged by line, and says so.
+`bash` starts every call in the working directory, so `cd` is pointless. Its
+output over 30 000 characters is cut, not streamed, and the result names an
+owner-only file holding each whole stream: the middle of a long log is usually
+where a build failed, and re-running the command that wrote it may not be safe.
+
+An argument of the wrong type is an error, never a default, so a call that
+asked for line 12 is never answered with line 1.
+
 `fetch` takes 1 MiB off the wire at most and gives the model at most 50 000
 characters, with `start` and `chars` to page through a longer page; a body it
 had to cut says so. An HTML page is reduced to text, and any other body —

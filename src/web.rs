@@ -36,10 +36,10 @@ pub fn set_brave_key(key: Option<String>) {
 }
 
 pub fn fetch(args: &Value, cancel: &Cancel) -> String {
-    let Some(url) = args["url"].as_str() else {
-        return "error: missing \"url\"".into();
+    let url = match crate::tools::string(args, "url") {
+        Ok(url) => url.trim(),
+        Err(e) => return e,
     };
-    let url = url.trim();
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return format!("error: fetch: url must start with http:// or https://: {url}");
     }
@@ -147,11 +147,17 @@ fn page_text(text: &str, args: &Value) -> String {
     if total == 0 {
         return "error: fetch: page has no text".into();
     }
-    let start = args["start"].as_u64().unwrap_or(1).max(1) as usize;
+    let start = match crate::tools::integer(args, "start") {
+        Ok(start) => start.unwrap_or(1).max(1) as usize,
+        Err(e) => return e,
+    };
     if start > total {
         return format!("error: fetch: start {start} is past the end ({total} characters)");
     }
-    let chars = args["chars"].as_u64().unwrap_or(FETCH_CHARS as u64) as usize;
+    let chars = match crate::tools::integer(args, "chars") {
+        Ok(chars) => chars.unwrap_or(FETCH_CHARS as u64) as usize,
+        Err(e) => return e,
+    };
     let chars = chars.clamp(1, FETCH_CHARS);
     let head: String = text.chars().skip(start - 1).take(chars).collect();
     let shown = head.chars().count();
@@ -176,17 +182,17 @@ struct Hit {
 }
 
 pub fn web_search(args: &Value, cancel: &Cancel) -> String {
-    let Some(query) = args["query"]
-        .as_str()
-        .map(str::trim)
-        .filter(|q| !q.is_empty())
-    else {
-        return "error: missing \"query\"".into();
+    let query = match crate::tools::string(args, "query") {
+        Ok(query) => query.trim(),
+        Err(e) => return e,
     };
-    let count = args["count"]
-        .as_u64()
-        .unwrap_or(SEARCH_RESULTS)
-        .clamp(1, SEARCH_LIMIT) as usize;
+    if query.is_empty() {
+        return "error: missing \"query\"".into();
+    }
+    let count = match crate::tools::integer(args, "count") {
+        Ok(count) => count.unwrap_or(SEARCH_RESULTS).clamp(1, SEARCH_LIMIT) as usize,
+        Err(e) => return e,
+    };
 
     // Brave is the default when it has a token. Any reason it cannot answer —
     // no results, an HTTP error, a page that is not the JSON we expect — is a

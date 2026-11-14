@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use crate::http::Cancel;
 use crate::sandbox;
-use crate::text::{plural, truncate};
+use crate::text::{clip, plural, truncate};
 
 // ---- schemas ----
 
@@ -28,7 +28,7 @@ struct Spec {
 
 const READ: Spec = Spec {
     name: "read",
-    description: "Read a file's lines: offset is 1-based, limit a line count; one range per call. Prefer it to `cat`, `sed -n`, `head`, `tail`, `awk` in bash. Use `rg` to search.",
+    description: "Read a file's lines: offset is 1-based, limit a line count; one range per call. Lines are joined with LF, so a CRLF file reads as LF and `edit` must match its bytes. Prefer it to `cat`, `sed -n`, `head`, `tail`, `awk` in bash. Use `rg` to search.",
     parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"Path, relative to the working directory"},"offset":{"type":"integer","description":"1-based first line"},"limit":{"type":"integer","description":"Maximum number of lines"}},"required":["path"]}"#,
 };
 
@@ -64,9 +64,18 @@ const ABOUT: Spec = Spec {
 /// lower; this keeps one call from loading a huge file into the parent.
 const READ_BYTES: u64 = 1 << 20;
 
-/// Bytes of a command's output the parent reads. The model-facing cap is 30k;
+/// Characters of a `read` window the model sees. `offset` is the only way back
+/// in, so the cut lands after a whole line and names the offset that follows.
+const READ_CHARS: usize = 50_000;
+
+/// Bytes of a command's output the parent reads. The model-facing cap is lower;
 /// this keeps one call from loading a huge scratch file into memory.
 const BASH_BYTES: u64 = 1 << 20;
+
+/// Characters of a command's result the model sees. Past it the capture files
+/// are kept and named: the middle of a long log is how a build failed, and
+/// re-running the command that produced it may not be safe.
+const BASH_CHARS: usize = 30_000;
 
 /// Disk cap for one command's combined output files. The parent reads only
 /// `BASH_BYTES`; this stops a runaway command before it fills the disk.
@@ -265,11 +274,68 @@ pub fn execute(name: &str, args: &str, cancel: &Cancel, mode: Mode) -> String {
     }
 }
 
+// ---- arguments ----
+
+/// A key the schema declares. An absent key and an explicit `null` are the same
+/// thing — the model left it out — but a key of the wrong type is never a
+/// default: a call that asked for line 12 must not be answered with line 1, and
+/// the model cannot see that it was. Every mismatch is an error result it can
+/// act on, worded like the missing ones.
+fn present<'a>(args: &'a Value, name: &str) -> Option<&'a Value> {
+    args.get(name).filter(|value| !value.is_null())
+}
+
+pub(crate) fn string<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
+    let Some(value) = present(args, name) else {
+        return Err(format!("error: missing \"{name}\""));
+    };
+    value
+        .as_str()
+        .ok_or_else(|| mismatch(name, "a string", value))
+}
+
+pub(crate) fn integer(args: &Value, name: &str) -> Result<Option<u64>, String> {
+    let Some(value) = present(args, name) else {
+        return Ok(None);
+    };
+    // `3.0` is the integer 3 written as a float, which providers do emit; `3.5`
+    // and `-1` are not integers this tool has a meaning for.
+    let number = value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|float| float.fract() == 0.0 && *float >= 0.0)
+            .map(|float| float as u64)
+    });
+    number
+        .map(Some)
+        .ok_or_else(|| mismatch(name, "a non-negative integer", value))
+}
+
+pub(crate) fn boolean(args: &Value, name: &str) -> Result<Option<bool>, String> {
+    let Some(value) = present(args, name) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| mismatch(name, "a boolean", value))
+}
+
+/// What the schema said and the call did not: the argument's own JSON, clipped,
+/// so the model reads what it sent instead of guessing which field is wrong.
+fn mismatch(name: &str, want: &str, value: &Value) -> String {
+    format!(
+        "error: \"{name}\" must be {want}, got {}",
+        clip(&value.to_string(), 40)
+    )
+}
+
 // ---- local tools ----
 
 fn read(args: &Value) -> String {
-    let Some(path) = args["path"].as_str() else {
-        return "error: missing \"path\"".into();
+    let path = match string(args, "path") {
+        Ok(path) => path,
+        Err(e) => return e,
     };
     // `/proc` serves the environment the process was exec'd with; `unsetenv`
     // does not clear it. Refuse the one file that holds the provider keys,
@@ -290,8 +356,14 @@ fn read(args: &Value) -> String {
         Ok(file) => file,
         Err(e) => return format!("error: read {path}: {e}"),
     };
-    let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
-    let limit = args["limit"].as_u64().map(|n| n as usize);
+    let offset = match integer(args, "offset") {
+        Ok(offset) => offset.unwrap_or(1).max(1) as usize,
+        Err(e) => return e,
+    };
+    let limit = match integer(args, "limit") {
+        Ok(limit) => limit.map(|n| n as usize),
+        Err(e) => return e,
+    };
 
     // Stream lines so an offset past 1 MiB still works; stop accumulating once
     // the read cap is reached. One very long line can still allocate itself,
@@ -302,7 +374,6 @@ fn read(args: &Value) -> String {
     let mut index = 0usize;
     let mut taken = 0usize;
     let mut bytes = 0u64;
-    let mut stopped = false;
     loop {
         line.clear();
         let read = match reader.read_until(b'\n', &mut line) {
@@ -317,8 +388,9 @@ fn read(args: &Value) -> String {
         if limit.is_some_and(|limit| taken >= limit) {
             break;
         }
+        // Past the byte cap the window is already over its character cap, so
+        // there is no separate marker: `window` names the offset that goes on.
         if bytes >= READ_BYTES {
-            stopped = true;
             break;
         }
         let text = String::from_utf8_lossy(&line);
@@ -328,18 +400,52 @@ fn read(args: &Value) -> String {
         out.push('\n');
         taken += 1;
         bytes += read as u64;
-        if bytes >= READ_BYTES {
-            stopped = true;
-            break;
-        }
     }
     if taken == 0 && offset > 1 && limit != Some(0) && offset > index {
         return format!("error: read {path}: offset {offset} is past the end ({index} lines)");
     }
-    if stopped {
-        out.push_str("\n...[read stopped at 1 MiB]...\n");
+    // A cut names the offset that continues it: `offset` is the only way back
+    // into a file, so a head-and-tail split would leave the model guessing
+    // where the gap began.
+    if out.chars().count() > READ_CHARS {
+        return window(&out, offset);
     }
-    truncate(out, 50_000)
+    out
+}
+
+/// The head of a window too big for the cap, cut after a whole line and closed
+/// with the offset that continues it. One line longer than the cap has no line
+/// to cut at: no offset reaches inside it, so it says that instead of claiming
+/// a continuation that does not exist.
+fn window(out: &str, first: usize) -> String {
+    // Room for the longest marker, so the result never grows past the cap.
+    const NOTE: usize = 160;
+    let room = READ_CHARS.saturating_sub(NOTE);
+    let mut end = 0usize;
+    let mut lines = 0usize;
+    for (chars, (bytes, c)) in out.char_indices().enumerate() {
+        if chars >= room {
+            break;
+        }
+        if c == '\n' {
+            end = bytes + 1;
+            lines += 1;
+        }
+    }
+    if lines == 0 {
+        let head: String = out.chars().take(room).collect();
+        let length = out.find('\n').unwrap_or(out.len());
+        return format!(
+            "{head}\n...[line {first} is {} characters; read cannot page inside one line]...\n",
+            out[..length].chars().count()
+        );
+    }
+    let next = first + lines;
+    format!(
+        "{}\n...[truncated after line {}; continue with offset {next}]...\n",
+        &out[..end],
+        next - 1
+    )
 }
 
 /// Whether `path` resolves to a `/proc` environment file: `/proc/self/environ`,
@@ -356,11 +462,13 @@ fn proc_environ(path: &Path) -> bool {
 }
 
 fn write(args: &Value) -> String {
-    let Some(path) = args["path"].as_str() else {
-        return "error: missing \"path\"".into();
+    let path = match string(args, "path") {
+        Ok(path) => path,
+        Err(e) => return e,
     };
-    let Some(content) = args["content"].as_str() else {
-        return "error: missing \"content\"".into();
+    let content = match string(args, "content") {
+        Ok(content) => content,
+        Err(e) => return e,
     };
     if let Some(parent) = Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
@@ -376,19 +484,25 @@ fn write(args: &Value) -> String {
 }
 
 fn edit(args: &Value) -> String {
-    let Some(path) = args["path"].as_str() else {
-        return "error: missing \"path\"".into();
+    let path = match string(args, "path") {
+        Ok(path) => path,
+        Err(e) => return e,
     };
-    let Some(old) = args["old"].as_str() else {
-        return "error: missing \"old\"".into();
+    let old = match string(args, "old") {
+        Ok(old) => old,
+        Err(e) => return e,
     };
-    let Some(new) = args["new"].as_str() else {
-        return "error: missing \"new\"".into();
+    let new = match string(args, "new") {
+        Ok(new) => new,
+        Err(e) => return e,
     };
     if old.is_empty() {
         return "error: edit: \"old\" must not be empty".into();
     }
-    let replace_all = args["replace_all"].as_bool().unwrap_or(false);
+    let replace_all = match boolean(args, "replace_all") {
+        Ok(flag) => flag.unwrap_or(false),
+        Err(e) => return e,
+    };
 
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -413,18 +527,19 @@ fn edit(args: &Value) -> String {
 }
 
 fn bash(args: &Value, cancel: &Cancel, mode: Mode) -> String {
-    let Some(command) = args["command"].as_str() else {
-        return "error: missing \"command\"".into();
+    let command = match string(args, "command") {
+        Ok(command) => command,
+        Err(e) => return e,
     };
 
-    // Output goes to scratch files, not pipes: a command that leaves a
+    // Output goes to capture files, not pipes: a command that leaves a
     // background process behind must not be able to keep this call waiting on
     // a pipe nobody will close.
-    let (mut out_file, mut err_file) = match (scratch("out"), scratch("err")) {
+    let (mut out_file, mut err_file) = match (Capture::new("stdout"), Capture::new("stderr")) {
         (Ok(out), Ok(err)) => (out, err),
         (Err(e), _) | (_, Err(e)) => return format!("error: scratch file: {e}"),
     };
-    let (out_write, err_write) = match (out_file.try_clone(), err_file.try_clone()) {
+    let (out_write, err_write) = match (out_file.file.try_clone(), err_file.file.try_clone()) {
         (Ok(out), Ok(err)) => (out, err),
         (Err(e), _) | (_, Err(e)) => return format!("error: scratch file: {e}"),
     };
@@ -481,8 +596,8 @@ fn bash(args: &Value, cancel: &Cancel, mode: Mode) -> String {
                     timed_out = true;
                 }
                 if !too_big {
-                    let size = out_file.metadata().map(|m| m.len()).unwrap_or(0)
-                        + err_file.metadata().map(|m| m.len()).unwrap_or(0);
+                    let size = out_file.file.metadata().map(|m| m.len()).unwrap_or(0)
+                        + err_file.file.metadata().map(|m| m.len()).unwrap_or(0);
                     if size > BASH_OUTPUT_CAP {
                         kill("-KILL", pid);
                         too_big = true;
@@ -497,8 +612,8 @@ fn bash(args: &Value, cancel: &Cancel, mode: Mode) -> String {
         }
     };
 
-    let stdout = read_output(&mut out_file, BASH_BYTES);
-    let stderr = read_output(&mut err_file, BASH_BYTES);
+    let stdout = read_output(&mut out_file.file, BASH_BYTES);
+    let stderr = read_output(&mut err_file.file, BASH_BYTES);
 
     let mut out = format!(
         "exit: {}\n",
@@ -529,7 +644,16 @@ fn bash(args: &Value, cancel: &Cancel, mode: Mode) -> String {
     if mode.explore() && denied(&stderr) {
         out.push_str(&mode.denial(sandbox::plan()));
     }
-    truncate(out, 30_000)
+    let cut = out.chars().count() > BASH_CHARS;
+    let mut out = truncate(out, BASH_CHARS);
+    if cut {
+        // The cut middle is how a long build or install failed, and running it
+        // again may not be safe: keep both captures and name them, the way an
+        // MCP result names its own.
+        out.push_str(&out_file.name());
+        out.push_str(&err_file.name());
+    }
+    out
 }
 
 /// `EACCES` from Landlock and `EPERM` from seccomp both arrive as one of these
@@ -551,24 +675,60 @@ fn kill(signal: &str, pid: i32) {
         .status();
 }
 
-/// A command's output file. Created `0600`, then unlinked at once: the handle
-/// is the only name it has, so nothing is left in the temp directory and no
-/// other local user can open it in between.
-fn scratch(kind: &str) -> std::io::Result<File> {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "axe-{}-{}-{kind}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)?;
-    let _ = std::fs::remove_file(&path);
-    Ok(file)
+/// One stream's capture. Created `0600` with a name nobody else may open, and
+/// unlinked on drop unless a cut result kept it and handed the path on: the
+/// file is the only place the middle of a long log survives.
+struct Capture {
+    file: File,
+    path: std::path::PathBuf,
+    label: &'static str,
+    kept: bool,
+}
+
+impl Capture {
+    fn new(label: &'static str) -> std::io::Result<Capture> {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "axe-{}-{}-{label}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        Ok(Capture {
+            file,
+            path,
+            label,
+            kept: false,
+        })
+    }
+
+    /// Keep this capture and say where it is; an empty one has nothing to read
+    /// and stays anonymous.
+    fn name(&mut self) -> String {
+        let size = self.file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        if size == 0 {
+            return String::new();
+        }
+        self.kept = true;
+        format!(
+            "[full {}: {} ({size} bytes)]\n",
+            self.label,
+            self.path.display()
+        )
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        if !self.kept {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn read_output(file: &mut File, max: u64) -> String {
@@ -645,7 +805,108 @@ mod tests {
         std::fs::write(&path, "a".repeat((READ_BYTES + 64) as usize)).unwrap();
         let result = read(&json!({ "path": path.to_string_lossy() }));
         let _ = std::fs::remove_file(&path);
-        assert!(result.contains("read stopped at 1 MiB"), "{result}");
+        // One line over the cap: no offset reaches inside it, and the result
+        // says that instead of offering a continuation that does not exist.
+        assert!(result.chars().count() <= READ_CHARS, "{}", result.len());
+        assert!(result.contains("cannot page inside one line"), "{result}");
+    }
+
+    /// The cut lands after a whole line and names the offset that continues it,
+    /// so the model reads on instead of guessing where the gap began.
+    #[test]
+    fn a_cut_window_names_the_offset_that_continues_it() {
+        let dir = scratch_dir("tools-window");
+        let file = dir.join("many.txt");
+        let text: String = (1..=6000).map(|n| format!("line {n:04}\n")).collect();
+        std::fs::write(&file, &text).unwrap();
+        let path = file.to_string_lossy().to_string();
+
+        let cut = read(&json!({ "path": path }));
+        assert!(cut.chars().count() <= READ_CHARS, "{}", cut.len());
+        let next: usize = cut
+            .rsplit_once("; continue with offset ")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .and_then(|(next, _)| next.parse().ok())
+            .unwrap_or_else(|| panic!("{cut}"));
+        assert!(next > 1);
+        // Whole lines only: the line before the marker is the one before `next`.
+        assert!(
+            cut.contains(&format!("truncated after line {}", next - 1)),
+            "{cut}"
+        );
+        let body = cut.split("\n...[truncated after line ").next().unwrap();
+        assert!(body.ends_with(&format!("line {:04}\n", next - 1)), "{cut}");
+        // Asking for that offset continues exactly there.
+        assert_eq!(
+            read(&json!({ "path": path, "offset": next, "limit": 1 })),
+            format!("line {next:04}\n")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `read` joins lines with LF, so a CRLF file reads as LF and an edit that
+    /// copies what it saw needs the bytes on disk.
+    #[test]
+    fn crlf_reads_as_lf_and_edit_matches_the_bytes() {
+        let dir = scratch_dir("tools-crlf");
+        let file = dir.join("win.txt");
+        std::fs::write(&file, "one\r\ntwo\r\n").unwrap();
+        let path = file.to_string_lossy().to_string();
+        assert_eq!(read(&json!({ "path": path })), "one\ntwo\n");
+        assert!(
+            edit(&json!({ "path": path, "old": "one\ntwo\n", "new": "x" })).contains("not found")
+        );
+        assert!(
+            edit(&json!({ "path": path, "old": "one\r\ntwo\r\n", "new": "x\n" }))
+                .starts_with("edited")
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "x\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An argument of the wrong type is the request the model did not make: an
+    /// error result, never a silently different window or a default.
+    #[test]
+    fn a_wrongly_typed_argument_is_an_error_not_a_default() {
+        let dir = scratch_dir("tools-typed");
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+        let path = file.to_string_lossy().to_string();
+        assert_eq!(
+            read(&json!({ "path": path, "offset": "2", "limit": "1" })),
+            "error: \"offset\" must be a non-negative integer, got \"2\""
+        );
+        assert_eq!(
+            read(&json!({ "path": path, "limit": -1 })),
+            "error: \"limit\" must be a non-negative integer, got -1"
+        );
+        assert_eq!(
+            read(&json!({ "path": path, "offset": 12.5 })),
+            "error: \"offset\" must be a non-negative integer, got 12.5"
+        );
+        // `3.0` is the integer 3, and a present key is never reported missing.
+        assert_eq!(
+            read(&json!({ "path": path, "offset": 2.0, "limit": 1 })),
+            "two\n"
+        );
+        assert_eq!(
+            read(&json!({ "path": 5 })),
+            "error: \"path\" must be a string, got 5"
+        );
+        assert!(
+            edit(&json!({ "path": path, "old": "one", "new": "1", "replace_all": "true" }))
+                .contains("error: \"replace_all\" must be a boolean, got \"true\"")
+        );
+        assert_eq!(
+            bash(&json!({ "command": 1 }), &Cancel::new(), Mode::Normal),
+            "error: \"command\" must be a string, got 1"
+        );
+        // An explicit null is an omitted key, not a type error.
+        assert_eq!(
+            read(&json!({ "path": path, "limit": null })),
+            "one\ntwo\nthree\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -693,6 +954,36 @@ mod tests {
         );
         assert!(result.contains("exit: 0"), "{result}");
         assert!(result.contains("hi"), "{result}");
+        // Nothing was cut, so nothing is left behind for the model to open.
+        assert!(!result.contains("[full "), "{result}");
+    }
+
+    /// A cut result is where a build failed, and re-running the command that
+    /// produced it may not be safe: the captures are kept and named, so the
+    /// model can page through the whole log with `read`.
+    #[test]
+    fn a_cut_command_result_names_the_whole_output() {
+        let command = "i=0; while [ $i -lt 2000 ]; do echo \"line $i ........................................\"; i=$((i+1)); done";
+        let out = execute(
+            "bash",
+            &json!({ "command": command }).to_string(),
+            &Cancel::new(),
+            Mode::Normal,
+        );
+        assert!(out.contains("[full stdout: "), "{out}");
+        assert!(!out.contains("[full stderr: "), "stderr was empty: {out}");
+        let path = out
+            .rsplit_once("[full stdout: ")
+            .and_then(|(_, rest)| rest.split_once(" ("))
+            .map(|(path, _)| path.to_string())
+            .unwrap_or_else(|| panic!("{out}"));
+        let whole = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(whole.lines().count(), 2000);
+        assert_eq!(
+            whole.lines().last(),
+            Some("line 1999 ........................................")
+        );
     }
 
     #[test]
@@ -818,6 +1109,18 @@ mod tests {
         assert!(execute("nonesuch", "{}", &cancel, Mode::Normal).contains("unknown tool"));
         assert!(execute("read", "{ not json", &cancel, Mode::Normal).contains("invalid arguments"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A server's tools are the server's: the mode confines the process when it
+    /// starts, so the name reaches `mcp::call` in both modes and is refused
+    /// there when no server answers to it.
+    #[test]
+    fn a_server_tool_is_not_gated_by_the_mode() {
+        let cancel = Cancel::new();
+        for mode in [Mode::Normal, Mode::Explore] {
+            let result = execute("mcp__nope__echo", "{}", &cancel, mode);
+            assert_eq!(result, "error: unknown tool: mcp__nope__echo");
+        }
     }
 
     #[test]

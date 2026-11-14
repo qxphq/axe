@@ -217,6 +217,22 @@ fn codes(style: Style) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// The one cap behind `bash`, `web_search` and MCP: both ends survive, the
+    /// result never grows past `max`, and a cut can never split a character.
+    #[test]
+    fn truncate_keeps_both_ends_without_splitting_a_character() {
+        let out = truncate("é".repeat(2_000), 100);
+        assert_eq!(out.chars().count(), 100, "{out}");
+        assert!(out.contains("...[truncated]..."), "{out}");
+        assert!(out.starts_with("éé"), "{out}");
+        assert!(out.ends_with("éé"), "{out}");
+        // An exact fit is left alone; one character more is cut to the cap.
+        assert_eq!(truncate("x".repeat(100), 100), "x".repeat(100));
+        assert_eq!(truncate("x".repeat(101), 100).chars().count(), 100);
+        // Smaller than its own marker: the head is all there is room for.
+        assert_eq!(truncate("y".repeat(50), 10).chars().count(), 10);
+    }
+
     /// ANSI output only exists for a terminal, so the codes are what a test can
     /// read.
     #[test]

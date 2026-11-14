@@ -28,7 +28,7 @@ box.
 ## Prompt, tools, and extensions
 
 - [x] [System prompt and skills](prompt-prefix.md)
-- [ ] [Tool contract](tool-contract.md)
+- [x] [Tool contract](tool-contract.md)
 - [ ] [Config and MCP](config-and-mcp.md)
 
 ## Context and cost
