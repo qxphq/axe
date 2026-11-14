@@ -527,14 +527,17 @@ const HELP: &str = "/model [id]    list the models, or switch to one for this di
 
 /// `/help`: the command list, then where the config is read from and the keys
 /// it takes. The path is resolved rather than written out, because
-/// `XDG_CONFIG_HOME` moves it.
+/// `XDG_CONFIG_HOME` moves it; the keys are the parser's own lists, so the
+/// shell cannot list a key the file rejects or miss one it takes.
 fn help_text() -> String {
     format!(
         "{HELP}\nconfig: {}\n\
-         config keys: providers, base_url, model, explore_by_default, search, thinking, system, agents, skills\n\
+         config keys: {}\n\
          mcp: mcp.json is global, <repo>/.mcp.json is per project (/mcp)\n\
-         provider keys: base_url, api_key_env, models_url, session_header, session_field, max_tokens, max_tokens_field, store, thinking",
-        config::path().display()
+         provider keys: {}",
+        config::path().display(),
+        config::TOP_KEYS.join(", "),
+        config::PROVIDER_KEYS.join(", ")
     )
 }
 
@@ -2520,14 +2523,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The README ships through `about`, so it is the contract the model reads;
+    /// `/help` is the same list for the session. A command, a config key or a
+    /// tool missing from either is a stale contract, not a doc nit — and the two
+    /// reviews before this one found exactly that drift with nothing failing.
     #[test]
-    fn help_lists_every_command_and_the_config() {
+    fn the_contract_lists_every_command_key_and_tool() {
+        let readme = include_str!("../README.md");
+        let help = help_text();
+        assert!(help.contains(&*config::path().to_string_lossy()));
         for name in COMMANDS {
             assert!(HELP.contains(name), "{name} is missing from HELP");
+            assert!(readme.contains(name), "{name} is missing from README");
         }
-        let text = help_text();
-        assert!(text.contains(&*config::path().to_string_lossy()));
-        assert!(text.contains("explore_by_default"));
+        for key in config::TOP_KEYS.iter().chain(config::PROVIDER_KEYS) {
+            assert!(help.contains(key), "{key} is missing from /help");
+            assert!(readme.contains(key), "{key} is missing from README");
+        }
+        // The seven are the README's tools table: `read(path, …)` and so on.
+        for tool in tools::definitions().as_array().expect("the array") {
+            let name = tool["function"]["name"].as_str().expect("a name");
+            if name.starts_with("mcp__") {
+                continue;
+            }
+            assert!(
+                readme.contains(&format!("`{name}(")),
+                "{name} is missing from README"
+            );
+        }
+    }
+
+    /// A flip is history, not prefix: the request's system prompt and tools are
+    /// the same bytes before and after it, which is what keeps the provider's
+    /// cache warm — and what makes the refusal, not the catalogue, the mode's
+    /// job.
+    #[test]
+    fn a_mode_flip_appends_a_note_and_changes_nothing_above_it() {
+        let server = Server::new(vec![
+            sse(&[r#"{"choices":[{"delta":{"content":"one"}}]}"#, "[DONE]"]),
+            sse(&[r#"{"choices":[{"delta":{"content":"two"}}]}"#, "[DONE]"]),
+        ]);
+        let mut session = session_at(&server);
+        session.record(json!({ "role": "user", "content": "hi" }));
+        session
+            .turn(&mut PlainSink::default(), &http::Cancel::new())
+            .unwrap();
+        let first = body_of(&server.text());
+        session.set_mode(tools::Mode::Normal);
+        session.record(json!({ "role": "user", "content": "again" }));
+        session
+            .turn(&mut PlainSink::default(), &http::Cancel::new())
+            .unwrap();
+        let second = body_of(&server.text());
+
+        let first: Value = serde_json::from_str(&first).expect("a request body");
+        let second: Value = serde_json::from_str(&second).expect("a request body");
+        assert_eq!(
+            first["tools"], second["tools"],
+            "the catalogue is unchanged"
+        );
+        assert_eq!(
+            first["messages"][0], second["messages"][0],
+            "the system prompt is unchanged"
+        );
+        // The flip is in the history, after the prefix.
+        let notes: Vec<&str> = second["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .filter(|text| text.starts_with("explore mode:"))
+            .collect();
+        assert!(notes.len() >= 2, "{notes:?}");
+        assert!(notes.last().unwrap().starts_with("explore mode: off"));
     }
 
     #[test]
@@ -3062,6 +3130,14 @@ mod tests {
             context: Some(1000),
         }];
         session
+    }
+
+    /// The body of a captured request, without its headers.
+    fn body_of(request: &str) -> String {
+        request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .unwrap_or_else(|| request.to_string())
     }
 
     /// The pair a turn's events travel on.

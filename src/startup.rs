@@ -543,6 +543,28 @@ mod tests {
         }
     }
 
+    /// The request-shaping keys reach the body from the config, once: the cache
+    /// once published a field name here and no test could have seen the mapping
+    /// drop it.
+    #[test]
+    fn the_providers_fields_carry_the_session_and_retention() {
+        let mut cfg = provider("p", &["p/one"]).cfg;
+        assert!(
+            request_fields(&cfg, "sid").as_object().unwrap().is_empty(),
+            "nothing configured, nothing sent"
+        );
+        cfg.session_field = Some("prompt_cache_key".into());
+        cfg.store = Some(false);
+        let fields = request_fields(&cfg, "abc123");
+        assert_eq!(fields["prompt_cache_key"], "abc123");
+        assert_eq!(fields["store"], false);
+        // The value is the session id, never the header's.
+        cfg.session_header = Some("x-session".into());
+        let fields = request_fields(&cfg, "abc123");
+        assert!(fields.get("x-session").is_none(), "{fields}");
+        assert_eq!(fields.as_object().unwrap().len(), 2, "{fields}");
+    }
+
     #[test]
     fn a_choice_that_names_nothing_passes_to_the_next_source() {
         let providers = vec![

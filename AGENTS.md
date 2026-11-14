@@ -335,13 +335,17 @@ invariants a change must not break.
 
 ```sh
 cargo build
-cargo test --locked   # parsers, caps, keys, layout — and live runs: a shell, loopback
+cargo test --locked   # parsers, caps, keys, layout, the binary itself — and live
+                      # runs: a shell, loopback, a spawned `axe` (tests/piped.rs)
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
 `harness.py` is the UI loop: `mock.py` + tmux pty + virtual terminal. It needs
-python3 and tmux. `--work DIR` keeps one directory and its state; `--wait` and
+python3 and tmux. CI runs the journeys below, so a regression in the screen, the
+confinement or the MCP approval fails a build rather than waiting for a person:
+the deny and the allow, the mid-turn queue, a resize, fetch paging with the host
+guard, `/compact`, and a project MCP file that asks once. `--work DIR` keeps one directory and its state; `--wait` and
 `--timeout` bound idling; `--bin` selects the binary; `--ansi`/`--scroll` control
 the dump, and `--expect`/`--refute` make it an assertion. See `harness.py --help`
 and `mock.py` for fixtures and replies.

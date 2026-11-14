@@ -81,6 +81,58 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y tmux
       - run: ./harness.py --expect "mock/mock-1" --expect "ok" "text:ok"
 
+      # The screen and the kernel are what unit tests cannot see, so the
+      # journeys AGENTS.md documents are the gate. Explore mode's confinement
+      # first: an allowlisted command runs, a write outside its directories and
+      # an exec outside the allowlist do not.
+      - name: explore mode's confinement
+        run: |
+          set -ex
+          ./harness.py --scroll 400 'tool:bash:{"command":"head -n 1 tmux.conf"}' '!Escape' 'show:' \
+            --expect 'set-option -g status off'
+          ./harness.py --scroll 400 'tool:bash:{"command":"echo x > /tmp/axe-ci"}' '!Escape' 'show:' \
+            --expect 'no write outside a scratch'
+          ./harness.py --scroll 400 'tool:bash:{"command":"tmux -V"}' '!Escape' 'show:' \
+            --expect 'Permission denied'
+
+      - name: the mid-turn queue takes a line back
+        run: |
+          ./harness.py --wait 1 --scroll 20 \
+            'tool:bash:{"command":"python3 -c \"import time;time.sleep(6)\""}' hello '!Up' '!Escape' '!Escape' \
+            --expect '│ hello'
+
+      - name: a resize, fetch paging, the host guard and /compact
+        run: |
+          set -ex
+          ./harness.py --wait 1 --scroll 60 'text:hello' '@resize:60x20' 'text:again' --expect 'again'
+          ./harness.py --wait 1 --scroll 100 'fetch:plain@2+20' '!Escape' 'show:' --expect 'use start 22'
+          ./harness.py --no-fetch-local --wait 1 --scroll 60 'fetch:plain' '!Escape' 'show:' \
+            --expect 'refused host'
+          ./harness.py --wait 1 --scroll 40 'text:one' '/compact' --expect 'Mock summary of the session.'
+
+      # A project MCP file is code a repository shipped: one approval, then no
+      # question at the next start.
+      - name: a project MCP file asks once
+        run: |
+          set -ex
+          w="$RUNNER_TEMP/axe-mcp"
+          rm -rf "$w"
+          mkdir -p "$w/.git"
+          cat > "$w/srv.sh" <<'SRV'
+          read line
+          echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"t","version":"1"}}}'
+          read line
+          read line
+          echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"say it back","inputSchema":{"type":"object"}}]}}'
+          while read line; do
+            id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+            echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"said it back\"}]}}"
+          done
+          SRV
+          printf '{"mcpServers":{"t":{"command":"/bin/sh","args":["%s/srv.sh"]}}}\n' "$w" > "$w/.mcp.json"
+          ./harness.py --work "$w" --timeout 12 --scroll 120 'y' '/mcp' --expect 'mcp t: 1 tool'
+          ./harness.py --work "$w" --timeout 12 --scroll 120 '/mcp' --refute 'run them?'
+
   coverage:
     runs-on: ubuntu-latest
     steps:

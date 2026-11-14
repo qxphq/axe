@@ -935,6 +935,26 @@ mod tests {
         );
     }
 
+    /// The assembled results are capped, and the label survives the cut: a
+    /// caller that trusted a result set without its source would read a page of
+    /// hits as the model's own words.
+    #[test]
+    fn a_result_set_over_the_cap_is_cut_and_keeps_its_label() {
+        let hits: Vec<Hit> = (0..40)
+            .map(|_| Hit {
+                title: "t".repeat(2_000),
+                url: "https://example.test/".into(),
+                snippet: "s".repeat(2_000),
+            })
+            .collect();
+        let out = results("duckduckgo", hits, 40);
+        assert!(out.chars().count() <= 30_000, "{}", out.chars().count());
+        assert!(
+            out.starts_with("source: duckduckgo (untrusted)"),
+            "{out:.80}"
+        );
+    }
+
     #[test]
     fn result_rows_keep_source_and_hits() {
         let out = results(

@@ -413,6 +413,17 @@ fn fingerprint(path: &Path) -> Result<(u64, Option<SystemTime>), String> {
 /// Compression is the host's: `gzip` is essential on Debian, in every BSD base
 /// and shipped by macOS, so nothing is vendored for it. A machine without it
 /// keeps bodies plain instead of failing a startup over compression.
+/// A test that needs the host's gzip says so when it skips: a silent return
+/// reports a pass for a path that never ran.
+#[cfg(test)]
+fn require_gzip(what: &str) -> bool {
+    if have_gzip() {
+        return true;
+    }
+    eprintln!("skip {what}: no gzip on this host");
+    false
+}
+
 fn have_gzip() -> bool {
     Command::new("gzip")
         .arg("--version")
@@ -743,7 +754,7 @@ mod tests {
 
     #[test]
     fn gzip_roundtrip() {
-        if !have_gzip() {
+        if !require_gzip("gzip_roundtrip") {
             return;
         }
         let dir = std::env::temp_dir().join(format!("axe-test-gzip-{}", std::process::id()));
@@ -952,7 +963,7 @@ mod tests {
 
     #[test]
     fn archive_old_compresses_the_bodies_past_the_keep_count() {
-        if !have_gzip() {
+        if !require_gzip("archive_old_compresses_the_bodies_past_the_keep_count") {
             return;
         }
         testenv::home("sessions-archive", |home| {
@@ -1055,7 +1066,7 @@ mod tests {
 
     #[test]
     fn a_compressed_body_left_beside_its_plain_copy_is_finished_off() {
-        if !have_gzip() {
+        if !require_gzip("a_compressed_body_left_beside_its_plain_copy_is_finished_off") {
             return;
         }
         let dir = testenv::dir("sessions-crash");
@@ -1073,7 +1084,7 @@ mod tests {
 
     #[test]
     fn an_old_session_already_compressed_only_gets_its_marker() {
-        if !have_gzip() {
+        if !require_gzip("an_old_session_already_compressed_only_gets_its_marker") {
             return;
         }
         testenv::home("sessions-marker", |home| {

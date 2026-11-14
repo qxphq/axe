@@ -213,7 +213,7 @@ fn resolve_path(raw: &str) -> PathBuf {
 
 /// The keys a file defines. A typo would otherwise change what a session does
 /// with no sign that it did, so anything else is refused.
-const TOP_KEYS: &[&str] = &[
+pub(crate) const TOP_KEYS: &[&str] = &[
     "providers",
     "base_url",
     "model",
@@ -225,7 +225,7 @@ const TOP_KEYS: &[&str] = &[
     "skills",
 ];
 
-const PROVIDER_KEYS: &[&str] = &[
+pub(crate) const PROVIDER_KEYS: &[&str] = &[
     "base_url",
     "api_key_env",
     "models_url",
