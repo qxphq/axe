@@ -56,17 +56,31 @@ fn tag_path(path: &str) -> String {
 
 /// A closing tag the file carries is broken, so a repository's instructions
 /// cannot end the block they were wrapped in: only the wrapper closes it. The
-/// space keeps the line readable and out of the tag's shape.
+/// space keeps the line readable and out of the tag's shape. A closer is any
+/// spelling of the tag a reader would take for one, whitespace before the `>`
+/// included.
 fn unclose(text: &str) -> String {
-    const CLOSE: &str = "</project_instructions>";
+    const OPEN: &str = "</project_instructions";
     let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
-    while let Some(found) = lower[at..].find(CLOSE) {
+    while let Some(found) = lower[at..].find(OPEN) {
         let start = at + found;
+        let after = start + OPEN.len();
+        let mut end = after;
+        while end < bytes.len() && bytes[end].is_ascii_whitespace() {
+            end += 1;
+        }
+        if end >= bytes.len() || bytes[end] != b'>' {
+            // Not a tag after all: leave it as it was and keep looking.
+            out.push_str(&text[at..after]);
+            at = after;
+            continue;
+        }
         out.push_str(&text[at..start]);
         out.push_str("</ project_instructions>");
-        at = start + CLOSE.len();
+        at = end + 1;
     }
     out.push_str(&text[at..]);
     out
@@ -121,6 +135,21 @@ mod tests {
         );
         assert!(system.contains("</ project_instructions>"), "{system}");
         assert!(system.trim_end().ends_with("</project_instructions>"));
+
+        // A tag is a tag with whitespace before its `>`; one that is not a tag
+        // is left alone.
+        assert_eq!(
+            unclose("a </project_instructions > b"),
+            "a </ project_instructions> b"
+        );
+        assert_eq!(
+            unclose("a </PROJECT_INSTRUCTIONS\n> b"),
+            "a </ project_instructions> b"
+        );
+        assert_eq!(
+            unclose("a </project_instructions x> b"),
+            "a </project_instructions x> b"
+        );
         // Case does not get past it either.
         let shouty = system_with_instructions(
             None,

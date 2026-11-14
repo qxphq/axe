@@ -21,9 +21,11 @@ invariants a change must not break.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` +
    SSE only. Express differences as config (`base_url`, `models_url`,
    `api_key_env`, `session_header`), never per-provider code paths.
-5. **The prompt is structure.** The built-in system prompt is cwd and a short
-   numbered list of rules that hold for every user; tool names, descriptions and
-   schemas travel only in the `tools` array. Rules are policy: one line each, no
+5. **The prompt is structure.** The built-in system prompt is cwd, a paragraph
+   saying what each mode allows, and a short numbered list of rules that hold for
+   every user; tool descriptions and schemas travel only in the `tools` array,
+   and a tool is named in the prompt only where a mode refuses it or where
+   `about` is the answer. Rules are policy: one line each, no
    workflow, nothing project- or provider-specific. Instructions are appended in
    order: `agents` (config), the nearest `AGENTS.md` at or above cwd, then
    `system`, then the skills catalogue. The project file is wrapped in

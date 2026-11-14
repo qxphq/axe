@@ -203,7 +203,8 @@ const BEHAVIOR: &[&str] = &[
 ];
 
 /// The built-in rules and the mode paragraph, with the working directory. Tool
-/// names, descriptions and schemas travel only in `definitions`.
+/// descriptions and schemas travel only in `definitions`; the paragraph names
+/// the ones a mode takes away, because a refusal has to say what it refuses.
 pub fn system_prompt() -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())

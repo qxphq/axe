@@ -143,11 +143,14 @@ pub fn read_agents(file: &Path) -> Option<String> {
             text.len(),
             AGENTS_LIMIT
         );
-        let mut cut = AGENTS_LIMIT;
+        // The model reads the cap too: instructions that stop mid-sentence
+        // otherwise read like instructions that end there.
+        let marker = "\n...[instructions truncated at 48 KiB]...\n";
+        let mut cut = AGENTS_LIMIT.saturating_sub(marker.len());
         while !text.is_char_boundary(cut) {
             cut -= 1;
         }
-        return Some(text[..cut].to_string());
+        return Some(format!("{}{marker}", &text[..cut]));
     }
     Some(text)
 }
@@ -479,6 +482,23 @@ mod tests {
         );
         assert!(find_agents(&nested).unwrap().ends_with("AGENTS.md"));
         assert!(read_agents(&dir.join("missing.md")).is_none());
+
+        // Over the cap the model is told where the text stops, inside the cap.
+        let long = dir.join("long.md");
+        std::fs::write(&long, "x".repeat(AGENTS_LIMIT + 10)).unwrap();
+        let capped = read_agents(&long).unwrap();
+        assert!(capped.len() <= AGENTS_LIMIT, "{}", capped.len());
+        assert!(
+            capped.ends_with("...[instructions truncated at 48 KiB]...\n"),
+            "{}",
+            capped.chars().rev().take(40).collect::<String>()
+        );
+        // Exactly at the cap is not truncated.
+        let edge = dir.join("edge.md");
+        std::fs::write(&edge, "y".repeat(AGENTS_LIMIT)).unwrap();
+        let kept = read_agents(&edge).unwrap();
+        assert_eq!(kept.len(), AGENTS_LIMIT);
+        assert!(!kept.contains("truncated"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -555,7 +575,14 @@ mod tests {
         std::fs::write(&big, "é".repeat(AGENTS_LIMIT / 2 + 10)).unwrap();
         let text = read_agents(&big).expect("truncated, not dropped");
         assert!(text.len() <= AGENTS_LIMIT, "{}", text.len());
-        assert!(text.chars().all(|c| c == 'é'), "cut on a char boundary");
+        // The cap keeps the marker inside it, so the model reads where it stops
+        // and the cut still lands on a char boundary.
+        let (body, marker) = text.split_at(text.find("\n...[instructions").unwrap_or(text.len()));
+        assert!(body.chars().all(|c| c == 'é'), "cut on a char boundary");
+        assert!(
+            marker.ends_with("...\n") && marker.contains("truncated at 48 KiB"),
+            "{marker:?}"
+        );
 
         let unreadable = dir.join("unreadable.md");
         std::fs::write(&unreadable, "secret").unwrap();

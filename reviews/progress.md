@@ -27,7 +27,7 @@ box.
 
 ## Prompt, tools, and extensions
 
-- [ ] [System prompt and skills](prompt-prefix.md)
+- [x] [System prompt and skills](prompt-prefix.md)
 - [ ] [Tool contract](tool-contract.md)
 - [ ] [Config and MCP](config-and-mcp.md)
 

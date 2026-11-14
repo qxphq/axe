@@ -373,7 +373,7 @@ fn parse_head(lines: &[&str]) -> Front {
             continue;
         };
         let key = key.trim();
-        let rest = rest.trim();
+        let rest = strip_comment(rest.trim());
         let (value, next) = if matches!(rest, "|" | "|-" | "|+" | ">" | ">-" | ">+") {
             let folded = rest.starts_with('>');
             let mut block = Vec::new();
@@ -419,6 +419,32 @@ fn parse_head(lines: &[&str]) -> Front {
         index = next;
     }
     front
+}
+
+/// A value without its trailing comment. `#` starts a comment at the value's
+/// own start or after whitespace, and never inside a quoted scalar: a
+/// description is prose, and a comment is not part of it.
+fn strip_comment(raw: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut prev = ' ';
+    for (at, c) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            prev = c;
+            continue;
+        }
+        match quote {
+            Some('"') if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '#' && prev.is_whitespace() => return raw[..at].trim_end(),
+            None => {}
+        }
+        prev = c;
+    }
+    raw
 }
 
 fn scalar(raw: &str) -> String {
@@ -861,6 +887,31 @@ mod tests {
         assert_eq!(scalar("plain text"), "plain text");
         assert_eq!(scalar("\"a\\\"b\""), "a\"b");
         assert_eq!(scalar("'single'"), "single");
+    }
+
+    /// A comment is YAML, not part of the value: a skill written the way YAML
+    /// allows keeps the name its directory has.
+    #[test]
+    fn a_trailing_comment_is_not_part_of_the_value() {
+        let text = "---\nname: pdf-tools # the reader\n\
+                    description: Extracts text. # see the docs\n\
+                    allowed-tools: read bash # both\ndisable-model-invocation: true # off\n---\n";
+        let (front, _) = split_frontmatter(text).unwrap();
+        assert_eq!(front.name.as_deref(), Some("pdf-tools"));
+        assert_eq!(front.description.as_deref(), Some("Extracts text."));
+        assert_eq!(front.allowed_tools.as_deref(), Some("read bash"));
+        assert!(front.hidden);
+        // A block scalar's indicator takes one too.
+        let (front, _) =
+            split_frontmatter("---\ndescription: | # note\n  two\n  lines\n---\n").unwrap();
+        assert_eq!(front.description.as_deref(), Some("two\nlines"));
+        // A `#` inside quotes is content, and one with no space before it is
+        // not a comment.
+        assert_eq!(strip_comment("\"a # b\""), "\"a # b\"");
+        assert_eq!(strip_comment("'a # b' # c"), "'a # b'");
+        assert_eq!(strip_comment("\"a\\\" # b\""), "\"a\\\" # b\"");
+        assert_eq!(strip_comment("a#b"), "a#b");
+        assert_eq!(strip_comment("# all of it"), "");
     }
 
     #[test]

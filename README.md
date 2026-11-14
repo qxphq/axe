@@ -136,14 +136,17 @@ is still never written.
 
 ## Instructions
 
-The built-in prompt is the working directory and a short numbered list of
-rules; tool names, descriptions and schemas are sent only in the request's
-`tools` array, never repeated in the prompt. Instructions are appended after
-it, in this order: `agents` from the config, then the nearest `AGENTS.md` at or
-above the working directory, then `system`. `agents` and `AGENTS.md` are capped
-at 48 KB; `system` is not. All are read once at startup; nothing is re-read
-mid-session, and the mode is carried in the conversation, not the prompt. The
-skills catalogue, when there is one, is appended last.
+The built-in prompt is the working directory, a paragraph on what each mode
+allows, and a short numbered list of rules. Tool descriptions and schemas are
+sent only in the request's `tools` array, never repeated in the prompt; a tool
+is named there only where the prompt has to be exact about it — the ones a mode
+takes away, and `about`. Instructions are appended after it, in this order:
+`agents` from the config, then the nearest `AGENTS.md` at or above the working
+directory, then `system`. `agents` and `AGENTS.md` are capped at 48 KB; a file
+over the cap ends with a line that says so, and `system` is not capped at all.
+All are read once at startup; nothing is re-read mid-session, and the mode is
+carried in the conversation, not the prompt. The skills catalogue, when there is
+one, is appended last.
 
 A project's `AGENTS.md` comes from the repository, not from you, so it is
 wrapped in `<project_instructions path="...">`. The first rule in the prompt
