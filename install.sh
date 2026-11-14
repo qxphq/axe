@@ -2,6 +2,7 @@
 # Install axe from the rolling `latest` release: a build of `main` on every push.
 #   curl -fsSL https://raw.githubusercontent.com/qxphq/axe/main/install.sh | sh
 # AXE_INSTALL_DIR overrides the destination; the default is ~/.local/bin.
+# NixOS installs the flake instead: nix profile add --no-write-lock-file github:qxphq/axe#default.
 set -eu
 
 repo=qxphq/axe
@@ -16,6 +17,18 @@ die() {
 case ${HOME:-} in
 '') [ -n "${AXE_INSTALL_DIR:-}" ] || die "HOME is not set; set AXE_INSTALL_DIR" ;;
 esac
+
+# NixOS: the package manager is the install that belongs there. The flake
+# builds from source and wraps the tools axe shells out to, while the glibc
+# release binary expects a loader layout this system does not keep.
+if [ -e /etc/NIXOS ]; then
+	command -v nix >/dev/null 2>&1 ||
+		die "NixOS without nix; install with: nix profile add --no-write-lock-file github:$repo#default"
+	nix profile add --no-write-lock-file "github:$repo#default" ||
+		die "nix profile add failed"
+	printf 'installed axe via nix from github:%s#default\n' "$repo"
+	exit 0
+fi
 
 os=$(uname -s)
 arch=$(uname -m)

@@ -20,10 +20,12 @@ curl -fsSL https://raw.githubusercontent.com/qxphq/axe/main/install.sh | sh
 
 That fetches a build of `main` from the rolling `latest` release, checks its
 sha256 and installs the binary into `~/.local/bin` (`AXE_INSTALL_DIR` overrides
-it). Assets exist for x86_64 and aarch64 Linux (glibc; on musl, including
-Alpine, the script says so and stops) and for Apple Silicon and Intel macOS.
-The release is rebuilt on every push to `main`, so its version is whatever
-`Cargo.toml` says at that commit — no tag marks it.
+it). On NixOS it installs the flake instead — `nix profile add
+--no-write-lock-file github:qxphq/axe#default` — which builds from source and
+wraps the tools `axe` shells out to. Assets exist for x86_64 and aarch64 Linux
+(glibc; on musl, including Alpine, the script says so and stops) and for Apple
+Silicon and Intel macOS. The release is rebuilt on every push to `main`, so its
+version is whatever `Cargo.toml` says at that commit — no tag marks it.
 
 ## Build
 

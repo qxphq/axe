@@ -143,7 +143,8 @@ invariants a change must not break.
     per semver (pre-1.0: patch for a fix, minor for a capability, a breaking
     change bumps minor until `1.0.0`). No second copy, no generated file, no
     version tag: the release is a single mutable `latest` tag whose assets are
-    clobbered on each push to `main`, and `install.sh` downloads from it.
+    clobbered on each push to `main`, and `install.sh` downloads from it
+    (on NixOS it installs the flake instead).
 
 ## Architecture
 
