@@ -313,17 +313,19 @@ and Esc puts back what was there before. A blank line, a line starting with a
 space (the shell's "do not remember this") and a repeat of the line before it
 are not remembered.
 
-Tab completes paths as well. A token that starts with `@`, `~`, `/` or `.`, or
-holds a `/`, lists the directory it names — relative to the working directory,
-absolute from `/`, `~` from home — with directories first and a trailing `/` on
-each, so Tab on a directory keeps the list open and a lone file ends it with a
-space. `@` is a trigger, not part of the path: `@READ` completes to
-`README.md`, and what the model reads is the path, not a sigil. A word that is
-none of those is prose, and Tab leaves it alone: a file in the working directory
-is reached with `@`, and a root path with `@` or its own slash, because `/model`
-is a command. A path with a space in it is not completed. Enter runs the
-marked entry here as it does for a command, so a message about a file submits
-the file.
+Tab completes paths as well. `@` starts one anywhere in the line: `@READ`
+completes to `README.md`, and what the model reads is the path, not a sigil.
+Without it only the line's first token completes, and only when it is a path —
+one that starts with `~`, `/` or `.`, or holds a `/` — so a command is typed
+from `/` and a message about `/etc/nix` is left alone. The token lists the
+directory it names — relative to the working directory, absolute from `/`, `~`
+from home — with directories first and a trailing `/` on each, so Tab on a
+directory keeps the list open and a lone file ends it with a space. A word that
+is none of those is prose, and Tab leaves it alone: a file in the working
+directory is reached with `@`, and a root path with `@` or its own slash,
+because `/model` is a command. A path with a space in it is not completed. Enter
+runs the marked entry here as it does for a command, so a message about a file
+submits the file.
 
 | command | what it does |
 | --- | --- |

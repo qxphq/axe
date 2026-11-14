@@ -4,9 +4,13 @@
 //! nothing about spans.
 //!
 //! `@` starts a path and is consumed by the completion: what lands on the line
-//! is the path the model should read, not a sigil it has to interpret. A token
-//! that is already a path — `~`, `/`, `.`, or anything with a `/` — completes
-//! the same way without it. Anything else is prose, and Tab leaves it alone.
+//! is the path the model should read, not a sigil it has to interpret.
+//!
+//! Without `@` only the line's first token completes, and only when it is a
+//! path — `~`, `/`, `.`, or anything with a `/`. A path in the middle of a
+//! message is prose the user is writing, not a filename to finish: `/etc/nix`
+//! in a sentence is not the completion's business, and a keystroke must not
+//! read a directory to find that out.
 
 use std::cmp::Ordering;
 use std::fs;
@@ -37,7 +41,9 @@ fn paths_in(line: &str, cursor: usize, cwd: &Path, home: Option<&Path>) -> Vec<S
     let word: String = chars[start..end].iter().collect();
     let forced = word.starts_with('@');
     let token = word.strip_prefix('@').unwrap_or(&word);
-    if !forced && (token.is_empty() || !path_like(token)) {
+    // A path is asked for with `@` anywhere, or by opening the line with one:
+    // prose that happens to hold a slash is a message, not a filename.
+    if !forced && (token.is_empty() || start > 0 || !path_like(token)) {
         return Vec::new();
     }
     let head: String = chars[..start].iter().collect();
@@ -53,7 +59,7 @@ fn paths_in(line: &str, cursor: usize, cwd: &Path, home: Option<&Path>) -> Vec<S
         .collect()
 }
 
-/// Whether a token asks for a path rather than being prose.
+/// Whether the line's first token asks for a path rather than being prose.
 fn path_like(token: &str) -> bool {
     token.starts_with('~')
         || token.starts_with('/')
@@ -198,20 +204,40 @@ mod tests {
     }
 
     #[test]
-    fn completion_keeps_what_is_around_the_token() {
+    fn a_path_token_keeps_the_line_around_it() {
         let dir = tree("around");
-        // The cursor sits inside `src/ui`, and the tail survives.
+        // The line opens with the token: the cursor sits inside `src/ui` and
+        // what follows it survives.
+        assert_eq!(paths_in("src/ui now", 6, &dir, None), vec!["src/ui.rs now"]);
+        // Elsewhere the `@` is what asks for a path, and it works mid-sentence.
         assert_eq!(
-            paths_in("cp src/ui now", 8, &dir, None),
+            paths_in("cp @src/ui now", 10, &dir, None),
             vec!["cp src/ui.rs now"]
         );
-        // Prose is not a path, and a missing directory is empty, not a panic.
-        assert!(paths_in("hello", 5, &dir, None).is_empty());
-        assert!(paths_in("nope/x", 6, &dir, None).is_empty());
-        assert!(
-            paths_in("", 0, &dir, None).is_empty(),
-            "an empty line completes nothing"
-        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A slash in a message is prose: the completion leaves the line alone and
+    /// never reads a directory to find that out.
+    #[test]
+    fn a_path_in_the_middle_of_a_message_is_prose() {
+        let dir = tree("prose");
+        for (line, cursor) in [
+            ("look at src/ui", 14),
+            ("look at /etc/nix", 16),
+            ("look at ./x", 11),
+            ("home is ~", 9),
+            // A first token is only a path when it looks like one.
+            ("hello", 5),
+            // A missing directory is empty, not a panic.
+            ("nope/x", 6),
+            ("", 0),
+        ] {
+            assert!(
+                paths_in(line, cursor, &dir, Some(&dir)).is_empty(),
+                "{line:?} is not a completion"
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
