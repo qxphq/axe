@@ -187,11 +187,99 @@ fn resolve_path(raw: &str) -> PathBuf {
     p
 }
 
-fn text(v: &Value, key: &str) -> Option<String> {
-    v[key]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+/// The keys a file defines. A typo would otherwise change what a session does
+/// with no sign that it did, so anything else is refused.
+const TOP_KEYS: &[&str] = &[
+    "providers",
+    "base_url",
+    "model",
+    "explore_by_default",
+    "search",
+    "thinking",
+    "system",
+    "agents",
+    "skills",
+];
+
+const PROVIDER_KEYS: &[&str] = &[
+    "base_url",
+    "api_key_env",
+    "models_url",
+    "session_header",
+    "thinking",
+];
+
+/// A section of the file: an object, and only the keys it defines.
+fn section<'a>(
+    value: &'a Value,
+    keys: &[&str],
+    context: &str,
+) -> Result<&'a serde_json::Map<String, Value>, String> {
+    let Some(map) = value.as_object() else {
+        return Err(format!("{context}must be an object"));
+    };
+    for key in map.keys() {
+        if !keys.contains(&key.as_str()) {
+            return Err(format!(
+                "{context}unknown key \"{key}\" (axe takes {})",
+                keys.join(", ")
+            ));
+        }
+    }
+    Ok(map)
+}
+
+/// A section that may be absent: `null` and a missing key are the same thing.
+fn optional_section<'a>(
+    value: &'a Value,
+    keys: &[&str],
+    context: &str,
+) -> Result<Option<&'a serde_json::Map<String, Value>>, String> {
+    match value.is_null() {
+        true => Ok(None),
+        false => section(value, keys, context).map(Some),
+    }
+}
+
+fn object<'a>(
+    value: &'a Value,
+    context: &str,
+) -> Result<Option<&'a serde_json::Map<String, Value>>, String> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Object(map) => Ok(Some(map)),
+        _ => Err(format!("{context}must be an object")),
+    }
+}
+
+/// A literal secret is a policy error, not a typo: the message says what to do
+/// instead, so it is checked before the key list would call it unknown.
+fn no_literal_key(value: &Value, context: &str) -> Result<(), String> {
+    if value.get("api_key").is_some() {
+        return Err(format!(
+            "{context}\"api_key\" is not supported; put the secret in the environment and point \
+             \"api_key_env\" at it"
+        ));
+    }
+    Ok(())
+}
+
+/// An optional string, empty or absent meaning unset. Any other type is the
+/// file's mistake, not a default to fall back on.
+fn string_field(value: Option<&Value>, key: &str, context: &str) -> Result<Option<String>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone()).filter(|text| !text.is_empty())),
+        Some(_) => Err(format!("{context}\"{key}\" must be a string")),
+    }
+}
+
+fn bool_field(value: Option<&Value>, key: &str, context: &str) -> Result<Option<bool>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(flag)) => Ok(Some(*flag)),
+        Some(_) => Err(format!("{context}\"{key}\" must be true or false")),
+    }
 }
 
 fn parse_provider(name: &str, v: &Value) -> Result<ProviderConfig, String> {
@@ -208,24 +296,34 @@ fn parse_provider(name: &str, v: &Value) -> Result<ProviderConfig, String> {
              \"provider/id\" spec, so it cannot be empty, contain '/', or carry whitespace"
         ));
     }
-    let base_url =
-        text(v, "base_url").ok_or_else(|| format!("provider \"{name}\": missing \"base_url\""))?;
-    if v.get("api_key").is_some() {
-        return Err(format!(
-            "provider \"{name}\": \"api_key\" is not supported; put the secret in the \
-             environment and point \"api_key_env\" at it"
-        ));
-    }
+    let context = format!("provider \"{name}\": ");
+    no_literal_key(v, &context)?;
+    section(v, PROVIDER_KEYS, &context)?;
+    let base_url = string_field(v.get("base_url"), "base_url", &context)?
+        .ok_or_else(|| format!("{context}missing \"base_url\""))?;
+    let thinking = match object(&v["thinking"], &format!("{context}\"thinking\": "))? {
+        Some(levels) => {
+            let mut pairs = Vec::new();
+            for (level, body) in levels {
+                if !body.is_object() {
+                    return Err(format!(
+                        "{context}\"thinking.{level}\" must be an object merged into the \
+                         request body"
+                    ));
+                }
+                pairs.push((level.clone(), body.clone()));
+            }
+            pairs
+        }
+        None => Vec::new(),
+    };
     Ok(ProviderConfig {
         name: name.to_string(),
         base_url: base_url.trim_end_matches('/').to_string(),
-        api_key_env: text(v, "api_key_env"),
-        models_url: text(v, "models_url"),
-        session_header: text(v, "session_header"),
-        thinking: v["thinking"]
-            .as_object()
-            .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default(),
+        api_key_env: string_field(v.get("api_key_env"), "api_key_env", &context)?,
+        models_url: string_field(v.get("models_url"), "models_url", &context)?,
+        session_header: string_field(v.get("session_header"), "session_header", &context)?,
+        thinking,
     })
 }
 
@@ -286,29 +384,34 @@ fn parse_skills(v: &Value) -> Result<Vec<PathBuf>, String> {
 }
 
 fn parse_value(v: &Value) -> Result<Config, String> {
+    no_literal_key(v, "")?;
+    section(v, TOP_KEYS, "")?;
+    let top_url = string_field(v.get("base_url"), "base_url", "")?;
+    let configured = object(&v["providers"], "\"providers\": ")?;
+
     let mut providers = Vec::new();
-    if let Some(map) = v["providers"].as_object() {
-        for (name, entry) in map {
-            providers.push(parse_provider(name, entry)?);
-        }
-    } else if let Some(base_url) = text(v, "base_url") {
-        if v.get("api_key").is_some() {
+    match (configured, top_url) {
+        (Some(_), Some(_)) => {
             return Err(
-                "\"api_key\" is not supported; put the secret in the environment \
-                 and point \"api_key_env\" at it"
+                "\"providers\" and a top-level \"base_url\" are two ways to say the same \
+                 thing; keep one"
                     .into(),
-            );
+            )
         }
-        providers.push(ProviderConfig {
+        (Some(map), None) => {
+            for (name, entry) in map {
+                providers.push(parse_provider(name, entry)?);
+            }
+        }
+        (None, Some(base_url)) => providers.push(ProviderConfig {
             name: "local".to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key_env: None,
             models_url: None,
             session_header: None,
             thinking: Vec::new(),
-        });
-    } else {
-        return Err("need \"providers\" or \"base_url\"".into());
+        }),
+        (None, None) => return Err("need \"providers\" or \"base_url\"".into()),
     }
 
     if providers.is_empty() {
@@ -316,32 +419,41 @@ fn parse_value(v: &Value) -> Result<Config, String> {
     }
 
     // An unset key is not an error: search falls back to DuckDuckGo.
-    let brave = &v["search"]["brave"];
-    if brave.get("api_key").is_some() {
-        return Err(
-            "\"search.brave.api_key\" is not supported; put the secret in the \
-             environment and point \"search.brave.api_key_env\" at it"
-                .into(),
-        );
+    let mut brave_key = None;
+    let brave = optional_section(&v["search"], &["brave"], "\"search\": ")?;
+    if let Some(brave) = brave.map(|search| &search["brave"]) {
+        no_literal_key(brave, "\"search.brave\": ")?;
+        let brave = section(brave, &["api_key_env"], "\"search.brave\": ")?;
+        if let Some(var) = string_field(brave.get("api_key_env"), "api_key_env", "")? {
+            brave_key = env::var(&var).ok().filter(|key| !key.is_empty());
+        }
     }
-    let brave_key =
-        text(brave, "api_key_env").and_then(|var| env::var(var).ok().filter(|s| !s.is_empty()));
+
+    let thinking = match object(&v["thinking"], "\"thinking\": ")? {
+        Some(map) => {
+            let mut pairs = Vec::new();
+            for (spec, level) in map {
+                let Some(level) = level.as_str() else {
+                    return Err(format!(
+                        "\"thinking.{spec}\" must name a level, like \"high\""
+                    ));
+                };
+                pairs.push((spec.clone(), level.to_string()));
+            }
+            pairs
+        }
+        None => Vec::new(),
+    };
 
     Ok(Config {
         providers,
-        model: text(v, "model"),
-        explore_by_default: v["explore_by_default"].as_bool().unwrap_or(true),
+        model: string_field(v.get("model"), "model", "")?,
+        explore_by_default: bool_field(v.get("explore_by_default"), "explore_by_default", "")?
+            .unwrap_or(true),
         search: Search { brave_key },
-        thinking: v["thinking"]
-            .as_object()
-            .map(|map| {
-                map.iter()
-                    .filter_map(|(k, l)| Some((k.clone(), l.as_str()?.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        system: text(v, "system"),
-        agents: text(v, "agents").map(|raw| resolve_path(&raw)),
+        thinking,
+        system: string_field(v.get("system"), "system", "")?,
+        agents: string_field(v.get("agents"), "agents", "")?.map(|raw| resolve_path(&raw)),
         skills: parse_skills(v)?,
     })
 }
@@ -425,6 +537,81 @@ mod tests {
             "providers": {"p": {}}
         }))
         .is_err());
+    }
+
+    /// A typo must not change what a session does in silence: the key list is
+    /// the file's contract, at the top level and in a provider.
+    #[test]
+    fn a_key_the_file_does_not_define_is_an_error() {
+        let err = parse_value(&serde_json::json!({
+            "base_url": "http://p",
+            "agent": "~/AGENTS.md"
+        }))
+        .err()
+        .unwrap();
+        assert!(err.contains("unknown key \"agent\""), "{err}");
+        assert!(err.contains("agents"), "the message names the keys: {err}");
+
+        let err = parse_value(&serde_json::json!({
+            "providers": {"p": {"base_url": "http://p", "api_key_envr": "K"}}
+        }))
+        .err()
+        .unwrap();
+        assert!(err.contains("provider \"p\""), "{err}");
+        assert!(err.contains("unknown key \"api_key_envr\""), "{err}");
+
+        for nested in [
+            serde_json::json!({"base_url": "http://p", "search": {"brave": {}, "googel": {}}}),
+            serde_json::json!({"base_url": "http://p", "search": {"brave": {"token": "x"}}}),
+        ] {
+            let err = parse_value(&nested).err().unwrap();
+            assert!(err.contains("unknown key"), "{err}");
+        }
+
+        // `providers` and the top-level shorthand are one thing said twice.
+        assert!(parse_value(&serde_json::json!({
+            "providers": {"p": {"base_url": "http://p"}},
+            "base_url": "http://q"
+        }))
+        .is_err());
+
+        // A literal secret keeps its own message, even next to `providers`.
+        let err = parse_value(&serde_json::json!({
+            "providers": {"p": {"base_url": "http://p"}},
+            "api_key": "secret"
+        }))
+        .err()
+        .unwrap();
+        assert!(err.contains("not supported"), "{err}");
+    }
+
+    /// A known key of the wrong type is the file's mistake too, and `null`
+    /// stays "unset".
+    #[test]
+    fn a_known_key_of_the_wrong_type_is_an_error() {
+        for bad in [
+            serde_json::json!({"base_url": "http://p", "explore_by_default": "false"}),
+            serde_json::json!({"base_url": "http://p", "model": 5}),
+            serde_json::json!({"base_url": "http://p", "system": ["s"]}),
+            serde_json::json!({"base_url": "http://p", "agents": ["a"]}),
+            serde_json::json!({"base_url": "http://p", "thinking": {"p/m": 5}}),
+            serde_json::json!({"base_url": "http://p", "search": "brave"}),
+            serde_json::json!({"base_url": 5}),
+            serde_json::json!({"providers": "p"}),
+            serde_json::json!({"providers": {"p": {"base_url": "http://p",
+                                                   "thinking": {"low": "low"}}}}),
+        ] {
+            assert!(parse_value(&bad).is_err(), "{bad}");
+        }
+        assert!(parse_value(&serde_json::json!({
+            "base_url": "http://p",
+            "model": null,
+            "system": null,
+            "agents": null,
+            "skills": null,
+            "explore_by_default": null
+        }))
+        .is_ok());
     }
 
     #[test]

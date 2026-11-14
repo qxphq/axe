@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -276,6 +276,20 @@ fn expand(raw: &str) -> Result<String, String> {
 
 fn value(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is not set"))
+}
+
+/// A stdio entry's program and argv, expanded from axe's environment when the
+/// server starts. The approval question lists these variables, so they are the
+/// ones it must read: a reference in an argument is resolved here, not passed
+/// through as text.
+fn stdio_words(entry: &Entry) -> Result<(String, Vec<String>), String> {
+    let command = entry.command.as_deref().unwrap_or_default();
+    let program = expand(command).map_err(|e| format!("command: {e}"))?;
+    let mut args = Vec::with_capacity(entry.args.len());
+    for (at, arg) in entry.args.iter().enumerate() {
+        args.push(expand(arg).map_err(|e| format!("args[{at}]: {e}"))?);
+    }
+    Ok((program, args))
 }
 
 /// One file's entries. Unknown keys are errors: a typo, or a field from
@@ -631,8 +645,24 @@ fn remember(cwd: &Path, file: &Path, hash: &str) {
             return;
         }
     };
-    if let Err(e) = state::write_private(&trust_file(cwd), &text) {
+    if let Err(e) = write_atomic(&trust_file(cwd), &text, true) {
         eprintln!("axe: mcp trust: {e}");
+    }
+}
+
+/// Carry a project file's approval across a write axe itself made — but only
+/// when the file was already approved. An add or a remove must never bless
+/// entries the approval question has not listed: the file is code, and the
+/// question is the only place it is shown.
+fn carry_approval(cwd: &Path, file: &Path, prior: Option<&str>) {
+    match prior {
+        Some(hash) if approved(cwd, file, hash) => {}
+        _ => return,
+    }
+    if let Ok(bytes) = fs::read(file) {
+        if let Some(hash) = hash_of(&bytes) {
+            remember(cwd, file, &hash);
+        }
     }
 }
 
@@ -678,6 +708,9 @@ struct StdioConn {
     /// Replies by id, filled by the reader thread.
     pending: Arc<Mutex<HashMap<u64, Sender<Value>>>>,
     dead: Arc<AtomicBool>,
+    /// The reader stopped on a line over the cap, not on an exit: the process
+    /// is alive and its output is simply not read any more.
+    over_cap: Arc<AtomicBool>,
     stderr: Arc<Mutex<Vec<u8>>>,
     /// The process group is gone. A reaped pid may be reused, so this is what
     /// keeps `stop` from signalling a group that is not ours any more.
@@ -727,10 +760,10 @@ impl Conn {
 
 impl StdioConn {
     fn open(entry: &Entry, explore: bool) -> Result<StdioConn, String> {
-        let command = entry.command.as_deref().unwrap_or_default();
+        let (command, args) = stdio_words(entry)?;
         let program = match command.contains('/') {
-            true => PathBuf::from(command),
-            false => crate::sandbox::resolve_program(command)
+            true => PathBuf::from(&command),
+            false => crate::sandbox::resolve_program(&command)
                 .ok_or_else(|| format!("\"{command}\" is not on PATH"))?,
         };
         let mut env = Vec::new();
@@ -740,7 +773,7 @@ impl StdioConn {
                 expand(raw).map_err(|e| format!("{name}: {e}"))?,
             ));
         }
-        let mut cmd = crate::sandbox::server(&program, &entry.args, &env, explore)?;
+        let mut cmd = crate::sandbox::server(&program, &args, &env, explore)?;
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -755,11 +788,13 @@ impl StdioConn {
         let stderr_pipe = child.stderr.take();
         let pending: Arc<Mutex<HashMap<u64, Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
         let dead = Arc::new(AtomicBool::new(false));
+        let over_cap = Arc::new(AtomicBool::new(false));
         let stderr = Arc::new(Mutex::new(Vec::new()));
         if let Some(stdout) = stdout {
             let pending = pending.clone();
             let dead = dead.clone();
-            thread::spawn(move || read_replies(stdout, pending, dead));
+            let capped = over_cap.clone();
+            thread::spawn(move || read_replies(stdout, pending, dead, capped));
         }
         if let Some(pipe) = stderr_pipe {
             let tail = stderr.clone();
@@ -771,6 +806,7 @@ impl StdioConn {
             stdin,
             pending,
             dead,
+            over_cap,
             stderr,
             stopped: false,
         })
@@ -802,7 +838,7 @@ impl StdioConn {
         cancel: &Cancel,
     ) -> Result<Value, String> {
         if self.dead.load(Ordering::SeqCst) {
-            return Err(self.exited());
+            return Err(self.gone());
         }
         let (tx, rx) = mpsc::channel();
         if let Ok(mut pending) = self.pending.lock() {
@@ -854,9 +890,19 @@ impl StdioConn {
             return Err(format!("timed out after {}s", timeout.as_secs()));
         };
         if reply.is_null() {
-            return Err(self.exited());
+            return Err(self.gone());
         }
         Ok(reply)
+    }
+
+    /// What to say when the connection is gone: an oversized line is not an
+    /// exit, and saying so is how the model tells a protocol limit from a
+    /// crash.
+    fn gone(&self) -> String {
+        match self.over_cap.load(Ordering::SeqCst) {
+            true => cap_reason(),
+            false => self.exited(),
+        }
     }
 
     /// What to say when the server is gone: its own last words, if it had any.
@@ -1096,6 +1142,7 @@ fn read_replies(
     stdout: impl Read,
     pending: Arc<Mutex<HashMap<u64, Sender<Value>>>>,
     dead: Arc<AtomicBool>,
+    over_cap: Arc<AtomicBool>,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
@@ -1108,7 +1155,12 @@ fn read_replies(
             .read_until(b'\n', &mut line);
         match read {
             Ok(0) | Err(_) => break,
-            Ok(_) if line.len() > LINE_CAP => break,
+            // A line over the cap is a protocol limit, not an exit: the process
+            // may live on, and the answer says which one happened.
+            Ok(_) if line.len() > LINE_CAP => {
+                over_cap.store(true, Ordering::SeqCst);
+                break;
+            }
             Ok(_) => {}
         }
         let text = String::from_utf8_lossy(&line);
@@ -1409,7 +1461,12 @@ struct Registry {
     errors: Vec<String>,
     cwd: Option<PathBuf>,
     project: Option<PathBuf>,
+    /// The project's entries are in force.
     trusted: bool,
+    /// A trust record matched the file as it stands.
+    recorded: bool,
+    /// The file defines something, so the question is owed.
+    needs_approval: bool,
     stamps: Vec<(PathBuf, Option<Stamp>)>,
     explore: bool,
 }
@@ -1458,17 +1515,20 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
     errors.append(&mut problems);
 
     let mut trusted = project.is_none();
+    let mut recorded = false;
+    let mut needs_approval = false;
     if let Some(file) = &project {
         let bytes = fs::read(file).unwrap_or_default();
         let hash = hash_of(&bytes);
-        trusted = match (&hash, cwd) {
+        recorded = match (&hash, cwd) {
             (Some(hash), Some(dir)) => approved(dir, file, hash),
             _ => false,
         };
+        trusted = recorded;
         // A file that only switches global servers runs nothing new: it needs
         // no approval, and its entries are applied either way.
-        let runs = project_entries.iter().any(|entry| !entry.toggle_only);
-        if !trusted && runs {
+        needs_approval = project_entries.iter().any(|entry| !entry.toggle_only);
+        if !trusted && needs_approval {
             match &hash {
                 None => errors.push(format!(
                     "{}: no sha256sum or shasum, so it cannot be approved",
@@ -1480,10 +1540,11 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
                             remember(dir, file, hash);
                         }
                         trusted = true;
+                        recorded = true;
                     }
                 }
             }
-        } else if !runs {
+        } else if !needs_approval {
             trusted = true;
         }
     }
@@ -1542,6 +1603,8 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
         cwd: cwd.map(Path::to_path_buf),
         project,
         trusted,
+        recorded,
+        needs_approval,
         stamps,
         explore,
     };
@@ -1732,6 +1795,16 @@ pub fn dispatch(arg: &str) -> String {
     }
 }
 
+/// What the listing says about the project file: the record that matched, and
+/// whether the file defines anything the question is owed for.
+fn approval_state(recorded: bool, needs_approval: bool) -> &'static str {
+    match (recorded, needs_approval) {
+        (true, _) => "approved",
+        (false, true) => "not approved",
+        (false, false) => "nothing to approve",
+    }
+}
+
 fn listing() -> String {
     let reg = lock();
     if reg.entries.is_empty() {
@@ -1741,7 +1814,11 @@ fn listing() -> String {
         }
         // A file that exists and was not approved is the one thing the empty
         // state must not hide: the next start asks again.
-        if let Some(file) = reg.project.as_deref().filter(|_| !reg.trusted) {
+        if let Some(file) = reg
+            .project
+            .as_deref()
+            .filter(|_| reg.needs_approval && !reg.recorded)
+        {
             out.push_str(&format!(
                 "no MCP servers running\n  {}: not approved — the next start asks\n",
                 file.display()
@@ -1771,15 +1848,11 @@ fn listing() -> String {
         ));
     }
     if let Some(file) = &reg.project {
-        out.push_str(&format!(
-            "  {}: {}\n",
-            file.display(),
-            if reg.trusted {
-                "approved"
-            } else {
-                "not approved"
-            }
-        ));
+        // The record is what this line reports, not whether entries happen to
+        // be in force: a toggle-only file was never asked about, and a file
+        // whose approval was just forgotten is not approved any more.
+        let state = approval_state(reg.recorded, reg.needs_approval);
+        out.push_str(&format!("  {}: {state}\n", file.display()));
     }
     for error in &reg.errors {
         out.push_str(&format!("  error: {}\n", strip_control(error)));
@@ -1831,7 +1904,8 @@ fn empty_state() -> String {
          asked about once before it runs.\n\n  \
          /mcp add --url sentry https://mcp.sentry.dev/mcp\n     \
          a url is streamable HTTP; --header carries its bearer token.\n\n  \
-         --env NAME      hand it a variable from your environment (repeatable)\n  \
+         --env NAME      hand it a variable from your environment (repeatable);\n     \
+         NAME=VALUE writes the value as given, so a secret belongs in the first\n  \
          --header 'K: V' one header, for a url (repeatable)\n  \
          a new server appears after a restart; /mcp then lists it.\n\n\
          a project server with the same name replaces the global one.\n\
@@ -1895,8 +1969,9 @@ fn words(rest: &str) -> Result<Vec<String>, String> {
 }
 
 /// `/mcp add`'s flags. `--env` takes a variable **name** (meaning
-/// `NAME=${NAME}`) or `NAME=VALUE`; a value is a reference resolved from axe's
-/// environment, never a secret copied into the file.
+/// `NAME=${NAME}`) or `NAME=VALUE`. The name form is the one that keeps a
+/// secret out of the file; a value is written as given, and only `$NAME`
+/// inside it is expanded when the server starts.
 #[allow(clippy::type_complexity)]
 fn add_flags(
     rest: &str,
@@ -2031,15 +2106,14 @@ fn add(rest: &str) -> String {
         (true, None) => return "error: mcp: no working directory for a project file\n".into(),
         (false, _) => global_path(),
     };
+    let prior = fs::read(&path).ok().and_then(|bytes| hash_of(&bytes));
     match write_entry(&path, name, &entry) {
         Ok(()) => {
-            // The user just wrote this file through axe: the next start must
-            // not ask them to approve their own edit.
+            // The user typed this entry, not the whole file: an approval the
+            // file already had survives, and one it never had is not invented.
             if path != global_path() {
-                if let (Some(dir), Ok(bytes)) = (cwd.as_deref(), fs::read(&path)) {
-                    if let Some(hash) = hash_of(&bytes) {
-                        remember(dir, &path, &hash);
-                    }
+                if let Some(dir) = cwd.as_deref() {
+                    carry_approval(dir, &path, prior.as_deref());
                 }
             }
             format!(
@@ -2065,14 +2139,13 @@ fn remove(rest: &str) -> String {
     }
     let mut removed = 0;
     for file in files {
+        let prior = fs::read(&file).ok().and_then(|bytes| hash_of(&bytes));
         match remove_entry(&file, name) {
             Ok(true) => {
                 removed += 1;
                 if file != global_path() {
-                    if let (Some(dir), Ok(bytes)) = (cwd.as_deref(), fs::read(&file)) {
-                        if let Some(hash) = hash_of(&bytes) {
-                            remember(dir, &file, &hash);
-                        }
+                    if let Some(dir) = cwd.as_deref() {
+                        carry_approval(dir, &file, prior.as_deref());
                     }
                 }
             }
@@ -2089,7 +2162,16 @@ fn remove(rest: &str) -> String {
 fn forget() -> String {
     let cwd = lock().cwd.clone();
     match cwd {
-        Some(dir) => format!("◦ {}\n", forget_trust(&dir)),
+        Some(dir) => {
+            let message = forget_trust(&dir);
+            // The record is gone, so the file is not approved any more: the
+            // listing must not keep saying it is. The running servers stay
+            // what they are until the next start.
+            let mut reg = lock();
+            reg.trusted = false;
+            reg.recorded = false;
+            format!("◦ {message}\n")
+        }
         None => "error: mcp: no working directory\n".into(),
     }
 }
@@ -2104,18 +2186,53 @@ fn read_config(path: &Path) -> Result<Value, String> {
     }
 }
 
+/// The one place a file is replaced: beside it, then renamed, so a crash
+/// leaves the file it had rather than half of a new one. The temp is a
+/// sibling because a rename across filesystems is a copy.
+fn write_atomic(path: &Path, text: &str, private: bool) -> Result<(), String> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mcp.json".to_string());
+    let tmp = path.with_file_name(format!("{name}.tmp"));
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    if private {
+        options.mode(0o600);
+    }
+    let written = options
+        .open(&tmp)
+        .and_then(|mut file| {
+            if private {
+                // A temp left by an earlier crash may carry a looser mode; the
+                // rename would install it.
+                fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+            }
+            file.write_all(text.as_bytes())
+        })
+        .and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.map_err(|e| format!("{}: {e}", path.display()))
+}
+
 fn write_config(path: &Path, value: &Value) -> Result<(), String> {
     let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
     let text = format!("{text}\n");
+    // The global file can carry a header value or an env value; the project
+    // one is the repository's, and takes the mode a committed file has.
+    let private = path == global_path();
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+            let made = match private {
+                true => state::private_dir(parent),
+                false => fs::create_dir_all(parent),
+            };
+            made.map_err(|e| format!("{}: {e}", parent.display()))?;
         }
     }
-    match path == global_path() {
-        true => state::write_private(path, &text).map_err(|e| format!("{}: {e}", path.display())),
-        false => fs::write(path, text).map_err(|e| format!("{}: {e}", path.display())),
-    }
+    write_atomic(path, &text, private)
 }
 
 fn write_entry(path: &Path, name: &str, entry: &Value) -> Result<(), String> {
@@ -2146,6 +2263,16 @@ fn remove_entry(path: &Path, name: &str) -> Result<bool, String> {
     }
     write_config(path, &config)?;
     Ok(true)
+}
+
+/// One message is one line, and a line over `LINE_CAP` stops the reader: the
+/// server is still running, so this is not an exit and must not be reported as
+/// one.
+fn cap_reason() -> String {
+    format!(
+        "the reply was over the {} MiB line cap; restart axe to reload the server",
+        LINE_CAP >> 20
+    )
 }
 
 /// Char-safe cut, marked at the end: a description or a stderr tail longer
@@ -2408,6 +2535,141 @@ mod tests {
             assert!(forget_trust(&dir).contains("forgotten"));
             assert!(!approved(&dir, &file, &hash));
         });
+    }
+
+    /// An add or a remove through axe keeps an approval the file already had,
+    /// and never invents one for the entries the user did not see.
+    #[test]
+    fn an_axe_write_carries_only_an_approval_that_existed() {
+        state::testenv::home("mcp-carry", |home| {
+            let dir = home.join("repo");
+            fs::create_dir_all(&dir).unwrap();
+            let file = dir.join(".mcp.json");
+            let prior = b"{\"mcpServers\":{\"a\":{\"command\":\"/bin/true\"}}}";
+            fs::write(&file, prior).unwrap();
+            let Some(prior_hash) = hash_of(prior) else {
+                return; // no digester on this host: nothing can be approved
+            };
+
+            // Never approved: the new content stays unapproved, so the start
+            // still asks about everything the file now holds.
+            let added = b"{\"mcpServers\":{\"a\":{\"command\":\"/bin/true\"},\"b\":{\"command\":\"/bin/false\"}}}";
+            fs::write(&file, added).unwrap();
+            carry_approval(&dir, &file, Some(&prior_hash));
+            let added_hash = hash_of(added).expect("a digester");
+            assert!(!approved(&dir, &file, &added_hash), "nothing was blessed");
+
+            // Approved before: the user's own edit keeps the approval.
+            fs::write(&file, prior).unwrap();
+            remember(&dir, &file, &prior_hash);
+            fs::write(&file, added).unwrap();
+            carry_approval(&dir, &file, Some(&prior_hash));
+            assert!(approved(&dir, &file, &added_hash));
+        });
+    }
+
+    /// The listing reports the record, not whether entries happen to be in
+    /// force: after a forget, and for a file that never needed approval.
+    /// `/mcp help` is where a user meets the flags, so every block it names
+    /// must survive the string splicing it is written with.
+    #[test]
+    fn the_help_names_every_flag_and_its_meaning() {
+        let help = empty_state();
+        for wanted in [
+            "--project",
+            "--url",
+            "--env NAME",
+            "NAME=VALUE writes the value as given",
+            "--header 'K: V'",
+            "a url is streamable HTTP",
+        ] {
+            assert!(help.contains(wanted), "{wanted:?} missing from:\n{help}");
+        }
+    }
+
+    #[test]
+    fn the_approval_line_is_the_record() {
+        assert_eq!(approval_state(true, true), "approved");
+        assert_eq!(approval_state(true, false), "approved");
+        assert_eq!(approval_state(false, true), "not approved");
+        assert_eq!(approval_state(false, false), "nothing to approve");
+        assert!(cap_reason().contains("4 MiB"), "{}", cap_reason());
+    }
+
+    /// A line over the cap stops the reader without pretending the server
+    /// exited: the waiters get their answer and the flag says which happened.
+    #[test]
+    fn an_oversized_reply_is_the_cap_and_not_an_exit() {
+        use std::io::Cursor;
+        let pending: Arc<Mutex<HashMap<u64, Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        pending.lock().unwrap().insert(7, tx);
+        let dead = Arc::new(AtomicBool::new(false));
+        let over_cap = Arc::new(AtomicBool::new(false));
+        let huge = vec![b'x'; LINE_CAP + 1];
+        read_replies(
+            Cursor::new(huge),
+            pending.clone(),
+            dead.clone(),
+            over_cap.clone(),
+        );
+        assert!(dead.load(Ordering::SeqCst));
+        assert!(over_cap.load(Ordering::SeqCst));
+        assert_eq!(rx.recv().ok(), Some(Value::Null), "the waiter is released");
+    }
+
+    /// The approval question lists what the entry reads, so the command and
+    /// its arguments are expanded from that environment at start.
+    #[test]
+    fn a_command_and_its_arguments_expand_from_the_environment() {
+        std::env::set_var("AXE_TEST_MCP_ARG", "hello");
+        let mut with_args = entry("t", "$AXE_TEST_MCP_COMMAND");
+        with_args.args = vec![
+            "--greeting".into(),
+            "${AXE_TEST_MCP_ARG}".into(),
+            "$$literal".into(),
+        ];
+        std::env::set_var("AXE_TEST_MCP_COMMAND", "tool");
+        let (program, args) = stdio_words(&with_args).unwrap();
+        assert_eq!(program, "tool");
+        assert_eq!(args, ["--greeting", "hello", "$literal"]);
+
+        // The question lists the same names the expansion reads.
+        let parsed = parse_entry(
+            "t",
+            &json!({ "command": "tool", "args": ["--greeting", "${AXE_TEST_MCP_ARG}"] }),
+            Path::new("/tmp/mcp.json"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(parsed.vars, vec!["AXE_TEST_MCP_ARG".to_string()]);
+
+        std::env::remove_var("AXE_TEST_MCP_ARG");
+        let err = stdio_words(&with_args).unwrap_err();
+        assert!(err.contains("args[1]"), "{err}");
+        assert!(err.contains("AXE_TEST_MCP_ARG is not set"), "{err}");
+        std::env::remove_var("AXE_TEST_MCP_COMMAND");
+    }
+
+    /// A replaced file is written beside itself and renamed: a crash leaves the
+    /// old one, and the private modes stay private.
+    #[test]
+    fn a_write_lands_whole_and_leaves_no_temp_behind() {
+        let dir = state::testenv::dir("mcp-atomic");
+        let file = dir.join("mcp.json");
+        write_atomic(&file, "{\"a\":1}\n", true).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "{\"a\":1}\n");
+        write_atomic(&file, "{\"b\":2}\n", true).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "{\"b\":2}\n");
+        let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(leftovers, vec![file.clone()], "{leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

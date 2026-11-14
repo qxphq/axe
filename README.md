@@ -98,6 +98,10 @@ A provider entry describes the differences between servers, never code paths:
 
 `{}` as a level leaves the provider default in place. A provider name is the
 first half of a `provider/id`, so it cannot be empty or hold `/` or whitespace.
+The file is read strictly: a key it does not define, or a known key of the
+wrong type, is an error naming the file and the key, so a typo cannot change
+what a session does in silence. `providers` and a top-level `base_url` say the
+same thing, so a file with both is refused.
 
 ```json
 {
@@ -220,7 +224,7 @@ default.
 | --- | --- |
 | `command` | a program axe starts and speaks to over its stdin/stdout |
 | `url` | a streamable-HTTP endpoint; an entry is a command or a url, not both |
-| `args` | strings for a command; `~` is your home directory |
+| `args` | strings for a command; `~` is your home directory, and `$NAME` expands at start |
 | `env` | for a command: name → value, or an array of names as shorthand |
 | `headers` | for a url: name → value |
 | `enabled` | `false` keeps the entry and starts nothing |
@@ -264,6 +268,12 @@ mcp servers
 [--env NAME[=VALUE]]... [--header 'K: V']... [--timeout S] <name> [command
 [args...]]`, `/mcp remove <name>` and `/mcp forget` edit the files. The startup
 line is the proof that it worked: `mcp github: 26 tools (global)`.
+
+`--env NAME` writes a reference (`${NAME}`); `--env NAME=VALUE` writes the value
+as given, so a secret belongs in the first form — a project file is committed.
+Either command keeps an approval the file already had and never creates one it
+did not: an entry added to a file nobody approved still asks at the next start,
+about the whole file and not just the new entry.
 
 In explore mode a stdio server is confined like `bash`: it writes only to the
 scratch directory and the project's `plan/`, and the `io_uring` rule applies.

@@ -65,12 +65,16 @@ invariants a change must not break.
     `api_key_env`; never commit keys or read another app's auth store. Axe never
     writes it: the per-directory state and sessions live under
     `~/.local/state/axe/projects/<escaped cwd>/` (respects `XDG_STATE_HOME`).
+    Both input files are parsed strictly: a key they do not define, or a known
+    key of the wrong type, is an error — a typo must never change what a
+    session does in silence.
     MCP servers are a second input, `mcp.json` beside it and `.mcp.json` in a
     project, in the ecosystem's `mcpServers` shape: a `command` (stdio) or a
-    `url` (streamable HTTP), and values that may be `$NAME`/`${NAME}`
-    references to axe's environment, expanded when the server starts. The
-    binary writes those files only through an explicit
-    `/mcp add`/`remove`/`forget`.
+    `url` (streamable HTTP), and values, a command and its args that may be
+    `$NAME`/`${NAME}` references to axe's environment, expanded when the
+    server starts. The binary writes those files only through an explicit
+    `/mcp add`/`remove`/`forget`, atomically, and such a write carries an
+    approval the file already had and never creates one it did not.
     Config `model` is the seed: the selection a directory starts on is its own
     `state.json`, then `<state tree>/default.json` (what `/model -g` writes),
     then the config.
@@ -260,7 +264,9 @@ invariants a change must not break.
   `command`/`url` may only switch `enabled`: a repository narrows what runs,
   never defines it. The file is code, so it needs one approval per content hash
   (`mcp-trust.json` in the project's state directory), and the prompt shows the
-  commands and the `$NAME` variables each entry reads. A remote entry
+  commands and the `$NAME` variables each entry reads — the same names the
+  start expands, and `/mcp` reports that record, not whether entries are in
+  force. A remote entry
   authenticates with the bearer its own `headers` name; axe never sends a
   token to a server the entry did not name, and reads no other auth store.
 - Skills: a directory with `SKILL.md` is the unit; only the frontmatter is read at
