@@ -595,8 +595,9 @@ model into running something. Use normal mode only in directories you trust.
 The project's `AGENTS.md` and its skills are read at startup and go into the
 prompt; axe asks nothing and gates nothing, so the directory you start it in is
 the whole decision. Its `.mcp.json` is the one exception — a server is code, not
-text, so the file needs one approval per content hash, and the prompt shows
-every command and every variable it would hand over.
+text, so the file needs one approval per content hash (the host's `sha256sum`,
+or `shasum` on macOS; a host with neither cannot approve one), and the prompt
+shows every command and every variable it would hand over.
 `bash` runs as you and reaches the network as you do, and `fetch` and
 `web_search` are refused here, so in normal mode a command is the only way to
 the network and nothing stands between it and the internet.

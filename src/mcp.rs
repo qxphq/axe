@@ -568,8 +568,33 @@ fn trust_file(cwd: &Path) -> PathBuf {
     state::project(cwd).join("mcp-trust.json")
 }
 
-fn hash_of(bytes: &[u8]) -> String {
-    format!("{:016x}", state::fnv1a(bytes))
+/// The digest of a file's bytes, from the host's `sha256sum` — or `shasum -a
+/// 256`, which is the name macOS has. The approval binds the content, so it
+/// must not ride on a hash that can be inverted or collided; `None` when the
+/// host has neither, and the file goes unapproved rather than trusted on a
+/// weaker sum.
+fn hash_of(bytes: &[u8]) -> Option<String> {
+    digest("sha256sum", &[], bytes).or_else(|| digest("shasum", &["-a", "256"], bytes))
+}
+
+fn digest(program: &str, args: &[&str], bytes: &[u8]) -> Option<String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    stdin.write_all(bytes).ok()?;
+    drop(stdin);
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() || out.stdout.len() > 128 {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    let hex = text.split_whitespace().next()?;
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| hex.to_string())
 }
 
 fn read_trust(cwd: &Path) -> BTreeMap<String, String> {
@@ -1436,16 +1461,27 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
     if let Some(file) = &project {
         let bytes = fs::read(file).unwrap_or_default();
         let hash = hash_of(&bytes);
-        trusted = cwd.is_some_and(|dir| approved(dir, file, &hash));
+        trusted = match (&hash, cwd) {
+            (Some(hash), Some(dir)) => approved(dir, file, hash),
+            _ => false,
+        };
         // A file that only switches global servers runs nothing new: it needs
         // no approval, and its entries are applied either way.
         let runs = project_entries.iter().any(|entry| !entry.toggle_only);
         if !trusted && runs {
-            if interactive && ask(file, &project_entries) {
-                if let Some(dir) = cwd {
-                    remember(dir, file, &hash);
+            match &hash {
+                None => errors.push(format!(
+                    "{}: no sha256sum or shasum, so it cannot be approved",
+                    file.display()
+                )),
+                Some(hash) => {
+                    if interactive && ask(file, &project_entries) {
+                        if let Some(dir) = cwd {
+                            remember(dir, file, hash);
+                        }
+                        trusted = true;
+                    }
                 }
-                trusted = true;
             }
         } else if !runs {
             trusted = true;
@@ -2001,7 +2037,9 @@ fn add(rest: &str) -> String {
             // not ask them to approve their own edit.
             if path != global_path() {
                 if let (Some(dir), Ok(bytes)) = (cwd.as_deref(), fs::read(&path)) {
-                    remember(dir, &path, &hash_of(&bytes));
+                    if let Some(hash) = hash_of(&bytes) {
+                        remember(dir, &path, &hash);
+                    }
                 }
             }
             format!(
@@ -2032,7 +2070,9 @@ fn remove(rest: &str) -> String {
                 removed += 1;
                 if file != global_path() {
                     if let (Some(dir), Ok(bytes)) = (cwd.as_deref(), fs::read(&file)) {
-                        remember(dir, &file, &hash_of(&bytes));
+                        if let Some(hash) = hash_of(&bytes) {
+                            remember(dir, &file, &hash);
+                        }
                     }
                 }
             }
@@ -2355,16 +2395,33 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             let file = dir.join(".mcp.json");
             fs::write(&file, "{}").unwrap();
-            let hash = hash_of(b"{}");
+            let Some(hash) = hash_of(b"{}") else {
+                return; // no digester on this host: nothing can be approved
+            };
             assert!(!approved(&dir, &file, &hash));
             remember(&dir, &file, &hash);
             assert!(approved(&dir, &file, &hash));
-            assert!(!approved(&dir, &file, &hash_of(b"{\"mcpServers\":{}}")));
+            let other = hash_of(b"{\"mcpServers\":{}}").expect("a digester");
+            assert!(!approved(&dir, &file, &other));
             let mode = fs::metadata(trust_file(&dir)).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "the record is the user's");
             assert!(forget_trust(&dir).contains("forgotten"));
             assert!(!approved(&dir, &file, &hash));
         });
+    }
+
+    #[test]
+    fn the_trust_hash_is_a_sha256_of_the_bytes() {
+        let Some(hash) = hash_of(b"hello") else {
+            return; // the host's digester is the mechanism, like gzip
+        };
+        assert_eq!(
+            hash,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        // The approval binds the content: one byte changes the sum, and no
+        // suffix can be chosen to bring it back.
+        assert_ne!(hash_of(b"hello").as_deref(), hash_of(b"hello ").as_deref());
     }
 
     #[test]

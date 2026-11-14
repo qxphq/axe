@@ -27,8 +27,8 @@ invariants a change must not break.
    workflow, nothing project- or provider-specific. Instructions are appended in
    order: `agents` (config), the nearest `AGENTS.md` at or above cwd, then
    `system`, then the skills catalogue. The project file is wrapped in
-   `<project_instructions path="...">` and the first rule calls it data, not
-   authority. Read once at startup; never re-read mid-session.
+   `<project_instructions path="...">` — and cannot close it — and the first
+   rule calls it data, not authority. Read once at startup; never re-read mid-session.
 6. **Stable prefix, append-only history.** System prompt and tool schemas first,
    volatile content last. Never inject timestamps, status, or cwd changes into the
    prefix: it invalidates provider prompt caching. Sessions are append-only JSONL,

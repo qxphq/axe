@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::http::{self, Cancel};
 use crate::markdown;
+use crate::text::is_invisible;
 
 /// Caps on a fetched page: bytes off the wire, characters the model sees, and
 /// wall time spent reading the body.
@@ -617,21 +618,6 @@ fn sanitize(text: &str) -> String {
         }
     }
     neutralize(&out)
-}
-
-/// Zero-width and format characters, the tag block, and bidi controls.
-fn is_invisible(c: char) -> bool {
-    matches!(
-        c as u32,
-        0x00AD
-            | 0x180E
-            | 0x200B..=0x200F
-            | 0x202A..=0x202E
-            | 0x2060..=0x2064
-            | 0x2066..=0x2069
-            | 0xFEFF
-            | 0xE0000..=0xE007F
-    )
 }
 
 fn neutralize(text: &str) -> String {

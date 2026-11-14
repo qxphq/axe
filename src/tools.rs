@@ -341,15 +341,17 @@ fn read(args: &Value) -> String {
     truncate(out, 50_000)
 }
 
-/// Whether `path` names a `/proc` environment file: `/proc/self/environ`,
-/// `/proc/<pid>/environ`, `/proc/<pid>/task/<tid>/environ`, or a symlink to
-/// one. Resolved first, because `/proc/self` is itself a link.
+/// Whether `path` resolves to a `/proc` environment file: `/proc/self/environ`,
+/// `/proc/<pid>/environ`, `/proc/<pid>/task/<tid>/environ`, or any path or
+/// symlink that lands on one. Resolved first — the *given* name says nothing,
+/// because a symlink can be called anything — and `/proc/self` is itself a
+/// link.
 fn proc_environ(path: &Path) -> bool {
-    if !path.ends_with("environ") {
-        return false;
-    }
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     resolved.starts_with("/proc")
+        && resolved
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new("environ"))
 }
 
 fn write(args: &Value) -> String {
@@ -602,6 +604,24 @@ mod tests {
         assert!(!proc_environ(Path::new("/proc/self/cmdline")));
         assert!(!proc_environ(Path::new("/tmp/environ")));
         assert!(read(&json!({ "path": "/proc/self/environ" })).contains("not readable"));
+    }
+
+    /// The given name says nothing: a link can be called anything, and it is
+    /// the file it lands on that decides.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlink_to_a_proc_environ_is_refused() {
+        let dir = temp("proc-link");
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("innocent");
+        std::os::unix::fs::symlink("/proc/self/environ", &link).unwrap();
+        assert!(proc_environ(&link));
+        assert!(read(&json!({ "path": link })).contains("not readable"));
+        // A plain file is not one, whatever it is called.
+        let plain = dir.join("environ");
+        std::fs::write(&plain, "x").unwrap();
+        assert!(!proc_environ(&plain));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

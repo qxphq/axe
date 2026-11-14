@@ -19,6 +19,36 @@ pub fn strip_control(text: &str) -> String {
         .collect()
 }
 
+/// Whether a character may be drawn: a control byte paints on the terminal,
+/// and an invisible format mark (a bidi override, a tag character) reorders or
+/// hides what it shows.
+pub(crate) fn shows(c: char) -> bool {
+    !c.is_control() && !is_invisible(c)
+}
+
+/// The characters that occupy no cell but can reorder or hide text. The web
+/// sanitizer strips them from a page; a transcript row and a frame field must
+/// not carry them either.
+pub(crate) fn is_invisible(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x2069
+            | 0xFEFF
+            | 0xE0000..=0xE007F
+    )
+}
+
+/// Text a transcript row or a frame field may carry: `shows` per character,
+/// with no exception for the newline a row cannot use.
+pub fn displayable(text: &str) -> String {
+    text.chars().filter(|c| shows(*c)).collect()
+}
+
 /// Text for the terminal: stripped when there is one to strip for. Redirected
 /// output keeps its bytes, so a pipe is the same text the page held.
 pub fn terminal_text(text: &str) -> String {
@@ -64,6 +94,7 @@ pub fn clip(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
+    let text = displayable(text);
     if text.width() <= width {
         return text.to_string();
     }

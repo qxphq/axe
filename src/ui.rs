@@ -2081,6 +2081,15 @@ fn paint_above<B: Backend>(
 fn paint(buf: &mut Cells, rows: Vec<Line<'static>>, margin: u16) {
     let width = buf.area.width.max(1) as usize;
     Paragraph::new(rows).render(inset(buf.area, margin), buf);
+    // A cell's symbol is written to the terminal as it stands: a control byte
+    // or an invisible format mark in a model's prose, a command's output or a
+    // title would paint or reorder the screen. The prompt box spaces its own;
+    // this is the transcript's one place.
+    for cell in &mut buf.content {
+        if cell.symbol().chars().any(|c| !crate::text::shows(c)) {
+            cell.set_symbol(" ");
+        }
+    }
     for row in buf.content.chunks_mut(width) {
         // Past the last cell that is not blank, and past the columns a wide
         // glyph covers: the mark goes after the character, never inside it.
@@ -2289,6 +2298,31 @@ mod tests {
     fn clip_counts_cells_not_chars() {
         assert_eq!(clip("日本語", 4), "日…");
         assert_eq!(clip("abcd", 4), "abcd");
+    }
+
+    /// A frame field is one row of terminal: no escape, no bell, no bidi.
+    #[test]
+    fn a_frame_field_carries_no_terminal_sequence() {
+        assert_eq!(clip("a\x1b[7mb", 10), "a[7mb");
+        assert_eq!(clip("a\u{202e}b", 10), "ab");
+        assert_eq!(clip("\x1b]52;c;ZWNobyBoaQ==\x07", 40), "]52;c;ZWNobyBoaQ==");
+        assert_eq!(clip("x\ny", 10), "xy");
+    }
+
+    /// The transcript is a terminal too: a model's prose, a command's output
+    /// and a title are symbols in cells, written as they stand.
+    #[test]
+    fn a_transcript_row_carries_no_terminal_sequence() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.output("escape \x1b[7mhere\x07\n");
+        screen.insert(vec![Line::from("call \x1b]0;title\x07")], Block::Tool);
+        let rows = screen.transcript();
+        assert!(rows.iter().any(|row| row.contains("escape")), "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains('\x1b') && !row.contains('\x07')),
+            "{rows:?}"
+        );
     }
 
     #[test]
