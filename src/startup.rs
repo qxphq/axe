@@ -6,7 +6,7 @@
 use std::io::Read;
 
 use ratatui::crossterm::terminal;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::api;
 use crate::config;
@@ -171,6 +171,7 @@ pub(crate) fn run() -> Result<(), String> {
                     ep,
                     key,
                     headers,
+                    fields: request_fields(pc, &sid),
                     models,
                 });
             }
@@ -246,6 +247,8 @@ pub(crate) fn run() -> Result<(), String> {
         thinking,
         mode,
         used: None,
+        cached: 0,
+        used_bytes: 0,
         messages,
         bytes,
         sid,
@@ -473,6 +476,21 @@ pub(crate) fn find(providers: &[Provider], spec: &str) -> Option<(usize, String)
 /// names nothing is reported and passed over — a pin for a model that went
 /// away must not keep a directory off its default — and with none left, the
 /// first model of the first provider.
+/// The body fields a request carries because of what the provider is, never
+/// what the session is: the id its cache routes by, and the retention flag.
+/// The answer's ceiling is not here — a summary request is deliberately
+/// uncapped — so it is added per request in `main`.
+fn request_fields(cfg: &config::ProviderConfig, sid: &str) -> Value {
+    let mut fields = serde_json::Map::new();
+    if let Some(field) = &cfg.session_field {
+        fields.insert(field.clone(), json!(sid));
+    }
+    if let Some(store) = cfg.store {
+        fields.insert("store".to_string(), json!(store));
+    }
+    Value::Object(fields)
+}
+
 pub(crate) fn resolve(providers: &[Provider], picks: [Option<&str>; 3]) -> (usize, String) {
     let mut any = false;
     for spec in picks.iter().flatten().copied() {
@@ -505,8 +523,13 @@ mod tests {
                 api_key_env: None,
                 models_url: None,
                 session_header: None,
+                session_field: None,
+                max_tokens: None,
+                max_tokens_field: None,
+                store: None,
                 thinking: Vec::new(),
             },
+            fields: serde_json::json!({}),
             ep: http::parse_url("http://p").expect("endpoint"),
             key: None,
             headers: Vec::new(),

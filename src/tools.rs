@@ -194,6 +194,13 @@ pub fn definitions() -> &'static Value {
     })
 }
 
+/// The tools array's own size, once: every request carries it and no message
+/// weighs it, so the fill's estimate has to add it.
+pub fn definitions_bytes() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| definitions().to_string().len() as u64)
+}
+
 /// Rules that hold for every user: one line each, no workflow. Rendered as a
 /// numbered list so a later rule can refer back to an earlier one.
 const BEHAVIOR: &[&str] = &[

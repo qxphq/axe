@@ -49,7 +49,7 @@ pub(crate) enum Event {
     User(String),
     /// The terminal changed size; the live region must repaint.
     Resize,
-    Done(Result<Option<u64>, String>),
+    Done(Result<Option<crate::api::Usage>, String>),
     Eof,
 }
 

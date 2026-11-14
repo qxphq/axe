@@ -34,6 +34,10 @@ pub struct Reply {
     /// Thinking-mode chain of thought. Providers that enable tools require it
     /// back on every assistant message, so the caller keeps it in the history.
     pub reasoning: String,
+    /// The field the reasoning streamed in (`reasoning_content` or
+    /// `reasoning`): a reply goes back under the name it arrived with, so a
+    /// provider that reads one is not handed the other.
+    pub reasoning_field: Option<&'static str>,
     pub calls: Vec<ToolCall>,
     /// Tokens the provider counted for this round, when it reports them: the
     /// whole request, so it is how full the window was.
@@ -64,10 +68,16 @@ impl Reply {
 }
 
 /// What the provider counted for one request: the whole prompt it read
-/// (history included) and the answer it wrote.
+/// (history included), the answer it wrote, and how much of that prompt was a
+/// cache hit. Providers disagree on where a hit is reported — OpenAI and
+/// OpenRouter under `prompt_tokens_details.cached_tokens`, DeepSeek as
+/// `prompt_cache_hit_tokens`, Kimi as a top-level `cached_tokens` — so all
+/// three are read and added as one number.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Usage {
     pub prompt: u64,
     pub completion: u64,
+    pub cached: u64,
 }
 
 pub fn list_models(
@@ -213,6 +223,7 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
 struct Assembler {
     text: String,
     reasoning: String,
+    reasoning_field: Option<&'static str>,
     partials: Vec<(String, String, String)>,
     usage: Option<Usage>,
     finish_reason: Option<String>,
@@ -236,9 +247,16 @@ impl Assembler {
 
         // The usage chunk comes last and carries no choices at all.
         if let Some(prompt) = chunk["usage"]["prompt_tokens"].as_u64() {
+            let usage = &chunk["usage"];
+            let cached = usage["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .or_else(|| usage["prompt_cache_hit_tokens"].as_u64())
+                .or_else(|| usage["cached_tokens"].as_u64())
+                .unwrap_or(0);
             self.usage = Some(Usage {
                 prompt,
-                completion: chunk["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+                completion: usage["completion_tokens"].as_u64().unwrap_or(0),
+                cached,
             });
         }
 
@@ -253,8 +271,10 @@ impl Assembler {
         // still reasoning and no answer has started.
         let reasoning = delta["reasoning_content"]
             .as_str()
-            .or_else(|| delta["reasoning"].as_str());
-        if let Some(reasoning) = reasoning.filter(|r| !r.is_empty()) {
+            .map(|text| (text, "reasoning_content"))
+            .or_else(|| delta["reasoning"].as_str().map(|text| (text, "reasoning")));
+        if let Some((reasoning, field)) = reasoning.filter(|(text, _)| !text.is_empty()) {
+            self.reasoning_field = Some(field);
             self.reasoning.push_str(reasoning);
             on_reasoning(reasoning);
         }
@@ -309,6 +329,7 @@ impl Assembler {
         Reply {
             text: self.text,
             reasoning: self.reasoning,
+            reasoning_field: self.reasoning_field,
             calls,
             usage: self.usage,
             finish_reason: self.finish_reason,
@@ -336,6 +357,49 @@ mod tests {
         assert_eq!(models[0].context, Some(100));
         assert_eq!(models[1].context, Some(200));
         assert_eq!(models[2].context, Some(300));
+    }
+
+    /// A cache hit is reported in three places by three providers; all three
+    /// are read, and the reasoning's own field is remembered with it.
+    #[test]
+    fn a_usage_chunk_reports_its_cache_hit_wherever_it_lands() {
+        for usage in [
+            serde_json::json!({"prompt_tokens": 100, "completion_tokens": 5,
+                               "prompt_tokens_details": {"cached_tokens": 60}}),
+            serde_json::json!({"prompt_tokens": 100, "completion_tokens": 5,
+                               "prompt_cache_hit_tokens": 60}),
+            serde_json::json!({"prompt_tokens": 100, "completion_tokens": 5,
+                               "cached_tokens": 60}),
+            serde_json::json!({"prompt_tokens": 100, "completion_tokens": 5}),
+        ] {
+            let mut a = Assembler::default();
+            a.absorb(
+                &serde_json::json!({"usage": usage}),
+                &mut |_| {},
+                &mut |_| {},
+            )
+            .unwrap();
+            let reply = a.finish();
+            let counted = reply.usage.expect("a count");
+            assert_eq!(counted.prompt, 100);
+            assert_eq!(counted.completion, 5);
+            let want = usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details["cached_tokens"].as_u64())
+                .or_else(|| usage["prompt_cache_hit_tokens"].as_u64())
+                .or_else(|| usage["cached_tokens"].as_u64())
+                .unwrap_or(0);
+            assert_eq!(counted.cached, want, "{usage}");
+        }
+        // The field the reasoning streamed in is the field it goes back in.
+        let mut a = Assembler::default();
+        a.absorb(
+            &serde_json::json!({"choices": [{"delta": {"reasoning": "thought"}}]}),
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(a.finish().reasoning_field, Some("reasoning"));
     }
 
     #[test]
@@ -580,6 +644,7 @@ mod tests {
         // A reason on the choice ends the stream just as `[DONE]` does; the
         // reason is what may still say the answer was cut short.
         let mut whole = Reply {
+            reasoning_field: None,
             text: "half".into(),
             reasoning: String::new(),
             calls: Vec::new(),

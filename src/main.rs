@@ -59,6 +59,9 @@ struct Provider {
     ep: http::Endpoint,
     key: Option<String>,
     headers: Vec<(String, String)>,
+    /// Body fields every request carries: the cache-routing session id, and
+    /// whether the provider may retain it.
+    fields: Value,
     models: Vec<api::ModelInfo>,
 }
 
@@ -205,14 +208,39 @@ fn compact_request(
 /// level, so the provider does not think on terms of its own, and the
 /// temperature the caller wants.
 fn tool_less_extra(provider: &Provider, level: Option<&str>, temperature: f64) -> Value {
-    let mut extra = provider
-        .cfg
-        .thinking_body(level)
-        .unwrap_or_else(|| json!({}));
+    let mut extra = request_body(provider, level, false);
     if let Some(body) = extra.as_object_mut() {
         body.insert("temperature".into(), json!(temperature));
     }
     extra
+}
+
+/// What a request's body carries beyond the messages and the tools: the
+/// provider's own fields, then the answer's ceiling (a turn only: a summary is
+/// deliberately uncapped), then the thinking level, the more specific
+/// instruction, which wins.
+fn request_body(provider: &Provider, level: Option<&str>, ceiling: bool) -> Value {
+    let mut body = provider.fields.clone();
+    let Some(fields) = body.as_object_mut() else {
+        return body;
+    };
+    if ceiling {
+        let tokens = provider.cfg.max_tokens.unwrap_or(config::MAX_TOKENS);
+        if tokens > 0 {
+            let field = provider
+                .cfg
+                .max_tokens_field
+                .as_deref()
+                .unwrap_or("max_tokens");
+            fields.insert(field.to_string(), json!(tokens));
+        }
+    }
+    if let Some(Value::Object(extra)) = provider.cfg.thinking_body(level) {
+        for (key, value) in extra {
+            fields.insert(key, value);
+        }
+    }
+    body
 }
 
 /// What a reply that carried no text did instead, for the one place axe asks
@@ -243,6 +271,30 @@ fn no_text(reply: &api::Reply) -> String {
 /// API messages would carry `tool_calls` without the `tools` array that defines
 /// them, which a strict provider refuses; text cannot. The oldest messages go
 /// first when the transcript does not fit `budget`, and the newest always stays.
+/// Where the verbatim tail begins: pi's cut point. Walk back from the newest
+/// message while the tail is under `keep` tokens and start keeping at the
+/// oldest user or assistant message inside it — never at a tool result, which
+/// would start the tail with an answer to a call it does not carry. A history
+/// that fits inside the tail is summarized whole: a summary that replaces
+/// nothing is not a compaction.
+fn tail_start(messages: &[Value], keep: u64) -> usize {
+    let mut tokens = 0u64;
+    let mut start = 2.min(messages.len());
+    for at in (start..messages.len()).rev() {
+        tokens += crate::store::weight(&messages[at]) / 4;
+        let role = messages[at]["role"].as_str().unwrap_or("");
+        if role == "user" || role == "assistant" {
+            start = at;
+            if tokens >= keep {
+                return start;
+            }
+        }
+    }
+    // The whole history is inside the tail: nothing would be replaced, so the
+    // summary covers everything and there is no tail.
+    messages.len()
+}
+
 fn compaction_prompt(messages: &[Value], budget: usize) -> String {
     let mut lines: Vec<String> = Vec::new();
     for message in messages.iter().skip(2) {
@@ -362,6 +414,14 @@ struct Session {
     /// The last round's token count, from the provider. `None` until a turn
     /// reports one: the fill is then estimated from the history.
     used: Option<u64>,
+    /// How much of that prompt the provider served from its cache: a cached
+    /// prefix is the difference between a cheap session and an expensive one,
+    /// and the row says so.
+    cached: u64,
+    /// The history's size when `used` was measured: what was appended after
+    /// the last request is estimated on top, so the fill does not go stale
+    /// between rounds.
+    used_bytes: u64,
     messages: Vec<Value>,
     /// The history's own size in bytes, kept as it is appended to: the request
     /// is serialized once per message rather than once per info row.
@@ -797,6 +857,11 @@ impl Session {
                     } else {
                         PlainSink::default()
                     };
+                    // The same trigger the interactive loop runs: a piped run
+                    // gets the compaction before the request, not an error.
+                    if self.over_threshold() {
+                        self.compact(&mut Console::Stdout);
+                    }
                     let cancel = http::Cancel::new();
                     self.record(json!({ "role": "user", "content": input }));
                     if let Err(e) = self.turn(&mut sink, &cancel) {
@@ -1390,14 +1455,51 @@ impl Session {
     /// is. The second value is how full the window is, the gauge the info row
     /// colors: without a count there is nothing to measure.
     fn fill(&self) -> (String, Option<u8>) {
-        let used = self.used.unwrap_or(self.bytes / 4);
+        let used = self.used_tokens();
+        let cached = match self.cached {
+            0 => String::new(),
+            cached => format!(" · {} cached", scaled(cached)),
+        };
         match self.context() {
             Some(ctx) => (
-                format!("{}/{} ({})", scaled(used), scaled(ctx), percent(used, ctx)),
+                format!(
+                    "{}/{} ({}){cached}",
+                    scaled(used),
+                    scaled(ctx),
+                    percent(used, ctx)
+                ),
                 Some(fullness(used, ctx)),
             ),
-            None => (scaled(used), None),
+            None => (format!("{}{cached}", scaled(used)), None),
         }
+    }
+
+    /// The request's size in tokens: the provider's count plus an estimate of
+    /// what was appended since it, or a character estimate of the history and
+    /// the tools when nothing was measured. The tools travel with every request
+    /// and no message weighs them, so the estimate adds them.
+    fn used_tokens(&self) -> u64 {
+        match self.used {
+            Some(measured) => measured + self.bytes.saturating_sub(self.used_bytes) / 4,
+            None => (self.bytes + tools::definitions_bytes()) / 4,
+        }
+    }
+
+    /// Whether the next request would leave the answer no room: pi's trigger,
+    /// measured where it can be and estimated where it cannot. No window
+    /// reported, no trigger; a window smaller than the reserve keeps half of it
+    /// free instead, so a small model is not compacted on every turn.
+    fn over_threshold(&self) -> bool {
+        let Some(window) = self.context() else {
+            return false;
+        };
+        let reserve = config::COMPACT_RESERVE.min(window / 2);
+        let has_answer = self
+            .messages
+            .iter()
+            .skip(2)
+            .any(|message| message["role"].as_str() == Some("assistant"));
+        has_answer && self.used_tokens() + reserve > window
     }
 
     fn context(&self) -> Option<u64> {
@@ -1576,7 +1678,11 @@ impl Session {
             })
             .unwrap_or(200_000)
             .min(200_000);
-        let prompt = compaction_prompt(&self.messages, budget);
+        // The newest conversation stays verbatim beside the summary, so the
+        // model does not have to re-read the files it was just working on.
+        let cut = tail_start(&self.messages, config::COMPACT_KEEP);
+        let tail: Vec<Value> = self.messages[cut..].to_vec();
+        let prompt = compaction_prompt(&self.messages[..cut], budget);
         let request = vec![
             json!({ "role": "system", "content": COMPACT_PROMPT }),
             json!({ "role": "user", "content": prompt }),
@@ -1619,7 +1725,8 @@ impl Session {
             )),
             Ok(reply) if !reply.text.trim().is_empty() => {
                 let summary = reply.text.trim().to_string();
-                let replaced = self.messages.len().saturating_sub(2) as u64;
+                let replaced = cut.saturating_sub(2) as u64;
+                let kept = tail.len();
                 let content = format!("{COMPACT_NOTE}\n\n{summary}");
                 self.messages = self.base_messages();
                 self.messages
@@ -1628,13 +1735,27 @@ impl Session {
                 if let Some(store) = self.store.as_mut() {
                     store.compacted(&sessions::compacted(&content, replaced));
                 }
+                // The tail is written again after the marker: the file has to
+                // replay what the live session carries, and the copies before
+                // the marker are no longer part of the session.
+                for message in tail {
+                    self.record(message);
+                }
                 // The stored count was the old request's; the next reply sets it
                 // again, and the estimate stands in until then.
                 self.used = None;
+                self.cached = 0;
+                self.used_bytes = 0;
                 if let Some(screen) = console.screen() {
                     screen.set_info(self.info());
                 }
-                console.output(&format!("◦ compacted {replaced} messages into 1 summary\n"));
+                let kept = match kept {
+                    0 => String::new(),
+                    kept => format!(" ({kept} kept)"),
+                };
+                console.output(&format!(
+                    "◦ compacted {replaced} messages into 1 summary{kept}\n"
+                ));
                 console.text(&summary);
             }
             Ok(reply) => console.error(&format!(
@@ -1679,6 +1800,16 @@ impl Session {
         rx: &Receiver<Event>,
         screen: &mut ui::Screen,
     ) -> Result<Vec<String>, String> {
+        // pi's trigger: within the reserve of the window, the answer has
+        // nowhere to go, so the session is summarized before the request rather
+        // than after the provider refused it. The user's line is not in the
+        // history yet, so it is not part of what gets summarized.
+        let mut pending = Vec::new();
+        if self.over_threshold() {
+            if let Some(line) = self.compact(&mut Console::Screen { screen, rx }) {
+                pending.push(line);
+            }
+        }
         self.record(json!({ "role": "user", "content": input }));
         // The first request is the session's name until the model gives it one:
         // show it now, not once the turn is over.
@@ -1700,7 +1831,7 @@ impl Session {
         // What the last round counted, handed back by the turn's thread. The
         // history is borrowed by that thread, so `self` is out of reach until
         // the scope ends.
-        let mut used: Option<u64> = None;
+        let mut used: Option<api::Usage> = None;
         let mut live = Live {
             messages: &mut self.messages,
             bytes: &mut self.bytes,
@@ -1708,7 +1839,7 @@ impl Session {
         };
         let provider = &self.providers[self.provider];
         let model = self.model.clone();
-        let extra = provider.cfg.thinking_body(self.thinking.as_deref());
+        let extra = request_body(provider, self.thinking.as_deref(), true);
         let thoughts = self.state.thoughts;
         let mode = self.mode;
         let turn_tx = tx.clone();
@@ -1727,7 +1858,7 @@ impl Session {
                     key: provider.key.as_deref(),
                     headers: &provider.headers,
                     model: &model,
-                    extra: extra.as_ref(),
+                    extra: Some(&extra),
                     mode,
                     queue: Some(&turn_queue),
                     cancel: turn_cancel,
@@ -1786,7 +1917,14 @@ impl Session {
         }
         // A turn that reported nothing (interrupted, or a provider that does
         // not count) leaves the estimate in charge rather than a stale number.
-        self.used = used;
+        // What has been appended since the last measured request is estimated
+        // on top of it, so the fill never goes backwards on its own.
+        self.used = used.map(|usage| usage.prompt.saturating_add(usage.completion));
+        self.cached = used.map(|usage| usage.cached).unwrap_or(0);
+        self.used_bytes = match used {
+            Some(_) => self.bytes,
+            None => 0,
+        };
         screen.set_info(self.info());
 
         // Lines the turn read are submitted lines: the prompt was never the
@@ -1818,19 +1956,20 @@ impl Session {
         // that arrived too late for one, and a command line never entered the
         // queue at all. The REPL runs them in the order they were typed.
         show_queue(screen, &[]);
-        Ok(held.queued.into_iter().map(|entry| entry.line).collect())
+        pending.extend(held.queued.into_iter().map(|entry| entry.line));
+        Ok(pending)
     }
 
     fn turn(&mut self, sink: &mut dyn Sink, cancel: &http::Cancel) -> Result<(), String> {
         let provider = &self.providers[self.provider];
         let model = self.model.clone();
-        let extra = provider.cfg.thinking_body(self.thinking.as_deref());
+        let extra = request_body(provider, self.thinking.as_deref(), true);
         let turn = turn::Turn {
             ep: &provider.ep,
             key: provider.key.as_deref(),
             headers: &provider.headers,
             model: &model,
-            extra: extra.as_ref(),
+            extra: Some(&extra),
             mode: self.mode,
             queue: None,
             cancel,
@@ -2023,7 +2162,7 @@ impl Held {
         screen: &mut ui::Screen,
         queue: &Queue,
         cancel: &http::Cancel,
-        used: &mut Option<u64>,
+        used: &mut Option<api::Usage>,
     ) -> bool {
         match event {
             Event::Key(key) => return self.key(key, screen, queue, cancel),
@@ -2069,8 +2208,8 @@ impl Held {
                 screen.error(&format!("axe: {e}\n"));
                 return true;
             }
-            Event::Done(Ok(count)) => {
-                *used = count;
+            Event::Done(Ok(usage)) => {
+                *used = usage;
                 let tail = std::mem::take(&mut self.thought);
                 screen.thought(&tail);
                 // The last block has no ending line of its own.
@@ -2475,6 +2614,74 @@ mod tests {
         assert_eq!(parse_naming("nothing useful"), None);
     }
 
+    /// pi's keep-recent: the newest conversation stays verbatim beside the
+    /// summary, so the round after a compaction does not re-read what the model
+    /// just knew — and a kept tool result never loses the call it answers.
+    #[test]
+    fn a_compaction_keeps_the_newest_messages_verbatim() {
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"the summary"}}]}"#,
+            "[DONE]",
+        ])]);
+        let mut session = session_at(&server);
+        for at in 0..4 {
+            session.record(json!({ "role": "user", "content": format!("question {at}") }));
+            session.record(json!({ "role": "assistant", "content": "x".repeat(40_000) }));
+        }
+        let mut console = Console::Stdout;
+        assert!(session.compact(&mut console).is_none());
+        let kept: Vec<String> = session.messages[3..]
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .map(str::to_string)
+            .collect();
+        assert!(
+            kept.iter().any(|text| text.starts_with("xxxx")),
+            "{} kept",
+            kept.len()
+        );
+        assert!(!kept.iter().any(|text| text == "question 0"), "{kept:?}");
+        for (at, message) in session.messages[3..].iter().enumerate() {
+            if message["role"].as_str() == Some("tool") {
+                assert_eq!(
+                    session.messages[2 + at]["role"].as_str(),
+                    Some("assistant"),
+                    "{kept:?}"
+                );
+            }
+        }
+    }
+
+    /// A compaction with a tail is append-only: the marker goes into the body,
+    /// the kept messages follow it, and a resume replays exactly what the live
+    /// session carried.
+    #[test]
+    fn a_compaction_with_a_tail_resumes_from_the_marker_and_the_tail() {
+        let dir = crate::state::testenv::dir("main-compact-resume");
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"the summary"}}]}"#,
+            "[DONE]",
+        ])]);
+        let mut session = session_at(&server);
+        session.store = Some(Store::fresh(dir.clone(), "abc123"));
+        for at in 0..4 {
+            session.record(json!({ "role": "user", "content": format!("question {at}") }));
+            session.record(json!({ "role": "assistant", "content": "x".repeat(40_000) }));
+        }
+        let mut console = Console::Stdout;
+        assert!(session.compact(&mut console).is_none());
+        let live = session.messages.clone();
+        assert!(live.len() > 3, "a tail was kept: {}", live.len());
+
+        let mut meta = sessions::Meta::load(&dir, "abc123").unwrap();
+        let mut warnings = Vec::new();
+        let replayed = sessions::load_messages(&dir, &mut meta, &mut warnings).unwrap();
+        assert_eq!(replayed.len(), live.len() - 2, "the marker and its tail");
+        assert_eq!(replayed[0], live[2], "the summary is the marker");
+        assert_eq!(replayed[1], live[3], "then the tail, in order");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn compaction_prompt_keeps_the_newest_and_counts_what_it_dropped() {
         let messages = vec![
@@ -2619,7 +2826,12 @@ mod tests {
     fn model_selection_resolves_provider_and_bare_id() {
         let provider = Provider {
             name: "p".into(),
+            fields: serde_json::json!({}),
             cfg: config::ProviderConfig {
+                session_field: None,
+                max_tokens: None,
+                max_tokens_field: None,
+                store: None,
                 name: "p".into(),
                 base_url: "http://p".into(),
                 api_key_env: None,
@@ -2658,8 +2870,13 @@ mod tests {
 
     fn test_provider() -> Provider {
         Provider {
+            fields: serde_json::json!({}),
             name: "p".into(),
             cfg: config::ProviderConfig {
+                session_field: None,
+                max_tokens: None,
+                max_tokens_field: None,
+                store: None,
                 name: "p".into(),
                 base_url: "http://p".into(),
                 api_key_env: None,
@@ -2687,6 +2904,8 @@ mod tests {
             thinking: None,
             mode: tools::Mode::Explore,
             used: Some(10),
+            cached: 0,
+            used_bytes: 0,
             messages: vec![json!({ "role": "system", "content": "s" })],
             bytes: 40,
             sid: "abc".into(),
@@ -2720,6 +2939,8 @@ mod tests {
                 thinking: None,
                 mode: tools::Mode::Explore,
                 used: None,
+                cached: 0,
+                used_bytes: 0,
                 messages: Vec::new(),
                 bytes: 0,
                 sid: "abc".into(),
@@ -2841,6 +3062,8 @@ mod tests {
             thinking: None,
             mode: tools::Mode::Explore,
             used: None,
+            cached: 0,
+            used_bytes: 0,
             messages: vec![json!({ "role": "system", "content": "s" })],
             bytes: 40,
             sid: "abc".into(),
@@ -2872,6 +3095,8 @@ mod tests {
             thinking: None,
             mode: tools::Mode::Explore,
             used: None,
+            cached: 0,
+            used_bytes: 0,
             bytes: history_bytes(&messages),
             messages,
             sid: "abc".into(),
@@ -2890,9 +3115,11 @@ mod tests {
         session.record(json!({ "role": "user", "content": "hi" }));
         session.set_mode(tools::Mode::Normal);
         assert_eq!(session.bytes, history_bytes(&session.messages));
-        // The estimate the info row falls back to is that sum, four to a token.
+        // The estimate the info row falls back to is that sum plus the tools
+        // every request carries, four to a token.
+        let estimate = (session.bytes + tools::definitions_bytes()) / 4;
         assert!(
-            session.fill().0.starts_with(&scaled(session.bytes / 4)),
+            session.fill().0.starts_with(&scaled(estimate)),
             "{} of {}",
             session.fill().0,
             session.bytes
@@ -2930,6 +3157,8 @@ mod tests {
             thinking: None,
             mode: tools::Mode::Explore,
             used: None,
+            cached: 0,
+            used_bytes: 0,
             messages: vec![json!({ "role": "system", "content": "s" })],
             bytes: 40,
             sid: "abc".into(),
@@ -2963,6 +3192,8 @@ mod tests {
             thinking: None,
             mode: tools::Mode::Normal,
             used: None,
+            cached: 0,
+            used_bytes: 0,
             messages: Vec::new(),
             bytes: 0,
             sid: "abc".into(),
@@ -3366,6 +3597,8 @@ mod tests {
         let mut console = Console::Stdout;
 
         assert!(session.compact(&mut console).is_none());
+        // A history smaller than the kept tail is summarized whole: the base,
+        // then the summary, and no verbatim tail.
         assert_eq!(session.messages.len(), 3, "the base, then the summary");
         assert!(session.messages[2]["content"]
             .as_str()
@@ -3419,15 +3652,96 @@ mod tests {
         assert!(!body.contains("max_tokens"), "{body}");
     }
 
+    /// pi's ceiling: an answer gets `max_tokens` unless the provider config
+    /// says otherwise, under the field name the provider reads; a summary
+    /// request stays uncapped on purpose.
+    #[test]
+    fn a_turn_carries_the_answer_ceiling_and_a_summary_does_not() {
+        let provider = test_provider();
+        let turn = request_body(&provider, None, true);
+        assert_eq!(turn["max_tokens"], json!(config::MAX_TOKENS));
+        // The thinking level is merged on top, so a level can move the ceiling.
+        let mut tuned = test_provider();
+        tuned.cfg.max_tokens = Some(4096);
+        tuned.cfg.max_tokens_field = Some("max_completion_tokens".into());
+        let body = request_body(&tuned, None, true);
+        assert_eq!(body["max_completion_tokens"], json!(4096));
+        assert!(body.get("max_tokens").is_none(), "{body}");
+        // Zero is no ceiling at all.
+        let mut off = test_provider();
+        off.cfg.max_tokens = Some(0);
+        assert!(request_body(&off, None, true).get("max_tokens").is_none());
+        // The provider's own fields travel with every request, the summary one
+        // included; only the ceiling is a turn's.
+        let mut fields = test_provider();
+        fields.fields = json!({ "prompt_cache_key": "sid" });
+        fields.cfg.store = Some(false);
+        fields.fields["store"] = json!(false);
+        let tool_less = tool_less_extra(&fields, None, 0.0);
+        assert_eq!(tool_less["prompt_cache_key"], json!("sid"));
+        assert_eq!(tool_less["store"], json!(false));
+        assert_eq!(tool_less["temperature"], json!(0.0));
+        assert!(tool_less.get("max_tokens").is_none(), "{tool_less}");
+    }
+
+    /// The fill is the measured request plus an estimate of what came after it,
+    /// and the tools array when nothing was measured; the row also reports the
+    /// cache hit the provider counted.
+    #[test]
+    fn the_fill_measures_what_the_provider_counted_and_estimates_the_rest() {
+        let mut session = bare_session();
+        session.record(json!({ "role": "user", "content": "x".repeat(400) }));
+        // Nothing measured: the history and the tools, four chars to a token.
+        let estimate = (session.bytes + tools::definitions_bytes()) / 4;
+        assert_eq!(session.used_tokens(), estimate);
+        // Measured: the provider's number plus the growth since that request.
+        session.used = Some(1000);
+        session.used_bytes = session.bytes;
+        session.cached = 900;
+        assert_eq!(session.used_tokens(), 1000);
+        assert!(session.fill().0.contains("cached"), "{}", session.fill().0);
+        let grown = session.bytes;
+        session.record(json!({ "role": "user", "content": "y".repeat(400) }));
+        // Exactly what the request grew by, four chars to a token.
+        assert_eq!(session.used_tokens(), 1000 + (session.bytes - grown) / 4);
+    }
+
+    /// pi's trigger: within the reserve of the window there is no room for the
+    /// answer, so the session compacts before the request, not after it was
+    /// refused. Without a window, or without an answer to summarize, it does
+    /// not fire.
+    #[test]
+    fn the_compaction_trigger_fires_only_near_the_window() {
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"the summary"}}]}"#,
+            "[DONE]",
+        ])]);
+        let mut session = session_at(&server);
+        session.providers[0].models[0].context = Some(200_000);
+        assert!(!session.over_threshold(), "nothing to summarize yet");
+        session.record(json!({ "role": "assistant", "content": "an answer" }));
+        assert!(!session.over_threshold(), "the history is small");
+        // Within the reserve of the window: no room for the answer.
+        session.providers[0].models[0].context = Some(8_192);
+        session.used = Some(8_000);
+        session.used_bytes = session.bytes;
+        assert!(session.over_threshold());
+        // A model that does not say its window has no threshold to cross.
+        session.providers[0].models[0].context = None;
+        assert!(!session.over_threshold());
+    }
+
     #[test]
     fn a_reply_without_text_names_what_it_did_instead() {
         let reply = api::Reply {
             text: String::new(),
             reasoning: "thought".into(),
+            reasoning_field: Some("reasoning_content"),
             calls: Vec::new(),
             usage: Some(api::Usage {
                 prompt: 900,
                 completion: 2000,
+                cached: 0,
             }),
             finish_reason: Some("length".into()),
             complete: true,

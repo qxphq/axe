@@ -22,9 +22,33 @@ pub struct ProviderConfig {
     pub models_url: Option<String>,
     /// A header that carries a stable session id the provider wants echoed.
     pub session_header: Option<String>,
+    /// A body field that carries the same id, for a provider that routes its
+    /// cache by it (`prompt_cache_key`).
+    pub session_field: Option<String>,
+    /// Tokens an answer may take: `None` is the default, `Some(0)` no ceiling.
+    pub max_tokens: Option<u64>,
+    /// The field `max_tokens` travels in: `max_tokens` unless a provider wants
+    /// OpenAI's `max_completion_tokens`.
+    pub max_tokens_field: Option<String>,
+    /// Retain the request on the provider's side, when the provider defaults
+    /// to keeping it.
+    pub store: Option<bool>,
     /// Level name -> JSON object merged into the request body.
     pub thinking: Vec<(String, Value)>,
 }
+
+/// What an answer may take when the provider says nothing: pi's default, and
+/// enough for any answer this REPL shows. `0` turns the ceiling off.
+pub const MAX_TOKENS: u64 = 16_384;
+
+/// Tokens kept in reserve below the window before a session compacts on its
+/// own — pi's default. A window with less than half of it to spare uses half.
+pub const COMPACT_RESERVE: u64 = 16_384;
+
+/// Tokens of the newest conversation `/compact` keeps verbatim beside the
+/// summary, cut at a user or assistant message — pi's default. A history that
+/// is smaller than this is summarized whole, which is what compaction is for.
+pub const COMPACT_KEEP: u64 = 20_000;
 
 impl ProviderConfig {
     /// Extra request-body fields for a thinking level. `None` means "let the
@@ -206,6 +230,10 @@ const PROVIDER_KEYS: &[&str] = &[
     "api_key_env",
     "models_url",
     "session_header",
+    "session_field",
+    "max_tokens",
+    "max_tokens_field",
+    "store",
     "thinking",
 ];
 
@@ -317,12 +345,25 @@ fn parse_provider(name: &str, v: &Value) -> Result<ProviderConfig, String> {
         }
         None => Vec::new(),
     };
+    let max_tokens = match v.get("max_tokens") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let tokens = value.as_u64().filter(|tokens| *tokens <= 1_000_000);
+            Some(tokens.ok_or_else(|| {
+                format!("{context}\"max_tokens\" must be a number of tokens, 0 for none")
+            })?)
+        }
+    };
     Ok(ProviderConfig {
         name: name.to_string(),
         base_url: base_url.trim_end_matches('/').to_string(),
         api_key_env: string_field(v.get("api_key_env"), "api_key_env", &context)?,
         models_url: string_field(v.get("models_url"), "models_url", &context)?,
         session_header: string_field(v.get("session_header"), "session_header", &context)?,
+        session_field: string_field(v.get("session_field"), "session_field", &context)?,
+        max_tokens,
+        max_tokens_field: string_field(v.get("max_tokens_field"), "max_tokens_field", &context)?,
+        store: bool_field(v.get("store"), "store", &context)?,
         thinking,
     })
 }
@@ -409,6 +450,10 @@ fn parse_value(v: &Value) -> Result<Config, String> {
             api_key_env: None,
             models_url: None,
             session_header: None,
+            session_field: None,
+            max_tokens: None,
+            max_tokens_field: None,
+            store: None,
             thinking: Vec::new(),
         }),
         (None, None) => return Err("need \"providers\" or \"base_url\"".into()),
@@ -541,6 +586,55 @@ mod tests {
 
     /// A typo must not change what a session does in silence: the key list is
     /// the file's contract, at the top level and in a provider.
+    /// The request-shaping keys pi sends as compat flags are config here: a
+    /// ceiling and the field it travels in, the cache-routing session field,
+    /// and retention.
+    #[test]
+    fn a_provider_can_shape_its_requests() {
+        let cfg = parse_value(&serde_json::json!({
+            "providers": {"p": {
+                "base_url": "http://p",
+                "session_field": "prompt_cache_key",
+                "max_tokens": 4096,
+                "max_tokens_field": "max_completion_tokens",
+                "store": false
+            }}
+        }))
+        .unwrap();
+        let provider = &cfg.providers[0];
+        assert_eq!(provider.session_field.as_deref(), Some("prompt_cache_key"));
+        assert_eq!(provider.max_tokens, Some(4096));
+        assert_eq!(
+            provider.max_tokens_field.as_deref(),
+            Some("max_completion_tokens")
+        );
+        assert_eq!(provider.store, Some(false));
+        // `0` is no ceiling, and absent is the default.
+        let cfg = parse_value(&serde_json::json!({
+            "providers": {"p": {"base_url": "http://p", "max_tokens": 0}}
+        }))
+        .unwrap();
+        assert_eq!(cfg.providers[0].max_tokens, Some(0));
+        let cfg = parse_value(&serde_json::json!({
+            "providers": {"p": {"base_url": "http://p"}}
+        }))
+        .unwrap();
+        assert!(cfg.providers[0].max_tokens.is_none());
+        // A wrong type is the file's mistake, as everywhere else.
+        assert!(parse_value(&serde_json::json!({
+            "providers": {"p": {"base_url": "http://p", "max_tokens": "big"}}
+        }))
+        .is_err());
+        assert!(parse_value(&serde_json::json!({
+            "providers": {"p": {"base_url": "http://p", "store": "no"}}
+        }))
+        .is_err());
+        assert!(parse_value(&serde_json::json!({
+            "providers": {"p": {"base_url": "http://p", "session_field": 5}}
+        }))
+        .is_err());
+    }
+
     #[test]
     fn a_key_the_file_does_not_define_is_an_error() {
         let err = parse_value(&serde_json::json!({
@@ -623,6 +717,10 @@ mod tests {
             api_key_env: Some("AXE_TEST_PROVIDER_KEY".into()),
             models_url: None,
             session_header: None,
+            session_field: None,
+            max_tokens: None,
+            max_tokens_field: None,
+            store: None,
             thinking: vec![
                 ("off".into(), serde_json::json!({})),
                 ("high".into(), serde_json::json!({"effort":"high"})),

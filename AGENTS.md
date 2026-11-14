@@ -67,7 +67,10 @@ invariants a change must not break.
     `~/.local/state/axe/projects/<escaped cwd>/` (respects `XDG_STATE_HOME`).
     Both input files are parsed strictly: a key they do not define, or a known
     key of the wrong type, is an error — a typo must never change what a
-    session does in silence.
+    session does in silence. A provider entry shapes its requests from config,
+    never from a code path: the answer ceiling and the field it travels in
+    (`max_tokens`, `max_tokens_field`), the body field a cache-routing session
+    id rides in (`session_field`), and retention (`store`).
     MCP servers are a second input, `mcp.json` beside it and `.mcp.json` in a
     project, in the ecosystem's `mcpServers` shape: a `command` (stdio) or a
     `url` (streamable HTTP), and values, a command and its args that may be
@@ -286,9 +289,14 @@ invariants a change must not break.
   remembers the ones handed back — and every submitted line is remembered once.
 - Sessions: `<id>.json` is the mutable sidecar; `<id>.jsonl` is append-only; bodies
   older than `sessions::KEEP` are gzipped. The sidecar stays readable, so listing
-  and search work without unpacking. A compacted body carries a marked summary
-  and the loader returns the messages from the last marker on, with the marker's
-  key stripped: the marker is a file record, never a request field. The summary
+  and search work without unpacking. A compacted body carries a marked summary,
+  then the verbatim tail the compaction kept, and the loader returns the
+  messages from the last marker on, with the marker's key stripped: the marker
+  is a file record, never a request field. Compaction is manual (`/compact`) and
+  automatic when the request comes within `config::COMPACT_RESERVE` of the
+  window; the tail is `config::COMPACT_KEEP` tokens cut at a user or assistant
+  message so a tool result never loses its call, and a history inside the tail
+  is summarized whole. The summary
   reaches the transcript once, as its own block under the notice that records
   it; a resume starts from it without printing it again. The system prompt and
   mode notes are never logged; resume rebuilds them. A title and summary are

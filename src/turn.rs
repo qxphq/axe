@@ -220,11 +220,11 @@ pub fn run_turn(
     turn: &Turn,
     history: &mut dyn History,
     sink: &mut dyn Sink,
-) -> Result<Option<u64>, String> {
+) -> Result<Option<api::Usage>, String> {
     let tools = tools::definitions();
     // The last round's own count. It measures the whole request, so it is the
     // fill; `None` when no round reported one.
-    let mut used = None;
+    let mut used: Option<api::Usage> = None;
 
     loop {
         // An interrupt ends the turn here too: no further round is started.
@@ -276,10 +276,10 @@ pub fn run_turn(
             }
             Err(e) => return Err(e),
         };
+        // The provider's own numbers, kept whole: the fill is a display, not a
+        // request.
         if let Some(count) = &reply.usage {
-            // The provider's own numbers, added without a ceiling they could
-            // overflow: the fill is a display, not a request.
-            used = Some(count.prompt.saturating_add(count.completion));
+            used = Some(*count);
         }
         sink.end_round();
         // A shut-down read can also end the stream without an error, and an
@@ -397,7 +397,10 @@ fn unanswered(calls: &[api::ToolCall], answered: usize, why: &str) -> Vec<Value>
 fn assistant_message(reply: &api::Reply) -> Value {
     let mut message = json!({ "role": "assistant", "content": reply.text });
     if !reply.reasoning.is_empty() {
-        message["reasoning_content"] = json!(reply.reasoning);
+        // Back under the name it arrived with: a provider that streams
+        // `reasoning` does not read `reasoning_content`.
+        let field = reply.reasoning_field.unwrap_or("reasoning_content");
+        message[field] = json!(reply.reasoning);
     }
     message
 }
@@ -500,6 +503,7 @@ mod tests {
     /// `keep_on_cancel` reads to vary.
     fn reply_with(calls: Vec<api::ToolCall>, complete: bool) -> api::Reply {
         api::Reply {
+            reasoning_field: None,
             text: "answer".into(),
             reasoning: String::new(),
             calls,
@@ -616,7 +620,7 @@ mod tests {
         let mut sink = Recorder::default();
         let used = run_turn(&turn, &mut history, &mut sink).unwrap();
 
-        assert_eq!(used, Some(12));
+        assert_eq!(used.map(|u| u.prompt + u.completion), Some(12));
         // The call is answered before the second request, and the answer that
         // ends the turn is the assistant message.
         assert_eq!(history.0[1]["tool_calls"][0]["function"]["name"], "about");
@@ -664,7 +668,9 @@ mod tests {
         let mut sink = Recorder::default();
         // The count is the provider's; adding two of them must not wrap.
         assert_eq!(
-            run_turn(&turn, &mut history, &mut sink).unwrap(),
+            run_turn(&turn, &mut history, &mut sink)
+                .unwrap()
+                .map(|u| u.prompt.saturating_add(u.completion)),
             Some(u64::MAX)
         );
     }
@@ -851,6 +857,7 @@ mod tests {
         let reply = api::Reply {
             text: "answer".into(),
             reasoning: "thought".into(),
+            reasoning_field: Some("reasoning_content"),
             calls: Vec::new(),
             usage: None,
             finish_reason: Some("stop".into()),
@@ -859,6 +866,19 @@ mod tests {
         let message = assistant_message(&reply);
         assert_eq!(message["content"], "answer");
         assert_eq!(message["reasoning_content"], "thought");
+        // A provider that streamed `reasoning` gets it back under that name.
+        let other = api::Reply {
+            text: "answer".into(),
+            reasoning: "thought".into(),
+            reasoning_field: Some("reasoning"),
+            calls: Vec::new(),
+            usage: None,
+            finish_reason: Some("stop".into()),
+            complete: true,
+        };
+        let message = assistant_message(&other);
+        assert_eq!(message["reasoning"], "thought");
+        assert!(message.get("reasoning_content").is_none());
 
         let plain = api::Reply {
             reasoning: String::new(),

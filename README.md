@@ -94,6 +94,10 @@ A provider entry describes the differences between servers, never code paths:
 | `api_key_env` | environment variable holding the token |
 | `models_url` | where the model list lives, when not `base_url` + `/models` |
 | `session_header` | header that must carry a stable session id |
+| `session_field` | body field that carries the same id, for a provider that routes its cache by it (`prompt_cache_key`) |
+| `max_tokens` | tokens an answer may take; `16384` unless set, `0` for no ceiling |
+| `max_tokens_field` | the field that ceiling travels in (`max_tokens`, or `max_completion_tokens`) |
+| `store` | whether the provider may retain the request (`false` opts out) |
 | `thinking` | level name → object merged into the request body |
 
 `{}` as a level leaves the provider default in place. A provider name is the
@@ -114,6 +118,13 @@ same thing, so a file with both is refused.
   "model": "example/some-model"
 }
 ```
+
+Every request carries `max_tokens` — 16384, or what the entry says, `0` for
+none — so one answer cannot spend the window. A thinking level is merged on top
+of the entry's own fields, so `{"max_tokens": 4096}` in a level is a per-level
+ceiling. `session_field` and `store` are the cache and retention fields pi sends
+when a provider supports them: axe sends nothing it was not told to, because a
+provider that rejects an unknown body field would fail every request.
 
 Thinking levels are named by the provider, not by axe: `off`, `low`, `medium`
 and `high` are only what `/thinking` offers. A level the provider does not
@@ -417,7 +428,10 @@ session, and the line says the round was not whole.
 
 The row under the prompt is what the turn is doing on the left, and on the right
 the session's name, the directory it runs in, the provider/model and thinking
-level, and how much of the context window the history fills. Each piece on the
+level, and how much of the context window the request fills — the provider's
+own count once a round reports one, plus an estimate of what came after it, or
+a character estimate of the history and the tools until then, with the cache
+hit beside it (`412/8192 (5%) · 3.9k cached`). Each piece on the
 right carries its own color, and every color is one of the terminal's own ANSI
 names, so the theme decides what it actually is: the name in the default
 foreground, the directory dim, with the home directory written `~`, the
@@ -522,18 +536,27 @@ A session body belongs to one running axe. Two instances in one directory share
 the selection last-write-wins, and an archive pass skips a body another
 instance has touched since it was listed.
 
-`/compact` replaces the history with a summary of it. The body is not rewritten:
-the summary is appended as a marked message, and reading a body starts from the
-last marker, so replay matches what the live session sent. The summary is
+`/compact` replaces the history with a summary of it, and so does axe on its
+own when the request comes within 16384 tokens of the window: the summary is
+made before the request rather than after the provider refused it. The newest
+conversation — up to 20000 tokens of it, cut at a user or assistant message so a
+tool result never loses the call it answers — stays verbatim beside the summary,
+so the next round does not have to re-read what the model just knew. A session
+whose history fits inside that tail is summarized whole, which is what
+compaction is for. The body is not rewritten:
+the summary is appended as a marked message, the kept tail after it, and
+reading a body starts from the last marker, so replay matches what the live
+session sent. The summary is
 printed in the transcript when it is made — a block of its own, under the notice
 that records the compaction — so what the model now carries is readable; a
 resume does not print it again. What came before the marker stays on disk and
 `/sessions` search still finds it. The summary keeps the system prompt and the
 current mode note; a session that has been compacted lists the messages the
 model still has, not the bytes in the file. The summary and the naming request
-are the only ones axe sends without tools, and they run at the session's
-thinking level with no output cap: a cap small enough for the
-answer is one a thinking model can spend on reasoning before it writes a word.
+are the only ones axe sends without tools: they run at the session's thinking
+level, carry the entry's cache and retention fields, and go out with no output
+cap — a cap small enough for the summary is one a thinking model can spend on
+reasoning before it writes a word. Every other request carries `max_tokens`.
 A compaction that comes back empty reports what the reply did instead — the
 reason the stream ended and the tokens it took — which is the difference between
 an answer cut off and a model that said nothing. One that comes back cut is
