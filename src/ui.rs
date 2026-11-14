@@ -967,12 +967,17 @@ impl Screen {
     /// Commit the line: echo it into the transcript and return it. The line is
     /// settled, not editable, so it carries a marker `█` where the live field
     /// carries its background. Every row has it, so a wrapped line reads as one
-    /// block.
-    /// What was typed is markdown, laid out here because it is complete.
+    /// block. What was typed is markdown, laid out here because it is complete.
+    ///
+    /// A line of nothing but spaces submits nothing (`parse_command` reads it
+    /// as empty), so it leaves no block behind either: the prompt clears and
+    /// the transcript stays as it was.
     pub fn commit(&mut self) -> String {
         let line = self.take();
-        self.remember(&line);
-        self.echo(&line);
+        if !line.trim().is_empty() {
+            self.remember(&line);
+            self.echo(&line);
+        }
         self.status.clear();
         self.alert = None;
         line
@@ -1700,13 +1705,18 @@ impl Screen {
         };
         let lone = n == 1;
         let mut line = sel.matches[at].clone();
-        // A directory keeps the list open — the next segment is what is being
-        // typed — and a file ends it.
-        if lone && !line.ends_with('/') {
+        // A directory keeps the list open — the next segment is typed inside
+        // it — and a file ends it with a space. What follows the token is the
+        // candidate's too, so the space is only for a token that ends the line.
+        let tail = self.ed.len() - token_end(&self.ed.buf, self.ed.cursor);
+        if lone && tail == 0 && !line.ends_with('/') {
             line.push(' ');
         }
+        // The cursor goes after what was completed, not to the end of the line:
+        // a path completed mid-message must not swallow the words after it.
+        let after = line.chars().count().saturating_sub(tail);
         self.ed.buf = line;
-        self.ed.cursor = self.ed.len();
+        self.ed.cursor = after;
         if lone {
             self.selection = None;
         } else if let Some(sel) = &mut self.selection {
@@ -1717,7 +1727,9 @@ impl Screen {
 
     /// Keep the line for Up and Down. A blank, a leading space (the shell's
     /// "do not remember this") and a repeat of the newest are not steps.
-    fn remember(&mut self, line: &str) {
+    /// `commit` calls this; a line the caller took from the prompt instead is
+    /// a submitted line too, so it is remembered through here.
+    pub fn remember(&mut self, line: &str) {
         if line.trim().is_empty() || line.starts_with(' ') {
             return;
         }
@@ -2021,6 +2033,19 @@ fn prompt_layout(buf: &str, cursor: usize, width: usize) -> (Vec<String>, (u16, 
         }
     }
     (rows, (at.0 as u16, at.1 as u16))
+}
+
+/// End of the whitespace-delimited token the cursor is in or next to: the same
+/// run `complete.rs` replaces, so the cursor can be put back after the span it
+/// wrote rather than at the end of the line.
+fn token_end(line: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    let at = cursor.min(chars.len());
+    let mut end = at;
+    while end < chars.len() && !chars[end].is_whitespace() {
+        end += 1;
+    }
+    end
 }
 
 /// How the one row the status and the info share is split, in cells. The status
@@ -2915,6 +2940,23 @@ mod tests {
         assert_eq!(screen.ed.buf, "/model ");
     }
 
+    /// A path completed mid-line leaves the cursor after the path, not at the
+    /// end of the message, and gets no space there: the words after it stay
+    /// where the user typed them.
+    #[test]
+    fn tab_in_the_middle_of_a_line_keeps_the_cursor_after_the_path() {
+        fn file(_line: &str, _cursor: usize) -> Vec<String> {
+            vec!["cp src/ui.rs now".to_string()]
+        }
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_completer(file);
+        screen.insert_text("cp @src/ui now");
+        screen.ed.cursor = 10;
+        press(&mut screen, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "cp src/ui.rs now", "no space before `now`");
+        assert_eq!(screen.ed.cursor, 12, "the cursor sits after `ui.rs`");
+    }
+
     #[test]
     fn history_walks_and_gives_the_draft_back() {
         let mut screen = Screen::test_screen(40, 10);
@@ -2953,6 +2995,19 @@ mod tests {
         press(&mut screen, KeyCode::Enter, KeyModifiers::NONE);
         screen.commit();
         assert_eq!(screen.recall.history.len(), 2, "a leading space stays out");
+    }
+
+    /// A line of spaces submits nothing, so it leaves nothing behind either:
+    /// no `█` block, no history step.
+    #[test]
+    fn a_blank_line_leaves_no_block() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_history(vec!["old".into()]);
+        typed(&mut screen, "   ");
+        press(&mut screen, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(screen.commit(), "   ", "the line still comes back");
+        assert!(screen.transcript().is_empty(), "no block was written");
+        assert_eq!(screen.recall.history, vec!["old".to_string()]);
     }
 
     #[test]
@@ -3081,6 +3136,21 @@ mod tests {
         // Past the end it lands on the last row, where the arrows stop anyway.
         screen.menu_select(400);
         assert_eq!(screen.menu_selected(), 39);
+    }
+
+    /// A chooser clamps: the arrows stop at the ends and do not ring. Only the
+    /// candidate list wraps, because Tab walks it as a repeat action.
+    #[test]
+    fn a_chooser_mark_stops_at_both_ends() {
+        let mut screen = Screen::test_screen(40, 14);
+        screen.set_menu("Models", vec!["one".into(), "two".into()], false);
+        screen.draw().unwrap();
+        screen.menu_move(-1);
+        assert_eq!(screen.menu_selected(), 0, "up on the first row stays");
+        screen.menu_move(1);
+        assert_eq!(screen.menu_selected(), 1);
+        screen.menu_move(1);
+        assert_eq!(screen.menu_selected(), 1, "down on the last row stays");
     }
 
     #[test]

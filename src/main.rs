@@ -565,7 +565,10 @@ fn parse_command(line: &str) -> Command {
     if input.starts_with('/') {
         return Command::Unknown(input.to_string());
     }
-    Command::Turn(input.to_string())
+    // The message is what was typed, not what the command table matched: a
+    // leading indent is markdown the model should see, and the transcript
+    // echoes the same bytes.
+    Command::Turn(line.to_string())
 }
 
 /// Slash commands, for Tab completion in the prompt. Only the name is
@@ -743,6 +746,7 @@ impl Session {
             // A committed line is echoed by `readline`; a queued one was not.
             if was_queued {
                 screen.echo_user(&line);
+                self.remember(&line, &mut screen);
             }
             match self.dispatch(
                 &line,
@@ -837,6 +841,18 @@ impl Session {
         if self.warning.is_none() {
             self.warning = Some(text);
         }
+    }
+
+    /// A line that reached the model or the shell from a turn's queue. The
+    /// idle prompt remembers its own as it commits it; a queued line was
+    /// taken, not committed, so its memory is owed here. One place per line: a
+    /// line the turn read never comes back through the loop, and one handed
+    /// back never passed `took`.
+    fn remember(&mut self, line: &str, screen: &mut ui::Screen) {
+        if let Err(e) = state::append_history(&self.state.cwd, line) {
+            self.warn(format!("history: {e}"));
+        }
+        screen.remember(line);
     }
 
     /// Render the first pending warning at a safe point: the screen when there
@@ -1491,13 +1507,15 @@ impl Session {
         let cancel = http::Cancel::new();
         let args = json!({ "command": command }).to_string();
         let mut queued: Option<String> = None;
+        let mut explore = false;
         let result = thread::scope(|scope| {
             // `!cmd` is the user's own shell: explore mode does not confine
             // it, so the mode here is only about which tool set is offered.
             let handle =
                 scope.spawn(|| tools::execute("bash", &args, &cancel, tools::Mode::Normal));
-            let (joined, line) = pump(screen, rx, &cancel, handle);
+            let (joined, line, switch) = pump(screen, rx, &cancel, handle);
             queued = line;
+            explore = switch;
             joined.unwrap_or_else(|| "error: shell thread panicked".into())
         });
         screen.set_status("");
@@ -1522,6 +1540,11 @@ impl Session {
         }));
         screen.set_info(self.info());
         screen.repaint();
+        // A Shift+Tab typed while the command ran: the mode is the session's,
+        // so it lands once the command is over.
+        if explore {
+            self.toggle_explore(&mut Console::Screen { screen, rx });
+        }
         queued
     }
 
@@ -1563,6 +1586,7 @@ impl Session {
         let model = self.model.clone();
         let level = self.thinking.clone();
         let mut queued = None;
+        let mut explore = false;
         let result = match console {
             Console::Screen { screen, rx } => {
                 screen.set_status("▣ Compacting");
@@ -1571,8 +1595,9 @@ impl Session {
                     let handle = scope.spawn(|| {
                         compact_request(provider, &model, level.as_deref(), &request, &cancel)
                     });
-                    let (joined, line) = pump(screen, rx, &cancel, handle);
+                    let (joined, line, switch) = pump(screen, rx, &cancel, handle);
                     queued = line;
+                    explore = switch;
                     joined.unwrap_or_else(|| Err("compaction thread panicked".into()))
                 });
                 screen.set_status("");
@@ -1621,6 +1646,10 @@ impl Session {
         }
         if let Some(screen) = console.screen() {
             screen.repaint();
+        }
+        // Shift+Tab typed while the summary was being written.
+        if explore {
+            self.toggle_explore(console);
         }
         queued
     }
@@ -1759,6 +1788,13 @@ impl Session {
         // not count) leaves the estimate in charge rather than a stale number.
         self.used = used;
         screen.set_info(self.info());
+
+        // Lines the turn read are submitted lines: the prompt was never the
+        // one to commit them, so Up and the next session learn them here.
+        let read = std::mem::take(&mut held.read);
+        for line in &read {
+            self.remember(line, screen);
+        }
 
         // Held from the turn: applied now, so the note sits below the answer
         // and above whatever the user types next.
@@ -1973,6 +2009,10 @@ struct Held {
     armed: bool,
     /// Whether the turn was actually stopped, for the line that says so.
     interrupted: bool,
+    /// Lines the turn took into its history. The prompt was not there to commit
+    /// them — a queued line is taken, not committed — so their memory is owed
+    /// when the turn is over.
+    read: Vec<String>,
 }
 
 impl Held {
@@ -2138,6 +2178,7 @@ impl Held {
             self.queued.remove(at);
             show_queue(screen, &self.queued);
         }
+        self.read.push(line.to_string());
         screen.echo_user(line);
     }
 
@@ -2402,6 +2443,14 @@ mod tests {
         assert_eq!(parse_command("! ls"), Command::Shell("ls".into()));
         assert_eq!(parse_command("!"), Command::Empty);
         assert_eq!(parse_command("hello"), Command::Turn("hello".into()));
+        // The message is the line as typed: the command table matches the
+        // trimmed form, the model gets the indent and the tail.
+        assert_eq!(
+            parse_command("    fn main() {"),
+            Command::Turn("    fn main() {".into())
+        );
+        assert_eq!(parse_command(" hello  "), Command::Turn(" hello  ".into()));
+        assert_eq!(parse_command("  /help"), Command::Help);
         assert_eq!(parse_command("/skills"), Command::Skills);
         assert_eq!(
             parse_command("/skill:pdf-tools extract it"),
@@ -3642,9 +3691,10 @@ mod tests {
         let mut screen = ui::Screen::test_screen(60, 20);
         thread::scope(|scope| {
             let handle = scope.spawn(|| 1u32);
-            let (joined, queued) = pump(&mut screen, &rx, &cancel, handle);
+            let (joined, queued, explore) = pump(&mut screen, &rx, &cancel, handle);
             assert_eq!(joined, Some(1));
             assert!(queued.is_none());
+            assert!(!explore);
         });
         assert!(!cancel.cancelled(), "one press offers, it does not stop");
         drop(tx);
@@ -3674,6 +3724,19 @@ mod tests {
             pump(&mut screen, &rx, &cancel, handle);
         });
         assert!(cancel.cancelled());
+        drop(tx);
+
+        // Shift+Tab while the work runs is held, and comes back for the caller
+        // to apply once it is over.
+        let cancel = http::Cancel::new();
+        let (tx, rx) = events();
+        tx.send(down(KeyCode::BackTab)).unwrap();
+        let mut screen = ui::Screen::test_screen(60, 20);
+        let explore = thread::scope(|scope| {
+            let handle = scope.spawn(|| 1u32);
+            pump(&mut screen, &rx, &cancel, handle).2
+        });
+        assert!(explore, "the mode switch is not dropped");
         drop(tx);
     }
 
@@ -3731,12 +3794,13 @@ mod tests {
         tx.send(Event::Eof).unwrap();
         let mut screen = ui::Screen::test_screen(60, 20);
 
-        let (joined, queued) = thread::scope(|scope| {
+        let (joined, queued, explore) = thread::scope(|scope| {
             let handle = scope.spawn(|| 7u32);
             pump(&mut screen, &rx, &cancel, handle)
         });
         assert_eq!(joined, Some(7));
         assert_eq!(queued.as_deref(), Some("qpasted"), "the line is kept");
+        assert!(!explore, "no mode key was pressed");
         assert!(cancel.cancelled(), "the end of input cancels the work");
     }
 

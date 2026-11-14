@@ -46,9 +46,7 @@ impl Buffer {
         self.cursor += text.chars().count();
     }
 
-    /// The list under the prompt, taken from the line as it is now with the
-    /// first row marked, or the one a step already made. False when nothing
-    /// matches.
+    /// Remove the char before the cursor, and nothing at the start of the line.
     pub(crate) fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;

@@ -292,7 +292,8 @@ completed line. `/model` and `/thinking` are the exception: their argument is no
 completed, because Enter would take a candidate before the command ran. Bare,
 they open a chooser over what they pick from — every provider's models, or the
 levels this one configures — opened on the one in use, walked with the arrows,
-narrowed by typing, closed with Esc, and applied on Enter. `/model dee` is the
+which stop at the ends, narrowed by typing, closed with Esc, and applied on
+Enter. `/model dee` is the
 same chooser, already narrowed, and `/model provider/id` sets one directly.
 `/model -g` (or `--global`) is the same chooser for the global default, and
 `/model -g provider/id` sets that directly.

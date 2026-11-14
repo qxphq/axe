@@ -271,8 +271,12 @@ pub(crate) fn pump<T>(
     rx: &Receiver<Event>,
     cancel: &http::Cancel,
     handle: thread::ScopedJoinHandle<'_, T>,
-) -> (Option<T>, Option<String>) {
+) -> (Option<T>, Option<String>, bool) {
     let mut queued: Option<String> = None;
+    // Shift+Tab pressed while the work runs: applied once it is over, the way a
+    // turn holds its own switch, because the mode is the session's and the
+    // servers restart with it.
+    let mut explore = false;
     // The same offer the prompt makes during a turn: one ESC asks, any other
     // key withdraws it, the second ESC stops the work.
     let mut armed = false;
@@ -297,6 +301,7 @@ pub(crate) fn pump<T>(
                     ui::Action::Submit if !screen.is_empty() && queued.is_none() => {
                         queued = Some(screen.take());
                     }
+                    ui::Action::Explore => explore = true,
                     ui::Action::Eof => {
                         cancel.cancel();
                         break;
@@ -324,7 +329,7 @@ pub(crate) fn pump<T>(
         // A setter marked the screen; one paint per event.
         screen.repaint();
     }
-    (handle.join().ok(), queued)
+    (handle.join().ok(), queued, explore)
 }
 
 /// Collect one line from the prompt. Keys are the only input while idle;

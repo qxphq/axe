@@ -40,7 +40,8 @@ Verify with depth — press every key in context, do not skim:
   as typed, and a single candidate. Check `/model` and `/thinking` argument
   completion is deliberately off.
 - Choosers: bare `/model`, `/model -g`, `/thinking`, `/sessions` and the startup
-  list. Typing narrows by spec/id, not by displayed row; arrows wrap; Enter
+  list. Typing narrows by spec/id, not by displayed row; the arrows stop at the
+  ends, as the README says; Enter
   applies; Esc closes; a list that starts above the prompt; an empty filter;
   and a session switch while the list is open. Check `/model dee` opening
   narrowed and `/model provider/id` setting directly.

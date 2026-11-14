@@ -264,7 +264,9 @@ invariants a change must not break.
   by the REPL loop like any line typed while idle. The frame stacks the waiting
   lines, one row each, under a blank row and over the hint; `↑` takes every line
   the turn has not read back onto the prompt, above what was typed, and empties
-  the queue.
+  the queue. A queued line is taken, not committed, so its memory is owed where
+  it lands — the turn carries the lines it read out of the drain, the loop
+  remembers the ones handed back — and every submitted line is remembered once.
 - Sessions: `<id>.json` is the mutable sidecar; `<id>.jsonl` is append-only; bodies
   older than `sessions::KEEP` are gzipped. The sidecar stays readable, so listing
   and search work without unpacking. A compacted body carries a marked summary
@@ -280,6 +282,10 @@ invariants a change must not break.
   the newest 500, the same `0600`, and `mcp-trust.json`, the approved project
   MCP files by path and content hash. A blank, a leading space and a repeat of
   the newest are not steps.
+- The model reads the line as it was committed: `parse_command` matches the
+  trimmed form, so a command is typed with spaces around it, but the message it
+  hands over is the bytes the transcript echoed. A line of nothing but spaces is
+  no message at all — it leaves no block and no history step.
 - `!cmd` is the user's shell. It runs through `tools::execute`, its output joins
   the history as a `user` message, no turn follows, and explore-mode write
   confinement does not apply. It leaves the line a call leaves — `render`'s

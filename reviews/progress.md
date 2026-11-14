@@ -22,7 +22,7 @@ box.
 ## Terminal behavior
 
 - [x] [Frame and transcript](frame-and-transcript.md)
-- [ ] [Prompt editing and completion](prompt-editing.md)
+- [x] [Prompt editing and completion](prompt-editing.md)
 - [ ] [Rendering and streaming](rendering.md)
 
 ## Prompt, tools, and extensions
