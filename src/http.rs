@@ -405,24 +405,27 @@ impl Response {
         Ok(out)
     }
 
-    /// Read at most `limit` bytes, then stop: the cap is on bytes off the wire.
-    /// Decoded lossily, so a page that is not UTF-8 is mojibake rather than an
-    /// error. `deadline` bounds the loop, not a single blocked read.
-    pub fn read_capped(&mut self, limit: u64, deadline: Instant) -> io::Result<String> {
+    /// Read at most `limit` bytes: the cap is on bytes off the wire. Decoded
+    /// lossily, so a page that is not UTF-8 is mojibake rather than an error.
+    /// The flag says the limit stopped the read, so a caller can tell a whole
+    /// body from its first `limit` bytes; the deadline is an error, because a
+    /// body still arriving after it is a failure, not content. `deadline`
+    /// bounds the loop, not a single blocked read.
+    pub fn read_capped(&mut self, limit: u64, deadline: Instant) -> io::Result<(String, bool)> {
         let mut out = Vec::new();
         let mut chunk = [0u8; 8192];
         while (out.len() as u64) < limit {
             if Instant::now() > deadline {
-                break;
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "body timed out"));
             }
             let room = (limit - out.len() as u64).min(chunk.len() as u64) as usize;
             let n = self.reader.read(&mut chunk[..room])?;
             if n == 0 {
-                break;
+                return Ok((String::from_utf8_lossy(&out).into_owned(), false));
             }
             out.extend_from_slice(&chunk[..n]);
         }
-        Ok(String::from_utf8_lossy(&out).into_owned())
+        Ok((String::from_utf8_lossy(&out).into_owned(), true))
     }
 
     pub fn read_line(&mut self) -> io::Result<Option<String>> {
@@ -1014,15 +1017,25 @@ mod tests {
     fn a_capped_read_stops_at_the_limit_or_the_deadline() {
         let server = Server::new(vec![json("abcdefghij")]);
         let mut res = request(&server.ep, "GET", "/", None, &[], None, None).unwrap();
-        let cut = res
+        let (cut, at_limit) = res
             .read_capped(4, Instant::now() + Duration::from_secs(5))
             .unwrap();
         assert_eq!(cut, "abcd");
+        assert!(at_limit, "the cap stopped the read");
+
+        // A body that ends before the cap is whole, and says so.
+        let (whole, at_limit) = res
+            .read_capped(40, Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(whole, "efghij", "the rest, read after the cap stopped it");
+        assert!(!at_limit);
 
         let server = Server::new(vec![json("abcdefghij")]);
         let mut res = request(&server.ep, "GET", "/", None, &[], None, None).unwrap();
-        let expired = res.read_capped(4, Instant::now()).unwrap();
-        assert_eq!(expired, "", "a deadline already past reads nothing");
+        let err = res
+            .read_capped(4, Instant::now())
+            .expect_err("a deadline already past is an error");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

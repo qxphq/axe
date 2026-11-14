@@ -115,12 +115,29 @@ pub fn fetch(args: &Value, cancel: &Cancel) -> String {
     }
 
     let deadline = Instant::now() + Duration::from_secs(FETCH_SECONDS);
-    let body = match response.read_capped(FETCH_BYTES, deadline) {
-        Ok(body) => body,
+    let (body, cut) = match response.read_capped(FETCH_BYTES, deadline) {
+        Ok(pair) => pair,
         Err(e) => return format!("error: fetch: read: {e}"),
     };
-    let text = sanitize(&extract_text(&body));
-    page_text(&text, args)
+    // Only HTML is reduced: the extractor drops whatever sits between a `<`
+    // and a `>` and decodes entities, which would corrupt a JSON body, an XML
+    // feed, a diff or a script. Everything else is its own text, sanitized.
+    let text = if html(&content_type) {
+        sanitize(&extract_text(&body))
+    } else {
+        sanitize(&body)
+    };
+    let mut out = page_text(&text, args);
+    if cut {
+        out.push_str(&format!("\n...[body cut at {} bytes]...", FETCH_BYTES));
+    }
+    out
+}
+
+/// Whether the body is HTML the extractor may reduce: an XHTML document has
+/// the same markup, while a `text/plain` body is text and keeps its `<`.
+fn html(content_type: &str) -> bool {
+    content_type.contains("text/html") || content_type.contains("xhtml")
 }
 
 /// Slice, then cut: `start` and `chars` address the extracted text, so a page
@@ -339,6 +356,7 @@ fn get(url: &str, headers: &[(String, String)], cancel: &Cancel) -> Result<Strin
     let deadline = Instant::now() + Duration::from_secs(SEARCH_SECONDS);
     response
         .read_capped(SEARCH_BYTES, deadline)
+        .map(|(body, _cut)| body)
         .map_err(|e| format!("read: {e}"))
 }
 
@@ -1018,6 +1036,52 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/", server.ep.port);
         let out = fetch(&json!({ "url": url }), &Cancel::new());
         assert_eq!(out, "error: fetch: no content-type");
+    }
+
+    /// A body that is not HTML is text as it stands: the extractor would drop
+    /// every span between `<` and `>` and decode entities inside a JSON body,
+    /// an XML feed or a diff.
+    #[test]
+    fn a_body_that_is_not_html_is_not_reduced() {
+        allow_local();
+        let body = "if a < b and c > d &amp; e\n{\"path\": \"src/<name>.rs\"}\n";
+        let server = crate::http::support::Server::new(vec![crate::http::support::reply(
+            "200 OK",
+            &[("Content-Type", "text/plain; charset=utf-8")],
+            body,
+        )]);
+        let url = format!("http://127.0.0.1:{}/page.txt", server.ep.port);
+        let out = fetch(&json!({ "url": url }), &Cancel::new());
+        assert!(out.contains(body.trim_end()), "{out}");
+        assert!(out.starts_with("source: web (untrusted)\n"), "{out}");
+
+        // The same text as pages: HTML is still reduced.
+        let server = crate::http::support::Server::new(vec![crate::http::support::reply(
+            "200 OK",
+            &[("Content-Type", "text/html")],
+            "<p>a &amp; b</p><script>x()</script>",
+        )]);
+        let url = format!("http://127.0.0.1:{}/", server.ep.port);
+        let out = fetch(&json!({ "url": url }), &Cancel::new());
+        assert!(out.contains("a & b"), "{out}");
+        assert!(!out.contains("x()"), "{out}");
+    }
+
+    #[test]
+    fn a_body_over_the_wire_cap_says_so() {
+        allow_local();
+        let body = "a".repeat((1 << 20) + 16);
+        let server = crate::http::support::Server::new(vec![crate::http::support::reply(
+            "200 OK",
+            &[("Content-Type", "text/plain")],
+            &body,
+        )]);
+        let url = format!("http://127.0.0.1:{}/big", server.ep.port);
+        let out = fetch(&json!({ "url": url }), &Cancel::new());
+        // The window stops at 50 000 characters and says where to continue;
+        // the body itself stopped at the wire cap, and the result says that too.
+        assert!(out.contains("use start 50001 to continue"), "{out}");
+        assert!(out.contains("body cut at 1048576 bytes"), "{out}");
     }
 
     #[test]

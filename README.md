@@ -446,7 +446,9 @@ move behind a server.
 `read` returns lines without numbering. `bash` starts every call in the working
 directory, so `cd` is pointless; output is truncated, not streamed.
 `fetch` takes 1 MiB off the wire at most and gives the model at most 50 000
-characters, with `start` and `chars` to page through a longer page.
+characters, with `start` and `chars` to page through a longer page; a body it
+had to cut says so. An HTML page is reduced to text, and any other body —
+plain text, JSON, XML, markdown — is read as the text it is.
 `web_search` asks Brave when a token resolves and DuckDuckGo otherwise, falling
 back if Brave fails or returns nothing; `count` defaults to 10 and caps at 20.
 
