@@ -21,9 +21,23 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --release --locked
 
+  # NixOS installs the flake, not the tarball, so the flake is evaluated on
+  # every change: a renamed input, a stale cargoLock or a nixpkgs platform
+  # error would otherwise reach the first user who runs install.sh.
+  flake:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - run: nix flake check --no-build --all-systems
+      - run: nix build .#default --no-link
+
   # A rolling release of main: install.sh downloads from it, nothing is tagged.
   release:
-    needs: test
+    needs: [test, flake]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.os }}
     permissions:

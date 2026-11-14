@@ -39,5 +39,5 @@ box.
 
 - [x] [LLM ergonomics and documentation freshness](llm-ergonomics.md)
 - [x] [Test coverage and test quality](test-coverage.md)
-- [ ] [Release and packaging](release-and-packaging.md)
+- [x] [Release and packaging](release-and-packaging.md)
 - [ ] [Performance and snappiness](performance-and-snappiness.md)

@@ -77,7 +77,14 @@ tar -xzf "$tmp/$tar" -C "$tmp" axe || die "extract failed: $tar"
 mkdir -p "$dir" || die "cannot create $dir"
 install -m 755 "$tmp/axe" "$dir/axe" || die "cannot install to $dir"
 
-version=$("$dir/axe" --version) || die "installed binary does not run"
+# The musl guard reads `ldd`, which a host can also have and not answer, so the
+# binary is the authority: one that does not start here is removed rather than
+# left where the next `axe` would find it.
+version=$("$dir/axe" --version) || {
+	rm -f "$dir/axe"
+	die "the binary does not run on this system ($(uname -s)/$(uname -m)); build from source with
+  cargo install --git https://github.com/$repo --locked"
+}
 printf 'installed %s (%s)\n' "$dir/axe" "$version"
 
 case ":$PATH:" in
