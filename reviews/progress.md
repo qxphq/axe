@@ -21,7 +21,7 @@ box.
 
 ## Terminal behavior
 
-- [ ] [Frame and transcript](frame-and-transcript.md)
+- [x] [Frame and transcript](frame-and-transcript.md)
 - [ ] [Prompt editing and completion](prompt-editing.md)
 - [ ] [Rendering and streaming](rendering.md)
 

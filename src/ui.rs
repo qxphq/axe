@@ -317,14 +317,12 @@ impl Frame {
             // A header, then entries: a chooser is worth at least two rows.
             Mode::Choosing => (height / 3).clamp(2, 10).min(room),
         };
-        // The blank row above the list is the same rule as the blank row above
-        // the prompt: with nothing in the list it is that row, and with a list
-        // it is its own, so the frame never touches the block above it.
-        let lead = u16::from(list_rows > 0);
-        let rows = fixed
-            .saturating_add(lead)
-            .saturating_add(list_rows)
-            .min(height);
+        // The blank row above the list or the queue is the same rule as the
+        // blank row above the prompt: with neither it is that row, and with
+        // either it is its own, so the frame never touches the block above it.
+        let lead = u16::from(list_rows > 0 || queued_rows > 0);
+        let wanted = fixed.saturating_add(lead).saturating_add(list_rows);
+        let rows = wanted.min(height);
         let area = Rect::new(0, 0, 0, rows);
         // Top down: the parts are laid end to end, so a part that is not shown
         // takes its row out of the frame and not out of the blank row above the
@@ -339,20 +337,34 @@ impl Frame {
             height: queued_rows,
             ..area
         };
-        let status = Rect {
-            y: rows.saturating_sub(2),
-            height: 1,
-            ..area
+        // The blank row under the status is the frame's last, and the status is
+        // above it. A terminal with room for neither the blank first row nor a
+        // prompt row and the status gives the status up: two rows cannot hold
+        // both, and the prompt is the part that must be there. Dropped, it has
+        // no row of its own (`draw` reads the height) and takes none of the
+        // prompt's.
+        let status = if rows >= 4 {
+            Rect {
+                y: rows.saturating_sub(2),
+                height: 1,
+                ..area
+            }
+        } else {
+            Rect {
+                y: rows.saturating_sub(1),
+                height: 0,
+                ..area
+            }
         };
-        // Clamped by the screen, never to nothing: a terminal too short for the
-        // frame it asks for draws the prompt's one row inside what it has rather
-        // than reserving none for it. Everything else the frame would carry —
-        // the list, the blank rows — is what gives way.
+        // Clamped by the screen, never to nothing: the prompt keeps its rows
+        // inside what is left above the status rather than reserving none for
+        // itself. The blank between them is the first to give way, then the
+        // box's own rows, and the status itself only when two rows cannot hold
+        // it beside the frame's blank first row.
+        let prompt_y = lead + list_rows + queued_rows + 1;
         let prompt = Rect {
-            y: lead + list_rows + queued_rows + 1,
-            height: prompt_rows
-                .min(status.y.saturating_sub(lead + list_rows + queued_rows + 1))
-                .max(1),
+            y: prompt_y,
+            height: prompt_rows.min(status.y.saturating_sub(prompt_y)).max(1),
             ..area
         };
         Frame {
@@ -1434,16 +1446,20 @@ impl Screen {
                     .borders(Borders::ALL)
                     .border_set(symbols::border::PLAIN)
                     .border_style(if self.explore { CAUTION } else { PROMPT_STYLE });
-                // Clipped by the screen as well as by the part: a terminal too
-                // short for the box it asks for crops it instead of asking the
-                // buffer for a row it does not have.
+                // Clipped by the part and the screen: the layout clamped the
+                // box for a terminal too short for the frame it asked for, and
+                // the box must not grow back over the status row the layout
+                // kept apart from it.
+                let field = part(layout.prompt);
+                let box_height = (visible.len() as u16 + edge).min(field.height);
                 frame.render_widget(
                     Paragraph::new(prompt_rows).block(outline),
                     Rect {
                         y: top,
-                        height: visible.len() as u16 + edge,
-                        ..part(layout.prompt)
+                        height: box_height,
+                        ..field
                     }
+                    .intersection(field)
                     .intersection(screen),
                 );
                 // One row per waiting line, oldest first, under the blank row
@@ -1468,13 +1484,15 @@ impl Screen {
                     );
                 }
                 // One row for the question, whole: the info row is metadata
-                // and comes back when the question is answered.
+                // and comes back when the question is answered. A frame too
+                // short for the status row gives it up, and nothing is drawn.
                 match &alert {
-                    Some(text) => frame.render_widget(
+                    Some(text) if layout.status.height > 0 => frame.render_widget(
                         Paragraph::new(Line::styled(clip(text, cols), CAUTION)),
                         line(layout.status.y),
                     ),
-                    None => {
+                    Some(_) => {}
+                    None if layout.status.height > 0 => {
                         frame.render_widget(
                             Paragraph::new(Line::styled(status, DIM)),
                             line(layout.status.y),
@@ -1484,13 +1502,18 @@ impl Screen {
                             line(layout.status.y),
                         );
                     }
+                    None => {}
                 }
                 // A failed `settle` can leave the layout taller than the
                 // screen it was drawn into; the cursor is the one thing that
                 // cannot be clipped by a rect. It is the frame's row, not the
                 // buffer's: the window it scrolls in starts at `first`.
-                let row = (top + PROMPT_EDGE + crow - first as u16)
+                // The cursor stays inside the box as drawn: a cropped one has
+                // no text row to put it on, and the status row is not ours.
+                let bottom = (top + box_height)
+                    .saturating_sub(1)
                     .min(screen.bottom().saturating_sub(1));
+                let row = (top + PROMPT_EDGE + crow - first as u16).min(bottom);
                 frame.set_cursor_position(Position::new(
                     screen.x + margin + PROMPT_EDGE + pad.len() as u16 + ccol,
                     row,
@@ -1962,12 +1985,13 @@ fn prompt_layout(buf: &str, cursor: usize, width: usize) -> (Vec<String>, (u16, 
     let mut col = 0usize;
     let mut at = (0usize, 0usize);
     for (i, ch) in buf.chars().enumerate() {
-        if i == cursor {
-            at = (rows.len() - 1, col);
-        }
         // A newline is a row break the user chose: the rest of the line goes
-        // on the next row, which starts at the same column.
+        // on the next row, which starts at the same column. The cursor before
+        // it closes the row it is on.
         if ch == '\n' {
+            if i == cursor {
+                at = (rows.len() - 1, col);
+            }
             rows.push(String::new());
             col = 0;
             continue;
@@ -1979,6 +2003,12 @@ fn prompt_layout(buf: &str, cursor: usize, width: usize) -> (Vec<String>, (u16, 
         if col > 0 && col + cells > limit {
             rows.push(String::new());
             col = 0;
+        }
+        // The cursor is where the character at it is drawn: after the wrap
+        // decision, so a character that starts a row puts the cursor on that
+        // row's first cell rather than at the end of the row above.
+        if i == cursor {
+            at = (rows.len() - 1, col);
         }
         rows.last_mut().expect("a row").push(ch);
         col += cells;
@@ -2293,6 +2323,76 @@ impl<W: Write> Backend for Tail<W> {
 mod tests {
     use super::*;
     use ratatui::style::Color;
+
+    /// The cursor goes where the character at it is drawn, not where the row
+    /// it was on ended.
+    #[test]
+    fn the_cursor_sits_where_the_character_at_it_is_drawn() {
+        // Width 4: "abcd" fills a row, "e" starts the next.
+        let (rows, (row, col)) = prompt_layout("abcde", 4, 4);
+        assert_eq!(rows, vec!["abcd", "e"]);
+        assert_eq!((row, col), (1, 0), "the first cell of the wrapped row");
+        // The cursor on a newline closes the row it is on.
+        let (rows, (row, col)) = prompt_layout("ab\ncd", 2, 10);
+        assert_eq!(rows, vec!["ab", "cd"]);
+        assert_eq!((row, col), (0, 2));
+        // The end of the buffer at a full row is already the next row.
+        let (rows, (row, col)) = prompt_layout("abcd", 4, 4);
+        assert_eq!(rows, vec!["abcd", ""]);
+        assert_eq!((row, col), (1, 0));
+    }
+
+    #[test]
+    fn a_short_frame_keeps_its_parts_apart_and_its_first_row_blank() {
+        // The queue alone still gets the frame's blank first row.
+        let mut screen = Screen::test_screen(40, 8);
+        screen.set_queued(&["one".to_string()]);
+        screen.draw().unwrap();
+        let frame = screen.frame();
+        assert_eq!(frame.queued.y, 1, "the queue takes the first row");
+        // A terminal too short for the frame the prompt asks for: the box is
+        // cropped to the rows the layout gave it, the status keeps its rows
+        // only when they exist, and neither carries part of the other.
+        // One row cannot hold the frame's blank first row and a prompt row, so
+        // the loop starts at two.
+        for height in 2u16..=6 {
+            let mut screen = Screen::test_screen(40, height);
+            screen.insert_text("abc");
+            screen.draw().unwrap();
+            let frame = screen.frame();
+            assert_eq!(
+                frame.status.height > 0,
+                height >= 4,
+                "height {height}: status {:?}",
+                frame.status
+            );
+            if frame.status.height == 0 {
+                assert!(
+                    frame.prompt.y + frame.prompt.height <= height,
+                    "height {height}: prompt {:?}",
+                    frame.prompt
+                );
+                continue;
+            }
+            assert!(
+                frame.prompt.y + frame.prompt.height <= frame.status.y,
+                "height {height}: prompt {:?} status {:?}",
+                frame.prompt,
+                frame.status
+            );
+            let row: String = (0..40)
+                .map(|x| {
+                    screen.test_buffer()[(x, frame.status.y)]
+                        .symbol()
+                        .to_string()
+                })
+                .collect();
+            assert!(
+                !row.contains('┌') && !row.contains('└') && !row.contains('│'),
+                "height {height}: {row:?}"
+            );
+        }
+    }
 
     #[test]
     fn clip_counts_cells_not_chars() {

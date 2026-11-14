@@ -80,8 +80,10 @@ invariants a change must not break.
     lines, and the candidates. Its first row is blank whatever it draws, so
     nothing in the frame touches the transcript; the blank row above an idle
     prompt is that same row, not a special case.
-    Nothing is written against the bottom edge, and the status keeps a blank row
-    above it however many rows the prompt fills. A chooser is the one part the
+    Nothing is written against the bottom edge, and no part of it shares a row
+    with another: a frame too tall for the terminal gives up the list and the
+    queue first, then crops the prompt's box, and drops the status only when
+    the blank first row, a prompt row and the status cannot all stand. A chooser is the one part the
     terminal sizes: its header and entries take the rows, and when it closes
     without resuming its rows are committed to
     scrollback — except startup's chooser, whose list vanishes on the first
