@@ -1135,15 +1135,19 @@ impl Screen {
         let fits = self.slack.min(total);
         let mut above = rows;
         let rest = above.split_off(fits as usize);
+        // The head fills the slack from its top, and the rest is inserted next
+        // to the frame. The head goes first: the insert scrolls it up together
+        // with the rows it belongs to, so a block taller than the screen loses
+        // nothing at the top instead of painting over what is there.
+        if fits > 0 {
+            let top = self.term.area().top().saturating_sub(self.slack);
+            let _ = self.term.paint_above(top, above, width as u16, margin);
+            self.slack -= fits;
+        }
         if total > fits {
             let _ = self
                 .term
                 .insert_before(total - fits, |buf| paint(buf, rest, margin));
-        }
-        if fits > 0 {
-            let top = self.term.area().top().saturating_sub(total.max(self.slack));
-            let _ = self.term.paint_above(top, above, width as u16, margin);
-            self.slack -= fits;
         }
         let _ = self.draw();
     }
@@ -3688,6 +3692,35 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.contains("let y = 2;")),
             "{rows:?}"
+        );
+    }
+
+    /// A block taller than the room above the frame still lands in one piece:
+    /// its head fills the slack, the rest is inserted next to the frame, and
+    /// nothing above it is painted over.
+    #[test]
+    fn a_block_taller_than_the_room_above_the_frame_loses_nothing() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.output("before\n");
+        // A prompt that wraps and is then submitted gives the frame rows back,
+        // so there is slack between the transcript's end and the frame.
+        screen.insert_text("one\ntwo\nthree\nfour");
+        screen.draw().unwrap();
+        screen.take();
+        screen.draw().unwrap();
+        assert!(screen.slack > 0, "the frame gave rows back");
+        let rows: Vec<Line<'static>> = (1..=6).map(|n| Line::from(format!("row {n}"))).collect();
+        screen.insert(rows, Block::Tool);
+        let transcript = screen.transcript();
+        let kept: Vec<&str> = transcript
+            .iter()
+            .map(|row| row.trim())
+            .filter(|row| !row.is_empty())
+            .collect();
+        assert_eq!(
+            kept,
+            ["before", "row 1", "row 2", "row 3", "row 4", "row 5", "row 6"],
+            "{transcript:?}"
         );
     }
 
