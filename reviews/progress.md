@@ -37,7 +37,7 @@ box.
 
 ## Quality and delivery
 
-- [ ] [LLM ergonomics and documentation freshness](llm-ergonomics.md)
+- [x] [LLM ergonomics and documentation freshness](llm-ergonomics.md)
 - [ ] [Test coverage and test quality](test-coverage.md)
 - [ ] [Release and packaging](release-and-packaging.md)
 - [ ] [Performance and snappiness](performance-and-snappiness.md)

@@ -180,10 +180,7 @@ fn user_summary(message: &Value) -> Option<String> {
         return None;
     }
     let text = message["content"].as_str()?;
-    if text.starts_with("explore mode:")
-        || text.starts_with('$')
-        || text.starts_with(sessions::COMPACT_NOTE)
-    {
+    if !sessions::is_request(text) {
         return None;
     }
     Some(sessions::collapse(text, 240))
@@ -241,6 +238,15 @@ mod tests {
             ),
             None,
             "a compaction summary is not the user's request"
+        );
+        // The sandbox's caveat joins the history in the user's role, ahead of
+        // anything the user typed: it is not their summary.
+        assert_eq!(
+            user_summary(&json!({
+                "role": "user",
+                "content": "sandbox: Landlock is unavailable, so explore mode's bash is unconfined"
+            })),
+            None
         );
     }
 

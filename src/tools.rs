@@ -1,5 +1,10 @@
 //! The tool registry and local tools: schemas, the generated prompt, `read`,
 //! `write`, `edit`, `bash`, and `about`. Web tools live in `web.rs`.
+//!
+//! `Mode` is here too: which tools a session has, the note that announces a
+//! flip, and the denial a confined command's result carries. The catalogue
+//! itself is mode-independent — it is the cached prefix — so the mode refuses
+//! a call rather than changing the array.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};

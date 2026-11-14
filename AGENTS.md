@@ -16,7 +16,7 @@ invariants a change must not break.
    insufficient. MCP servers are the one addition on that list: they are the
    only way to give the model a capability axe will never build in, and they
    are additive — no built-in tool moves behind one. One feature per change.
-3. **Small surface.** Twenty-two modules; a new module needs a separate concern,
+3. **Small surface.** Twenty-three modules; a new module needs a separate concern,
    not a line count.
 4. **Provider-agnostic through the OpenAI-compatible API.** `chat/completions` +
    SSE only. Express differences as config (`base_url`, `models_url`,
@@ -201,6 +201,10 @@ invariants a change must not break.
 - `turn.rs` — the turn loop: one request per round, the queue a typed line joins
   at a boundary, the two sinks, and `History` (the one place a message is both
   appended to the request and written to the log).
+- `summary.rs` — the two requests that are not a turn: the transcript a
+  `/compact` summary sees, the tail kept verbatim beside it, and the naming
+  request's prompt and parse. `main` decides when they run; this decides what
+  they send.
 - `text.rs` — control bytes, the output cap, and the one place a `Style` becomes
   ANSI.
 - `markdown.rs` — markdown: blocks, inlines, tables, entities, URL checks, and the
@@ -331,7 +335,7 @@ invariants a change must not break.
 
 ```sh
 cargo build
-cargo test     # pure logic: markdown, parsers, caps, command parsing, keys
+cargo test --locked   # parsers, caps, keys, layout — and live runs: a shell, loopback
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```

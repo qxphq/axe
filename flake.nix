@@ -26,12 +26,16 @@
           # (an unwritable home, the host's gzip, /bin/sh).
           doCheck = false;
 
-          # Axe shells out to sh, git, rg, fd and gzip. A minimal server has
-          # none of them, so the wrapper pins them instead of the config.
+          # Axe shells out to sh, git, rg, fd, gzip, and to coreutils' `kill`
+          # (a timeout or an interrupt takes the process group) and
+          # `sha256sum` (the hash a project MCP file is approved by). A minimal
+          # server has none of them, so the wrapper pins them instead of the
+          # config.
           postInstall = ''
             wrapProgram $out/bin/axe --prefix PATH : ${
               pkgs.lib.makeBinPath [
                 pkgs.bash
+                pkgs.coreutils
                 pkgs.git
                 pkgs.ripgrep
                 pkgs.fd

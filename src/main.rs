@@ -1,5 +1,8 @@
-//! The REPL and session lifecycle: provider setup, the line loop, slash
-//! commands, the agent turn, and the transcript formatting.
+//! What a session is: its lifecycle (startup chooser, `/sessions`, `/new`,
+//! naming and compaction), model and thinking selection, the slash commands,
+//! the agent turn's driver, and the two sinks — the screen's channel and
+//! stdout. The keys and the frame are `repl.rs`'s, the prefix `prompt.rs`'s, the
+//! transcript's look `render.rs`'s.
 
 mod api;
 mod complete;
@@ -17,6 +20,7 @@ mod skills;
 mod startup;
 mod state;
 mod store;
+mod summary;
 mod text;
 mod tools;
 mod turn;
@@ -47,7 +51,7 @@ use startup::{
     set_thinking, thinking_label, NO_SESSIONS,
 };
 use store::{history_bytes, weight, Live, Store};
-use text::{head_tail, strip_control, terminal_text};
+use text::{strip_control, terminal_text};
 use turn::{PlainSink, Queue, Sink, TextSink};
 
 // ---- providers and the command line ----
@@ -139,43 +143,6 @@ fn main() {
     }
 }
 
-/// The first request and the latest answer, short enough to name from. Naming
-/// waits for an assistant message: a session that only ran `!cmd` gets the
-/// fallback.
-fn naming_excerpt(messages: &[Value]) -> Option<(String, String)> {
-    if !messages
-        .iter()
-        .any(|message| message["role"].as_str() == Some("assistant"))
-    {
-        return None;
-    }
-    let user = messages
-        .iter()
-        .filter(|message| message["role"].as_str() == Some("user"))
-        .filter_map(|message| message["content"].as_str())
-        .find(|text| {
-            !text.starts_with("explore mode:")
-                && !text.starts_with('$')
-                && !text.starts_with(COMPACT_NOTE)
-        })?;
-    let assistant = messages
-        .iter()
-        .filter(|message| message["role"].as_str() == Some("assistant"))
-        .filter_map(|message| message["content"].as_str())
-        .rfind(|text| !text.trim().is_empty())
-        .unwrap_or("");
-    Some((
-        sessions::collapse(user, 1500),
-        sessions::collapse(assistant, 1500),
-    ))
-}
-
-/// `/compact`'s instruction: the reply is the summary and nothing else.
-const COMPACT_PROMPT: &str = "You summarize a coding session so it can continue in a smaller \
-context. Reply with the summary only, no preamble. Keep every path, command, identifier, error \
-message and decision exact. Sections: task, what has been done, files changed, commands run, \
-decisions and constraints, open questions, next step. Under 800 words.";
-
 /// One tool-less completion for `/compact`. The summary is text, not a turn.
 ///
 /// No `max_tokens`: a cap small enough for a summary of 800 words is small
@@ -243,99 +210,10 @@ fn request_body(provider: &Provider, level: Option<&str>, ceiling: bool) -> Valu
     body
 }
 
-/// What a reply that carried no text did instead, for the one place axe asks
-/// for text it cannot show: `/compact`. The finish reason is the difference
-/// between an answer cut off and a model that said nothing.
-fn no_text(reply: &api::Reply) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(reason) = &reply.finish_reason {
-        parts.push(format!("finish reason: {reason}"));
-    }
-    if let Some(usage) = &reply.usage {
-        parts.push(format!("{} completion tokens", usage.completion));
-    }
-    if !reply.reasoning.trim().is_empty() {
-        parts.push(format!(
-            "{} chars of reasoning",
-            reply.reasoning.chars().count()
-        ));
-    }
-    if parts.is_empty() {
-        "the provider sent no text".to_string()
-    } else {
-        parts.join(", ")
-    }
-}
-
 /// The conversation as one plain-text transcript for the summarizing request.
 /// API messages would carry `tool_calls` without the `tools` array that defines
 /// them, which a strict provider refuses; text cannot. The oldest messages go
 /// first when the transcript does not fit `budget`, and the newest always stays.
-/// Where the verbatim tail begins: pi's cut point. Walk back from the newest
-/// message while the tail is under `keep` tokens and start keeping at the
-/// oldest user or assistant message inside it — never at a tool result, which
-/// would start the tail with an answer to a call it does not carry. A history
-/// that fits inside the tail is summarized whole: a summary that replaces
-/// nothing is not a compaction.
-fn tail_start(messages: &[Value], keep: u64) -> usize {
-    let mut tokens = 0u64;
-    let mut start = 2.min(messages.len());
-    for at in (start..messages.len()).rev() {
-        tokens += crate::store::weight(&messages[at]) / 4;
-        let role = messages[at]["role"].as_str().unwrap_or("");
-        if role == "user" || role == "assistant" {
-            start = at;
-            if tokens >= keep {
-                return start;
-            }
-        }
-    }
-    // The whole history is inside the tail: nothing would be replaced, so the
-    // summary covers everything and there is no tail.
-    messages.len()
-}
-
-fn compaction_prompt(messages: &[Value], budget: usize) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    for message in messages.iter().skip(2) {
-        let role = message["role"].as_str().unwrap_or("");
-        if let Some(text) = message["content"].as_str().filter(|text| !text.is_empty()) {
-            let (head, tail) = if role == "tool" {
-                (800, 200)
-            } else {
-                (2000, 500)
-            };
-            lines.push(format!("{role}: {}", head_tail(text, head, tail)));
-        }
-        if let Some(calls) = message["tool_calls"].as_array() {
-            for call in calls {
-                let name = call["function"]["name"].as_str().unwrap_or("");
-                let args = call["function"]["arguments"].as_str().unwrap_or("");
-                lines.push(format!(
-                    "{role}: calls {name} {}",
-                    head_tail(args, 300, 100)
-                ));
-            }
-        }
-    }
-    let mut total: usize = lines.iter().map(|line| line.len() + 1).sum();
-    let mut dropped = 0;
-    while total > budget && lines.len() > 1 {
-        total -= lines[0].len() + 1;
-        lines.remove(0);
-        dropped += 1;
-    }
-    let mut out = String::new();
-    if dropped > 0 {
-        out.push_str(&format!("[{dropped} earlier messages omitted]\n"));
-    }
-    for line in &lines {
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
-}
-
 /// One small completion, without tools. The session header stays: providers
 /// that require it would refuse the request otherwise. Like `/compact` it sends
 /// no `max_tokens`, so a thinking model cannot spend the answer's budget.
@@ -346,19 +224,7 @@ fn title_request(
     user: &str,
     assistant: &str,
 ) -> Option<String> {
-    let messages = vec![
-        json!({
-            "role": "system",
-            "content": "You name conversations. Reply with exactly two lines:\n\
-                        TITLE: a descriptive title of three to six words\n\
-                        SUMMARY: one sentence describing the task, under 25 words\n\
-                        No quotes, no markdown, no extra lines."
-        }),
-        json!({
-            "role": "user",
-            "content": format!("User: {user}\nAssistant: {assistant}"),
-        }),
-    ];
+    let messages = summary::naming_messages(user, assistant);
     let extra = tool_less_extra(provider, level, 0.3);
     let cancel = http::Cancel::new();
     api::stream_chat(
@@ -375,27 +241,6 @@ fn title_request(
     )
     .ok()
     .map(|reply| reply.text)
-}
-
-/// The two lines the naming prompt asks for. Anything else falls back.
-fn parse_naming(text: &str) -> Option<(String, String)> {
-    let mut title = None;
-    let mut summary = None;
-    for line in text.lines() {
-        let Some((key, value)) = line.trim().split_once(':') else {
-            continue;
-        };
-        let value = value.trim().trim_matches('"').trim();
-        if value.is_empty() {
-            continue;
-        }
-        if key.trim().eq_ignore_ascii_case("title") {
-            title = Some(value.to_string());
-        } else if key.trim().eq_ignore_ascii_case("summary") {
-            summary = Some(value.to_string());
-        }
-    }
-    title.map(|title| (title, summary.unwrap_or_default()))
 }
 
 /// Everything the REPL mutates between turns: the model selection and history.
@@ -658,7 +503,7 @@ fn safe_name(name: &str) -> bool {
 
 const HELP: &str = "/model [id]    list the models, or switch to one for this directory\n\
                     /model -g [id] set the default a directory without one starts on\n\
-                    /thinking [l]  show or set thinking level (off, low, medium, high)\n\
+                    /thinking [l]  show or set the thinking level this provider configures\n\
                     /thoughts      show or hide the model's reasoning\n\
                     /sessions [q]  list, search and resume sessions\n\
                     /compact       replace the history with a summary of itself\n\
@@ -686,9 +531,9 @@ const HELP: &str = "/model [id]    list the models, or switch to one for this di
 fn help_text() -> String {
     format!(
         "{HELP}\nconfig: {}\n\
-         config keys: providers, model, explore_by_default, search, thinking, system, agents, skills\n\
+         config keys: providers, base_url, model, explore_by_default, search, thinking, system, agents, skills\n\
          mcp: mcp.json is global, <repo>/.mcp.json is per project (/mcp)\n\
-         provider keys: base_url, api_key_env, models_url, session_header, thinking",
+         provider keys: base_url, api_key_env, models_url, session_header, session_field, max_tokens, max_tokens_field, store, thinking",
         config::path().display()
     )
 }
@@ -1186,7 +1031,9 @@ impl Session {
         let Some(meta) = &store.meta else {
             return false;
         };
-        meta.title.is_empty() && !store.naming_tried && naming_excerpt(&self.messages).is_some()
+        meta.title.is_empty()
+            && !store.naming_tried
+            && summary::naming_excerpt(&self.messages).is_some()
     }
 
     /// Start the title request off the UI thread. The prompt stays live; the
@@ -1196,7 +1043,7 @@ impl Session {
         if !self.may_name() {
             return;
         }
-        let Some((user, assistant)) = naming_excerpt(&self.messages) else {
+        let Some((user, assistant)) = summary::naming_excerpt(&self.messages) else {
             return;
         };
         if let Some(store) = self.store.as_mut() {
@@ -1210,7 +1057,7 @@ impl Session {
         thread::spawn(move || {
             let named = title_request(&provider, &model, level.as_deref(), &user, &assistant)
                 .as_deref()
-                .and_then(parse_naming)
+                .and_then(summary::parse_naming)
                 .unwrap_or(fallback);
             let _ = tx.send(Some(named));
         });
@@ -1247,7 +1094,7 @@ impl Session {
         if !self.may_name() {
             return;
         }
-        let Some((user, assistant)) = naming_excerpt(&self.messages) else {
+        let Some((user, assistant)) = summary::naming_excerpt(&self.messages) else {
             return;
         };
         if let Some(store) = self.store.as_mut() {
@@ -1263,7 +1110,7 @@ impl Session {
             &assistant,
         )
         .as_deref()
-        .and_then(parse_naming);
+        .and_then(summary::parse_naming);
         let (title, summary) = named.unwrap_or_else(|| sessions::fallback(&self.messages));
         if title.is_empty() {
             return;
@@ -1680,11 +1527,11 @@ impl Session {
             .min(200_000);
         // The newest conversation stays verbatim beside the summary, so the
         // model does not have to re-read the files it was just working on.
-        let cut = tail_start(&self.messages, config::COMPACT_KEEP);
+        let cut = summary::tail_start(&self.messages, config::COMPACT_KEEP);
         let tail: Vec<Value> = self.messages[cut..].to_vec();
-        let prompt = compaction_prompt(&self.messages[..cut], budget);
+        let prompt = summary::compaction_prompt(&self.messages[..cut], budget);
         let request = vec![
-            json!({ "role": "system", "content": COMPACT_PROMPT }),
+            json!({ "role": "system", "content": summary::COMPACT_PROMPT }),
             json!({ "role": "user", "content": prompt }),
         ];
         let cancel = http::Cancel::new();
@@ -1760,7 +1607,7 @@ impl Session {
             }
             Ok(reply) => console.error(&format!(
                 "compaction: the model returned nothing ({})",
-                no_text(&reply)
+                summary::no_text(&reply)
             )),
             Err(_) if cancel.cancelled() => console.output("× Compaction cancelled\n"),
             Err(e) => console.error(&e),
@@ -2605,15 +2452,6 @@ mod tests {
         assert_eq!(parse_command("/models"), Command::Unknown("/models".into()));
     }
 
-    #[test]
-    fn naming_parses_two_lines() {
-        assert_eq!(
-            parse_naming("TITLE: Fix parser\nSUMMARY: The parser was fixed."),
-            Some(("Fix parser".into(), "The parser was fixed.".into()))
-        );
-        assert_eq!(parse_naming("nothing useful"), None);
-    }
-
     /// pi's keep-recent: the newest conversation stays verbatim beside the
     /// summary, so the round after a compaction does not re-read what the model
     /// just knew — and a kept tool result never loses the call it answers.
@@ -2680,50 +2518,6 @@ mod tests {
         assert_eq!(replayed[0], live[2], "the summary is the marker");
         assert_eq!(replayed[1], live[3], "then the tail, in order");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn compaction_prompt_keeps_the_newest_and_counts_what_it_dropped() {
-        let messages = vec![
-            json!({ "role": "system", "content": "the prompt" }),
-            json!({ "role": "user", "content": "explore mode: on" }),
-            json!({ "role": "user", "content": "first" }),
-            json!({ "role": "assistant", "content": "second" }),
-            json!({ "role": "user", "content": "third" }),
-        ];
-        // Wide enough: everything the session said, and neither the system
-        // prompt nor the mode note.
-        let all = compaction_prompt(&messages, 10_000);
-        assert!(all.contains("user: first"));
-        assert!(all.contains("assistant: second"));
-        assert!(all.contains("user: third"));
-        assert!(!all.contains("the prompt"));
-        assert!(!all.contains("explore mode"));
-        // Tight enough for one message: the oldest goes first, the newest stays.
-        let one = compaction_prompt(&messages, 10);
-        assert!(one.contains("third"));
-        assert!(!one.contains("first"));
-        assert!(one.starts_with("["));
-        assert!(one.contains("earlier messages omitted"));
-        // Nothing to say is not a panic.
-        assert_eq!(compaction_prompt(&messages[..2], 10), "");
-    }
-
-    #[test]
-    fn a_tool_result_is_cut_before_it_is_summarized() {
-        let long = "x".repeat(5000);
-        let messages = vec![
-            json!({ "role": "system", "content": "s" }),
-            json!({ "role": "user", "content": "u" }),
-            json!({ "role": "tool", "content": long }),
-            json!({ "role": "user", "content": "newest" }),
-        ];
-        let prompt = compaction_prompt(&messages, 10_000);
-        assert!(prompt.contains("…[cut]…"));
-        assert!(prompt.len() < 1500);
-        assert!(prompt.contains("newest"));
-        // Short text is left alone.
-        assert_eq!(head_tail("abc", 2, 2), "abc");
     }
 
     #[test]
@@ -2806,20 +2600,6 @@ mod tests {
         let id = startup::session_id();
         assert_eq!(id.len(), 32);
         assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn naming_excerpt_skips_mode_and_shell_lines() {
-        let messages = vec![
-            json!({ "role": "user", "content": "explore mode: on" }),
-            json!({ "role": "user", "content": "$ !ls\nfile" }),
-            json!({ "role": "user", "content": "fix it" }),
-            json!({ "role": "assistant", "content": "fixed" }),
-        ];
-        assert_eq!(
-            naming_excerpt(&messages),
-            Some(("fix it".into(), "fixed".into()))
-        );
     }
 
     #[test]
@@ -3732,35 +3512,6 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_without_text_names_what_it_did_instead() {
-        let reply = api::Reply {
-            text: String::new(),
-            reasoning: "thought".into(),
-            reasoning_field: Some("reasoning_content"),
-            calls: Vec::new(),
-            usage: Some(api::Usage {
-                prompt: 900,
-                completion: 2000,
-                cached: 0,
-            }),
-            finish_reason: Some("length".into()),
-            complete: true,
-        };
-        assert_eq!(
-            no_text(&reply),
-            "finish reason: length, 2000 completion tokens, 7 chars of reasoning"
-        );
-
-        let bare = api::Reply {
-            reasoning: String::new(),
-            usage: None,
-            finish_reason: None,
-            ..reply
-        };
-        assert_eq!(no_text(&bare), "the provider sent no text");
-    }
-
-    #[test]
     fn a_session_with_nothing_answered_has_nothing_to_compact() {
         let mut session = bare_session();
         let mut console = Console::Stdout;
@@ -3781,33 +3532,12 @@ mod tests {
         };
         let text = title_request(&provider, "m", None, "the request", "the answer").unwrap();
         assert_eq!(
-            parse_naming(&text),
+            summary::parse_naming(&text),
             Some(("A short title".to_string(), "One sentence.".to_string()))
         );
         assert!(server
             .text()
             .contains("\"content\":\"User: the request\\nAssistant: the answer\""));
-    }
-
-    #[test]
-    fn a_naming_reply_is_read_loosely_or_not_at_all() {
-        assert_eq!(
-            parse_naming("title: T\nsummary: S"),
-            Some(("T".into(), "S".into()))
-        );
-        assert_eq!(
-            parse_naming("TITLE: \"quoted\"\nSUMMARY: \"also quoted\""),
-            Some(("quoted".into(), "also quoted".into()))
-        );
-        // A title with no summary is still a title.
-        assert_eq!(
-            parse_naming("TITLE: only"),
-            Some(("only".into(), String::new()))
-        );
-        // No title, no name.
-        assert_eq!(parse_naming("SUMMARY: orphan"), None);
-        assert_eq!(parse_naming(""), None);
-        assert_eq!(parse_naming("TITLE:\nSUMMARY: x"), None);
     }
 
     #[test]

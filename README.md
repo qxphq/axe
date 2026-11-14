@@ -9,7 +9,8 @@
 A minimal coding agent in Rust. One binary, one line REPL, any
 OpenAI-compatible `chat/completions` server, seven tools, **six dependencies**.
 
-Axe starts in read-only mode by default; web search works there only.
+Axe starts in explore mode (`read` and a confined `bash`; the info row calls it
+`read-only`); `fetch` and `web_search` work there only.
 Axe does not re-implement or compete with the functionality of your other tools, shell, or Unix system.
 
 ## Install
@@ -363,6 +364,7 @@ submits the file.
 | `/sessions [query]` | browse or search this directory's sessions |
 | `/compact` | summarize the session and continue from the summary |
 | `/skills` | list loaded skills, where they came from, and what the model sees |
+| `/mcp [name]` | the MCP servers: list them, one server's tools, `add`, `remove`, `forget` |
 | `/skill:name [request]` | load a skill's instructions and run a turn |
 | `/help` | list the commands, the key bindings, the config path and its keys |
 | `/exit`, `/quit` | quit |
@@ -431,7 +433,7 @@ the session's name, the directory it runs in, the provider/model and thinking
 level, and how much of the context window the request fills — the provider's
 own count once a round reports one, plus an estimate of what came after it, or
 a character estimate of the history and the tools until then, with the cache
-hit beside it (`412/8192 (5%) · 3.9k cached`). Each piece on the
+hit beside it (`412/8192 (5%) · 390 cached`). Each piece on the
 right carries its own color, and every color is one of the terminal's own ANSI
 names, so the theme decides what it actually is: the name in the default
 foreground, the directory dim, with the home directory written `~`, the

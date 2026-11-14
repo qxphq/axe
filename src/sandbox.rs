@@ -3,7 +3,8 @@
 //! One layer, in the kernel, because a string is not a guard: the first-token
 //! check this replaces let `ls; rm -rf .`, `ls $(curl x)` and
 //! `git -c alias.p='!sh' p` through. In explore mode it confines `bash` to a
-//! scratch directory and a fixed exec allowlist; it degrades with one startup
+//! scratch directory, the project's `plan/` and a fixed exec allowlist; it
+//! degrades with one startup
 //! line on a Linux kernel without Landlock, because there is nothing else to
 //! use there. Normal mode keeps only `no_new_privs` and the environment
 //! whitelist.

@@ -557,6 +557,19 @@ pub fn collapse(text: &str, max: usize) -> String {
     out
 }
 
+/// Whether a `user` line is the user's own request. The harness says things in
+/// that role too — the mode note, the sandbox's caveat, a shell echo, a
+/// compaction summary — and a title, a summary or a naming excerpt built from
+/// one of them names the session after the machinery. One rule, because the
+/// three places that pick "the user's words" must agree on what those are.
+pub fn is_request(text: &str) -> bool {
+    !(text.starts_with("explore mode:")
+        || text.starts_with("sandbox:")
+        || text.starts_with("bash is unavailable")
+        || text.starts_with('$')
+        || text.starts_with(COMPACT_NOTE))
+}
+
 /// A title and summary that need no model: the first request, then the first
 /// answer. Used for an interrupted session and when naming fails.
 pub fn fallback(messages: &[Value]) -> (String, String) {
@@ -564,11 +577,7 @@ pub fn fallback(messages: &[Value]) -> (String, String) {
         .iter()
         .filter(|m| m["role"].as_str() == Some("user"))
         .filter_map(|m| m["content"].as_str())
-        .find(|text| {
-            !text.starts_with("explore mode:")
-                && !text.starts_with('$')
-                && !text.starts_with(COMPACT_NOTE)
-        })
+        .find(|text| is_request(text))
         .map(|text| collapse(text, 240))
         .unwrap_or_default();
     if user.is_empty() {
@@ -676,6 +685,38 @@ mod tests {
         assert_eq!(messages[1]["content"].as_str(), Some("three"));
         assert_eq!(meta.messages, 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every line the harness speaks in the user's role is skipped, the
+    /// sandbox's caveat included: on a kernel without Landlock that note is the
+    /// first user message, and a title built from it names the session after
+    /// the machinery.
+    #[test]
+    fn only_the_users_own_lines_are_requests() {
+        for note in [
+            "explore mode: on — write and edit are unavailable",
+            "explore mode: off — write, edit and a full bash are available",
+            "sandbox: Landlock is unavailable, so explore mode's bash is unconfined",
+            "sandbox: this kernel's Landlock (ABI 2) cannot deny truncation",
+            "bash is unavailable: /usr/bin/sandbox-exec is missing",
+            "$ ls -la",
+            "Earlier in this session, before it was compacted:\n\nsummary",
+        ] {
+            assert!(!is_request(note), "{note:?} is the harness's");
+        }
+        assert!(is_request("fix the parser"));
+        assert!(is_request("sandbox the parser, please"));
+        // The fallback title is the first real request, whatever came first.
+        let history = vec![
+            json!({ "role": "system", "content": "prompt" }),
+            json!({ "role": "user", "content": "explore mode: on" }),
+            json!({ "role": "user", "content": "sandbox: Landlock is unavailable" }),
+            json!({ "role": "user", "content": "make it green" }),
+            json!({ "role": "assistant", "content": "done" }),
+        ];
+        let (title, summary) = fallback(&history);
+        assert_eq!(title, "make it green");
+        assert_eq!(summary, "make it green — done");
     }
 
     #[test]
