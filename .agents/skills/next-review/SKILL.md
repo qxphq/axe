@@ -59,20 +59,27 @@ Follow the brief exactly. Defaults for every review:
   breaks.
 - Report findings by severity (critical / major / minor), most severe first,
   then the checks verified clean.
-- End with a **Fix readiness** section: per finding, the concrete fix (what
-  changes, where) and whether it is objectively determined by the docs and code
-  (`objective`) or needs a decision from the user (`needs input`, with the exact
-  question). Close with one verdict line: `All findings objectively fixable —
-  no input needed.` or `Input needed — N finding(s); questions above.`
-  Describe fixes, no patch code.
+- End with a **Summary** that splits the findings by what the review can and
+  cannot decide alone — never a mixed list:
+  - *Confident fixes* — one line per finding: what changes, where, in a
+    sentence or two.
+  - *Needs your input* — one block per finding, in this order:
+    1. The problem in plain language, two or three sentences, for a reader who
+       is not deep in the code: what goes wrong for the user if nothing changes,
+       and why it costs.
+    2. Two or three concrete options, numbered, the recommended one first and
+       marked `(recommended)`, each with a line on what it costs or buys.
+- Close with one verdict line: `All findings objectively fixable — no input
+  needed.` or `Input needed — N finding(s); questions above.` Describe fixes,
+  no patch code.
 - If a claim needs a measurement or a run the review cannot make (it would
   write something, or the mode does not offer the tool), say so and give the
   exact `!` command; never guess a number.
 
 ## 3. Stop for triage
 
-Present the report and wait. Use its Fix readiness verdict to triage:
-`objective` findings can be applied as described; `needs input` findings wait
+Present the report and wait. Triage by its Summary: confident fixes can be
+applied as described; a needs-input block names its open question, so it waits
 for the user's answer. Do not fix findings, tick the checklist, or commit until
 the user asks.
 
