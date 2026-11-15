@@ -9,8 +9,7 @@
 A minimal coding agent in Rust. One binary, one line REPL, any
 OpenAI-compatible `chat/completions` server, seven tools, **six dependencies**.
 
-Axe starts in explore mode (`read` and a confined `bash`; the info row calls it
-`read-only`); `fetch` and `web_search` work there only.
+Axe starts in read-only mode by default; `fetch` and `web_search` work there only.
 Axe does not re-implement or compete with the functionality of your other tools, shell, or Unix system.
 
 ## Install
