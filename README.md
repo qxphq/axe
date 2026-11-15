@@ -311,7 +311,9 @@ Ctrl+J or Alt+Enter starts a new line, and the box grows with every row it
 takes: the terminal is the only limit, and a prompt taller than the screen
 scrolls inside it. Typing a slash word lists the matching commands in the
 rows above the prompt — as many as the terminal's height allows, up to four
-— the first one marked. ↓ and ↑ move the mark and leave the line as typed,
+— the first one marked. Matching is fuzzy: the characters typed, in their order,
+gaps allowed, so `/mdl` lists `/model` and `/e` lists `/exit` as well as
+`/explore`. ↓ and ↑ move the mark and leave the line as typed,
 wrapping at both ends; Enter runs the marked row and Tab puts it on the line, so
 a step never rewrites the prompt by itself. The rule does not depend on where the
 list came from: a path in a message lists what it could be, and Enter submits the

@@ -1925,11 +1925,12 @@ impl Screen {
         self.ed.cursor = self.ed.len();
     }
 
-    /// The lines the buffer is a prefix of. Only a name is completed while only
-    /// a name is typed, so Tab on a bare slash word cannot land on a model; an
-    /// argument is completed while it is one word, so `/model dee` matches
-    /// `/model deepseek-chat`. A free-text argument takes no candidates, and a
-    /// second space ends the matching.
+    /// The lines the buffer fuzzily matches: its characters in order, gaps
+    /// allowed, so `/mdl` finds `/model` and the commands keep their own order.
+    /// Only a name is completed while only a name is typed, so Tab on a bare
+    /// slash word cannot land on a model; an argument is completed while it is
+    /// one word, so `/model dee` matches `/model deepseek-chat`. A free-text
+    /// argument takes no candidates, and a second space ends the matching.
     fn candidates(&self) -> Vec<String> {
         if !self.command_line() {
             return match self.complete {
@@ -1941,13 +1942,13 @@ impl Screen {
             None => self
                 .commands
                 .iter()
-                .filter(|c| !c.contains(' ') && c.starts_with(&self.ed.buf))
+                .filter(|c| !c.contains(' ') && fuzzily(&self.ed.buf, c))
                 .cloned()
                 .collect(),
             Some((_, arg)) if !arg.contains(char::is_whitespace) => self
                 .commands
                 .iter()
-                .filter(|c| c.starts_with(&self.ed.buf))
+                .filter(|c| fuzzily(&self.ed.buf, c))
                 .cloned()
                 .collect(),
             Some(_) => Vec::new(),
@@ -1984,6 +1985,14 @@ impl Drop for Screen {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Whether `pattern`'s characters appear in `line` in that order, gaps
+/// allowed. Fuzzy means one thing here: an order and nothing else — no
+/// ranking, no scoring, so the commands stay in the order they are listed.
+fn fuzzily(pattern: &str, line: &str) -> bool {
+    let mut rest = line.chars();
+    pattern.chars().all(|want| rest.any(|have| have == want))
 }
 
 // ---- layout and painting ----
@@ -3192,7 +3201,9 @@ mod tests {
     fn tab_cycles_the_candidates() {
         let mut screen = Screen::test_screen(40, 10);
         screen.set_commands(vec!["/exit".into(), "/explore".into(), "/help".into()]);
-        for c in ['/', 'e'] {
+        // `/help` holds an `e` too, so the cycle is asked for with a word that
+        // only two of them match.
+        for c in ['/', 'e', 'x'] {
             screen.apply_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
@@ -3322,6 +3333,55 @@ mod tests {
         screen.insert_text("/skill:ship");
         screen.apply_key(key(KeyCode::Enter));
         assert_eq!(screen.take(), "/skill:ship");
+    }
+
+    /// A command is matched fuzzily: the typed characters in order, gaps
+    /// allowed. The two rules above it stand — a bare word lands on a name,
+    /// an argument on a whole line — and the list keeps the commands' order.
+    #[test]
+    fn a_command_matches_its_characters_in_order() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_commands(vec![
+            "/compact".into(),
+            "/model".into(),
+            "/model one/big".into(),
+            "/model two/small".into(),
+            "/sessions".into(),
+        ]);
+        screen.insert_text("/mdl");
+        assert_eq!(screen.candidates(), vec!["/model"], "gaps are allowed");
+        // The order is the one thing fuzzy keeps.
+        screen.take();
+        screen.insert_text("/ldm");
+        assert!(screen.candidates().is_empty());
+        // A bare word is still a name, not an argument line.
+        screen.take();
+        screen.insert_text("/model");
+        assert_eq!(screen.candidates(), vec!["/model"]);
+        // The argument matches the whole line the same way, gaps and all.
+        screen.take();
+        screen.insert_text("/model /b");
+        assert_eq!(screen.candidates(), vec!["/model one/big"]);
+        // A second word is free text: no candidates.
+        screen.take();
+        screen.insert_text("/model one/big now");
+        assert!(screen.candidates().is_empty());
+    }
+
+    /// Tab and Enter take a fuzzy list like a prefix one: the marked row is
+    /// what fills the line, and Enter runs it.
+    #[test]
+    fn a_fuzzy_line_is_filled_and_run() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_commands(vec!["/help".into(), "/model".into()]);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        screen.insert_text("/hp");
+        screen.apply_key(key(KeyCode::Tab));
+        assert_eq!(screen.ed.buf, "/help ", "a lone hit finishes the line");
+        screen.take();
+        screen.insert_text("/hp");
+        screen.apply_key(key(KeyCode::Enter));
+        assert_eq!(screen.take(), "/help");
     }
 
     #[test]
