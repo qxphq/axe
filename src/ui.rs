@@ -910,9 +910,10 @@ impl Screen {
             // says otherwise, and asking for that costs every shifted
             // character its layout.
             KeyCode::Enter if alt => self.insert_char('\n'),
-            // Enter runs the marked row, whether the marker was stepped to or
-            // is still on the first row of a list that just appeared: the list
-            // is a choice, and a line with one under it submits the choice.
+            // Enter runs the marked command, whether the marker was stepped to
+            // or is still on the first row of a list that just appeared: a
+            // command list is a choice of what to run. A path list is Tab's,
+            // and the line submits as it was typed.
             KeyCode::Enter => {
                 self.take_marked();
                 return Action::Submit;
@@ -1348,7 +1349,7 @@ impl Screen {
         // candidate is always the one nearest what is being typed.
         let (hints, at) = match menu {
             Some(_) => (Vec::new(), 0),
-            None => self.hints(),
+            None => self.hint_rows(),
         };
         let fit = hints.len().min(layout.list.height as usize);
         let start = if fit == 0 {
@@ -1712,7 +1713,7 @@ impl Screen {
         // A directory keeps the list open — the next segment is typed inside
         // it — and a file ends it with a space. What follows the token is the
         // candidate's too, so the space is only for a token that ends the line.
-        let tail = self.ed.len() - token_end(&self.ed.buf, self.ed.cursor);
+        let tail = self.ed.len() - token_span(&self.ed.buf, self.ed.cursor).1;
         if lone && tail == 0 && !line.ends_with('/') {
             line.push(' ');
         }
@@ -1905,13 +1906,17 @@ impl Screen {
         })
     }
 
-    /// Enter runs the marked row: the candidate the arrows stepped to, or the
+    /// Enter runs the marked row: the command the arrows stepped to, or the
     /// first one when the list was never stepped through. The line is what the
     /// marker points at, even though its text may still be the prefix typed.
+    ///
+    /// A path is not run, so Enter never writes one onto the line: a path
+    /// candidate is a fragment of a message, and Enter submits the message as
+    /// it was typed. Tab is what completes.
     fn take_marked(&mut self) {
         // A chooser owns the list rows while it is open; the candidates are not
         // on screen, so they are not what Enter runs.
-        if self.menu_active() {
+        if self.menu_active() || !self.command_line() {
             return;
         }
         let (hints, at) = self.hints();
@@ -1978,6 +1983,24 @@ impl Screen {
             Some(sel) if sel.belongs(&self.ed.buf) => (sel.matches.clone(), sel.at),
             _ => (self.candidates(), 0),
         }
+    }
+
+    /// The rows the list shows and the row the marker is on: a command is the
+    /// whole line, because that is what would run, while a path is the span the
+    /// completion rewrites — the message around the token stays on the prompt,
+    /// where the user typed it.
+    fn hint_rows(&self) -> (Vec<String>, usize) {
+        let (hints, at) = self.hints();
+        if self.command_line() {
+            return (hints, at);
+        }
+        (
+            hints
+                .iter()
+                .map(|line| completed(line, &self.ed.buf, self.ed.cursor))
+                .collect(),
+            at,
+        )
     }
 }
 
@@ -2048,17 +2071,32 @@ fn prompt_layout(buf: &str, cursor: usize, width: usize) -> (Vec<String>, (u16, 
     (rows, (at.0 as u16, at.1 as u16))
 }
 
-/// End of the whitespace-delimited token the cursor is in or next to: the same
-/// run `complete.rs` replaces, so the cursor can be put back after the span it
-/// wrote rather than at the end of the line.
-fn token_end(line: &str, cursor: usize) -> usize {
+/// The chars from the start of the whitespace-delimited token the cursor is in
+/// or next to, to its end: the same run `complete.rs` replaces, so the cursor
+/// can be put back after the span it wrote rather than at the end of the line.
+fn token_span(line: &str, cursor: usize) -> (usize, usize) {
     let chars: Vec<char> = line.chars().collect();
     let at = cursor.min(chars.len());
+    let mut start = at;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
     let mut end = at;
     while end < chars.len() && !chars[end].is_whitespace() {
         end += 1;
     }
-    end
+    (start, end)
+}
+
+/// What a candidate row reads as: the path the completion rewrites. The head
+/// before the token and the tail after it are the typed line's on every
+/// candidate, so cutting them leaves the file alone.
+fn completed(candidate: &str, typed: &str, cursor: usize) -> String {
+    let (start, end) = token_span(typed, cursor);
+    let tail = typed.chars().count().saturating_sub(end);
+    let chars: Vec<char> = candidate.chars().collect();
+    let stop = chars.len().saturating_sub(tail).max(start);
+    chars[start.min(stop)..stop].iter().collect()
 }
 
 /// How the one row the status and the info share is split, in cells. The status
@@ -3384,18 +3422,69 @@ mod tests {
         assert_eq!(screen.take(), "/help");
     }
 
+    /// A path is a fragment of a message, not something to run: Enter submits
+    /// the line as it was typed, and the list stays Tab's.
     #[test]
-    fn enter_completes_a_path_in_a_message() {
-        // Candidates are whole lines, so a path in prose completes like a
-        // command does.
+    fn enter_never_completes_a_path() {
         fn file(_line: &str, _cursor: usize) -> Vec<String> {
             vec!["why does src/ui.rs wrap?".to_string()]
         }
         let mut screen = Screen::test_screen(40, 10);
         screen.set_completer(file);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         screen.insert_text("why does src/ui wrap?");
-        screen.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(screen.take(), "why does src/ui.rs wrap?");
+        screen.apply_key(key(KeyCode::Enter));
+        assert_eq!(screen.take(), "why does src/ui wrap?");
+        // The same line completes on Tab, which is the only key that writes a
+        // candidate onto it.
+        screen.insert_text("why does src/ui wrap?");
+        screen.apply_key(key(KeyCode::Tab));
+        // A lone candidate finishes the line with a space, as Tab always did.
+        assert_eq!(screen.ed.buf, "why does src/ui.rs wrap? ");
+        assert_eq!(screen.take(), "why does src/ui.rs wrap? ");
+    }
+
+    /// The rows a path list shows are the completed path alone: the message
+    /// around the token is on the prompt already, and echoing it back turned
+    /// the list into a copy of what was typed. A command row is the whole
+    /// line, because that is what would run.
+    #[test]
+    fn a_path_list_shows_the_path_and_a_command_list_the_line() {
+        fn file(_line: &str, _cursor: usize) -> Vec<String> {
+            vec![
+                "look at src/ui.rs".to_string(),
+                "look at src/ui_test.rs".to_string(),
+            ]
+        }
+        let mut screen = Screen::test_screen(60, 10);
+        screen.set_completer(file);
+        for c in "look at @src/ui".chars() {
+            screen.insert_char(c);
+        }
+        assert_eq!(
+            screen.hint_rows().0,
+            vec!["src/ui.rs".to_string(), "src/ui_test.rs".to_string()]
+        );
+        // What Tab puts on the line is still the whole line, around the token
+        // it completes.
+        assert_eq!(
+            screen.hints().0,
+            vec![
+                "look at src/ui.rs".to_string(),
+                "look at src/ui_test.rs".to_string()
+            ]
+        );
+        screen.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(screen.ed.buf, "look at src/ui.rs");
+        // A command list is untouched: its rows are the lines it would run.
+        screen.set_completer(|_, _| Vec::new());
+        screen.take();
+        screen.set_commands(vec!["/model".into(), "/model one/big".into()]);
+        screen.insert_text("/model /b");
+        assert_eq!(screen.hint_rows().0, vec!["/model one/big".to_string()]);
+        screen.take();
+        screen.insert_text("/mo");
+        assert_eq!(screen.hint_rows().0, vec!["/model".to_string()]);
     }
 
     /// The invariant: one blank row between two blocks, never two, and never a

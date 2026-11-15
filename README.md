@@ -287,8 +287,11 @@ Typing a slash word lists the matching commands above the prompt, up to four,
 the first marked. Matching is fuzzy — the characters typed, in order, gaps
 allowed — so `/mdl` lists `/model`. ↓ and ↑ move the mark and leave the line as
 typed, wrapping at both ends; Enter runs the marked row and Tab puts it on the
-line, so a step never rewrites the prompt by itself. A path in a message
-follows the same rule, and Enter submits the completed line.
+line, so a step never rewrites the prompt by itself.
+
+A path in a message is not something to run: its list shows the path being
+completed rather than the message around it, only Tab writes one onto the line,
+and Enter submits the line exactly as it was typed.
 
 `/model` and `/thinking` are the exception: their argument is not completed,
 because Enter would take a candidate before the command ran. Bare, they open a
@@ -309,8 +312,9 @@ what was typed here, newest first, ↓ comes back down, and Ctrl+R searches. A
 blank line, a line starting with a space (the shell's "do not remember this")
 and a repeat of the line before it are not remembered.
 
-Tab completes paths. `@` starts one anywhere in the line: `@READ` completes to
-`README.md`, and what the model reads is the path, not a sigil. Without it only
+Tab completes paths, and is the only key that does. `@` starts one anywhere in
+the line: `@READ` completes to `README.md`, and what the model reads is the
+path, not a sigil. Without it only
 the line's first token completes, and only when it is a path — one that starts
 with `~`, `/` or `.`, or holds a `/` — so a command is typed from `/` and a
 message about `/etc/nix` is left alone. Directories come first with a trailing
@@ -364,7 +368,7 @@ where typing filters it and Enter on an empty line resumes the selection.
 
 | key | what it does |
 | --- | --- |
-| Enter | submit the marked candidate when a list is under the prompt, else the line |
+| Enter | submit the line; over a command list, run the marked command |
 | Ctrl+J, Alt+Enter | new line |
 | Tab | complete a command or a path token: put the marked candidate on the line without submitting it |
 | ↑ ↓ | move the mark over the candidates above the prompt, walk the history when there is no list, or move in a chooser; ↑ with lines waiting takes them back |
