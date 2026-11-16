@@ -503,6 +503,10 @@ Landlock plus one seccomp rule, on macOS a Seatbelt profile. The confinement
 applies in explore mode and is about writes and execution; normal mode keeps
 only `no_new_privs` and the scrubbed environment.
 
+A target with neither — anything but Linux and macOS — compiles, but no child
+is ever spawned unconfined there: `bash` and MCP servers are refused in both
+modes, and startup says so.
+
 In explore mode, writes outside two directories are denied and only an
 allowlist of programs may be executed: the common inspection and tooling set —
 text and coreutils (`sed`, `awk`, `xargs`, `tee`, `nl`, …), checksums, file
