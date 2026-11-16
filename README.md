@@ -31,19 +31,6 @@ On NixOS it installs the flake instead — `nix profile add
 wraps what it runs: `sh`, `git`, `gzip`, coreutils' `kill` and `sha256sum`, and
 the `rg` and `fd` a confined `bash` needs.
 
-## Build
-
-```sh
-cargo build --release
-cargo install --git https://github.com/qxphq/axe --locked   # same binary, no release pipeline
-```
-
-The binary is `target/release/axe`. It needs a current stable Rust toolchain
-(edition 2021) and a C toolchain for `ring`. Linux (x86_64 or aarch64) and macOS
-are supported. Other Unix-like targets compile, but `bash` is unavailable
-there: a child that cannot be confined is not spawned. Windows is not
-supported.
-
 ## Run
 
 ```sh
