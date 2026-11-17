@@ -464,7 +464,12 @@ the local account is not the right boundary.
 
 The active body is append-only, so a crash can only leave one unfinished line:
 it is skipped when the body is read, and the next message starts a line of its
-own, so nothing written after the crash is lost to the next resume. Archiving
+own, so nothing written after the crash is lost to the next resume. A crash
+between a tool call and the result that answers it leaves a gap a provider
+refuses — an assistant message naming an id no later message answers — so
+reading a body answers every call it left open, and drops a result whose call
+is not there, before the session replays. The body is not rewritten: the repair
+is what the session carries, and the next read gives the same one. Archiving
 gzips and removes a body and resuming unpacks it back to plain; on a host
 without `gzip` nothing is archived, and a body archived elsewhere cannot be
 resumed there. Listing and search read the sidecar, which stays plain, so an

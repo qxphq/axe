@@ -315,7 +315,85 @@ pub fn load_messages(
         meta.messages = messages.len() as u64;
         let _ = meta.save(dir);
     }
+    let repaired = answer_calls(&mut messages);
+    if repaired > 0 {
+        warnings.push(format!(
+            "repaired {repaired} tool call{} in {}",
+            if repaired == 1 { "" } else { "s" },
+            plain.display()
+        ));
+    }
     Ok(messages)
+}
+
+/// What the session answers with when a call in the log has no result: the
+/// call ran to nothing, and the session carries that instead of a request no
+/// provider will take.
+const UNANSWERED: &str =
+    "error: the session ended before this call was answered; the call was not run";
+
+/// Make a replayed body a request the provider accepts: every call an
+/// assistant message named is answered before the next message, and a tool
+/// result nothing calls is dropped. A kill between a call's record and its
+/// result's leaves the first half, and two writers under one session id leave
+/// both halves interleaved; either one is a body that 400s on every message
+/// until something repairs it. The body is left as it is — the repair is what
+/// the session replays, and reading it again gives the same answer. Returns
+/// the number of results added and dropped.
+fn answer_calls(messages: &mut Vec<Value>) -> usize {
+    // The ids the last assistant message named, in the order it named them.
+    let mut owed: Vec<String> = Vec::new();
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut repaired = 0;
+    for message in messages.drain(..) {
+        if message["role"].as_str() != Some("tool") {
+            repaired += settle(&mut out, &mut owed);
+            if message["role"].as_str() == Some("assistant") {
+                owed = named(&message);
+            }
+            out.push(message);
+            continue;
+        }
+        // A result answers a call still owed, once. Anything else answers a
+        // call the body does not carry, which a provider refuses.
+        let id = message["tool_call_id"].as_str().unwrap_or("");
+        match owed.iter().position(|owed| owed == id) {
+            Some(at) => {
+                owed.remove(at);
+                out.push(message);
+            }
+            None => repaired += 1,
+        }
+    }
+    repaired += settle(&mut out, &mut owed);
+    *messages = out;
+    repaired
+}
+
+/// Answer what the last assistant message is still owed, in the order it named
+/// the calls.
+fn settle(out: &mut Vec<Value>, owed: &mut Vec<String>) -> usize {
+    let repaired = owed.len();
+    for id in owed.drain(..) {
+        out.push(json!({ "role": "tool", "tool_call_id": id, "content": UNANSWERED }));
+    }
+    repaired
+}
+
+/// The ids an assistant message names. A call with no id names nothing a
+/// result could answer.
+fn named(message: &Value) -> Vec<String> {
+    message["tool_calls"]
+        .as_array()
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|call| call["id"].as_str())
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn unpack(dir: &Path, meta: &mut Meta, gz: &Path, plain: &Path) -> Result<(), String> {
@@ -820,6 +898,119 @@ mod tests {
         assert_eq!(body[1]["content"], "three");
         assert!(
             warnings.iter().any(|w| w.contains("damaged")),
+            "{warnings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A kill between a call's record and its result's leaves a body no
+    /// provider will take: it replays as an assistant naming an id nothing
+    /// answers, and the session 400s on every message. The loader answers it.
+    #[test]
+    fn a_call_the_body_left_unanswered_is_answered() {
+        let dir = testenv::dir("sessions-unanswered");
+        let mut meta = Meta::new("abc123");
+        meta.save(&dir).unwrap();
+        std::fs::write(
+            log_path(&dir, "abc123"),
+            [
+                json!({ "role": "user", "content": "two reads" }).to_string(),
+                json!({ "role": "assistant", "content": "", "tool_calls": [
+                    { "id": "a", "type": "function", "function": { "name": "read", "arguments": "{}" } },
+                    { "id": "b", "type": "function", "function": { "name": "read", "arguments": "{}" } },
+                ]})
+                .to_string(),
+                json!({ "role": "tool", "tool_call_id": "a", "content": "one" }).to_string(),
+                json!({ "role": "user", "content": "go on" }).to_string(),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let body = load_messages(&dir, &mut meta, &mut warnings).unwrap();
+        let roles: Vec<&str> = body.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "tool", "tool", "user"],
+            "{body:?}"
+        );
+        assert_eq!(body[2]["tool_call_id"], "a");
+        assert_eq!(
+            body[3]["tool_call_id"], "b",
+            "in the order the call named them"
+        );
+        assert!(body[3]["content"].as_str().unwrap().contains("not run"));
+        assert!(
+            warnings.iter().any(|w| w.contains("repaired 1 tool call ")),
+            "{warnings:?}"
+        );
+        // The body is untouched: the repair is what the session replays.
+        let raw = std::fs::read_to_string(log_path(&dir, "abc123")).unwrap();
+        assert_eq!(raw.lines().count(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same break from the other side: a result whose call is not in the
+    /// body, which a provider refuses as an answer to a call it cannot see.
+    #[test]
+    fn a_result_nothing_calls_is_dropped() {
+        let dir = testenv::dir("sessions-orphan-result");
+        let mut meta = Meta::new("abc123");
+        meta.save(&dir).unwrap();
+        let mut log = Log::open(&dir, "abc123").unwrap();
+        log.append(&json!({ "role": "user", "content": "hi" }))
+            .unwrap();
+        log.append(&json!({ "role": "tool", "tool_call_id": "gone", "content": "x" }))
+            .unwrap();
+        log.append(&json!({ "role": "assistant", "content": "ok" }))
+            .unwrap();
+        drop(log);
+
+        let mut warnings = Vec::new();
+        let body = load_messages(&dir, &mut meta, &mut warnings).unwrap();
+        assert_eq!(body.len(), 2, "{body:?}");
+        assert_eq!(body[1]["content"], "ok");
+        assert!(
+            warnings.iter().any(|w| w.contains("repaired 1 tool call ")),
+            "{warnings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The kill's own shape: the result's line was cut mid-append and skipped,
+    /// so the call it belonged to arrives owed.
+    #[test]
+    fn a_truncated_result_leaves_the_call_answered() {
+        let dir = testenv::dir("sessions-truncated-result");
+        let mut meta = Meta::new("abc123");
+        meta.save(&dir).unwrap();
+        let path = log_path(&dir, "abc123");
+        std::fs::write(
+            &path,
+            [
+                json!({ "role": "user", "content": "ls" }).to_string(),
+                json!({ "role": "assistant", "content": "", "tool_calls": [
+                    { "id": "c1", "type": "function", "function": { "name": "bash", "arguments": "{}" } },
+                ]})
+                .to_string(),
+            ]
+            .join("\n")
+                + "\n{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"conte",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let body = load_messages(&dir, &mut meta, &mut warnings).unwrap();
+        assert_eq!(body.len(), 3, "{body:?}");
+        assert_eq!(body[2]["tool_call_id"], "c1");
+        assert!(
+            warnings.iter().any(|w| w.contains("damaged")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("repaired 1 tool call ")),
             "{warnings:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);

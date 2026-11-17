@@ -2523,6 +2523,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A kill between a call's record and its result's leaves a body that every
+    /// provider refuses; the resumed session sends a request that answers the
+    /// call instead, so the break costs the call and not the session.
+    #[test]
+    fn a_body_a_kill_broke_resumes_into_a_request_the_provider_takes() {
+        let dir = crate::state::testenv::dir("main-resume-unanswered");
+        let meta = sessions::Meta::new("abc123");
+        meta.save(&dir).unwrap();
+        let mut log = sessions::Log::open(&dir, "abc123").unwrap();
+        log.append(&json!({ "role": "user", "content": "read both" }))
+            .unwrap();
+        log.append(&json!({ "role": "assistant", "content": "", "tool_calls": [
+            { "id": "a", "type": "function", "function": { "name": "read", "arguments": "{}" } },
+            { "id": "b", "type": "function", "function": { "name": "read", "arguments": "{}" } },
+        ]}))
+        .unwrap();
+        log.append(&json!({ "role": "tool", "tool_call_id": "a", "content": "one" }))
+            .unwrap();
+        drop(log);
+
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
+            "[DONE]",
+        ])]);
+        let mut session = session_at(&server);
+        // Wide enough that the round is the only request: this tests replay,
+        // not the compaction trigger.
+        session.providers[0].models[0].context = Some(200_000);
+        session.store = Some(Store::fresh(dir.clone(), "abc123"));
+        let (tx, rx) = events();
+        let mut screen = ui::Screen::test_screen(60, 20);
+        session.resume("abc123", Some(&mut screen)).unwrap();
+        assert!(
+            screen
+                .transcript()
+                .iter()
+                .any(|row| row.contains("repaired")),
+            "the repair is named: {:?}",
+            screen.transcript()
+        );
+
+        session
+            .messages_turn("go on", &tx, &rx, &mut screen)
+            .unwrap();
+        let roles: Vec<&str> = session.messages[2..]
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "tool", "tool", "user", "assistant"]
+        );
+        assert_eq!(session.messages[5]["tool_call_id"], "b");
+        // The request itself carries the answer before the round that asked
+        // for it: a provider reads the gap, not the transcript.
+        let request = body_of(&server.text());
+        let answered = request.find(r#""tool_call_id":"b""#).expect("the answer");
+        let asked = request.find("go on").expect("the next request");
+        assert!(answered < asked, "{request}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The README ships through `about`, so it is the contract the model reads;
     /// `/help` is the same list for the session. A command, a config key or a
     /// tool missing from either is a stale contract, not a doc nit — and the two

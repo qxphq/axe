@@ -296,7 +296,12 @@ invariants a change must not break.
   and search work without unpacking. A compacted body carries a marked summary,
   then the verbatim tail the compaction kept, and the loader returns the
   messages from the last marker on, with the marker's key stripped: the marker
-  is a file record, never a request field. Compaction is manual (`/compact`) and
+  is a file record, never a request field. A kill between a call's record and
+  the result's leaves a gap no provider takes, so the loader answers every call
+  the body left open — the call was not run, and it says so — and drops a
+  result whose call is not there, in memory only: the body stays append-only
+  and reading it again gives the same repair, with one warning naming it.
+  Compaction is manual (`/compact`) and
   automatic when the request comes within `config::COMPACT_RESERVE` of the
   window; the tail is `config::COMPACT_KEEP` tokens cut at a user or assistant
   message so a tool result never loses its call, and a history inside the tail
