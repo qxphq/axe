@@ -36,9 +36,14 @@ the `rg` and `fd` a confined `bash` needs.
 ```sh
 axe              # in the directory you want it to work on
 axe < prompts    # without a terminal: plain-text lines in, transcript out
+axe --unsafe     # -u: start with write, edit and a full bash (explore mode off)
 axe --version    # prints the version and exits; no config, no network
 axe --help       # prints the usage and exits; no config, no network
 ```
+
+`--unsafe` (`-u`) overrides `explore_by_default` for the session that starts: a pipe
+gets a normal-mode session from its first line, and `/new` still turns explore
+mode back on, because the mode belongs to the session.
 
 An argument that is neither is named, and axe exits with the usage rather than
 ignoring it.
@@ -396,10 +401,11 @@ shown as `read-only`. When it is on, `write` and `edit` are unavailable, `bash`
 runs only a fixed allowlist of commands and writes only inside a scratch
 directory and the project's `plan/`, and `fetch` and `web_search` are the way
 to read the web. When it is off, `write`, `edit` and a full `bash` are back,
-and `fetch` and `web_search` are refused. `/new` turns explore mode back on:
-the mode belongs to the session, and the next one starts read-only. Every flip
-is announced in the conversation as `explore mode: on` or `explore mode: off`,
-so the model knows which side it is on.
+and `fetch` and `web_search` are refused. `--unsafe` (`-u`) starts the session that
+flag opens in the off side, whatever the config says. `/new` turns explore mode
+back on: the mode belongs to the session, and the next one starts read-only.
+Every flip is announced in the conversation as `explore mode: on` or `explore
+mode: off`, so the model knows which side it is on.
 
 ## Tools
 

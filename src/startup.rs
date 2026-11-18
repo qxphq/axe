@@ -27,7 +27,7 @@ use crate::web;
 
 use super::{Provider, Session};
 
-pub(crate) fn run() -> Result<(), String> {
+pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
     let cfg = config::load()?;
     // `web_search` holds its token rather than the config: read once, like the
     // providers, and never re-read mid-session.
@@ -92,13 +92,15 @@ pub(crate) fn run() -> Result<(), String> {
             plural(project_skills)
         ));
     }
-    // The mode is history, not prompt: the config decides where a session
-    // starts, and the note below tells the model which side it is on.
-    let mode = if cfg.explore_by_default {
+    // The mode is history, not prompt: `--unsafe` decides where a session
+    // starts, then the config, and the note below tells the model which side
+    // it is on. A flag decides only this start: `/new` brings explore mode
+    // back like it does for a directory that starts read-only.
+    let mode = start.unwrap_or(if cfg.explore_by_default {
         tools::Mode::Explore
     } else {
         tools::Mode::Normal
-    };
+    });
     // The directory's sessions: archive the old bodies before the listing so
     // the markers match what a chooser will resume. Read before the banner, so
     // a directory with no sessions gets the line that says where to start.

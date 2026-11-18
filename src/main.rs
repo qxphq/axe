@@ -74,7 +74,11 @@ struct Provider {
 /// it, and all three can fail.
 #[derive(Debug, PartialEq)]
 enum Cli {
-    Run,
+    /// A session. `unsafe` is `--unsafe` (`-u`): the first one starts in
+    /// normal mode whatever the config says.
+    Run {
+        unsafe_mode: bool,
+    },
     Version,
     Help,
     /// An argument axe does not take. Ignored, it would look like a setting
@@ -84,12 +88,25 @@ enum Cli {
 
 fn cli(mut args: impl Iterator<Item = String>) -> Cli {
     match args.next() {
-        None => Cli::Run,
+        None => Cli::Run { unsafe_mode: false },
         Some(arg) => match arg.as_str() {
             "--version" | "-V" => Cli::Version,
             "--help" | "-h" => Cli::Help,
+            "--unsafe" | "-u" => Cli::Run { unsafe_mode: true },
             _ => Cli::Unknown(arg),
         },
+    }
+}
+
+impl Cli {
+    /// The mode the session starts in, when the flag names one: `--unsafe` is
+    /// explore mode off, and the config's `explore_by_default` is what a run
+    /// without it follows.
+    fn start(&self) -> Option<tools::Mode> {
+        match *self {
+            Cli::Run { unsafe_mode } => unsafe_mode.then_some(tools::Mode::Normal),
+            _ => None,
+        }
     }
 }
 
@@ -97,10 +114,11 @@ fn cli(mut args: impl Iterator<Item = String>) -> Cli {
 /// config lives. The manual is `README.md`, which `about` hands the model.
 fn usage() -> String {
     format!(
-        "usage: axe [--version | --help]
+        "usage: axe [-u | --unsafe] [--version | --help]
 
   axe            interactive session in the working directory
   axe < prompts  one request per line; stdout is the model's text
+  -u, --unsafe   start with write, edit and a full bash (explore mode off)
   --version      print the version and exit
   --help         print this and exit
 
@@ -112,7 +130,8 @@ commands: /help inside a session; the model reads the README with `about`
 }
 
 fn main() {
-    match cli(std::env::args().skip(1)) {
+    let asked = cli(std::env::args().skip(1));
+    match asked {
         // Answered before anything else: no config, no network, no terminal.
         Cli::Version => {
             println!("axe {}", env!("CARGO_PKG_VERSION"));
@@ -127,9 +146,9 @@ fn main() {
             eprint!("\n{}", usage());
             std::process::exit(2);
         }
-        Cli::Run => {}
+        Cli::Run { .. } => {}
     }
-    let result = startup::run();
+    let result = startup::run(asked.start());
     // MCP servers are ours: nothing outlives the session that started it. They
     // go first — a server still alive has the scratch in its write rules and
     // could put a file back under it.
@@ -2667,7 +2686,22 @@ mod tests {
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(cli(args("").into_iter()), Cli::Run);
+        assert_eq!(cli(args("").into_iter()), Cli::Run { unsafe_mode: false });
+        for flag in ["--unsafe", "-u"] {
+            assert_eq!(
+                cli(args(flag).into_iter()),
+                Cli::Run { unsafe_mode: true },
+                "{flag}"
+            );
+            assert_eq!(
+                cli(args(flag).into_iter()).start(),
+                Some(tools::Mode::Normal),
+                "{flag}"
+            );
+        }
+        // The flag is the start's mode and nothing else: a config that asks
+        // for read-only is overridden by it, and nothing else names a mode.
+        assert_eq!(cli(args("").into_iter()).start(), None);
         for flag in ["--version", "-V"] {
             assert_eq!(cli(args(flag).into_iter()), Cli::Version, "{flag}");
         }
@@ -2684,7 +2718,14 @@ mod tests {
             );
         }
         let text = usage();
-        for needle in ["--version", "--help", "< prompts", "commands:"] {
+        for needle in [
+            "--version",
+            "--help",
+            "--unsafe",
+            "-u",
+            "< prompts",
+            "commands:",
+        ] {
             assert!(text.contains(needle), "{needle} missing from usage");
         }
         assert!(text.contains(&*config::path().to_string_lossy()));

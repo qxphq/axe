@@ -106,6 +106,43 @@ fn provider() -> u16 {
     port
 }
 
+/// A provider that says which mode the request's messages announce: the mode
+/// is a note in the history, and `--unsafe` is what decides the first one.
+fn mode_provider() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("loopback addr").port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let (head, body) = read_request(&mut stream);
+            if head.starts_with("GET /v1/models") {
+                answer(
+                    &mut stream,
+                    "{\"data\":[{\"id\":\"m\",\"context_length\":200000}]}",
+                    "application/json",
+                );
+            } else {
+                // The note is a message of its own; the built-in prompt names
+                // both modes in one paragraph, so the opening quote counts.
+                let note = "\"content\":\"explore mode: ";
+                let text = if body.contains(&format!("{note}off")) {
+                    "mode: off"
+                } else if body.contains(&format!("{note}on")) {
+                    "mode: on"
+                } else {
+                    "mode: none"
+                };
+                answer(
+                    &mut stream,
+                    &sse(&format!("{{\"content\":\"{text}\"}}"), "null"),
+                    "text/event-stream",
+                );
+            }
+        }
+    });
+    port
+}
+
 /// Run the binary with a piped stdin and a bounded wait: a test that hangs is a
 /// test that fails, not a job that never finishes.
 fn run(dir: &Path, args: &[&str], input: Option<&str>, envs: &[(&str, PathBuf)]) -> Output {
@@ -171,6 +208,52 @@ fn without_a_terminal_the_answer_is_stdout_and_the_tool_call_is_stderr() {
     assert!(!stdout.contains("read("), "a call on stdout: {stdout:?}");
     // The call is the harness's account of the turn: stderr.
     assert!(stderr.contains("read(notes.txt)"), "{stderr:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unsafe_starts_the_session_on_the_writing_side_of_the_mode() {
+    let dir = scratch("unsafe");
+    let port = mode_provider();
+    let config = dir.join("config/axe");
+    std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::write(
+        config.join("config.json"),
+        format!("{{\"providers\":{{\"m\":{{\"base_url\":\"http://127.0.0.1:{port}/v1\"}}}},\"model\":\"m/m\"}}"),
+    )
+    .expect("config");
+    let envs: [(&str, PathBuf); 3] = [
+        ("HOME", dir.clone()),
+        ("XDG_CONFIG_HOME", dir.join("config")),
+        ("XDG_STATE_HOME", dir.join("state")),
+    ];
+    // Without the flag the session is explore mode, on the config's default.
+    let out = run(&dir, &[], Some("hi\n"), &envs);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(stdout.contains("mode: on"), "{stdout:?}");
+    // `--unsafe` and its shortcut start the session the other way round,
+    // whatever the config's `explore_by_default` says — here, the default
+    // `true`.
+    for flag in ["--unsafe", "-u"] {
+        let out = run(&dir, &[flag], Some("hi\n"), &envs);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{flag}: {stderr}");
+        assert!(stdout.contains("mode: off"), "{flag}: {stdout:?}");
+    }
+    // The config still decides a run that names no flag.
+    std::fs::write(
+        config.join("config.json"),
+        format!("{{\"providers\":{{\"m\":{{\"base_url\":\"http://127.0.0.1:{port}/v1\"}}}},\"model\":\"m/m\",\"explore_by_default\":false}}"),
+    )
+    .expect("config");
+    let out = run(&dir, &[], Some("hi\n"), &envs);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(stdout.contains("mode: off"), "{stdout:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
