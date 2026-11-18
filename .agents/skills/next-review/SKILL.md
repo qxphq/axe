@@ -42,7 +42,10 @@ that review.
 
 ## 2. Review
 
-Follow the brief exactly. Defaults for every review:
+Follow the brief exactly. A brief may add per-finding fields, a required
+table, or an ordering within a severity, but the report structure below —
+severity sections, checks, Summary, verdict line — is fixed and wins over any
+brief. Defaults for every review:
 
 - You have the whole repo. `README.md` ships through `about` and is the
   user-facing contract; `AGENTS.md` records the invariants a change must not
@@ -69,9 +72,9 @@ Follow the brief exactly. Defaults for every review:
        and why it costs.
     2. Two or three concrete options, numbered, the recommended one first and
        marked `(recommended)`, each with a line on what it costs or buys.
-- Close with one verdict line: `All findings objectively fixable — no input
-  needed.` or `Input needed — N finding(s); questions above.` Describe fixes,
-  no patch code.
+- Close with one verdict line: `No findings.`, `All findings objectively
+  fixable — no input needed.`, or `Input needed — N finding(s); questions
+  above.` Describe fixes, no patch code.
 - If a claim needs a measurement or a run the review cannot make (it would
   write something, or the mode does not offer the tool), say so and give the
   exact `!` command; never guess a number.
@@ -105,3 +108,9 @@ itself never asked for that switch.
    findings`.
 6. If any question is still unanswered, do not tick, do not commit; report
    what remains and wait.
+
+When the review had no findings, or the user declines every finding, there is
+nothing to fix or ship: once the user confirms, tick the entry and commit
+`reviews/progress.md` alone as `Close <concern> review, no findings to fix`,
+with no version bump. Otherwise the entry stays unchecked and the next run
+repeats this review.
