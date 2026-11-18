@@ -319,12 +319,20 @@ impl Assembler {
     }
 
     fn finish(self) -> Reply {
+        // A server that sends no id still gets one per call: the history
+        // pairs each result with its call by id, and a strict provider refuses
+        // an empty or repeated one on the next request.
         let calls = self
             .partials
             .into_iter()
-            .filter(|(_, name, _)| !name.is_empty())
-            .map(|(id, name, arguments)| ToolCall {
-                id,
+            .enumerate()
+            .filter(|(_, (_, name, _))| !name.is_empty())
+            .map(|(index, (id, name, arguments))| ToolCall {
+                id: if id.is_empty() {
+                    format!("call_{index}")
+                } else {
+                    id
+                },
                 name,
                 arguments,
             })
@@ -449,6 +457,19 @@ mod tests {
         assert_eq!(reply.calls[0].arguments, "{\"path\":\"x\"}");
         assert_eq!(reply.usage.unwrap().prompt, 7);
         assert!(reply.finish_reason.is_none());
+    }
+
+    #[test]
+    fn a_call_without_an_id_gets_one_of_its_own() {
+        let mut assembler = Assembler::default();
+        let chunk = json!({ "choices": [{ "delta": { "tool_calls": [
+            {"index":0,"function":{"name":"read","arguments":"{}"}},
+            {"index":1,"function":{"name":"about","arguments":"{}"}},
+            {"index":2,"id":"kept","function":{"name":"about","arguments":"{}"}}
+        ]}}]});
+        assembler.absorb(&chunk, &mut |_| {}, &mut |_| {}).unwrap();
+        let ids: Vec<String> = assembler.finish().calls.into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec!["call_0", "call_1", "kept"]);
     }
 
     #[test]

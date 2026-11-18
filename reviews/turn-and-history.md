@@ -8,9 +8,10 @@ Read first: `AGENTS.md` invariants 6 and 13, and the paragraph "A line typed
 during a turn joins it at the next round boundary" in Conventions; README
 "State and sessions" (the `/compact` paragraph), "REPL" (turns run in the
 background), "Run" (piped output). Then `src/turn.rs` in full, `src/store.rs`,
+`src/summary.rs` (`tail_start`, `compaction_prompt`, `naming_excerpt`),
 `sessions.rs` (`load_messages`, `compacted`, `fallback`), `api.rs` (`Reply`,
-`Assembler`), and `main.rs` (`messages_turn`, `run_turn`, `compact`,
-`naming_excerpt`, the two sinks).
+`Assembler`), and `main.rs` (`messages_turn`, `turn`, `compact`,
+`over_threshold`, `count`, the screen sink).
 
 Verify with depth — trace actual message sequences, do not skim:
 

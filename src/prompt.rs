@@ -95,6 +95,14 @@ pub(crate) fn mode_note(mode: tools::Mode) -> Value {
     json!({ "role": "user", "content": mode.note() })
 }
 
+/// Whether a message is a mode note: state the history announces, never a
+/// record the session body keeps.
+pub(crate) fn is_mode_note(message: &Value) -> bool {
+    [tools::Mode::Normal, tools::Mode::Explore]
+        .into_iter()
+        .any(|mode| *message == mode_note(mode))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

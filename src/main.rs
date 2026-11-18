@@ -726,7 +726,7 @@ impl Session {
                     };
                     // The same trigger the interactive loop runs: a piped run
                     // gets the compaction before the request, not an error.
-                    if self.over_threshold() {
+                    if self.over_threshold(&input) {
                         self.compact(&mut Console::Stdout);
                     }
                     let cancel = http::Cancel::new();
@@ -813,7 +813,7 @@ impl Session {
         self.provider = provider;
         self.model = id;
         // The count belonged to the old model's window.
-        self.used = None;
+        self.forget_count();
         let spec = self.spec();
         self.thinking = self.state.thinking_for(&spec).or_else(|| {
             self.providers[provider]
@@ -928,7 +928,7 @@ impl Session {
         self.sid = id.to_string();
         self.store = Some(store);
         self.naming = None;
-        self.used = None;
+        self.forget_count();
         self.set_session_header();
 
         if let Some(screen) = screen {
@@ -1037,7 +1037,7 @@ impl Session {
         self.sid = sid;
         self.naming = None;
         self.picks.clear();
-        self.used = None;
+        self.forget_count();
         self.set_session_header();
         if let Some(screen) = screen {
             screen.reset();
@@ -1357,8 +1357,10 @@ impl Session {
     /// Whether the next request would leave the answer no room: pi's trigger,
     /// measured where it can be and estimated where it cannot. No window
     /// reported, no trigger; a window smaller than the reserve keeps half of it
-    /// free instead, so a small model is not compacted on every turn.
-    fn over_threshold(&self) -> bool {
+    /// free instead, so a small model is not compacted on every turn. `line`
+    /// is the request about to be sent: it is not in the history yet, so it is
+    /// not summarized, but it travels with the request and counts.
+    fn over_threshold(&self, line: &str) -> bool {
         let Some(window) = self.context() else {
             return false;
         };
@@ -1368,7 +1370,8 @@ impl Session {
             .iter()
             .skip(2)
             .any(|message| message["role"].as_str() == Some("assistant"));
-        has_answer && self.used_tokens() + reserve > window
+        let line = weight(&json!({ "role": "user", "content": line })) / 4;
+        has_answer && self.used_tokens() + line + reserve > window
     }
 
     fn context(&self) -> Option<u64> {
@@ -1502,9 +1505,8 @@ impl Session {
         } else {
             screen.output(body(&result));
         }
-        // The output is part of the history now: drop the provider's last
-        // count so the fill estimate includes it.
-        self.used = None;
+        // The output is part of the history now; the fill estimates it on top
+        // of the provider's last count, which stays good.
         self.record(json!({
             "role": "user",
             "content": format!("$ {command}\n{result}"),
@@ -1549,8 +1551,16 @@ impl Session {
             .min(200_000);
         // The newest conversation stays verbatim beside the summary, so the
         // model does not have to re-read the files it was just working on.
-        let cut = summary::tail_start(&self.messages, config::COMPACT_KEEP);
-        let tail: Vec<Value> = self.messages[cut..].to_vec();
+        let base = self.base_messages().len();
+        let cut = summary::tail_start(&self.messages, base, config::COMPACT_KEEP);
+        // A mode note is never in the body, and the new base carries the
+        // current one: written after the marker, an old note would outlive the
+        // flips that followed it on resume.
+        let tail: Vec<Value> = self.messages[cut..]
+            .iter()
+            .filter(|message| !prompt::is_mode_note(message))
+            .cloned()
+            .collect();
         let prompt = summary::compaction_prompt(&self.messages[..cut], budget);
         let request = vec![
             json!({ "role": "system", "content": summary::COMPACT_PROMPT }),
@@ -1594,7 +1604,7 @@ impl Session {
             )),
             Ok(reply) if !reply.text.trim().is_empty() => {
                 let summary = reply.text.trim().to_string();
-                let replaced = cut.saturating_sub(2) as u64;
+                let replaced = cut.saturating_sub(base) as u64;
                 let kept = tail.len();
                 let content = format!("{COMPACT_NOTE}\n\n{summary}");
                 self.messages = self.base_messages();
@@ -1612,9 +1622,7 @@ impl Session {
                 }
                 // The stored count was the old request's; the next reply sets it
                 // again, and the estimate stands in until then.
-                self.used = None;
-                self.cached = 0;
-                self.used_bytes = 0;
+                self.forget_count();
                 if let Some(screen) = console.screen() {
                     screen.set_info(self.info());
                 }
@@ -1674,7 +1682,7 @@ impl Session {
         // than after the provider refused it. The user's line is not in the
         // history yet, so it is not part of what gets summarized.
         let mut pending = Vec::new();
-        if self.over_threshold() {
+        if self.over_threshold(input) {
             if let Some(line) = self.compact(&mut Console::Screen { screen, rx }) {
                 pending.push(line);
             }
@@ -1784,16 +1792,7 @@ impl Session {
             // the cost.
             screen.error("Turn interrupted — the reply is partial\n");
         }
-        // A turn that reported nothing (interrupted, or a provider that does
-        // not count) leaves the estimate in charge rather than a stale number.
-        // What has been appended since the last measured request is estimated
-        // on top of it, so the fill never goes backwards on its own.
-        self.used = used.map(|usage| usage.prompt.saturating_add(usage.completion));
-        self.cached = used.map(|usage| usage.cached).unwrap_or(0);
-        self.used_bytes = match used {
-            Some(_) => self.bytes,
-            None => 0,
-        };
+        self.count(used);
         screen.set_info(self.info());
 
         // Lines the turn read are submitted lines: the prompt was never the
@@ -1848,7 +1847,30 @@ impl Session {
             bytes: &mut self.bytes,
             store: self.store.as_mut(),
         };
-        turn::run_turn(&turn, &mut live, sink).map(|_| ())
+        let used = turn::run_turn(&turn, &mut live, sink)?;
+        // A piped run has no row to show it, but its compaction trigger reads
+        // the same count an interactive one does.
+        self.count(used);
+        Ok(())
+    }
+
+    /// What the last turn measured. A turn that reported nothing (interrupted,
+    /// or a provider that does not count) leaves the estimate in charge rather
+    /// than a stale number. What is appended after the measured request is
+    /// estimated on top of it, so the fill never goes backwards on its own.
+    fn count(&mut self, used: Option<api::Usage>) {
+        self.used = used.map(|usage| usage.prompt.saturating_add(usage.completion));
+        self.cached = used.map(|usage| usage.cached).unwrap_or(0);
+        self.used_bytes = match used {
+            Some(_) => self.bytes,
+            None => 0,
+        };
+    }
+
+    /// The history or the window changed under the last count: drop it, and
+    /// the cache hit that came with it, until the next reply measures again.
+    fn forget_count(&mut self) {
+        self.count(None);
     }
 
     /// Slash commands and selection changes. The console is the only thing a
@@ -3677,17 +3699,114 @@ mod tests {
         ])]);
         let mut session = session_at(&server);
         session.providers[0].models[0].context = Some(200_000);
-        assert!(!session.over_threshold(), "nothing to summarize yet");
+        assert!(!session.over_threshold(""), "nothing to summarize yet");
         session.record(json!({ "role": "assistant", "content": "an answer" }));
-        assert!(!session.over_threshold(), "the history is small");
+        assert!(!session.over_threshold(""), "the history is small");
         // Within the reserve of the window: no room for the answer.
         session.providers[0].models[0].context = Some(8_192);
         session.used = Some(8_000);
         session.used_bytes = session.bytes;
-        assert!(session.over_threshold());
+        assert!(session.over_threshold(""));
         // A model that does not say its window has no threshold to cross.
         session.providers[0].models[0].context = None;
-        assert!(!session.over_threshold());
+        assert!(!session.over_threshold(""));
+    }
+
+    /// The line about to be sent is not in the history, but it is in the
+    /// request: a paste that would overflow the window compacts first.
+    #[test]
+    fn the_line_about_to_be_sent_counts_toward_the_threshold() {
+        let mut session = bare_session();
+        session.messages = session.base_messages();
+        session.bytes = history_bytes(&session.messages);
+        session.record(json!({ "role": "assistant", "content": "an answer" }));
+        session.providers[0].models = vec![api::ModelInfo {
+            id: session.model.clone(),
+            context: Some(100_000),
+        }];
+        session.used = Some(80_000);
+        session.used_bytes = session.bytes;
+        assert!(!session.over_threshold("short"));
+        assert!(session.over_threshold(&"x".repeat(20_000)));
+    }
+
+    /// `/new`, a resume and a model switch drop the count and the cache hit
+    /// with it: the row must not show the last session's cache.
+    #[test]
+    fn a_count_is_dropped_with_its_cache_hit() {
+        let mut session = bare_session();
+        session.used = Some(1_000);
+        session.cached = 900;
+        session.new_session(None);
+        assert_eq!((session.used, session.cached), (None, 0));
+
+        session.count(Some(api::Usage {
+            prompt: 1_000,
+            completion: 10,
+            cached: 900,
+        }));
+        session.forget_count();
+        assert_eq!(
+            (session.used, session.cached, session.used_bytes),
+            (None, 0, 0)
+        );
+    }
+
+    /// A piped turn keeps the provider's count, so its compaction trigger reads
+    /// a measurement rather than the byte estimate.
+    #[test]
+    fn a_piped_turn_keeps_the_count_it_was_given() {
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
+            r#"{"usage":{"prompt_tokens":30,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":20}}}"#,
+            "[DONE]",
+        ])]);
+        let mut session = session_at(&server);
+        session.record(json!({ "role": "user", "content": "hi" }));
+        let mut sink = PlainSink::default();
+        session.turn(&mut sink, &http::Cancel::new()).unwrap();
+        assert_eq!(session.used, Some(32));
+        assert_eq!(session.cached, 20);
+        assert_eq!(session.used_bytes, session.bytes);
+    }
+
+    /// A mode note in the kept tail is not written after the marker: the body
+    /// never holds one, and a resume reads only the current mode's.
+    #[test]
+    fn a_compaction_never_writes_a_mode_note_into_the_body() {
+        let dir = crate::state::testenv::dir("main-compact-note");
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"the summary"}}]}"#,
+            "[DONE]",
+        ])]);
+        let mut session = session_at(&server);
+        session.store = Some(Store::fresh(dir.clone(), "abc123"));
+        for at in 0..4 {
+            session.record(json!({ "role": "user", "content": format!("question {at}") }));
+            session.record(json!({ "role": "assistant", "content": "x".repeat(40_000) }));
+            if at == 2 {
+                // A flip inside what the tail will keep.
+                session.set_mode(session.mode.flip());
+            }
+        }
+        let mut console = Console::Stdout;
+        assert!(session.compact(&mut console).is_none());
+        assert!(session.messages.len() > 3, "a tail was kept");
+        assert!(
+            !session.messages[2..].iter().any(prompt::is_mode_note),
+            "only the base carries the mode"
+        );
+
+        let mut meta = sessions::Meta::load(&dir, "abc123").unwrap();
+        let mut warnings = Vec::new();
+        let replayed = sessions::load_messages(&dir, &mut meta, &mut warnings).unwrap();
+        assert!(!replayed.iter().any(prompt::is_mode_note), "{replayed:?}");
+        assert_eq!(
+            replayed,
+            session.messages[2..],
+            "resume matches the live history"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

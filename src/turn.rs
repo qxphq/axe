@@ -274,7 +274,12 @@ pub fn run_turn(
                 sink.end_round();
                 return Ok(used);
             }
-            Err(e) => return Err(e),
+            // The text that streamed before the failure is on screen; its
+            // unfinished last line is closed before the error goes under it.
+            Err(e) => {
+                sink.end_round();
+                return Err(e);
+            }
         };
         // The provider's own numbers, kept whole: the fill is a display, not a
         // request.
@@ -726,6 +731,34 @@ mod tests {
             "{:?}",
             sink.seen
         );
+    }
+
+    #[test]
+    fn a_provider_error_mid_stream_closes_the_line_it_cut() {
+        use crate::http::support::{sse, Server};
+
+        let server = Server::new(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"half a li"}}]}"#,
+            r#"{"error":{"message":"overloaded"}}"#,
+        ])]);
+        let cancel = Cancel::new();
+        let turn = Turn {
+            ep: &server.ep,
+            key: None,
+            headers: &[],
+            model: "m",
+            extra: None,
+            mode: tools::Mode::Normal,
+            queue: None,
+            cancel: &cancel,
+        };
+        let mut history = log();
+        let mut sink = Recorder::default();
+        let error = run_turn(&turn, &mut history, &mut sink).unwrap_err();
+        assert!(error.contains("overloaded"), "{error}");
+        // The round is ended, so the sink writes out the line it held.
+        assert_eq!(sink.seen.last().map(String::as_str), Some("round"));
+        assert_eq!(history.0.len(), 1, "no half an answer in the history");
     }
 
     #[test]

@@ -71,24 +71,24 @@ pub(crate) fn no_text(reply: &api::Reply) -> String {
 /// Where the verbatim tail begins: pi's cut point. Walk back from the newest
 /// message while the tail is under `keep` tokens and start keeping at the
 /// oldest user or assistant message inside it — never at a tool result, which
-/// would start the tail with an answer to a call it does not carry. A history
-/// that fits inside the tail is summarized whole: a summary that replaces
-/// nothing is not a compaction.
-pub(crate) fn tail_start(messages: &[Value], keep: u64) -> usize {
+/// would start the tail with an answer to a call it does not carry. `base` is
+/// how many messages every history starts with (the prompt and its notes),
+/// which are never summarized nor kept. A history that fits inside the tail,
+/// or whose cut would leave no answer to summarize, is summarized whole: a
+/// summary that replaces nothing is not a compaction.
+pub(crate) fn tail_start(messages: &[Value], base: usize, keep: u64) -> usize {
+    let base = base.min(messages.len());
     let mut tokens = 0u64;
-    let mut start = 2.min(messages.len());
-    for at in (start..messages.len()).rev() {
+    for at in (base..messages.len()).rev() {
         tokens += crate::store::weight(&messages[at]) / 4;
         let role = messages[at]["role"].as_str().unwrap_or("");
-        if role == "user" || role == "assistant" {
-            start = at;
-            if tokens >= keep {
-                return start;
-            }
+        if (role == "user" || role == "assistant") && tokens >= keep {
+            let replaces = messages[base..at]
+                .iter()
+                .any(|message| message["role"].as_str() == Some("assistant"));
+            return if replaces { at } else { messages.len() };
         }
     }
-    // The whole history is inside the tail: nothing would be replaced, so the
-    // summary covers everything and there is no tail.
     messages.len()
 }
 
@@ -97,12 +97,17 @@ pub(crate) fn compaction_prompt(messages: &[Value], budget: usize) -> String {
     for message in messages.iter().skip(2) {
         let role = message["role"].as_str().unwrap_or("");
         if let Some(text) = message["content"].as_str().filter(|text| !text.is_empty()) {
-            let (head, tail) = if role == "tool" {
-                (800, 200)
+            // An earlier summary is already the short form of what it
+            // replaced, and its prompt bounds it: cut, its middle sections
+            // would be lost for good.
+            let text = if text.starts_with(sessions::COMPACT_NOTE) {
+                text.to_string()
+            } else if role == "tool" {
+                head_tail(text, 800, 200)
             } else {
-                (2000, 500)
+                head_tail(text, 2000, 500)
             };
-            lines.push(format!("{role}: {}", head_tail(text, head, tail)));
+            lines.push(format!("{role}: {text}"));
         }
         if let Some(calls) = message["tool_calls"].as_array() {
             for call in calls {
@@ -228,6 +233,49 @@ mod tests {
         assert!(prompt.contains("newest"));
         // Short text is left alone.
         assert_eq!(head_tail("abc", 2, 2), "abc");
+    }
+
+    #[test]
+    fn a_tail_never_leaves_nothing_to_summarize() {
+        let base = vec![
+            json!({ "role": "system", "content": "s" }),
+            json!({ "role": "user", "content": "explore mode: off" }),
+        ];
+        // The oldest message alone fills the tail: keeping it would summarize
+        // the base and nothing else, so the whole history is summarized.
+        let mut big = base.clone();
+        big.push(json!({ "role": "user", "content": "x".repeat(400) }));
+        big.push(json!({ "role": "assistant", "content": "ok" }));
+        assert_eq!(tail_start(&big, 2, 50), big.len());
+        // A sandbox caveat in the base is not a place to cut either.
+        let mut caveat = base.clone();
+        caveat.push(json!({ "role": "user", "content": "sandbox: degraded" }));
+        caveat.push(json!({ "role": "user", "content": "x".repeat(400) }));
+        caveat.push(json!({ "role": "assistant", "content": "ok" }));
+        assert_eq!(tail_start(&caveat, 3, 50), caveat.len());
+        // With an answer before the cut, the newest messages are the tail.
+        let mut long = base.clone();
+        long.push(json!({ "role": "user", "content": "first" }));
+        long.push(json!({ "role": "assistant", "content": "x".repeat(400) }));
+        long.push(json!({ "role": "user", "content": "x".repeat(400) }));
+        long.push(json!({ "role": "assistant", "content": "ok" }));
+        assert_eq!(tail_start(&long, 2, 50), 4);
+        // A history smaller than the tail is summarized whole.
+        assert_eq!(tail_start(&long, 2, 1_000_000), long.len());
+    }
+
+    #[test]
+    fn an_earlier_summary_is_summarized_whole() {
+        let earlier = format!("{}\n\n{}", sessions::COMPACT_NOTE, "y".repeat(5000));
+        let messages = vec![
+            json!({ "role": "system", "content": "s" }),
+            json!({ "role": "user", "content": "explore mode: off" }),
+            json!({ "role": "user", "content": earlier }),
+            json!({ "role": "user", "content": "z".repeat(5000) }),
+        ];
+        let prompt = compaction_prompt(&messages, 100_000);
+        assert!(prompt.contains(&"y".repeat(5000)), "the summary is whole");
+        assert!(prompt.contains("…[cut]…"), "a long request is still cut");
     }
 
     #[test]
