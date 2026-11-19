@@ -263,7 +263,7 @@ did not: an entry added to a file nobody approved still asks at the next start,
 about the whole file.
 
 In explore mode a stdio server is confined like `bash` — the same two writable
-directories, the same `io_uring` rule, exec unconfined; see
+directories, the same seccomp filter, its own session, exec unconfined; see
 [Sandbox](#sandbox). A process cannot be narrowed, so `/explore` restarts every
 server: the names the model was given stay the same, and one that fails then
 answers with an error.
@@ -513,7 +513,7 @@ line says why.
 ## Sandbox
 
 `bash` is confined by the kernel, not by string checks. On Linux that is
-Landlock plus one seccomp rule, on macOS a Seatbelt profile. The confinement
+Landlock plus a seccomp filter, on macOS a Seatbelt profile. The confinement
 applies in explore mode and is about writes and execution; normal mode keeps
 only `no_new_privs` and the scrubbed environment.
 
@@ -543,7 +543,11 @@ executable — a script written there is a file, not a program. Three classes ar
 left off on purpose: daemons that write through another process (`docker`,
 `systemctl`, `dbus-send`), setuid (`sudo`, `mount`), and programs whose side
 effect is a mode or a timestamp rather than a write (`chmod`, `touch`) —
-Landlock has no right for those. `nix` and `brew` are also off: they exec their
+Landlock has no right for those. On Linux the seccomp filter refuses the mode,
+owner and extended-attribute calls themselves, so an interpreter cannot make
+them either, in scratch included; timestamps are not refused, so a script can
+still change one. A command in explore mode also runs in a session of its own,
+without axe's terminal, so it cannot type into axe's prompt. `nix` and `brew` are also off: they exec their
 own `/nix/store` and `/opt/homebrew` paths, which no list entry can cover.
 `ld.so` can start a program that is not on the list, and an allowed program can
 load code with `LD_PRELOAD`; loaded code runs in the same domain, and still
@@ -556,9 +560,10 @@ truncation is not mediated at all; that line joins the session's history too, so
 the model is told which rules the kernel is actually holding.
 
 The network is not confined, in either mode: a command connects where you
-connect, private ranges included. `io_uring_setup` is the only syscall denied,
-in explore mode, because Landlock does not mediate io_uring and allowing it
-would punch a hole in the write confinement. Normal mode installs no filter, so
+connect, private ranges included. In explore mode the filter denies
+`io_uring_setup`, because Landlock does not mediate io_uring and allowing it
+would punch a hole in the write confinement, and the mode, owner and
+extended-attribute calls, which Landlock has no right for. Normal mode installs no filter, so
 a 32-bit binary runs there.
 
 A refusal comes from the kernel, not from axe's argument parsing, and its
@@ -566,8 +571,8 @@ message says so: a missing binary and a denied one read differently, and a
 denied write comes back with the two directories that would have been allowed
 and the toggle that lifts both.
 
-In explore mode an MCP server gets the same two writable directories and the
-same `io_uring` rule; its exec is not confined, because a server starts its own
+In explore mode an MCP server gets the same two writable directories, the
+same seccomp filter and a session of its own; its exec is not confined, because a server starts its own
 runtime (`npx`, `uvx`) that a leading-word check would refuse.
 
 A command child inherits a minimal environment — `PATH`, `HOME`, `LANG`,

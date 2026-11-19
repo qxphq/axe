@@ -136,8 +136,9 @@ invariants a change must not break.
     writes outside two directories — the session scratch, and the project's
     `plan/` under the state tree, which survives exit so a plan outlives the
     session; neither is executable — and exec outside a fixed allowlist
-    (Landlock/Seatbelt, plus seccomp denying `io_uring_setup`, which Landlock
-    cannot mediate); it degrades with one startup line, which the history
+    (Landlock/Seatbelt, plus seccomp denying `io_uring_setup` and the mode,
+    owner and xattr calls, which Landlock cannot mediate), in a session of its
+    own so it cannot `TIOCSTI` into axe's prompt; it degrades with one startup line, which the history
     carries too, because the model must not be told a rule the kernel is not
     holding. The allowlist is a
     convenience guard, not the containment: it carries the common inspection and
@@ -148,7 +149,7 @@ invariants a change must not break.
     network is confined in neither mode: a child connects where the user
     connects, `!cmd` included. A leading-word check is never a substitute.
     A stdio MCP server gets the same two writable directories in explore mode
-    and the same `io_uring` rule, and keeps exec: the allowlist is a
+    and the same seccomp filter and session, and keeps exec: the allowlist is a
     convenience for `bash`, and `npx`/`uvx` start a runtime a leading-word
     check would refuse. An HTTP server has no process to confine, and the
     network is unconfined in both modes anyway. A process cannot be narrowed,

@@ -12,7 +12,9 @@
 //! The network is not confined in either mode: a child reaches what the user
 //! reaches. `io_uring_setup` stays denied in explore mode because Landlock does
 //! not mediate io_uring, and allowing it would punch a hole in the write
-//! confinement.
+//! confinement; the mode, owner and xattr calls for the same reason. An
+//! explore-mode child also leaves axe's controlling terminal behind, because a
+//! child that shares it can push keys into axe's prompt with `TIOCSTI`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -353,6 +355,31 @@ mod imp {
     const IO_URING_SETUP: u32 = 425;
     const X32_BIT: u32 = 0x4000_0000;
 
+    /// Mode, owner and extended-attribute changes: Landlock has no right for
+    /// them, and the interpreters on the list would otherwise reach every file
+    /// the user owns. Timestamps stay: tools set them on what they create in
+    /// scratch. The numbers past 450 are shared by every architecture.
+    const ATTRIBUTES: &[libc::c_long] = &[
+        libc::SYS_fchmod,
+        libc::SYS_fchmodat,
+        452, // fchmodat2
+        libc::SYS_fchown,
+        libc::SYS_fchownat,
+        libc::SYS_setxattr,
+        libc::SYS_lsetxattr,
+        libc::SYS_fsetxattr,
+        libc::SYS_removexattr,
+        libc::SYS_lremovexattr,
+        libc::SYS_fremovexattr,
+        463, // setxattrat
+        466, // removexattrat
+    ];
+    /// The calls x86_64 keeps from before the `*at` family.
+    #[cfg(target_arch = "x86_64")]
+    const LEGACY: &[libc::c_long] = &[libc::SYS_chmod, libc::SYS_chown, libc::SYS_lchown];
+    #[cfg(not(target_arch = "x86_64"))]
+    const LEGACY: &[libc::c_long] = &[];
+
     // libc exposes the syscall numbers for linux-gnu, but neither `prctl` nor
     // its constants, so both are declared here.
     const PR_SET_SECCOMP: libc::c_long = 22;
@@ -486,14 +513,32 @@ mod imp {
         let mut cmd = Command::new(&shell);
         cmd.arg("-c").arg(command);
         confine_env(&mut cmd, read_only)?;
+        confine(&mut cmd, audit_arch, rules);
+        Ok(cmd)
+    }
+
+    /// The child's half, installed between fork and exec. Explore mode gets a
+    /// session of its own: a child that shares axe's controlling terminal can
+    /// `TIOCSTI` keys into axe's own prompt, where they run as the user's
+    /// `!cmd`. Its own session is also its own process group, which is what an
+    /// interrupt signals; outside explore mode the group is made directly.
+    fn confine(cmd: &mut Command, audit_arch: Option<u32>, rules: Option<RawFd>) {
+        if audit_arch.is_none() {
+            cmd.process_group(0);
+        }
+        // Built here, in the parent: no allocation after fork.
+        let filter = audit_arch.map(filter);
         // SAFETY: `pre_exec` is unsafe because the closure runs in the child
         // between fork and exec; this one calls only fixed syscalls on state
         // inherited from the parent, before any user program runs.
         unsafe {
             cmd.pre_exec(move || {
+                if filter.is_some() && libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
                 no_new_privs()?;
-                if let Some(audit_arch) = audit_arch {
-                    seccomp(audit_arch)?;
+                if let Some(filter) = &filter {
+                    seccomp(filter)?;
                 }
                 if let Some(fd) = rules {
                     restrict(fd)?;
@@ -501,7 +546,6 @@ mod imp {
                 Ok(())
             });
         }
-        Ok(cmd)
     }
 
     /// The kernel ABI, or `None` when the LSM is absent or the kernel predates
@@ -676,20 +720,7 @@ mod imp {
         for (name, value) in env {
             cmd.env(name, value);
         }
-        // SAFETY: as `shell`'s closure: only fixed syscalls, before any user
-        // program runs, on state inherited from the parent.
-        unsafe {
-            cmd.pre_exec(move || {
-                no_new_privs()?;
-                if let Some(audit_arch) = audit_arch {
-                    seccomp(audit_arch)?;
-                }
-                if let Some(fd) = rules {
-                    restrict(fd)?;
-                }
-                Ok(())
-            });
-        }
+        confine(&mut cmd, audit_arch, rules);
         Ok(cmd)
     }
 
@@ -752,14 +783,13 @@ mod imp {
         Ok(())
     }
 
-    fn seccomp(audit_arch: u32) -> io::Result<()> {
-        let filter = filter(audit_arch);
+    fn seccomp(filter: &[libc::sock_filter]) -> io::Result<()> {
         let prog = libc::sock_fprog {
             len: filter.len() as u16,
             filter: filter.as_ptr() as *mut libc::sock_filter,
         };
-        // SAFETY: `prog` points at `filter`, a stack array that outlives the
-        // call, and its `len` matches; the kernel copies the filter.
+        // SAFETY: `prog` points at `filter`, built in the parent and borrowed
+        // for the call, and its `len` matches; the kernel copies the filter.
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_prctl,
@@ -793,25 +823,37 @@ mod imp {
     /// The arch word is pinned first: a 32-bit binary would reach the syscalls
     /// below through a different number, and `x32` would slip past a filter
     /// that reads the number alone. What is left to deny is `io_uring_setup`,
-    /// which can issue the file operations Landlock is supposed to mediate.
-    fn filter(audit_arch: u32) -> [libc::sock_filter; 8] {
+    /// which can issue the file operations Landlock is supposed to mediate,
+    /// and the attribute changes Landlock has no right for.
+    pub(super) fn filter(audit_arch: u32) -> Vec<libc::sock_filter> {
         let insn = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
         let deny = RET_ERRNO | EPERM;
-        [
-            insn(LD_ABS, 0, 0, ARCH),          // 0  A = arch
-            insn(JEQ_K, 1, 0, audit_arch),     // 1  -> 3, else 2
-            insn(RET_K, 0, 0, deny),           // 2  another ABI: deny all
-            insn(LD_ABS, 0, 0, NR),            // 3  A = nr
-            insn(JGE_K, 2, 0, X32_BIT),        // 4  x32 -> 7
-            insn(JEQ_K, 1, 0, IO_URING_SETUP), // 5  -> 7, else 6
-            insn(RET_K, 0, 0, RET_ALLOW),      // 6
-            insn(RET_K, 0, 0, deny),           // 7
-        ]
+        let denied: Vec<u32> = std::iter::once(IO_URING_SETUP)
+            .chain(ATTRIBUTES.iter().chain(LEGACY).map(|&nr| nr as u32))
+            .collect();
+        // The deny return is last; each jump counts the instructions after it.
+        let last = 5 + denied.len() + 1;
+        let to_deny = |at: usize| (last - at - 1) as u8;
+        let mut prog = vec![
+            insn(LD_ABS, 0, 0, ARCH),            // A = arch
+            insn(JEQ_K, 1, 0, audit_arch),       // the pinned ABI skips the next
+            insn(RET_K, 0, 0, deny),             // another ABI: deny all
+            insn(LD_ABS, 0, 0, NR),              // A = nr
+            insn(JGE_K, to_deny(4), 0, X32_BIT), // x32: deny
+        ];
+        for nr in denied {
+            let at = prog.len();
+            prog.push(insn(JEQ_K, to_deny(at), 0, nr));
+        }
+        prog.push(insn(RET_K, 0, 0, RET_ALLOW));
+        prog.push(insn(RET_K, 0, 0, deny));
+        prog
     }
 }
 
 #[cfg(target_os = "macos")]
 mod imp {
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::OnceLock;
@@ -840,7 +882,33 @@ mod imp {
             .arg("-c")
             .arg(command);
         confine_env(&mut cmd, read_only)?;
+        session(&mut cmd, read_only);
         Ok(cmd)
+    }
+
+    // libSystem's, which std already links: `libc` is a Linux-only dependency.
+    extern "C" {
+        fn setsid() -> i32;
+    }
+
+    /// Explore mode's child leaves axe's terminal behind, as on Linux: sharing
+    /// it would let `TIOCSTI` type into axe's prompt. Outside explore mode the
+    /// process group is made directly.
+    fn session(cmd: &mut Command, read_only: bool) {
+        if !read_only {
+            cmd.process_group(0);
+            return;
+        }
+        // SAFETY: the closure runs between fork and exec and makes one fixed
+        // syscall with no arguments.
+        unsafe {
+            cmd.pre_exec(|| {
+                if setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 
     /// A program axe starts itself: same write rule, and no exec rule, so the
@@ -858,6 +926,7 @@ mod imp {
         for (name, value) in env {
             cmd.env(name, value);
         }
+        session(&mut cmd, read_only);
         Ok(cmd)
     }
 
@@ -1023,6 +1092,91 @@ mod tests {
         assert!(loader.is_file(), "{}", loader.display());
         let plain = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         assert_eq!(imp::interpreter(&plain), None);
+    }
+
+    /// Every jump in the filter lands on the deny return, and every call it is
+    /// meant to refuse has one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_filter_denies_what_it_lists_and_nothing_jumps_past_it() {
+        let prog = imp::filter(0xc000_003e);
+        let last = prog.len() - 1;
+        for (at, insn) in prog.iter().enumerate().skip(4) {
+            if insn.code == 0x15 || insn.code == 0x35 {
+                assert_eq!(at + 1 + insn.jt as usize, last, "instruction {at}");
+            }
+        }
+        let denied: Vec<u32> = prog
+            .iter()
+            .filter(|insn| insn.code == 0x15)
+            .map(|insn| insn.k)
+            .collect();
+        for nr in [
+            425,
+            libc::SYS_fchmodat as u32,
+            452,
+            libc::SYS_fchownat as u32,
+            libc::SYS_setxattr as u32,
+        ] {
+            assert!(denied.contains(&nr), "{nr} is not denied");
+        }
+    }
+
+    /// Explore mode's child is the leader of a session of its own, so it has
+    /// no controlling terminal to type into.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_explore_child_has_a_session_of_its_own() {
+        let probe = "read -r _ _ _ _ _ sid _ < /proc/self/stat; echo \"$sid $$\"";
+        let Ok(mut cmd) = shell(probe, true) else {
+            return;
+        };
+        let out = cmd.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut words = text.split_whitespace();
+        let (sid, pid) = (words.next(), words.next());
+        assert!(
+            sid.is_some() && sid == pid,
+            "{text:?} {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Normal mode stays in the parent's session.
+        let out = shell(probe, false).unwrap().output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut words = text.split_whitespace();
+        assert_ne!(words.next(), words.next(), "{text:?}");
+    }
+
+    /// An interpreter on the list cannot change the mode of a file the user
+    /// owns in explore mode: Landlock has no right for it, so seccomp refuses
+    /// it, and the file keeps its mode.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explore_mode_refuses_a_mode_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if resolve("python3").is_none() {
+            eprintln!("skip explore_mode_refuses_a_mode_change: no python3 on this host");
+            return;
+        }
+        let dir = crate::state::testenv::dir("sandbox-chmod");
+        let file = dir.join("kept");
+        std::fs::write(&file, "x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let script = format!(
+            "python3 -c 'import os,sys; os.chmod(sys.argv[1], 0)' '{}'",
+            file.display()
+        );
+        let Ok(mut cmd) = shell(&script, true) else {
+            return;
+        };
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "chmod ran: {stderr}");
+        assert!(stderr.contains("Operation not permitted"), "{stderr}");
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// End to end: an allowlisted command runs under the explore ruleset. A

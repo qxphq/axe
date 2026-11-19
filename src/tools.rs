@@ -9,7 +9,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -566,8 +565,6 @@ fn bash(args: &Value, cancel: &Cancel, mode: Mode) -> String {
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_write))
         .stderr(Stdio::from(err_write))
-        // Own process group, so an interrupt kills the whole pipeline.
-        .process_group(0)
         .spawn()
     {
         Ok(c) => c,

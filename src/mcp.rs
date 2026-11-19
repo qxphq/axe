@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -785,8 +784,6 @@ impl StdioConn {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // Own process group, so a restart takes its runtime with it.
-            .process_group(0)
             .spawn()
             .map_err(|e| format!("spawn {}: {e}", program.display()))?;
         let pid = child.id() as i32;
