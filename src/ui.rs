@@ -1049,10 +1049,15 @@ impl Screen {
             KeyCode::Up => self.arrow(true),
             KeyCode::Down => self.arrow(false),
             KeyCode::BackTab => return Action::Explore,
-            // A shell's Ctrl-C: drop what was typed, keep the prompt.
+            // A shell's Ctrl-C: drop what was typed, keep the prompt. The
+            // line is settled, and still a history step, so Up brings back
+            // what was cancelled; what the history already holds is
+            // reachable without a second step.
             KeyCode::Char('c') if ctrl => {
-                self.ed.buf.clear();
-                self.ed.cursor = 0;
+                let line = self.take();
+                if !self.recall.history.contains(&line) {
+                    self.remember(&line);
+                }
             }
             KeyCode::Char('d') if ctrl && self.ed.buf.is_empty() => return Action::Eof,
             KeyCode::Char('d') if ctrl => self.ed.delete(),
@@ -1915,7 +1920,8 @@ impl Screen {
     /// Keep the line for Up and Down. A blank, a leading space (the shell's
     /// "do not remember this") and a repeat of the newest are not steps.
     /// `commit` calls this; a line the caller took from the prompt instead is
-    /// a submitted line too, so it is remembered through here.
+    /// a submitted line too, so it is remembered through here, and Ctrl-C
+    /// remembers the line it cancels.
     pub fn remember(&mut self, line: &str) {
         if line.trim().is_empty() || line.starts_with(' ') {
             return;
@@ -3334,6 +3340,45 @@ mod tests {
         assert_eq!(screen.ed.buf, "three");
         press(&mut screen, KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(screen.ed.buf, "draft", "down from the newest restores it");
+    }
+
+    /// Ctrl-C settles the line without submitting it: the prompt clears, but
+    /// the line is still a history step, so Up brings back what was
+    /// cancelled. A cancelled blank is not a step, and a line the walk was
+    /// showing is already in the history and gains no second one.
+    #[test]
+    fn a_cancelled_line_stays_a_history_step() {
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_history(vec!["old".into()]);
+        typed(&mut screen, "cancelled");
+        press(&mut screen, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(screen.ed.buf, "", "Ctrl-C drops what was typed");
+        assert_eq!(
+            screen.recall.history,
+            vec!["old".to_string(), "cancelled".to_string()]
+        );
+        press(&mut screen, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "cancelled", "Up brings the line back");
+        press(&mut screen, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "", "down from the newest is the empty draft");
+
+        // A blank cancelled is not a step.
+        typed(&mut screen, "  ");
+        press(&mut screen, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(screen.recall.history.len(), 2);
+
+        // Cancelling a line the walk was showing adds no second step for it,
+        // and the walk itself ends: Up starts from the newest again.
+        typed(&mut screen, "newest");
+        press(&mut screen, KeyCode::Enter, KeyModifiers::NONE);
+        screen.commit();
+        press(&mut screen, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut screen, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "cancelled");
+        press(&mut screen, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(screen.recall.history.len(), 3, "no second `cancelled`");
+        press(&mut screen, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(screen.ed.buf, "newest", "the walk was settled, not kept");
     }
 
     #[test]

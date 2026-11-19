@@ -367,7 +367,7 @@ where typing filters it and Enter on an empty line resumes the selection.
 | ↑ ↓ | move the mark over the candidates above the prompt, walk the history when there is no list, or move in a chooser; ↑ with lines waiting takes them back |
 | Shift+Tab | toggle explore mode |
 | Esc | close a chooser; twice to interrupt the running turn |
-| Ctrl+C | clear the prompt line |
+| Ctrl+C | clear the prompt line, which stays in the ↑ history |
 | Ctrl+D | end input on an empty line; delete the character under the cursor otherwise |
 | Ctrl+A / Ctrl+E | start of line / end of line |
 | Ctrl+B / Ctrl+F, Alt+B / Alt+F | move by character, by word |
