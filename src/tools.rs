@@ -139,13 +139,26 @@ impl Mode {
     /// The note that goes into the history when the mode is set. The mode is
     /// history, never the cached prefix, so a toggle rewrites nothing above it.
     pub fn note(self) -> String {
+        self.note_with(crate::sandbox::plan().is_some())
+    }
+
+    /// The note, saying a private directory exists only when the sandbox
+    /// grants one: the model must not be told a rule the kernel is not
+    /// holding. The plan is fixed at startup, so a session's note never
+    /// changes under it.
+    fn note_with(self, plan: bool) -> String {
         match self {
-            Mode::Explore => "explore mode: on — write and edit are unavailable; bash runs \
-                 allowlisted commands and writes only to a scratch directory ($TMPDIR) and \
-                 one private directory axe keeps, for files the user asks you to write; the \
-                 network is not confined. If the user asks for changes, do not attempt them: \
-                 say `/explore off` and they can switch."
-                .to_string(),
+            Mode::Explore => format!(
+                "explore mode: on — write and edit are unavailable; bash runs \
+                 allowlisted commands and writes only to a scratch directory ($TMPDIR){}; \
+                 the network is not confined. If the user asks for changes, do not attempt \
+                 them: say `/explore off` and they can switch.",
+                if plan {
+                    " and one private directory axe keeps, for files the user asks you to write"
+                } else {
+                    ""
+                }
+            ),
             Mode::Normal => "explore mode: off — write, edit and a full bash are available; \
                              fetch and web_search are unavailable."
                 .to_string(),
@@ -762,6 +775,19 @@ fn read_output(file: &mut File, max: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_explore_note_names_a_private_directory_only_when_there_is_one() {
+        let with = Mode::Explore.note_with(true);
+        let without = Mode::Explore.note_with(false);
+        assert!(with.contains("one private directory axe keeps"), "{with}");
+        assert!(!without.contains("private directory"), "{without}");
+        assert!(
+            without.contains("only to a scratch directory ($TMPDIR);"),
+            "{without}"
+        );
+        assert!(without.contains("`/explore off`"));
+    }
 
     fn temp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("axe-test-{}-{name}", std::process::id()))
