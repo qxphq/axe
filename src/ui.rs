@@ -453,7 +453,8 @@ impl Term {
     }
 
     /// Where the terminal has its cursor now. Asking takes crossterm's event
-    /// reader, which the input thread holds in short turns, as `reshape` does.
+    /// reader, which the input thread holds in short turns, so it can miss a
+    /// few times before it lands.
     fn cursor_now(&mut self) -> io::Result<Position> {
         match self {
             Term::Real(term) => {
@@ -534,30 +535,23 @@ impl Term {
         }
     }
 
-    /// The same terminal, in a viewport `height` rows tall starting at the
-    /// cursor. The backend is carried over, so a test's scrollback survives the
-    /// move: it is the session's history, not the terminal's.
-    fn reshape(&mut self, height: u16) -> io::Result<()> {
+    /// The same terminal, in a viewport `height` rows tall starting at row
+    /// `top`, where the caller has just put the cursor. The backend is carried
+    /// over, so a test's scrollback survives the move: it is the session's
+    /// history, not the terminal's.
+    fn reshape(&mut self, height: u16, top: u16) -> io::Result<()> {
         let options = || TerminalOptions {
             viewport: Viewport::Inline(height),
         };
         let term = match self {
-            // Deriving the area asks the terminal where its cursor is, and
-            // crossterm answers only while it holds the event reader: the input
-            // thread takes it in short turns, so this can miss a few times
-            // before it lands.
+            // Deriving the area asks for the cursor, and asking the terminal
+            // would flush the erased frame and leave it on screen for a round
+            // trip: the prompt blinks. The caller put the cursor there, so the
+            // backend answers that once instead.
             Term::Real(_) => {
-                let mut tries = 0;
-                loop {
-                    match Terminal::with_options(backend(), options()) {
-                        Ok(term) => break Term::Real(term),
-                        Err(_) if tries < 50 => {
-                            tries += 1;
-                            std::thread::sleep(std::time::Duration::from_millis(2));
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
+                let mut backend = backend();
+                backend.1 = Some(Position::new(0, top));
+                Term::Real(Terminal::with_options(backend, options())?)
             }
             #[cfg(test)]
             Term::Test(term) => {
@@ -1413,7 +1407,7 @@ impl Screen {
         let height = self.term.area().height;
         let top = size.height.saturating_sub(height);
         self.term.set_cursor_position(Position::new(0, top))?;
-        self.term.reshape(height)?;
+        self.term.reshape(height, top)?;
         self.term.clear()
     }
 
@@ -1763,7 +1757,7 @@ impl Screen {
         // An inline area starts at the cursor row and this one's bottom is the
         // screen's, so the cursor goes where the new top has to be.
         self.term.set_cursor_position(Position::new(0, top))?;
-        self.term.reshape(height)?;
+        self.term.reshape(height, top)?;
         // Blank the whole region and force a full repaint.
         self.term.clear()?;
         // Count the rows above the new top that are blank now, because they are
@@ -2535,7 +2529,7 @@ pub fn is_interactive() -> bool {
 /// writer, and this is where it gets the stream.
 #[allow(clippy::disallowed_methods)] // the screen's backend
 fn backend() -> Tail<Stdout> {
-    Tail(CrosstermBackend::new(io::stdout()))
+    Tail(CrosstermBackend::new(io::stdout()), None)
 }
 
 /// The terminal, with one rule added: a cell whose symbol is empty ends its
@@ -2548,7 +2542,10 @@ fn backend() -> Tail<Stdout> {
 /// into, because its buffer is not sparse. Only `Screen::write` empties cells,
 /// and only in the dense buffer of a transcript insert; the live region is
 /// repainted by diff, where a row that ends early must keep its right half.
-struct Tail<W: Write>(CrosstermBackend<W>);
+///
+/// The second field is a cursor position the caller already knows, answered
+/// once in place of asking the terminal (see `Term::reshape`).
+struct Tail<W: Write>(CrosstermBackend<W>, Option<Position>);
 
 impl<W: Write> Write for Tail<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -2609,6 +2606,9 @@ impl<W: Write> Backend for Tail<W> {
     }
 
     fn get_cursor_position(&mut self) -> io::Result<Position> {
+        if let Some(at) = self.1.take() {
+            return Ok(at);
+        }
         self.0.get_cursor_position()
     }
 
