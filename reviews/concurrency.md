@@ -6,9 +6,9 @@ it deliberately — never races, deadlocks, or paints from the wrong thread.**
 
 Read first: `AGENTS.md` invariants 12–13 and the mid-turn queue paragraph in
 Conventions; README "REPL" (turns in the background, queued lines, two-press
-interrupt) and "Modes". Then `main.rs` (`Event`, the two producers, `event`,
-`key`, `send`, `run_interactive`, `run_piped`, the turn spawn), `repl.rs`
-(`spawn_input`, the cursor-report filter, `pump`, `readline`, `choose`),
+interrupt) and "Modes". Then `main.rs` (the two producers, `event`, `key`,
+`send`, `run_interactive`, `run_piped`, the turn spawn), `repl.rs` (`Event`,
+`spawn_input`, the cursor-report filter, `pump`, `readline`, `choose`),
 `turn.rs` (`run_turn`, `take_queue`, the sinks), `tools.rs` (the bash child and
 cancel), `http.rs` (the response thread and `Cancel`), and `mcp.rs` (the stdio
 reader, the HTTP connection, `restart`).

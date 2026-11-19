@@ -173,7 +173,8 @@ invariants a change must not break.
 - `main.rs` — what a session is: the lifecycle (startup chooser, `/sessions`,
   `/new`, naming), model and thinking selection (a chooser that typing narrows;
   no argument completion, because Enter would take the candidate), slash
-  commands, the agent loop, and the two sinks. Two producers (keys, a turn) feed
+  commands, driving a turn (`messages_turn`, `turn`), and the screen's sink
+  (`ChannelSink`). Two producers (keys, a turn) feed
   one `mpsc` channel; the main thread applies events and draws once per batch.
 - `repl.rs` — the terminal's line loop: the key thread and the cursor-report
   filter, `readline`, the chooser's keys, `pump` for work behind a live prompt,
@@ -206,7 +207,8 @@ invariants a change must not break.
 - `render.rs` — transcript text: `Paint`, and what a call, a command and a
   reasoning line look like. The screen renders the same spans as cells.
 - `turn.rs` — the turn loop: one request per round, the queue a typed line joins
-  at a boundary, the two sinks, and `History` (the one place a message is both
+  at a boundary, the `Sink` trait and the piped sinks (`PlainSink`,
+  `TextSink`), and `History` (the one place a message is both
   appended to the request and written to the log).
 - `summary.rs` — the two requests that are not a turn: the transcript a
   `/compact` summary sees, the tail kept verbatim beside it, and the naming
@@ -352,6 +354,10 @@ cargo test --locked   # parsers, caps, keys, layout, the binary itself — and l
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
+
+No test reads the terminal it runs in: an agent's shell keeps stdin open, so a
+test that waited for its end would hang the gate. Read input through a reader
+the test supplies.
 
 `harness.py` is the UI loop: `mock.py` + tmux pty + virtual terminal. It needs
 python3 and tmux. CI runs the journeys below, so a regression in the screen, the

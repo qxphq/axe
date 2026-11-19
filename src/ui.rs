@@ -2505,8 +2505,15 @@ pub(crate) fn split(text: &str) -> Vec<&str> {
 /// printed — there is no prompt to close, and a read that finds the end must
 /// not leave a row open.
 pub fn cooked_line() -> Option<String> {
+    line_from(&mut io::stdin().lock())
+}
+
+/// One line from `input`, without its line ending; `None` at the end. Taken
+/// apart from stdin so a test never reads the terminal it runs in: an agent's
+/// shell keeps stdin open, and a test that waits for its end waits forever.
+fn line_from(input: &mut impl io::BufRead) -> Option<String> {
     let mut line = String::new();
-    if io::BufRead::read_line(&mut io::stdin().lock(), &mut line).ok()? == 0 {
+    if input.read_line(&mut line).ok()? == 0 {
         return None;
     }
     Some(line.trim_end_matches(['\n', '\r']).to_string())
@@ -4498,8 +4505,13 @@ mod tests {
 
     #[test]
     fn a_read_that_finds_the_end_is_no_line_and_prints_nothing() {
-        // The test binary's stdin is at its end, so the line is over.
-        assert!(cooked_line().is_none());
+        // A reader of its own, never the process's stdin: an agent's shell
+        // keeps that open, and the read would wait for an end that never comes.
+        assert!(line_from(&mut io::empty()).is_none());
+        let mut input: &[u8] = b"one\r\ntwo";
+        assert_eq!(line_from(&mut input).as_deref(), Some("one"));
+        assert_eq!(line_from(&mut input).as_deref(), Some("two"));
+        assert!(line_from(&mut input).is_none());
     }
 
     #[test]

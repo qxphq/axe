@@ -9,7 +9,8 @@ is waste; README "REPL" (turns in the background, the frame and status); then
 `src/ui.rs` (`draw`, `paint_above`, `settle`, `wrap`, `Screen::write`,
 `repaint`, `invalidate`), `src/repl.rs` (the input thread, `readline`, `pump`,
 the 100 ms/50 ms waits), `src/markdown.rs` (`Stream`, block layout), `src/main.rs`
-(the event loop, `replay`, `compact`, `compaction_prompt`, `history_bytes`),
+(the event loop, `replay`, `compact`), `src/summary.rs` (`compaction_prompt`),
+`src/store.rs` (`history_bytes`),
 `src/sessions.rs` (`list`, `load_messages`, `search`, `archive_old`),
 `src/startup.rs` (config, models, skills, MCP, splash), and `src/http.rs`.
 

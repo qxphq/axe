@@ -10,7 +10,8 @@ servers", "REPL"; then `src/prompt.rs`, `src/tools.rs` (`BEHAVIOR`, `SPECS`,
 `definitions`, the truncation constants), `src/skills.rs` (catalogue and caps),
 `src/api.rs` (`chat`, `stream_chat`, `Usage`), `src/turn.rs`
 (`assistant_message`, usage recording), `src/main.rs` (`compact`,
-`compaction_prompt`, `naming_excerpt`, `history_bytes`, `fill`), `src/store.rs`,
+`over_threshold`, `count`, `fill`), `src/summary.rs` (`compaction_prompt`,
+`tail_start`, `naming_excerpt`), `src/store.rs` (`history_bytes`),
 and `src/mcp.rs` (`definitions`, schema caps).
 
 Then mine the two references for behavior, not code:
@@ -41,8 +42,9 @@ Verify with depth — measure the bytes and tokens, do not only read:
   `used` is reset when compaction or `/new` shrinks the history. Compare
   `history_bytes` with the actual serialized request: JSON overhead, tool
   results, code, and non-Latin text.
-- Compaction: `/compact` is manual; there is no trigger before the provider
-  rejects an oversized request. The request is half the window in characters,
+- Compaction: `/compact` by hand, and automatically when the request (the line
+  about to be sent included) comes within `COMPACT_RESERVE` of the window,
+  keeping a `COMPACT_KEEP` tail verbatim. The request is half the window in characters,
   capped at 200 000, drops the oldest lines, and cuts each message head/tail.
   Check the summary request's own cost and output ceiling, whether a second
   compaction summarizes a summary, whether file paths and decisions survive,
@@ -56,8 +58,10 @@ Verify with depth — measure the bytes and tokens, do not only read:
   is head-and-tail with a marker, whether the marker says how much was cut, and
   whether one read-heavy turn can be quantified. Say whether a smaller default
   window is justified and which check would regress.
-- Output tokens: no `max_tokens` on regular requests, no round limit, no
-  recovery for tool-call arguments cut by a length stop. Check `finish_reason`
+- Output tokens: `max_tokens` (`config::MAX_TOKENS` unless the provider entry
+  says otherwise) on a turn's requests and none on the summary and naming
+  ones; no round limit, by decision; a round cut by a length stop runs none of
+  its calls and answers each. Check `finish_reason`
   reporting and what a runaway answer costs. Decide whether an output ceiling
   or a step limit is a token fix or a product decision.
 - History growth: every tool result stays in the body and every request; stale

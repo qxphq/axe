@@ -49,8 +49,8 @@ Verify with depth — follow the secret and the untrusted text:
   not values), a non-interactive or piped start, a project file above cwd, and
   a project entry that only toggles a global one. Check the trust record's
   permissions and whether `/mcp forget` clears it.
-- Modes: explore removes `write`/`edit` from the array and refuses them if
-  called anyway; normal refuses `fetch`/`web_search`; `/new` resets explore on;
+- Modes: the tool array is the same in both modes; explore refuses
+  `write`/`edit` in `execute`; normal refuses `fetch`/`web_search`; `/new` resets explore on;
   the mode note says what is true. Check that the note, the tool array and
   `execute` agree after a flip, a resume, and a model switch.
 - Terminal safety: source labels, project paths, model names, tool arguments,

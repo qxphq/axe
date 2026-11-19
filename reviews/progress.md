@@ -37,7 +37,7 @@ box.
 
 ## Quality and delivery
 
-- [ ] [LLM ergonomics and documentation freshness](llm-ergonomics.md)
+- [x] [LLM ergonomics and documentation freshness](llm-ergonomics.md)
 - [ ] [Test coverage and test quality](test-coverage.md)
 - [ ] [Deslopification](deslopification.md)
 - [ ] [Release and packaging](release-and-packaging.md)

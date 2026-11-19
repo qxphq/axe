@@ -9,7 +9,7 @@ sessions; README "State and sessions" (both tables and the paragraphs on
 archiving, search and defaults), "Config", "Run". Then `src/state.rs` in full,
 `src/sessions.rs` in full, `src/store.rs` (`fresh`, `resumed`, `record`,
 `finalize`, `compacted`), `main.rs` (`resume`, `replay`, `new_session`,
-`start_naming`, `poll_naming`, `name_session`, `sessions`), and `startup.rs`
+`start_naming`, `poll_naming`, `sessions`; a piped run names nothing), and `startup.rs`
 (`run`, the default-model resolution).
 
 Verify with depth — exercise the paths on paper with real inputs:

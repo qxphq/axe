@@ -38,8 +38,9 @@ Verify with depth — call each tool with the hard arguments:
   `count` bounds, refusal outside explore mode, and the source label. Check a
   missing required argument, an unknown extra key, a wrong type (string for an
   integer), and invalid JSON.
-- Mode gating: explore removes `write`/`edit` from the array and refuses them
-  in `execute`; normal refuses the web tools. Check an MCP tool is not gated
+- Mode gating: the tool array is the same in both modes (invariant 6: it is
+  the cached prefix); explore refuses `write`/`edit` in `execute`, and normal
+  refuses the web tools. Check an MCP tool is not gated
   by accident, and that a mode flip does not leave a stale array.
 - Errors as results: unknown tool, malformed arguments, missing argument,
   tool panic, a sandbox denial, a provider-independent failure. Check the
