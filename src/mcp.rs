@@ -1569,29 +1569,7 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
         ));
     }
 
-    // Each server is a process and a handshake of its own, and one that is
-    // slow must not hold the others back: the fan-out runs in parallel and the
-    // notices are pushed afterwards in entry order.
-    let opened: Vec<Option<Result<Server, String>>> = thread::scope(|scope| {
-        let handles: Vec<_> = entries
-            .iter()
-            .map(|entry| {
-                entry
-                    .enabled
-                    .then(|| scope.spawn(move || Server::open(entry, explore)))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle.map(|handle| {
-                    handle
-                        .join()
-                        .unwrap_or_else(|_| Err("the server thread panicked".into()))
-                })
-            })
-            .collect()
-    });
+    let opened = open_all(&entries, explore);
     let mut running = Vec::with_capacity(entries.len());
     let mut failures = Vec::with_capacity(entries.len());
     for (entry, opened) in entries.iter().zip(opened) {
@@ -1724,6 +1702,48 @@ pub fn call(name: &str, args: &Value, cancel: &Cancel) -> String {
     server.call(&original, args, cancel)
 }
 
+/// Whether any server is configured: a mode flip then has servers to restart.
+pub fn configured() -> bool {
+    !lock().entries.is_empty()
+}
+
+/// Open every enabled entry, `None` for a disabled one. Each server is a
+/// process and a handshake of its own, and one that is slow must not hold the
+/// others back: the fan-out runs in parallel and the results come back in
+/// entry order, so the notices do too.
+fn open_all(entries: &[Entry], explore: bool) -> Vec<Option<Result<Server, String>>> {
+    thread::scope(|scope| {
+        let handles: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .enabled
+                    .then(|| scope.spawn(move || Server::open(entry, explore)))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("the server thread panicked".into()))
+                })
+            })
+            .collect()
+    })
+}
+
+/// Stop every running server at once: each may take its two-second grace, and
+/// in turn they would add up.
+fn stop_all(running: &mut [Option<Server>]) {
+    thread::scope(|scope| {
+        for server in running.iter_mut().flatten() {
+            scope.spawn(move || server.stop());
+        }
+    });
+}
+
 /// A mode flip moves the confinement, and a running process cannot be narrowed
 /// or widened: every server is restarted under the new rules. The tool names
 /// stay what they were; a server that fails now only answers with errors.
@@ -1747,16 +1767,14 @@ pub fn restart(explore: bool) -> Vec<String> {
             );
         }
     }
-    for server in reg.running.iter_mut().flatten() {
-        server.stop();
-    }
+    stop_all(&mut reg.running);
     let mut notices = Vec::new();
     let entries = reg.entries.clone();
-    for (at, entry) in entries.iter().enumerate() {
-        if !entry.enabled {
+    for (at, (entry, opened)) in entries.iter().zip(open_all(&entries, explore)).enumerate() {
+        let Some(opened) = opened else {
             continue;
-        }
-        match Server::open(entry, explore) {
+        };
+        match opened {
             Ok(mut server) => {
                 let listed = std::mem::take(&mut server.listed);
                 for item in listed {
@@ -1796,9 +1814,7 @@ pub fn restart(explore: bool) -> Vec<String> {
 /// left behind — a failed cleanup must not be the way a server survives.
 pub fn shutdown() {
     let mut reg = lock();
-    for server in reg.running.iter_mut().flatten() {
-        server.stop();
-    }
+    stop_all(&mut reg.running);
 }
 
 // ---- `/mcp` -----------------------------------------------------------------
@@ -2848,6 +2864,41 @@ done
         flag.join().unwrap();
         assert!(result.contains("interrupted"), "{result}");
         assert_eq!(server.call("slow", &json!({}), &Cancel::new()), "late");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A restart opens its servers at once, like the start: three that each
+    /// take a second to answer take about a second, not three, and come back
+    /// in entry order with a disabled one left out.
+    #[test]
+    fn servers_open_in_parallel_and_in_order() {
+        let dir = state::testenv::dir("mcp-parallel");
+        let fast = stdio_fixture(&dir);
+        let slow = dir.join("slow.sh");
+        fs::write(&slow, format!("sleep 1\n. {}\n", fast[0])).unwrap();
+        let mut entries: Vec<Entry> = (0..3)
+            .map(|at| {
+                let mut e = entry(&format!("s{at}"), "/bin/sh");
+                e.args = vec![slow.display().to_string()];
+                e
+            })
+            .collect();
+        entries[1].enabled = false;
+        let started = Instant::now();
+        let mut opened = open_all(&entries, false);
+        assert!(
+            started.elapsed() < Duration::from_millis(1900),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(matches!(opened[0], Some(Ok(_))));
+        assert!(opened[1].is_none(), "a disabled entry is not opened");
+        assert!(matches!(opened[2], Some(Ok(_))));
+        let mut running: Vec<Option<Server>> = opened
+            .drain(..)
+            .map(|server| server.and_then(Result::ok))
+            .collect();
+        stop_all(&mut running);
         let _ = fs::remove_dir_all(&dir);
     }
 

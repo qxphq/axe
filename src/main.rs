@@ -731,10 +731,12 @@ impl Session {
                     }
                     let cancel = http::Cancel::new();
                     self.record(json!({ "role": "user", "content": input }));
+                    // No naming request: a piped run is over when its answer
+                    // is, and the session takes its first request as its title
+                    // when it is finalized.
                     if let Err(e) = self.turn(&mut sink, &cancel) {
                         eprintln!("axe: {}", strip_control(&e));
                     }
-                    self.name_session();
                 }
                 Cmd::Shell(command) => {
                     // The user's own shell, and the same line and glyph the
@@ -1069,8 +1071,8 @@ impl Session {
     }
 
     /// Start the title request off the UI thread. The prompt stays live; the
-    /// result is applied at the next idle poll. Piped runs keep the synchronous
-    /// `name_session` because they have no UI to block.
+    /// result is applied at the next idle poll. Piped runs never name: they
+    /// would wait on a second request after their answer.
     fn start_naming(&mut self) {
         if !self.may_name() {
             return;
@@ -1119,36 +1121,6 @@ impl Session {
             }
             Ok(None) | Err(mpsc::TryRecvError::Disconnected) => self.naming = None,
             Err(mpsc::TryRecvError::Empty) => {}
-        }
-    }
-
-    fn name_session(&mut self) {
-        if !self.may_name() {
-            return;
-        }
-        let Some((user, assistant)) = summary::naming_excerpt(&self.messages) else {
-            return;
-        };
-        if let Some(store) = self.store.as_mut() {
-            store.naming_tried = true;
-        }
-        let model = self.model.clone();
-        let provider = &self.providers[self.provider];
-        let named = title_request(
-            provider,
-            &model,
-            self.thinking.as_deref(),
-            &user,
-            &assistant,
-        )
-        .as_deref()
-        .and_then(summary::parse_naming);
-        let (title, summary) = named.unwrap_or_else(|| sessions::fallback(&self.messages));
-        if title.is_empty() {
-            return;
-        }
-        if let Some(store) = self.store.as_mut() {
-            store.set_title(&title, &summary);
         }
     }
 
@@ -1411,7 +1383,17 @@ impl Session {
         ));
         // A running server cannot be narrowed or widened, so flipping the mode
         // restarts them under the new rules. The tool names stay what they are.
-        for line in mcp::restart(self.mode.explore()) {
+        // The row says so while it runs: a handshake can take seconds.
+        let restarting = mcp::configured();
+        if let (true, Some(screen)) = (restarting, console.screen()) {
+            screen.set_status("▣ Restarting MCP servers");
+            screen.repaint();
+        }
+        let notices = mcp::restart(self.mode.explore());
+        if let (true, Some(screen)) = (restarting, console.screen()) {
+            screen.set_status("");
+        }
+        for line in notices {
             console.output(&format!("{line}\n"));
         }
     }
@@ -3879,28 +3861,6 @@ mod tests {
         session.naming = Some(rx);
         session.poll_naming(None);
         assert!(session.naming.is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_named_session_is_named_once_and_synchronously() {
-        let server = Server::new(vec![sse(&[
-            r#"{"choices":[{"delta":{"content":"TITLE: Made by hand\n"}}]}"#,
-            "[DONE]",
-        ])]);
-        let dir = crate::state::testenv::dir("main-name-session");
-        let mut session = session_at(&server);
-        session.store = Some(Store::fresh(dir.clone(), "abc123"));
-        session.record(json!({ "role": "user", "content": "a request" }));
-        session.record(json!({ "role": "assistant", "content": "an answer" }));
-        session.name_session();
-        let meta = session.store.as_ref().unwrap().meta.as_ref().unwrap();
-        assert_eq!(meta.title, "Made by hand");
-        assert!(!session.may_name(), "named once is named");
-        // A session with no store cannot be named at all.
-        let mut bare = bare_session();
-        bare.name_session();
-        assert!(bare.store.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

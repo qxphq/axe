@@ -283,3 +283,79 @@ fn version_and_help_answer_before_the_config_or_the_network() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A piped run is over when its answer is: no second request names the
+/// session, and the sidecar takes the first request as its title.
+#[test]
+fn a_piped_run_asks_once_and_takes_its_first_request_as_the_title() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let dir = scratch("naming");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("loopback addr").port();
+    let chats = Arc::new(AtomicUsize::new(0));
+    let counted = chats.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let (head, _) = read_request(&mut stream);
+            if head.starts_with("GET /v1/models") {
+                answer(
+                    &mut stream,
+                    "{\"data\":[{\"id\":\"m\",\"context_length\":200000}]}",
+                    "application/json",
+                );
+            } else {
+                counted.fetch_add(1, Ordering::SeqCst);
+                answer(
+                    &mut stream,
+                    &sse("{\"content\":\"done\"}", "null"),
+                    "text/event-stream",
+                );
+            }
+        }
+    });
+    let config = dir.join("config/axe");
+    std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::write(
+        config.join("config.json"),
+        format!("{{\"providers\":{{\"m\":{{\"base_url\":\"http://127.0.0.1:{port}/v1\"}}}},\"model\":\"m/m\"}}"),
+    )
+    .expect("config");
+    let out = run(
+        &dir,
+        &[],
+        Some("tidy the notes\n"),
+        &[
+            ("HOME", dir.clone()),
+            ("XDG_CONFIG_HOME", dir.join("config")),
+            ("XDG_STATE_HOME", dir.join("state")),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        chats.load(Ordering::SeqCst),
+        1,
+        "only the turn's own request"
+    );
+
+    let projects = dir.join("state/axe/projects");
+    let project = std::fs::read_dir(&projects)
+        .expect("projects")
+        .next()
+        .expect("one")
+        .expect("entry");
+    let sidecar = std::fs::read_dir(project.path().join("sessions"))
+        .expect("sessions")
+        .flatten()
+        .find(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .expect("a sidecar");
+    let meta = std::fs::read_to_string(sidecar.path()).expect("sidecar");
+    assert!(meta.contains("\"title\": \"tidy the notes\""), "{meta}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

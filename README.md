@@ -484,7 +484,8 @@ resumed there. Listing and search read the sidecar, which stays plain, so an
 archived body still answers from its title and summary. The system prompt and
 mode notes are not logged; resume rebuilds them from the current instructions
 and mode. Titles and summaries are generated after the first answer, and fall
-back to the first request if that fails. A session body belongs to one running
+back to the first request if that fails; a piped run asks for none and takes
+its first request, so it ends when its answer does. A session body belongs to one running
 axe: two instances in one directory share the selection last-write-wins, and an
 archive pass skips a body another instance has touched since it was listed.
 
