@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::http::{self, Cancel, Endpoint, Response};
+use crate::text::short;
 
 /// The most parallel tool calls one round may name. A provider's `index` sizes
 /// an array here, and it is the provider's number: past this the call is
@@ -104,7 +105,7 @@ pub fn list_models(
     )?;
     let body = res.read_all().map_err(|e| format!("read models: {e}"))?;
     if res.status != 200 {
-        return Err(format!("models: HTTP {}: {}", res.status, body.trim()));
+        return Err(format!("models: HTTP {}: {}", res.status, short(&body)));
     }
     parse_models(&body)
 }
@@ -149,11 +150,15 @@ pub fn chat(
         "model": model,
         "messages": messages,
         "stream": true,
-        "tools": tools,
         // Ask for the final chunk's token counts. Servers that do not know the
         // field ignore it, and then no `usage` arrives at all.
         "stream_options": { "include_usage": true },
     });
+    // A request with no tools leaves the field out: OpenAI refuses an empty
+    // array, and an absent one means the same thing to every provider.
+    if tools.as_array().is_none_or(|tools| !tools.is_empty()) {
+        body["tools"] = tools.clone();
+    }
     if let (Some(Value::Object(extra)), Some(obj)) = (extra, body.as_object_mut()) {
         for (k, v) in extra {
             obj.insert(k.clone(), v.clone());
@@ -187,7 +192,7 @@ pub fn stream_chat<F: FnMut(&str), G: FnMut(&str)>(
     let mut res = chat(ep, api_key, headers, model, messages, tools, extra, cancel)?;
     if res.status != 200 {
         let body = res.read_all().unwrap_or_default();
-        return Err(format!("HTTP {}: {}", res.status, body.trim()));
+        return Err(format!("HTTP {}: {}", res.status, short(&body)));
     }
 
     let mut assembler = Assembler::default();
@@ -599,6 +604,29 @@ mod tests {
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(body["messages"][0]["content"], "hi");
         assert!(sent.starts_with("POST /chat/completions "), "{sent:?}");
+        assert!(body.get("tools").is_none(), "an empty array is left out");
+    }
+
+    #[test]
+    fn a_chat_request_carries_the_tools_it_has() {
+        let server =
+            crate::http::support::Server::new(vec![crate::http::support::sse(&["[DONE]"])]);
+        let tools = serde_json::json!([{ "type": "function", "function": { "name": "read" } }]);
+        chat(
+            &server.ep,
+            None,
+            &[],
+            "m",
+            &[],
+            &tools,
+            None,
+            &Cancel::new(),
+        )
+        .unwrap();
+        let sent = server.text();
+        let body: Value =
+            serde_json::from_str(sent.split("\r\n\r\n").nth(1).unwrap_or_default()).unwrap();
+        assert_eq!(body["tools"], tools);
     }
 
     #[test]
@@ -731,5 +759,31 @@ mod tests {
         .unwrap();
         assert!(err.contains("HTTP 403"), "{err}");
         assert!(err.contains("no go"), "{err}");
+    }
+
+    #[test]
+    fn a_refused_chat_cuts_a_long_error_page() {
+        let page = format!("<html>{}</html>", "x".repeat(5_000));
+        let server = crate::http::support::Server::new(vec![crate::http::support::reply(
+            "502 Bad Gateway",
+            &[],
+            &page,
+        )]);
+        let err = stream_chat(
+            &server.ep,
+            None,
+            &[],
+            "m",
+            &[],
+            &serde_json::json!([]),
+            None,
+            &Cancel::new(),
+            |_| {},
+            |_| {},
+        )
+        .err()
+        .unwrap();
+        assert!(err.starts_with("HTTP 502: <html>"), "{err}");
+        assert!(err.chars().count() < 450, "{}", err.len());
     }
 }

@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use crate::http::{self, Cancel};
 use crate::state;
-use crate::text::{strip_control, truncate};
+use crate::text::{cut, short, strip_control, truncate};
 
 /// The revision axe speaks.
 const PROTOCOL: &str = "2025-06-18";
@@ -2302,22 +2302,6 @@ fn cap_reason() -> String {
         "the reply was over the {} MiB line cap; restart axe to reload the server",
         LINE_CAP >> 20
     )
-}
-
-/// Char-safe cut, marked at the end: a description or a stderr tail longer
-/// than the cap must not split a character.
-fn cut(text: &str, max: usize) -> String {
-    let count = text.chars().count();
-    if count <= max {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max.saturating_sub(12)).collect();
-    out.push_str(" …[truncated]");
-    out
-}
-
-fn short(text: &str) -> String {
-    cut(text.trim(), 400)
 }
 
 fn plural(n: usize) -> &'static str {

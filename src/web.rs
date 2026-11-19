@@ -43,9 +43,9 @@ pub fn fetch(args: &Value, cancel: &Cancel) -> String {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return format!("error: fetch: url must start with http:// or https://: {url}");
     }
-    // `split_url` reads the authority up to the last ':', which cannot express a
-    // bracketed literal, and the v6 ranges this tool would not cover are worse
-    // than an honest refusal.
+    // The host guard's ranges are written for v4 and the common v6 ones; a
+    // literal reaching the v6 ranges it would not cover is worse than an
+    // honest refusal. A provider's base URL may still name one.
     if url
         .split_once("://")
         .is_some_and(|(_, rest)| rest.starts_with('['))

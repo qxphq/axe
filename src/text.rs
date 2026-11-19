@@ -61,6 +61,24 @@ pub fn terminal_text(text: &str) -> String {
 
 /// Keep both ends of an oversized result: the error is at the end and the
 /// command is at the start, and the model can tell what was cut.
+/// Char-safe cut, marked at the end: a description or a stderr tail longer
+/// than the cap must not split a character.
+pub fn cut(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(12)).collect();
+    out.push_str(" …[truncated]");
+    out
+}
+
+/// A server's error body as one error line's worth: an HTML error page or a
+/// megabyte of JSON is the server's, not something to scroll past.
+pub fn short(text: &str) -> String {
+    cut(text.trim(), 400)
+}
+
 pub fn truncate(text: String, max: usize) -> String {
     let total = text.chars().count();
     if total <= max {

@@ -140,12 +140,27 @@ pub fn split_url(url: &str) -> Result<(Endpoint, String), String> {
         Scheme::Http => 80,
         Scheme::Https => 443,
     };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (
-            h.to_string(),
-            p.parse::<u16>().map_err(|_| format!("bad port in {url}"))?,
-        ),
-        None => (authority.to_string(), default_port),
+    // The error does not repeat the URL: what it refuses is a secret.
+    if authority.contains('@') {
+        return Err("credentials in a URL are refused; a provider key goes in api_key_env".into());
+    }
+    let port_of = |p: &str| p.parse::<u16>().map_err(|_| format!("bad port in {url}"));
+    // A bracketed IPv6 literal holds colons of its own; the host is kept
+    // without the brackets, which is what resolution and SNI take.
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("bad IPv6 host in {url}"))?;
+        let port = match after {
+            "" => default_port,
+            after => port_of(after.strip_prefix(':').unwrap_or(after))?,
+        };
+        (host.to_string(), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), port_of(p)?),
+            None => (authority.to_string(), default_port),
+        }
     };
 
     Ok((
@@ -184,10 +199,16 @@ fn host_header(ep: &Endpoint) -> String {
         Scheme::Http => 80,
         Scheme::Https => 443,
     };
-    if ep.port == default {
-        ep.host.clone()
+    // An IPv6 literal goes back in its brackets.
+    let host = if ep.host.contains(':') {
+        format!("[{}]", ep.host)
     } else {
-        format!("{}:{}", ep.host, ep.port)
+        ep.host.clone()
+    };
+    if ep.port == default {
+        host
+    } else {
+        format!("{host}:{}", ep.port)
     }
 }
 
@@ -387,6 +408,8 @@ impl<R: Read> Read for BodyReader<R> {
 
 pub struct Response {
     pub status: u16,
+    /// The socket's read timeout, for the error that says it ran out.
+    read_timeout: Duration,
     pub content_type: Option<String>,
     pub location: Option<String>,
     /// Every response header, names lowercased. Transport details such as
@@ -401,7 +424,8 @@ impl Response {
         self.reader
             .by_ref()
             .take(BODY_MAX)
-            .read_to_string(&mut out)?;
+            .read_to_string(&mut out)
+            .map_err(|e| silent(e, self.read_timeout))?;
         Ok(out)
     }
 
@@ -419,7 +443,10 @@ impl Response {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "body timed out"));
             }
             let room = (limit - out.len() as u64).min(chunk.len() as u64) as usize;
-            let n = self.reader.read(&mut chunk[..room])?;
+            let n = self
+                .reader
+                .read(&mut chunk[..room])
+                .map_err(|e| silent(e, self.read_timeout))?;
             if n == 0 {
                 return Ok((String::from_utf8_lossy(&out).into_owned(), false));
             }
@@ -430,7 +457,12 @@ impl Response {
 
     pub fn read_line(&mut self) -> io::Result<Option<String>> {
         let mut line = String::new();
-        let n = self.reader.by_ref().take(LINE_MAX).read_line(&mut line)?;
+        let n = self
+            .reader
+            .by_ref()
+            .take(LINE_MAX)
+            .read_line(&mut line)
+            .map_err(|e| silent(e, self.read_timeout))?;
         if n == 0 {
             Ok(None)
         } else if !line.ends_with('\n') && n as u64 >= LINE_MAX {
@@ -555,7 +587,7 @@ pub fn request_with_timeout(
 
     let mut reader = BufReader::new(stream);
 
-    let status_line = read_line(&mut reader)?;
+    let status_line = read_line(&mut reader, read_timeout)?;
     let mut parts = status_line.split_whitespace();
     let _version = parts.next();
     let status = parts
@@ -570,7 +602,7 @@ pub fn request_with_timeout(
     let mut headers_out: Vec<(String, String)> = Vec::new();
     let mut head_bytes = 0u64;
     loop {
-        let line = read_line(&mut reader)?;
+        let line = read_line(&mut reader, read_timeout)?;
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
@@ -613,6 +645,7 @@ pub fn request_with_timeout(
 
     Ok(Response {
         status,
+        read_timeout,
         content_type,
         location,
         headers: headers_out,
@@ -625,13 +658,26 @@ pub fn request_with_timeout(
 
 // ---- lines ----
 
-fn read_line<R: BufRead>(reader: &mut R) -> Result<String, String> {
+/// A read the socket's timeout ended, said as what happened: the platform's
+/// words for it are "Resource temporarily unavailable", which reads like a
+/// local fault. Any other error is left as it is.
+fn silent(e: io::Error, timeout: Duration) -> io::Error {
+    match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("no data from the server for {timeout:?}"),
+        ),
+        _ => e,
+    }
+}
+
+fn read_line<R: BufRead>(reader: &mut R, timeout: Duration) -> Result<String, String> {
     let mut line = String::new();
     let n = reader
         .by_ref()
         .take(LINE_MAX)
         .read_line(&mut line)
-        .map_err(|e| format!("read: {e}"))?;
+        .map_err(|e| format!("read: {}", silent(e, timeout)))?;
     if n == 0 {
         return Err("connection closed before response".into());
     }
@@ -869,6 +915,28 @@ mod tests {
         assert!(split_url("ftp://host").is_err());
         assert!(split_url("http://").is_err());
         assert!(split_url("http://host:bad/").is_err());
+        assert!(split_url("http://[::1/").is_err());
+        assert!(split_url("http://[::1]x/").is_err());
+        // Credentials are refused without the error repeating them.
+        let err = split_url("https://user:secret@host/v1").err().unwrap();
+        assert!(
+            err.contains("api_key_env") && !err.contains("secret"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_host_keeps_its_colons_and_its_brackets_in_host() {
+        let (ep, target) = split_url("http://[::1]:8000/v1").unwrap();
+        assert_eq!(
+            (ep.host.as_str(), ep.port, ep.prefix.as_str()),
+            ("::1", 8000, "/v1")
+        );
+        assert_eq!(target, "/v1");
+        assert_eq!(host_header(&ep), "[::1]:8000");
+        let ep = parse_url("https://[2001:db8::1]/v1").unwrap();
+        assert_eq!((ep.host.as_str(), ep.port), ("2001:db8::1", 443));
+        assert_eq!(host_header(&ep), "[2001:db8::1]");
     }
 
     #[test]
@@ -922,8 +990,11 @@ mod tests {
     #[test]
     fn header_line_reader_reports_eof() {
         let mut reader = &b"a: b\r\n"[..];
-        assert_eq!(read_line(&mut reader).unwrap(), "a: b\r\n");
-        assert!(read_line(&mut reader).is_err());
+        assert_eq!(
+            read_line(&mut reader, Duration::from_secs(1)).unwrap(),
+            "a: b\r\n"
+        );
+        assert!(read_line(&mut reader, Duration::from_secs(1)).is_err());
     }
 
     #[test]
@@ -1127,7 +1198,7 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(err.starts_with("read:"), "{err}");
+        assert_eq!(err, "read: no data from the server for 100ms");
     }
 
     #[test]
