@@ -20,6 +20,13 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --release --locked
+      # The Linux release is a static musl build: checked here, so a change
+      # that breaks it fails the push rather than the release.
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked --target x86_64-unknown-linux-musl
 
   # NixOS installs the flake, not the tarball, so the flake is evaluated on
   # every change: a renamed input, a stale cargoLock or a nixpkgs platform
@@ -37,7 +44,9 @@ jobs:
 
   # A rolling release of main: install.sh downloads from it, nothing is tagged.
   release:
-    needs: [test, flake]
+    # The interactive journeys gate it too: a regression in the screen or the
+    # confinement must not replace the binaries install.sh serves.
+    needs: [test, flake, interactive]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.os }}
     permissions:
@@ -50,10 +59,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Static musl: a glibc build from these runners needs the runner's
+          # own glibc (2.39), which most servers do not have.
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
           # Cross-compiled: GitHub retired the Intel macOS runner.
@@ -64,6 +75,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # ring compiles C, and a musl target needs musl's compiler for it.
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - run: strip target/${{ matrix.target }}/release/axe || true
       - name: Package
@@ -86,6 +100,12 @@ jobs:
               --notes "Rolling build of $GITHUB_SHA: a push to main, not a tag. The version is Cargo.toml's." ||
             gh release view latest >/dev/null
           gh release upload latest axe-*.tar.gz axe-*.tar.gz.sha256 --clobber
+          # The tag and the notes say which commit the assets are: both move
+          # with every push, or the page names the first build forever. The
+          # four jobs write the same commit, so the race is harmless.
+          git push -f origin "$GITHUB_SHA:refs/tags/latest"
+          gh release edit latest \
+            --notes "Rolling build of $GITHUB_SHA: a push to main, not a tag. The version is Cargo.toml's."
 
   interactive:
     runs-on: ubuntu-latest

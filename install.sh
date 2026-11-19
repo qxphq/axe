@@ -19,8 +19,8 @@ case ${HOME:-} in
 esac
 
 # NixOS: the package manager is the install that belongs there. The flake
-# builds from source and wraps the tools axe shells out to, while the glibc
-# release binary expects a loader layout this system does not keep.
+# builds from source and wraps the tools axe shells out to, which a NixOS
+# PATH does not otherwise promise.
 if [ -e /etc/NIXOS ]; then
 	command -v nix >/dev/null 2>&1 ||
 		die "NixOS without nix; install with: nix profile add --no-write-lock-file github:$repo#default"
@@ -35,7 +35,7 @@ arch=$(uname -m)
 
 case $os in
 Darwin) os=apple-darwin ;;
-Linux) os=unknown-linux-gnu ;;
+Linux) os=unknown-linux-musl ;;
 *) die "unsupported system: $os (Linux and macOS only)" ;;
 esac
 
@@ -45,15 +45,19 @@ arm64 | aarch64) arch=aarch64 ;;
 *) die "unsupported machine: $arch (x86_64 and aarch64 only)" ;;
 esac
 
-# The release binaries are glibc; a musl system would install a file that
-# cannot start.
-if [ "$os" = unknown-linux-gnu ] && ldd --version 2>&1 | grep -qi musl; then
-	die "musl libc: no matching release binary; build from source with
-  cargo install --git https://github.com/$repo --locked"
-fi
-
 triple=$arch-$os
 tar=axe-$triple.tar.gz
+
+# Each tool named up front: a missing one would otherwise read as a failed
+# download or, worse, a checksum mismatch.
+command -v curl >/dev/null 2>&1 || die "curl is required"
+if command -v sha256sum >/dev/null 2>&1; then
+	sum="sha256sum -c"
+elif command -v shasum >/dev/null 2>&1; then
+	sum="shasum -a 256 -c"
+else
+	die "sha256sum or shasum is required to check the download"
+fi
 
 tmp=$(mktemp -d) || die "mktemp failed"
 trap 'rm -rf "$tmp"' EXIT
@@ -63,28 +67,19 @@ curl -fsSL -o "$tmp/$tar" "$base/$tar" || die "download failed: $base/$tar"
 curl -fsSL -o "$tmp/$tar.sha256" "$base/$tar.sha256" ||
 	die "download failed: $base/$tar.sha256"
 
-(
-	cd "$tmp" || exit 1
-	if command -v sha256sum >/dev/null 2>&1; then
-		sha256sum -c "$tar.sha256"
-	else
-		shasum -a 256 -c "$tar.sha256"
-	fi
-) >/dev/null 2>&1 || die "checksum mismatch for $tar"
+(cd "$tmp" && $sum "$tar.sha256") >/dev/null 2>&1 || die "checksum mismatch for $tar"
 
 tar -xzf "$tmp/$tar" -C "$tmp" axe || die "extract failed: $tar"
 
-mkdir -p "$dir" || die "cannot create $dir"
-install -m 755 "$tmp/axe" "$dir/axe" || die "cannot install to $dir"
-
-# The musl guard reads `ldd`, which a host can also have and not answer, so the
-# binary is the authority: one that does not start here is removed rather than
-# left where the next `axe` would find it.
-version=$("$dir/axe" --version) || {
-	rm -f "$dir/axe"
+# The binary is the authority on whether it runs here, and it is asked before
+# it replaces anything: a failure leaves an existing install as it was.
+chmod 755 "$tmp/axe"
+version=$("$tmp/axe" --version) ||
 	die "the binary does not run on this system ($(uname -s)/$(uname -m)); build from source with
   cargo install --git https://github.com/$repo --locked"
-}
+
+mkdir -p "$dir" || die "cannot create $dir"
+install -m 755 "$tmp/axe" "$dir/axe" || die "cannot install to $dir"
 printf 'installed %s (%s)\n' "$dir/axe" "$version"
 
 case ":$PATH:" in

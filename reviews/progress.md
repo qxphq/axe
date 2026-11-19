@@ -41,4 +41,4 @@ box.
 - [x] [Test coverage and test quality](test-coverage.md)
 - [x] [Deslopification](deslopification.md)
 - [x] [Performance and snappiness](performance-and-snappiness.md)
-- [ ] [Release and packaging](release-and-packaging.md)
+- [x] [Release and packaging](release-and-packaging.md)
