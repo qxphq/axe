@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 
 use crate::http::{self, Cancel};
 use crate::state;
-use crate::text::{cut, short, strip_control, truncate};
+use crate::text::{cut, plural, short, strip_control, truncate};
 
 /// The revision axe speaks.
 const PROTOCOL: &str = "2025-06-18";
@@ -881,13 +881,15 @@ impl StdioConn {
             return Err(self.gone());
         }
         let (tx, rx) = mpsc::channel();
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.insert(id, tx);
-        }
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, tx);
         if let Err(e) = self.write(message) {
-            if let Ok(mut map) = self.pending.lock() {
-                map.remove(&id);
-            }
+            self.pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id);
             return Err(e);
         }
         let start = Instant::now();
@@ -907,9 +909,10 @@ impl StdioConn {
                 }
             }
         };
-        if let Ok(mut map) = self.pending.lock() {
-            map.remove(&id);
-        }
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
         let Some(reply) = reply else {
             if cancelled || cancel.cancelled() {
                 let _ = self.notify(&json!({
@@ -947,11 +950,10 @@ impl StdioConn {
 
     /// What to say when the server is gone: its own last words, if it had any.
     fn exited(&self) -> String {
-        let tail = self
-            .stderr
-            .lock()
-            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
-            .unwrap_or_default();
+        let tail =
+            String::from_utf8_lossy(&self.stderr.lock().unwrap_or_else(PoisonError::into_inner))
+                .trim()
+                .to_string();
         let mut out = "the server exited".to_string();
         if !tail.is_empty() {
             out.push_str(": ");
@@ -975,13 +977,7 @@ impl StdioConn {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg("--")
-            .arg(format!("-{}", self.pid))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        crate::sandbox::kill_group("-KILL", self.pid);
         let _ = self.child.wait();
     }
 }
@@ -1210,18 +1206,22 @@ fn read_replies(
         let Some(id) = message["id"].as_u64() else {
             continue;
         };
-        if let Ok(mut map) = pending.lock() {
-            if let Some(tx) = map.remove(&id) {
-                let _ = tx.send(message);
-            }
+        if let Some(tx) = pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id)
+        {
+            let _ = tx.send(message);
         }
     }
     dead.store(true, Ordering::SeqCst);
     // Nothing will answer these now.
-    if let Ok(mut map) = pending.lock() {
-        for (_, tx) in map.drain() {
-            let _ = tx.send(Value::Null);
-        }
+    for (_, tx) in pending
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .drain()
+    {
+        let _ = tx.send(Value::Null);
     }
 }
 
@@ -1233,12 +1233,11 @@ fn read_stderr(pipe: impl Read, tail: Arc<Mutex<Vec<u8>>>) {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(read) => {
-                if let Ok(mut tail) = tail.lock() {
-                    tail.extend_from_slice(&buf[..read]);
-                    if tail.len() > STDERR_CAP {
-                        let cut = tail.len() - STDERR_CAP;
-                        tail.drain(..cut);
-                    }
+                let mut tail = tail.lock().unwrap_or_else(PoisonError::into_inner);
+                tail.extend_from_slice(&buf[..read]);
+                if tail.len() > STDERR_CAP {
+                    let cut = tail.len() - STDERR_CAP;
+                    tail.drain(..cut);
                 }
             }
         }
@@ -1534,7 +1533,7 @@ fn registry() -> &'static Mutex<Registry> {
 }
 
 fn lock() -> MutexGuard<'static, Registry> {
-    registry().lock().unwrap_or_else(|e| e.into_inner())
+    registry().lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Load both files, ask about a project's if it is new, start the servers, and
@@ -1613,7 +1612,7 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
             }
             Some(Ok(server)) => {
                 notices.push(format!(
-                    "mcp {}: {} {}{}",
+                    "mcp {}: {} tool{}{}",
                     entry.name,
                     server.listed.len(),
                     plural(server.listed.len()),
@@ -1823,7 +1822,7 @@ pub fn restart(explore: bool) -> Vec<String> {
                     });
                 }
                 notices.push(format!(
-                    "mcp {}: {} {}{}",
+                    "mcp {}: {} tool{}{}",
                     entry.name,
                     server.tools.len(),
                     plural(server.tools.len()),
@@ -1911,7 +1910,7 @@ fn listing() -> String {
         let status = match (&reg.running[at], &reg.failures[at], entry.enabled) {
             (_, _, false) => "disabled".to_string(),
             (Some(server), _, _) => {
-                format!("{} {}", server.tools.len(), plural(server.tools.len()))
+                format!("{} tool{}", server.tools.len(), plural(server.tools.len()))
             }
             (None, Some(e), _) => format!("failed: {e}"),
             (None, None, _) => "failed".to_string(),
@@ -1960,7 +1959,7 @@ fn detail(name: &str) -> String {
                 out.push_str(&format!("  {}\n", strip_control(&tool.exposed)));
             }
             out.push_str(&format!(
-                "  {} {}\n",
+                "  {} tool{}\n",
                 server.tools.len(),
                 plural(server.tools.len())
             ));
@@ -2351,14 +2350,6 @@ fn cap_reason() -> String {
         "the reply was over the {} MiB line cap; restart axe to reload the server",
         LINE_CAP >> 20
     )
-}
-
-fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        "tool"
-    } else {
-        "tools"
-    }
 }
 
 #[cfg(test)]

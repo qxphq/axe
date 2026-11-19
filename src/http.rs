@@ -4,7 +4,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
@@ -61,7 +61,11 @@ impl Cancel {
     /// Raise the flag and unblock the request in flight, if there is one.
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::SeqCst);
-        let socket = self.socket.lock().ok().and_then(|mut slot| slot.take());
+        let socket = self
+            .socket
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         if let Some(socket) = socket {
             let _ = socket.shutdown(Shutdown::Both);
         }
@@ -75,9 +79,7 @@ impl Cancel {
         let Ok(clone) = socket.try_clone() else {
             return;
         };
-        let Ok(mut slot) = self.socket.lock() else {
-            return;
-        };
+        let mut slot = self.socket.lock().unwrap_or_else(PoisonError::into_inner);
         if self.cancelled() {
             let _ = clone.shutdown(Shutdown::Both);
         } else {

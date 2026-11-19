@@ -222,6 +222,20 @@ pub fn server(
     imp::server(program, args, env, read_only)
 }
 
+/// Signal the whole process group a child was started in (`confine` makes
+/// one for every child): a pipeline or a server's runtime must not outlive its
+/// leader. `--` is not optional and the error output is dropped: by the time
+/// the group is gone, `kill` reporting that is noise on the user's terminal.
+pub(crate) fn kill_group(signal: &str, pid: i32) {
+    let _ = Command::new("kill")
+        .arg(signal)
+        .arg("--")
+        .arg(format!("-{pid}"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 /// First `name` on PATH, canonicalised, for a caller that must exec it.
 pub(crate) fn resolve_program(name: &str) -> Option<PathBuf> {
     resolve(name)

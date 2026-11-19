@@ -41,7 +41,6 @@ enum Block {
     },
     Paragraph(Vec<Inline>),
     Code {
-        lang: String,
         content: String,
     },
     Blockquote(Vec<Block>),
@@ -736,7 +735,9 @@ fn is_table_delim(line: &str) -> bool {
     s.split('|').all(|cell| is_delim_cell(cell.trim()))
 }
 
-fn fence_open(line: &str) -> Option<(char, usize, String)> {
+/// The fence a line opens: its character and its length. The info string
+/// after it is not shown: the transcript has no highlighter to give it to.
+fn fence_open(line: &str) -> Option<(char, usize)> {
     let t = line.trim();
     let ch = t.chars().next()?;
     if ch != '`' && ch != '~' {
@@ -746,8 +747,7 @@ fn fence_open(line: &str) -> Option<(char, usize, String)> {
     if n < 3 {
         return None;
     }
-    let lang = t.chars().skip(n).collect::<String>().trim().to_string();
-    Some((ch, n, lang))
+    Some((ch, n))
 }
 
 fn fence_closes(line: &str, ch: char, n: usize) -> bool {
@@ -945,7 +945,7 @@ fn parse_blocks(input: &str, depth: usize) -> Vec<Block> {
         }
 
         // Fenced code block
-        if let Some((ch, n, lang)) = fence_open(line) {
+        if let Some((ch, n)) = fence_open(line) {
             let mut code: Vec<&str> = Vec::new();
             i += 1;
             while i < lines.len() {
@@ -957,7 +957,6 @@ fn parse_blocks(input: &str, depth: usize) -> Vec<Block> {
                 i += 1;
             }
             blocks.push(Block::Code {
-                lang,
                 content: code.join("\n"),
             });
             continue;
@@ -1205,8 +1204,7 @@ fn emit(
                 spans.push(Span::styled("─".repeat(n), base.patch(DIM)));
                 out.push(Line::from(spans));
             }
-            Block::Code { lang, content } => {
-                let _ = lang;
+            Block::Code { content } => {
                 // A row too wide for the field takes the rows it needs, gutter
                 // and all, the way a paragraph does: left to the screen, the
                 // continuation would start at the terminal's edge and leave the
@@ -1640,7 +1638,7 @@ impl Stream {
             return;
         }
         self.separate(line, width, out);
-        if let Some((ch, n, _)) = fence_open(line) {
+        if let Some((ch, n)) = fence_open(line) {
             self.fence = Some((ch, n));
         }
         self.lines.push(line.to_string());

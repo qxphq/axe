@@ -1,7 +1,7 @@
 //! The screen: a live frame at the bottom of the terminal, the transcript above
 //! it.
 //!
-//! `ratatui` owns the arithmetic that used to live here: where the cursor goes,
+//! `ratatui` owns the terminal arithmetic: where the cursor goes,
 //! what to repaint after a resize, how to push a line into scrollback without
 //! losing the drawing. This module decides what the two zones are, and one rule
 //! keeps them apart:
@@ -1518,8 +1518,8 @@ impl Screen {
         // left, the info what the session is pointed at on the right. The info
         // takes whatever the status leaves, so a row with room to spare cuts
         // nothing; only a status long enough to fill the row holds the info to
-        // half, because a title long enough to take the row used to squeeze the
-        // status to nothing and a running turn looked idle. An alert is the
+        // half, because a title long enough to take the row would squeeze the
+        // status to nothing and a running turn would look idle. An alert is the
         // exception: it is a question, so it takes the row and the info waits.
         let (status_cols, info_cols) = shared_row(&self.status, &self.info, cols);
         let info = info_line(&self.info, info_cols);

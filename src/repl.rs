@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -222,8 +222,9 @@ pub(crate) fn show_queue(screen: &mut ui::Screen, queue: &[Pending]) {
 pub(crate) fn take_back(queue: &Queue, queued: &[Pending]) -> (Vec<String>, usize) {
     let unsent = queue
         .lock()
-        .map(|mut lines| lines.drain(..).count())
-        .unwrap_or(0);
+        .unwrap_or_else(PoisonError::into_inner)
+        .drain(..)
+        .count();
     let waiting = queued.iter().filter(|entry| entry.turn).count();
     let read = waiting.saturating_sub(unsent);
     let mut kept = Vec::new();
@@ -265,7 +266,7 @@ pub(crate) const IDLE: Duration = Duration::from_millis(100);
 /// typed while it ran — a panic is `None`, and the caller names it.
 ///
 /// `!cmd` and `/compact` wait the same way, which is why this is one function:
-/// the two used to be one loop each, and only one of them took a line.
+/// both keep a line typed while they run.
 pub(crate) fn pump<T>(
     screen: &mut ui::Screen,
     rx: &Receiver<Event>,

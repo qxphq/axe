@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::panic::catch_unwind;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ratatui::text::Line;
 use serde_json::{json, Value};
@@ -180,16 +180,17 @@ impl Sink for PlainSink {
 /// already streaming.
 pub type Queue = Arc<Mutex<VecDeque<String>>>;
 
-/// What a turn's queue holds now, oldest first. Empty without a queue, and
-/// empty rather than a failed turn when the lock is poisoned.
+/// What a turn's queue holds now, oldest first; empty without a queue. A lock
+/// a panic poisoned still holds the lines, so they are taken all the same.
 fn take_queue(queue: Option<&Queue>) -> Vec<String> {
     let Some(queue) = queue else {
         return Vec::new();
     };
-    match queue.lock() {
-        Ok(mut lines) => lines.drain(..).collect(),
-        Err(_) => Vec::new(),
-    }
+    queue
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .drain(..)
+        .collect()
 }
 
 /// One turn, from the request that starts it to the answer that ends it. The
@@ -472,6 +473,25 @@ impl TextSink {
 mod tests {
     use super::*;
 
+    /// The turn every loop test runs: model `m`, normal mode, no key, no
+    /// thinking fields; only the server, the interrupt and the queue vary.
+    fn turn_at<'a>(
+        ep: &'a http::Endpoint,
+        cancel: &'a Cancel,
+        queue: Option<&'a Queue>,
+    ) -> Turn<'a> {
+        Turn {
+            ep,
+            key: None,
+            headers: &[],
+            model: "m",
+            extra: None,
+            mode: tools::Mode::Normal,
+            queue,
+            cancel,
+        }
+    }
+
     #[test]
     fn an_interrupted_round_answers_every_call_it_named() {
         let calls = vec![
@@ -613,16 +633,7 @@ mod tests {
             sse(&[r#"{"choices":[{"delta":{"content":"done"}}]}"#, "[DONE]"]),
         ]);
         let cancel = Cancel::new();
-        let turn = Turn {
-            ep: &server.ep,
-            key: None,
-            headers: &[],
-            model: "m",
-            extra: None,
-            mode: tools::Mode::Normal,
-            queue: None,
-            cancel: &cancel,
-        };
+        let turn = turn_at(&server.ep, &cancel, None);
         let mut history = log();
         let mut sink = Recorder::default();
         let used = run_turn(&turn, &mut history, &mut sink).unwrap();
@@ -661,16 +672,7 @@ mod tests {
             "[DONE]",
         ])]);
         let cancel = Cancel::new();
-        let turn = Turn {
-            ep: &server.ep,
-            key: None,
-            headers: &[],
-            model: "m",
-            extra: None,
-            mode: tools::Mode::Normal,
-            queue: None,
-            cancel: &cancel,
-        };
+        let turn = turn_at(&server.ep, &cancel, None);
         let mut history = log();
         let mut sink = Recorder::default();
         // The count is the provider's; adding two of them must not wrap.
@@ -688,16 +690,7 @@ mod tests {
 
         let server = Server::new(vec![sse(frames)]);
         let cancel = Cancel::new();
-        let turn = Turn {
-            ep: &server.ep,
-            key: None,
-            headers: &[],
-            model: "m",
-            extra: None,
-            mode: tools::Mode::Normal,
-            queue: None,
-            cancel: &cancel,
-        };
+        let turn = turn_at(&server.ep, &cancel, None);
         let mut history = log();
         let mut sink = Recorder::default();
         run_turn(&turn, &mut history, &mut sink).unwrap();
@@ -744,16 +737,7 @@ mod tests {
             r#"{"error":{"message":"overloaded"}}"#,
         ])]);
         let cancel = Cancel::new();
-        let turn = Turn {
-            ep: &server.ep,
-            key: None,
-            headers: &[],
-            model: "m",
-            extra: None,
-            mode: tools::Mode::Normal,
-            queue: None,
-            cancel: &cancel,
-        };
+        let turn = turn_at(&server.ep, &cancel, None);
         let mut history = log();
         let mut sink = Recorder::default();
         let error = run_turn(&turn, &mut history, &mut sink).unwrap_err();
@@ -799,16 +783,7 @@ mod tests {
             sse(&[r#"{"choices":[{"delta":{"content":"after"}}]}"#, "[DONE]"]),
         ]);
         let cancel = Cancel::new();
-        let turn = Turn {
-            ep: &server.ep,
-            key: None,
-            headers: &[],
-            model: "m",
-            extra: None,
-            mode: tools::Mode::Normal,
-            queue: None,
-            cancel: &cancel,
-        };
+        let turn = turn_at(&server.ep, &cancel, None);
         let mut history = log();
         let mut sink = Recorder::default();
         run_turn(&turn, &mut history, &mut sink).unwrap();
@@ -834,16 +809,7 @@ mod tests {
         let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
         queue.lock().unwrap().push_back("and this".into());
         let cancel = Cancel::new();
-        let turn = Turn {
-            ep: &server.ep,
-            key: None,
-            headers: &[],
-            model: "m",
-            extra: None,
-            mode: tools::Mode::Normal,
-            queue: Some(&queue),
-            cancel: &cancel,
-        };
+        let turn = turn_at(&server.ep, &cancel, Some(&queue));
         let mut history = log();
         let mut sink = Recorder::default();
         run_turn(&turn, &mut history, &mut sink).unwrap();
@@ -860,21 +826,28 @@ mod tests {
         let server = crate::http::support::Server::new(Vec::new());
         let cancel = Cancel::new();
         cancel.cancel();
-        let turn = Turn {
-            ep: &server.ep,
-            key: None,
-            headers: &[],
-            model: "m",
-            extra: None,
-            mode: tools::Mode::Normal,
-            queue: None,
-            cancel: &cancel,
-        };
+        let turn = turn_at(&server.ep, &cancel, None);
         let mut history = log();
         let mut sink = Recorder::default();
         assert_eq!(run_turn(&turn, &mut history, &mut sink).unwrap(), None);
         assert_eq!(history.0.len(), 1);
         assert!(sink.seen.is_empty());
+    }
+
+    /// A thread that panicked holding the queue poisons it; the lines in it
+    /// are still the user's, and the turn still takes them.
+    #[test]
+    fn a_poisoned_queue_still_gives_its_lines() {
+        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
+        let held = queue.clone();
+        let _ = std::thread::spawn(move || {
+            let mut lines = held.lock().unwrap();
+            lines.push_back("kept".into());
+            panic!("poison the queue");
+        })
+        .join();
+        assert!(queue.lock().is_err(), "the lock is poisoned");
+        assert_eq!(take_queue(Some(&queue)), vec!["kept"]);
     }
 
     #[test]

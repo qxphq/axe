@@ -30,7 +30,7 @@ mod web;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -2172,9 +2172,10 @@ impl Held {
         let line = screen.take();
         let turn = match parse_command(&line) {
             Command::Turn(input) => {
-                if let Ok(mut lines) = queue.lock() {
-                    lines.push_back(input);
-                }
+                queue
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push_back(input);
                 true
             }
             _ => false,
@@ -2868,24 +2869,9 @@ mod tests {
     #[test]
     fn session_switches_model_and_new_session() {
         let mut session = Session {
-            state: state::State::default(),
-            providers: vec![test_provider()],
-            provider: 0,
-            model: "m".into(),
-            thinking: None,
-            mode: tools::Mode::Explore,
             used: Some(10),
-            cached: 0,
-            used_bytes: 0,
-            messages: vec![json!({ "role": "system", "content": "s" })],
-            bytes: 40,
-            sid: "abc".into(),
-            store: None,
-            startup: Vec::new(),
             picks: vec!["old".into()],
-            naming: None,
-            warning: None,
-            skills: Vec::new(),
+            ..bare_session()
         };
         let info = ui::info_text(&session.set_model(0, "m".into(), Scope::Dir));
         assert!(info.contains("p/m"), "{info}");
@@ -2904,23 +2890,9 @@ mod tests {
             std::fs::create_dir_all(&cwd).unwrap();
             let mut session = Session {
                 state: state::load(&cwd),
-                providers: vec![test_provider()],
-                provider: 0,
-                model: "m".into(),
-                thinking: None,
-                mode: tools::Mode::Explore,
-                used: None,
-                cached: 0,
-                used_bytes: 0,
                 messages: Vec::new(),
                 bytes: 0,
-                sid: "abc".into(),
-                store: None,
-                startup: Vec::new(),
-                picks: Vec::new(),
-                naming: None,
-                warning: None,
-                skills: Vec::new(),
+                ..bare_session()
             };
             session.set_model(0, "m".into(), Scope::Dir);
             assert_eq!(state::load(&cwd).model.as_deref(), Some("p/m"));
@@ -3026,24 +2998,8 @@ mod tests {
             hidden: false,
         };
         let session = Session {
-            state: state::State::default(),
-            providers: vec![test_provider()],
-            provider: 0,
-            model: "m".into(),
-            thinking: None,
-            mode: tools::Mode::Explore,
-            used: None,
-            cached: 0,
-            used_bytes: 0,
-            messages: vec![json!({ "role": "system", "content": "s" })],
-            bytes: 40,
-            sid: "abc".into(),
-            store: None,
-            startup: Vec::new(),
-            picks: Vec::new(),
-            naming: None,
-            warning: None,
             skills: vec![skill],
+            ..bare_session()
         };
         assert!(session.commands().contains(&"/skill:demo".to_string()));
         let listing = session.skill_listing();
@@ -3120,26 +3076,7 @@ mod tests {
 
     #[test]
     fn session_info_and_mode_note() {
-        let mut session = Session {
-            state: state::State::default(),
-            providers: vec![test_provider()],
-            provider: 0,
-            model: "m".into(),
-            thinking: None,
-            mode: tools::Mode::Explore,
-            used: None,
-            cached: 0,
-            used_bytes: 0,
-            messages: vec![json!({ "role": "system", "content": "s" })],
-            bytes: 40,
-            sid: "abc".into(),
-            store: None,
-            startup: Vec::new(),
-            picks: Vec::new(),
-            naming: None,
-            warning: None,
-            skills: Vec::new(),
-        };
+        let mut session = bare_session();
         assert!(info_text(&session).contains("p/m"));
         assert_eq!(session.context(), Some(100));
         assert!(session.fill().0.contains("100"));
@@ -3156,28 +3093,15 @@ mod tests {
     fn session_info_carries_the_title_left_of_the_model() {
         let meta = sessions::Meta::new("abc");
         let mut session = Session {
-            state: state::State::default(),
-            providers: vec![test_provider()],
-            provider: 0,
-            model: "m".into(),
-            thinking: None,
             mode: tools::Mode::Normal,
-            used: None,
-            cached: 0,
-            used_bytes: 0,
-            messages: Vec::new(),
-            bytes: 0,
-            sid: "abc".into(),
             store: {
                 let mut store = Store::fresh(std::env::temp_dir(), "abc");
                 store.meta = Some(meta);
                 Some(store)
             },
-            startup: Vec::new(),
-            picks: Vec::new(),
-            naming: None,
-            warning: None,
-            skills: Vec::new(),
+            messages: Vec::new(),
+            bytes: 0,
+            ..bare_session()
         };
         // Untitled and empty history: the row starts with the model.
         assert!(

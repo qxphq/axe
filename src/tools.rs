@@ -10,7 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::thread;
@@ -398,8 +398,8 @@ fn read(args: &Value) -> String {
     };
 
     // Stream lines so an offset past 1 MiB still works; stop accumulating once
-    // the read cap is reached. One very long line can still allocate itself,
-    // but the whole file no longer does.
+    // the read cap is reached. One very long line can still allocate itself;
+    // the rest of the file never does.
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     let mut out = String::new();
@@ -635,14 +635,14 @@ fn bash(args: &Value, cancel: &Cancel, mode: Mode) -> String {
                     interrupted = true;
                     // `--` is not optional: without it `kill` reads the
                     // negative pid as an option and signals nothing.
-                    kill("-TERM", pid);
+                    sandbox::kill_group("-TERM", pid);
                     // Grace period, then the whole group gets SIGKILL.
                     let deadline = Instant::now() + Duration::from_secs(2);
                     while Instant::now() < deadline && child.try_wait().ok().flatten().is_none() {
                         thread::sleep(Duration::from_millis(20));
                     }
                     if child.try_wait().ok().flatten().is_none() {
-                        kill("-KILL", pid);
+                        sandbox::kill_group("-KILL", pid);
                     }
                     match child.wait() {
                         Ok(status) => break status,
@@ -652,21 +652,21 @@ fn bash(args: &Value, cancel: &Cancel, mode: Mode) -> String {
                 if !timed_out && start.elapsed() > Duration::from_secs(120) {
                     // Kill the group, not just `sh`: a pipeline must not
                     // survive its timeout.
-                    kill("-KILL", pid);
+                    sandbox::kill_group("-KILL", pid);
                     timed_out = true;
                 }
                 if !too_big {
                     let size = out_file.file.metadata().map(|m| m.len()).unwrap_or(0)
                         + err_file.file.metadata().map(|m| m.len()).unwrap_or(0);
                     if size > BASH_OUTPUT_CAP {
-                        kill("-KILL", pid);
+                        sandbox::kill_group("-KILL", pid);
                         too_big = true;
                     }
                 }
                 thread::sleep(Duration::from_millis(20));
             }
             Err(e) => {
-                kill("-KILL", pid);
+                sandbox::kill_group("-KILL", pid);
                 return format!("error: wait: {e}");
             }
         }
@@ -720,19 +720,6 @@ fn bash(args: &Value, cancel: &Cancel, mode: Mode) -> String {
 /// two strings from `sh`, which is the only signal the tool gets.
 fn denied(stderr: &str) -> bool {
     stderr.contains("Permission denied") || stderr.contains("Operation not permitted")
-}
-
-/// Signal the whole process group: a pipeline must not outlive its `sh`.
-/// `--` is not optional and the error output is dropped: by the time the group
-/// is gone, `kill` reporting that is noise on the user's terminal.
-fn kill(signal: &str, pid: i32) {
-    let _ = Command::new("kill")
-        .arg(signal)
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 /// One stream's capture. Created `0600` with a name nobody else may open, and
