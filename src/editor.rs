@@ -10,6 +10,10 @@ pub struct Buffer {
     pub(crate) cursor: usize,
     /// The last killed text: one slot, enough for Ctrl-U ... Ctrl-Y.
     pub(crate) killed: String,
+    /// The key before this one was a kill too: readline joins a run of kills
+    /// into one slot, so Ctrl+W twice yanks back both words. The caller clears
+    /// it on every other key.
+    pub(crate) chain: bool,
 }
 
 impl Buffer {
@@ -107,33 +111,46 @@ impl Buffer {
         self.cursor = self.word_end();
     }
 
+    /// Remove chars `from..to` into the kill slot: after another kill it joins
+    /// what is there, in front for a kill backwards and behind for one forwards,
+    /// so the slot reads as the text did.
+    fn kill(&mut self, from: usize, to: usize) {
+        let text = self.buf[self.offset(from)..self.offset(to)].to_string();
+        let forward = from == self.cursor;
+        if !self.chain {
+            self.killed = text;
+        } else if forward {
+            self.killed.push_str(&text);
+        } else {
+            self.killed.insert_str(0, &text);
+        }
+        self.chain = true;
+        self.splice(from, to, "");
+    }
+
     pub(crate) fn kill_word_back(&mut self) {
         let start = self.word_start();
         if start < self.cursor {
-            self.killed = self.buf[self.offset(start)..self.offset(self.cursor)].to_string();
-            self.splice(start, self.cursor, "");
+            self.kill(start, self.cursor);
         }
     }
 
     pub(crate) fn kill_word_forward(&mut self) {
         let end = self.word_end();
         if end > self.cursor {
-            self.killed = self.buf[self.offset(self.cursor)..self.offset(end)].to_string();
-            self.splice(self.cursor, end, "");
+            self.kill(self.cursor, end);
         }
     }
 
     pub(crate) fn kill_to_start(&mut self) {
         if self.cursor > 0 {
-            self.killed = self.buf[..self.offset(self.cursor)].to_string();
-            self.splice(0, self.cursor, "");
+            self.kill(0, self.cursor);
         }
     }
 
     pub(crate) fn kill_to_end(&mut self) {
         if self.cursor < self.len() {
-            self.killed = self.buf[self.offset(self.cursor)..].to_string();
-            self.splice(self.cursor, self.len(), "");
+            self.kill(self.cursor, self.len());
         }
     }
 
@@ -147,14 +164,16 @@ impl Buffer {
         self.splice(at, at, &text);
     }
 
-    /// Swap the two chars before the cursor, as readline does: at the end of
-    /// the line the cursor steps back one first.
+    /// Swap the char before the cursor with the one under it and step past
+    /// both, as readline does; at the end of the line there is none under it,
+    /// so the two before it swap and the cursor stays.
     pub(crate) fn transpose_chars(&mut self) {
-        let end = self.cursor;
-        if end < 2 {
+        let len = self.len();
+        if self.cursor == 0 || len < 2 {
             return;
         }
-        let (a, b) = (end - 2, end - 1);
+        let b = self.cursor.min(len - 1);
+        let a = b - 1;
         let (x, y) = (self.char_at(a).unwrap(), self.char_at(b).unwrap());
         self.splice(a, b + 1, &format!("{y}{x}"));
         // The cursor is a char index, so a multi-cell char is one step.
@@ -244,12 +263,44 @@ mod tests {
         let mut buffer = typed("é");
         buffer.transpose_chars();
         assert_eq!(buffer.buf, "é");
-        // Mid-line, past a wide char.
+        // Mid-line: the char before the cursor and the one under it, past a
+        // wide char, and the cursor steps past both.
         let mut buffer = typed("日本x");
         buffer.cursor = 2;
         buffer.transpose_chars();
-        assert_eq!(buffer.buf, "本日x");
-        assert_eq!(buffer.cursor, 2);
+        assert_eq!(buffer.buf, "日x本");
+        assert_eq!(buffer.cursor, 3);
+        let mut buffer = typed("abcd");
+        buffer.cursor = 2;
+        buffer.transpose_chars();
+        assert_eq!(buffer.buf, "acbd");
+        assert_eq!(buffer.cursor, 3);
+        // At the start there is nothing before the cursor.
+        buffer.cursor = 0;
+        buffer.transpose_chars();
+        assert_eq!(buffer.buf, "acbd");
+    }
+
+    #[test]
+    fn a_run_of_kills_is_yanked_back_whole() {
+        let mut buffer = typed("one two three");
+        buffer.kill_word_back();
+        buffer.chain = true;
+        buffer.kill_word_back();
+        assert_eq!(buffer.buf, "one ");
+        buffer.yank();
+        assert_eq!(buffer.buf, "one two three", "both words, in order");
+        // Forward kills join behind.
+        let mut buffer = typed("a b c");
+        buffer.cursor = 0;
+        buffer.kill_word_forward();
+        buffer.chain = true;
+        buffer.kill_word_forward();
+        assert_eq!(buffer.killed, "a b");
+        // A kill that does not follow one starts the slot over.
+        buffer.chain = false;
+        buffer.kill_to_end();
+        assert_eq!(buffer.killed, " c");
     }
 
     #[test]
@@ -304,6 +355,9 @@ mod tests {
         assert_eq!(buffer.buf, " two");
         assert_eq!(buffer.cursor, 0);
         assert_eq!(buffer.killed, "one");
+        // The caller ends a run of kills on any other key; this one starts a
+        // new slot.
+        buffer.chain = false;
         buffer.kill_to_end();
         assert_eq!(buffer.buf, "");
         assert_eq!(buffer.killed, " two");

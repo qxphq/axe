@@ -1004,6 +1004,8 @@ impl Screen {
             }
             self.recall.search = None;
         }
+        // A run of kills joins in one slot; any other key ends the run.
+        let chain = std::mem::take(&mut self.ed.chain);
         match key.code {
             // A chooser owns the arrows and Esc while it is open. Enter on an
             // empty line accepts it; Enter on a search query submits as usual.
@@ -1027,7 +1029,10 @@ impl Screen {
                 self.take_marked();
                 return Action::Submit;
             }
-            KeyCode::Backspace if alt || ctrl => self.ed.kill_word_back(),
+            KeyCode::Backspace if alt || ctrl => {
+                self.ed.chain = chain;
+                self.ed.kill_word_back();
+            }
             KeyCode::Backspace => self.ed.backspace(),
             KeyCode::Delete => self.ed.delete(),
             KeyCode::Left if alt || ctrl => self.ed.word_back(),
@@ -1057,10 +1062,22 @@ impl Screen {
             KeyCode::Char('f') if ctrl => self.ed.cursor = (self.ed.cursor + 1).min(self.ed.len()),
             KeyCode::Char('b') if alt => self.ed.word_back(),
             KeyCode::Char('f') if alt => self.ed.word_forward(),
-            KeyCode::Char('w') if ctrl || alt => self.ed.kill_word_back(),
-            KeyCode::Char('d') if alt => self.ed.kill_word_forward(),
-            KeyCode::Char('u') if ctrl => self.ed.kill_to_start(),
-            KeyCode::Char('k') if ctrl => self.ed.kill_to_end(),
+            KeyCode::Char('w') if ctrl || alt => {
+                self.ed.chain = chain;
+                self.ed.kill_word_back();
+            }
+            KeyCode::Char('d') if alt => {
+                self.ed.chain = chain;
+                self.ed.kill_word_forward();
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.ed.chain = chain;
+                self.ed.kill_to_start();
+            }
+            KeyCode::Char('k') if ctrl => {
+                self.ed.chain = chain;
+                self.ed.kill_to_end();
+            }
             KeyCode::Char('y') if ctrl => self.ed.yank(),
             KeyCode::Char('t') if ctrl => self.ed.transpose_chars(),
             KeyCode::Char('t') if alt => self.ed.transpose_words(),
@@ -2107,6 +2124,16 @@ impl Screen {
                 None => Vec::new(),
             };
         }
+        // What was typed as a prefix outranks a line that only holds its
+        // letters in order: `/t` marks `/thinking`, not `/compact`, and Enter
+        // runs the marked row. Each group keeps the table's order.
+        let mut found = self.fuzzy_commands();
+        found.sort_by_key(|line| !line.starts_with(self.ed.buf.as_str()));
+        found
+    }
+
+    /// The commands the line fuzzily matches, in the table's order.
+    fn fuzzy_commands(&self) -> Vec<String> {
         match self.ed.buf.split_once(' ') {
             None => self
                 .commands
@@ -3907,6 +3934,63 @@ mod tests {
                 "height {height}: the prompt reaches past the screen"
             );
         }
+    }
+
+    /// Enter runs the marked row, so the first row must be what was typed as a
+    /// prefix, not a command that merely holds the same letters earlier in the
+    /// table.
+    #[test]
+    fn a_typed_prefix_outranks_a_fuzzy_match() {
+        let mut screen = Screen::test_screen(40, 24);
+        screen.set_commands(
+            [
+                "/compact",
+                "/exit",
+                "/explore",
+                "/help",
+                "/mcp",
+                "/model",
+                "/new",
+                "/quit",
+                "/sessions",
+                "/skills",
+                "/thinking",
+                "/thoughts",
+            ]
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
+        );
+        for (typed, first) in [
+            ("/t", "/thinking"),
+            ("/m", "/mcp"),
+            ("/mdl", "/model"),
+            ("/e", "/exit"),
+        ] {
+            screen.ed.buf = typed.into();
+            screen.ed.cursor = typed.chars().count();
+            screen.selection = None;
+            assert_eq!(
+                screen.hints().0.first().map(String::as_str),
+                Some(first),
+                "{typed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_of_kills_yanks_back_whole_and_a_motion_ends_it() {
+        let mut screen = Screen::test_screen(40, 10);
+        typed(&mut screen, "one two three");
+        screen.apply_key(ctrl('w'));
+        screen.apply_key(ctrl('w'));
+        screen.apply_key(ctrl('y'));
+        assert_eq!(screen.ed.buf, "one two three");
+        // A motion between two kills starts the slot over.
+        screen.apply_key(ctrl('w'));
+        screen.apply_key(ctrl('b'));
+        screen.apply_key(ctrl('w'));
+        assert_eq!(screen.ed.killed, "two", "not \"twothree\"");
     }
 
     #[test]

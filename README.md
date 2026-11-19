@@ -367,12 +367,13 @@ where typing filters it and Enter on an empty line resumes the selection.
 | Shift+Tab | toggle explore mode |
 | Esc | close a chooser; twice to interrupt the running turn |
 | Ctrl+C | clear the prompt line |
-| Ctrl+D / Ctrl+A / Ctrl+E | end input / start of line / end of line |
+| Ctrl+D | end input on an empty line; delete the character under the cursor otherwise |
+| Ctrl+A / Ctrl+E | start of line / end of line |
 | Ctrl+B / Ctrl+F, Alt+B / Alt+F | move by character, by word |
 | Ctrl+W, Alt+W, Alt+D | kill the word before, before, after |
 | Ctrl+U / Ctrl+K | kill to the start / to the end |
 | Ctrl+R | search the history backwards: the line previews the match, Enter accepts, Esc gives the line back |
-| Ctrl+Y / Ctrl+T / Alt+T | yank / transpose characters / transpose words |
+| Ctrl+Y / Ctrl+T / Alt+T | yank (a run of kills yanks back whole) / transpose characters / transpose words |
 
 Turns run in the background: the prompt stays live while the model answers, and
 the lines typed meanwhile are queued, one row each above the prompt. Each joins
