@@ -1252,6 +1252,7 @@ impl Screen {
         let cols = width.saturating_sub(2 * margin as usize).max(1);
         let rows: Vec<Line<'static>> = lines
             .into_iter()
+            .map(expand_tabs)
             .flat_map(|line| wrap(line, cols))
             .collect();
         let total = rows.len() as u16;
@@ -2366,6 +2367,39 @@ fn paint_above<B: Backend>(
     backend.draw(cells)?;
     backend.flush()
 }
+
+/// A row's tabs as the spaces a terminal would put there: to the next stop of
+/// eight cells from the start of the row. A cell holds no tab, and drawn as one
+/// it collapsed a code block's indentation and a command's columns, while the
+/// same text piped kept them.
+fn expand_tabs(line: Line<'static>) -> Line<'static> {
+    if !line.spans.iter().any(|span| span.content.contains('\t')) {
+        return line;
+    }
+    let mut column = 0;
+    let spans = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            let mut text = String::with_capacity(span.content.len());
+            for c in span.content.chars() {
+                if c == '\t' {
+                    let pad = TAB - column % TAB;
+                    text.extend(std::iter::repeat_n(' ', pad));
+                    column += pad;
+                } else {
+                    text.push(c);
+                    column += c.width().unwrap_or(0);
+                }
+            }
+            Span::styled(text, span.style)
+        })
+        .collect::<Vec<_>>();
+    Line { spans, ..line }
+}
+
+/// A terminal's tab stop.
+const TAB: usize = 8;
 
 /// Lay rows out in `buf` with `margin` cells at each side, then mark where each
 /// row's text ends.
@@ -3939,6 +3973,26 @@ mod tests {
     /// Enter runs the marked row, so the first row must be what was typed as a
     /// prefix, not a command that merely holds the same letters earlier in the
     /// table.
+    #[test]
+    fn tabs_become_the_spaces_to_the_next_stop() {
+        let line = Line::from(vec![Span::raw("ab\tc"), Span::raw("\td\te")]);
+        let out: String = expand_tabs(line)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(out, "ab      c       d       e");
+        // Through the transcript: a tab-indented code line keeps its indent.
+        let mut screen = Screen::test_screen(40, 12);
+        screen.text("```\nfn x() {\n\treturn;\n}\n```\n");
+        screen.flush();
+        let rows = screen.transcript();
+        assert!(
+            rows.iter().any(|row| row.contains("        return;")),
+            "{rows:?}"
+        );
+    }
+
     #[test]
     fn a_typed_prefix_outranks_a_fuzzy_match() {
         let mut screen = Screen::test_screen(40, 24);

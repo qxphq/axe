@@ -23,7 +23,7 @@ box.
 
 - [x] [Frame and transcript](frame-and-transcript.md)
 - [x] [Prompt editing and completion](prompt-editing.md)
-- [ ] [Rendering and streaming](rendering.md)
+- [x] [Rendering and streaming](rendering.md)
 
 ## Prompt, tools, and extensions
 

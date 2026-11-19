@@ -49,11 +49,22 @@ pub fn displayable(text: &str) -> String {
     text.chars().filter(|c| shows(*c)).collect()
 }
 
+/// Text for a terminal with no screen: the screen's rule, `shows`, with the
+/// line breaks and tabs a terminal lays out itself. An invisible format mark
+/// (a bidi override) would reorder what the terminal shows, as on the screen.
+/// `strip_control` stays for text that is not bound for a terminal: a
+/// zero-width joiner there is content.
+pub fn terminal_safe(text: &str) -> String {
+    text.chars()
+        .filter(|&c| c == '\n' || c == '\t' || shows(c))
+        .collect()
+}
+
 /// Text for the terminal: stripped when there is one to strip for. Redirected
 /// output keeps its bytes, so a pipe is the same text the page held.
 pub fn terminal_text(text: &str) -> String {
     if io::stdout().is_terminal() {
-        strip_control(text)
+        terminal_safe(text)
     } else {
         text.to_string()
     }
@@ -183,7 +194,7 @@ pub fn ansi_err(text: &str, style: Style) -> String {
 /// decides by stdout; this is what it does once that is known, so the styling
 /// itself can be checked without borrowing the process's own output.
 pub fn styled(text: &str, style: Style) -> String {
-    let text = strip_control(text);
+    let text = terminal_safe(text);
     let codes = codes(style);
     if codes.is_empty() {
         text
@@ -302,5 +313,14 @@ mod tests {
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
         assert_eq!(codes(style), vec![36, 1, 4]);
         assert!(codes(Style::new()).is_empty());
+    }
+
+    #[test]
+    fn a_terminal_line_drops_what_reorders_or_hides_text() {
+        let styled = styled("a\u{202e}b\u{200b}c\td\x1b[2Je", Style::new());
+        assert_eq!(styled, "abc\td[2Je");
+        assert_eq!(terminal_safe("x\ny"), "x\ny");
+        // Model-bound text keeps its joiners: only the terminal path drops them.
+        assert_eq!(strip_control("a\u{200d}b"), "a\u{200d}b");
     }
 }
