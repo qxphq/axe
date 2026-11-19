@@ -94,7 +94,9 @@ invariants a change must not break.
     nothing in the frame touches the transcript; the blank row above an idle
     prompt is that same row, not a special case.
     Nothing is written against the bottom edge, and no part of it shares a row
-    with another: a frame too tall for the terminal gives up the list and the
+    with another: one row above the frame is always the transcript's (a frame
+    with nothing above it would scroll itself into scrollback), and a frame
+    too tall for the rest gives up the list and the
     queue first, then crops the prompt's box, and drops the status only when
     the blank first row, a prompt row and the status cannot all stand. A chooser is the one part the
     terminal sizes: its header and entries take the rows, and when it closes
@@ -114,7 +116,11 @@ invariants a change must not break.
     us is repainted even when no state changed. It also settles the frame back
     on the bottom — a reflow moves the text, and the inline area comes from the
     cursor it moved — and drops `slack`, because no row above the frame is
-    known blank any more. No caller draws for a state change, so work that
+    known blank any more. The exception is a narrowing the cursor proves the
+    terminal rewrapped: the old frame's rows are measured from where the cursor
+    went, blanked, and become `slack`, so the next block still lands under the
+    last. A terminal is trusted with a narrowing that also changed the height
+    only after a width-only one confirmed it rewraps. No caller draws for a state change, so work that
     finishes off the UI thread cannot strand the row.
     Startup banner and piped output run before/without a `Screen`; a stray
     `print!` while it exists is a rendering bug. A piped run has no prompt,

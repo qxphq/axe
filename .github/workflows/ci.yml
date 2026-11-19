@@ -119,6 +119,13 @@ jobs:
         run: |
           set -ex
           ./harness.py --wait 1 --scroll 60 'text:hello' '@resize:60x20' 'text:again' --expect 'again'
+          # Narrowing rewraps the frame's long rows; the next block still sits
+          # one blank row under the last one, not under the rewrapped rows.
+          ./harness.py --size 60x30 --wait 1 --scroll 60 'text:aaa' '@resize:40x30' 'text:bbb' \
+            --expect $' aaa\n\n █ text:bbb'
+          # A terminal too short for the whole frame keeps a row above it, so
+          # writing a block never scrolls the frame itself into scrollback.
+          ./harness.py --size 30x7 --wait 1 --scroll 40 'text:aaa' 'text:bbb' --refute 'Responding'
           ./harness.py --wait 1 --scroll 100 'fetch:plain@2+20' '!Escape' 'show:' --expect 'use start 22'
           ./harness.py --no-fetch-local --wait 1 --scroll 60 'fetch:plain' '!Escape' 'show:' \
             --expect 'refused host'
