@@ -2626,7 +2626,11 @@ mod tests {
     fn the_contract_lists_every_command_key_and_tool() {
         let readme = include_str!("../README.md");
         let help = help_text();
-        assert!(help.contains(&*config::path().to_string_lossy()));
+        // Read under the environment lock: a test that moves HOME could change
+        // the path between `help_text` and this line.
+        crate::state::testenv::with_env_lock(|| {
+            assert!(help_text().contains(&*config::path().to_string_lossy()));
+        });
         for name in COMMANDS {
             assert!(HELP.contains(name), "{name} is missing from HELP");
             assert!(readme.contains(name), "{name} is missing from README");
@@ -2742,7 +2746,9 @@ mod tests {
         ] {
             assert!(text.contains(needle), "{needle} missing from usage");
         }
-        assert!(text.contains(&*config::path().to_string_lossy()));
+        crate::state::testenv::with_env_lock(|| {
+            assert!(usage().contains(&*config::path().to_string_lossy()));
+        });
     }
 
     #[test]

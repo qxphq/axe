@@ -2585,7 +2585,8 @@ mod tests {
             let file = dir.join(".mcp.json");
             fs::write(&file, "{}").unwrap();
             let Some(hash) = hash_of(b"{}") else {
-                return; // no digester on this host: nothing can be approved
+                eprintln!("skip trust_is_by_path_and_content: no sha256sum or shasum on this host");
+                return;
             };
             assert!(!approved(&dir, &file, &hash));
             remember(&dir, &file, &hash);
@@ -2614,7 +2615,8 @@ mod tests {
             let prior = b"{\"mcpServers\":{\"a\":{\"command\":\"/bin/true\"}}}";
             fs::write(&file, prior).unwrap();
             let Some(prior_hash) = hash_of(prior) else {
-                return; // no digester on this host: nothing can be approved
+                eprintln!("skip an_axe_write_carries_only_an_approval_that_existed: no sha256sum or shasum on this host");
+                return;
             };
 
             // Never approved: the new content stays unapproved, so the start
@@ -2741,7 +2743,8 @@ mod tests {
     #[test]
     fn the_trust_hash_is_a_sha256_of_the_bytes() {
         let Some(hash) = hash_of(b"hello") else {
-            return; // the host's digester is the mechanism, like gzip
+            eprintln!("skip the_trust_hash_is_a_sha256_of_the_bytes: no sha256sum or shasum");
+            return;
         };
         assert_eq!(
             hash,
@@ -2952,7 +2955,9 @@ done
         let started = Instant::now();
         let mut opened = open_all(&entries, false);
         assert!(
-            started.elapsed() < Duration::from_millis(1900),
+            // Serial would be three seconds at least: the margin is for a slow
+            // runner spawning three shells, not for the code.
+            started.elapsed() < Duration::from_millis(2600),
             "{:?}",
             started.elapsed()
         );

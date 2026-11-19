@@ -1129,6 +1129,7 @@ mod tests {
     fn an_explore_child_has_a_session_of_its_own() {
         let probe = "read -r _ _ _ _ _ sid _ < /proc/self/stat; echo \"$sid $$\"";
         let Ok(mut cmd) = shell(probe, true) else {
+            eprintln!("skip an_explore_child_has_a_session_of_its_own: no explore-mode shell on this platform");
             return;
         };
         let out = cmd.output().unwrap();
@@ -1168,6 +1169,9 @@ mod tests {
             file.display()
         );
         let Ok(mut cmd) = shell(&script, true) else {
+            eprintln!(
+                "skip explore_mode_refuses_a_mode_change: no explore-mode shell on this platform"
+            );
             return;
         };
         let out = cmd.output().unwrap();
@@ -1185,6 +1189,9 @@ mod tests {
     #[test]
     fn explore_mode_runs_an_allowed_command() {
         let Ok(mut cmd) = shell("ls /dev/null", true) else {
+            eprintln!(
+                "skip explore_mode_runs_an_allowed_command: no explore-mode shell on this platform"
+            );
             return;
         };
         let out = cmd.output().unwrap();

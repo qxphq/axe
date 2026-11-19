@@ -425,6 +425,14 @@ pub(crate) mod testenv {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// Run `f` holding the environment lock and changing nothing: for a test
+    /// that reads a path derived from `HOME` or `XDG_*` twice and compares,
+    /// which a `home` test running alongside would move in between.
+    pub fn with_env_lock<T>(f: impl FnOnce() -> T) -> T {
+        let _held = lock().lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
     /// A directory named for the test, emptied first.
     pub fn dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("axe-test-{name}-{}", std::process::id()));
