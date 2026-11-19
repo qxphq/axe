@@ -380,6 +380,14 @@ fn read(args: &Value) -> String {
         Ok(file) => file,
         Err(e) => return format!("error: read {path}: {e}"),
     };
+    // A NUL near the top is a binary file: its bytes as text are replacement
+    // glyphs the model pays for and learns nothing from.
+    if binary(&file) {
+        return format!(
+            "error: read {path}: binary file ({} bytes); inspect it with bash (file, xxd, strings)",
+            meta.len()
+        );
+    }
     let offset = match integer(args, "offset") {
         Ok(offset) => offset.unwrap_or(1).max(1) as usize,
         Err(e) => return e,
@@ -428,6 +436,15 @@ fn read(args: &Value) -> String {
     if taken == 0 && offset > 1 && limit != Some(0) && offset > index {
         return format!("error: read {path}: offset {offset} is past the end ({index} lines)");
     }
+    // An empty result would read like a result that went missing: say which
+    // nothing it is.
+    if taken == 0 {
+        return if index == 0 {
+            "...[empty file]...\n".into()
+        } else {
+            "...[no lines in this window]...\n".into()
+        };
+    }
     // A cut names the offset that continues it: `offset` is the only way back
     // into a file, so a head-and-tail split would leave the model guessing
     // where the gap began.
@@ -470,6 +487,16 @@ fn window(out: &str, first: usize) -> String {
         &out[..end],
         next - 1
     )
+}
+
+/// Whether the first 8 KiB of a file hold a NUL, which text does not. Read
+/// through a clone of the handle at its own offset, so the caller's read
+/// starts at the top.
+fn binary(file: &File) -> bool {
+    use std::os::unix::fs::FileExt;
+    let mut head = [0u8; 8192];
+    let read = file.read_at(&mut head, 0).unwrap_or(0);
+    head[..read].contains(&0)
 }
 
 /// Whether `path` resolves to a `/proc` environment file: `/proc/self/environ`,
@@ -523,6 +550,9 @@ fn edit(args: &Value) -> String {
     if old.is_empty() {
         return "error: edit: \"old\" must not be empty".into();
     }
+    if old == new {
+        return "error: edit: old and new are the same; nothing to change".into();
+    }
     let replace_all = match boolean(args, "replace_all") {
         Ok(flag) => flag.unwrap_or(false),
         Err(e) => return e,
@@ -534,6 +564,14 @@ fn edit(args: &Value) -> String {
     };
     let count = text.matches(old).count();
     if count == 0 {
+        // `read` shows a CRLF file as LF lines, so the natural `old` misses
+        // by the line endings alone: say so, rather than send the model back
+        // to the same text.
+        if old.contains('\n') && !old.contains('\r') && text.contains(&old.replace('\n', "\r\n")) {
+            return format!(
+                "error: edit {path}: text not found; the file uses CRLF line endings — old must match them"
+            );
+        }
         return format!("error: edit {path}: text not found");
     }
     if count > 1 && !replace_all {
@@ -775,6 +813,61 @@ fn read_output(file: &mut File, max: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_that_finds_nothing_says_which_nothing() {
+        let dir = crate::state::testenv::dir("tools-nothing");
+        let empty = dir.join("empty");
+        std::fs::write(&empty, "").unwrap();
+        let three = dir.join("three");
+        std::fs::write(&three, "a\nb\nc").unwrap();
+        let read_with = |args: Value| read(&args);
+        assert_eq!(read_with(json!({ "path": empty })), "...[empty file]...\n");
+        assert_eq!(
+            read_with(json!({ "path": three, "limit": 0 })),
+            "...[no lines in this window]...\n"
+        );
+        assert_eq!(read_with(json!({ "path": three, "offset": 3 })), "c\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_binary_file_is_refused_with_what_to_use() {
+        let dir = crate::state::testenv::dir("tools-binary");
+        let bin = dir.join("bin");
+        std::fs::write(&bin, [0x89u8, b'P', b'N', b'G', 0, 1, 2]).unwrap();
+        let out = read(&json!({ "path": bin }));
+        assert!(
+            out.contains("binary file (7 bytes)") && out.contains("xxd"),
+            "{out}"
+        );
+        // UTF-8 text with no NUL is still text.
+        let text = dir.join("text");
+        std::fs::write(&text, "café\n").unwrap();
+        assert_eq!(read(&json!({ "path": text })), "café\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_edit_says_why_it_changed_nothing() {
+        let dir = crate::state::testenv::dir("tools-edit-why");
+        let crlf = dir.join("crlf");
+        std::fs::write(&crlf, "one\r\ntwo\r\n").unwrap();
+        let out = edit(&json!({ "path": crlf, "old": "one\ntwo", "new": "x" }));
+        assert!(out.contains("CRLF"), "{out}");
+        // Matching the bytes still works.
+        let out = edit(&json!({ "path": crlf, "old": "one\r\ntwo", "new": "x" }));
+        assert!(out.starts_with("edited"), "{out}");
+        // Text that is simply absent is not blamed on line endings.
+        let out = edit(&json!({ "path": crlf, "old": "nope\nzip", "new": "x" }));
+        assert_eq!(
+            out,
+            format!("error: edit {}: text not found", crlf.display())
+        );
+        let out = edit(&json!({ "path": crlf, "old": "x", "new": "x" }));
+        assert!(out.contains("old and new are the same"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_explore_note_names_a_private_directory_only_when_there_is_one() {

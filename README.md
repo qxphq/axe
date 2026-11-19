@@ -412,7 +412,7 @@ mode: off`, so the model knows which side it is on.
 
 | tool | what it does |
 | --- | --- |
-| `read(path, offset?, limit?)` | a text file; relative paths resolve from cwd; up to 50 000 characters |
+| `read(path, offset?, limit?)` | a text file (a binary one is refused); relative paths resolve from cwd; up to 50 000 characters |
 | `write(path, content)` | create or overwrite; parent directories are created |
 | `edit(path, old, new, replace_all?)` | exact text; ambiguous `old` fails |
 | `bash(command)` | run `sh -c` here; 120 s, 30 000 characters |
