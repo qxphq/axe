@@ -311,6 +311,19 @@ fn parse_servers(path: &Path, project: bool) -> (Vec<Entry>, Vec<String>) {
             return (entries, errors);
         }
     };
+    // Parsed strictly, like the config: a misspelled `mcpServers` would
+    // otherwise run nothing and say nothing.
+    let Some(top) = parsed.as_object() else {
+        errors.push(format!("{}: must be a JSON object", path.display()));
+        return (entries, errors);
+    };
+    if let Some(key) = top.keys().find(|key| *key != "mcpServers") {
+        errors.push(format!(
+            "{}: unknown key \"{key}\" (axe takes mcpServers)",
+            path.display()
+        ));
+        return (entries, errors);
+    }
     let Some(servers) = parsed["mcpServers"].as_object() else {
         if parsed.get("mcpServers").is_some() {
             errors.push(format!(
@@ -345,11 +358,19 @@ fn parse_entry(name: &str, value: &Value, path: &Path, project: bool) -> Result<
         ) {
             return Err(format!(
                 "server \"{name}\": unknown key \"{key}\" (axe takes command, args, env, url, \
-                 headers, enabled, timeout)"
+                 headers, enabled, timeout, type)"
             ));
         }
     }
-    if let Some(kind) = object.get("type").and_then(Value::as_str) {
+    let kind = match object.get("type") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| format!("server \"{name}\": \"type\" must be a string"))?,
+        ),
+    };
+    if let Some(kind) = kind {
         if !matches!(kind, "stdio" | "http" | "streamable-http") {
             return Err(format!(
                 "server \"{name}\": type \"{kind}\" is not supported; axe runs stdio and \
@@ -383,6 +404,21 @@ fn parse_entry(name: &str, value: &Value, path: &Path, project: bool) -> Result<
         return Err(format!(
             "server \"{name}\": an entry is a command or a url, not both"
         ));
+    }
+    // A `type` that names the other transport is a file written for something
+    // else: running whichever key is there would start what it said it was not.
+    match (kind, command.is_some(), url.is_some()) {
+        (Some("stdio"), _, true) => {
+            return Err(format!(
+                "server \"{name}\": type \"stdio\" runs a command, but the entry has a url"
+            ))
+        }
+        (Some(kind @ ("http" | "streamable-http")), true, _) => {
+            return Err(format!(
+                "server \"{name}\": type \"{kind}\" names a url, but the entry has a command"
+            ))
+        }
+        _ => {}
     }
     if let Some(url) = &url {
         parse_url_value(name, url)?;
@@ -2784,6 +2820,38 @@ mod tests {
         assert!(!remove_entry(&file, "files").unwrap());
         assert!(parse_servers(&file, false).0.is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_with_a_key_axe_does_not_take_is_refused() {
+        let dir = state::testenv::dir("mcp-strict");
+        let file = dir.join("mcp.json");
+        for raw in [
+            r#"{"mcpserver":{"t":{"command":"c"}}}"#,
+            r#"{"mcpServers":{"t":{"command":"c"}},"other":1}"#,
+            r#"["mcpServers"]"#,
+        ] {
+            fs::write(&file, raw).unwrap();
+            let (entries, errors) = parse_servers(&file, false);
+            assert!(entries.is_empty(), "{raw}");
+            assert_eq!(errors.len(), 1, "{raw}: {errors:?}");
+        }
+        fs::write(&file, r#"{"mcpserver":{}}"#).unwrap();
+        assert!(parse_servers(&file, false).1[0].contains("unknown key \"mcpserver\""));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_type_must_be_a_string_that_agrees_with_the_entry() {
+        let file = Path::new("/tmp/mcp.json");
+        let check = |value: Value| parse_entry("t", &value, file, false);
+        assert!(check(json!({ "command": "c", "type": 5 })).is_err());
+        assert!(check(json!({ "command": "c", "type": "http" })).is_err());
+        assert!(check(json!({ "url": "https://x/mcp", "type": "stdio" })).is_err());
+        assert!(check(json!({ "command": "c", "type": "stdio" })).is_ok());
+        assert!(check(json!({ "url": "https://x/mcp", "type": "streamable-http" })).is_ok());
+        let err = check(json!({ "command": "c", "bogus": 1 })).err().unwrap();
+        assert!(err.contains("timeout, type)"), "{err}");
     }
 
     /// A stdio server in one line of shell: initialize, list, call.

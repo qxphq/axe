@@ -29,7 +29,7 @@ box.
 
 - [x] [System prompt and skills](prompt-prefix.md)
 - [x] [Tool contract](tool-contract.md)
-- [ ] [Config and MCP](config-and-mcp.md)
+- [x] [Config and MCP](config-and-mcp.md)
 
 ## Context and cost
 

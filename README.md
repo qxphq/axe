@@ -225,7 +225,8 @@ Values are strings with `$NAME` and `${NAME}` expanded from axe's own
 environment at start, `$$` for a literal `$`: that is how a committed file
 names a secret without holding one. A missing variable is reported by name and
 the server does not start half-configured. `type` may name `stdio`, `http` or
-`streamable-http`; unknown keys are errors. An entry with no `command`/`url`
+`streamable-http`, and must agree with the entry's `command` or `url`; unknown
+keys are errors, in an entry and at the top of the file. An entry with no `command`/`url`
 may only switch a global server's `enabled` — a repository can narrow what
 runs, never define it.
 
