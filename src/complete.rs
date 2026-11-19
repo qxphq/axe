@@ -3,8 +3,10 @@
 //! prompt already has, so the existing list and its marker need to know
 //! nothing about spans.
 //!
-//! `@` starts a path and is consumed by the completion: what lands on the line
-//! is the path the model should read, not a sigil it has to interpret.
+//! `@` starts a path and stays on the candidates, so a Tab into a directory
+//! keeps listing it: the list is open while the token carries the `@`. Enter
+//! takes the marked path and drops the `@` (`ui` does that), so what lands on
+//! the line is the path the model should read, not a sigil it has to interpret.
 //!
 //! Without `@` only the line's first token completes, and only when it is a
 //! path — `~`, `/`, `.`, or anything with a `/`. A path in the middle of a
@@ -48,6 +50,7 @@ fn paths_in(line: &str, cursor: usize, cwd: &Path, home: Option<&Path>) -> Vec<S
     }
     let head: String = chars[..start].iter().collect();
     let tail: String = chars[end..].iter().collect();
+    let sigil = if forced { "@" } else { "" };
     let found = match token {
         // A bare `~` is the home directory itself: the rest is typed inside it.
         "~" => vec!["~/".to_string()],
@@ -55,7 +58,7 @@ fn paths_in(line: &str, cursor: usize, cwd: &Path, home: Option<&Path>) -> Vec<S
     };
     found
         .into_iter()
-        .map(|path| format!("{head}{path}{tail}"))
+        .map(|path| format!("{head}{sigil}{path}{tail}"))
         .collect()
 }
 
@@ -158,17 +161,17 @@ mod tests {
         assert_eq!(paths_in("src/ui", 6, &dir, None), vec!["src/ui.rs"]);
         assert_eq!(
             paths_in("@s", 2, &dir, None),
-            vec!["src/".to_string()],
+            vec!["@src/".to_string()],
             "a bare name completes after @, and a directory keeps the list going"
         );
         assert_eq!(
             paths_in("@", 1, &dir, None),
             vec![
-                "docs/".to_string(),
-                "src/".to_string(),
-                "README.md".to_string()
+                "@docs/".to_string(),
+                "@src/".to_string(),
+                "@README.md".to_string()
             ],
-            "the @ is a trigger, not part of the path"
+            "the @ stays on the token until Enter takes the path"
         );
         // Several matches stay in name order.
         let all = paths_in("src/", 4, &dir, None);
@@ -212,7 +215,7 @@ mod tests {
         // Elsewhere the `@` is what asks for a path, and it works mid-sentence.
         assert_eq!(
             paths_in("cp @src/ui now", 10, &dir, None),
-            vec!["cp src/ui.rs now"]
+            vec!["cp @src/ui.rs now"]
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -253,10 +256,10 @@ mod tests {
         assert_eq!(
             paths_in("@", 1, &dir, None),
             vec![
-                "a_dir/".to_string(),
-                "A.txt".to_string(),
-                "b.txt".to_string(),
-                "c.txt".to_string(),
+                "@a_dir/".to_string(),
+                "@A.txt".to_string(),
+                "@b.txt".to_string(),
+                "@c.txt".to_string(),
             ]
         );
         let _ = fs::remove_dir_all(&dir);
@@ -285,7 +288,7 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
         assert_eq!(
             paths_in("@", 1, &dir, None),
-            vec!["link/".to_string(), "real/".to_string()],
+            vec!["@link/".to_string(), "@real/".to_string()],
             "a link to a directory is one"
         );
         let _ = fs::remove_dir_all(&dir);

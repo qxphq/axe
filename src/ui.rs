@@ -1015,8 +1015,10 @@ impl Screen {
             KeyCode::Enter if alt => self.insert_char('\n'),
             // Enter runs the marked command, whether the marker was stepped to
             // or is still on the first row of a list that just appeared: a
-            // command list is a choice of what to run. A path list is Tab's,
-            // and the line submits as it was typed.
+            // command list is a choice of what to run. An `@` list is a choice
+            // of path: Enter takes it and closes the list, and sends nothing.
+            // Any other path list is Tab's, and the line submits as typed.
+            KeyCode::Enter if self.take_path() => {}
             KeyCode::Enter => {
                 self.take_marked();
                 return Action::Submit;
@@ -1876,7 +1878,8 @@ impl Screen {
     /// it the marker steps on first, so Tab walks the list; the set was
     /// captured when the list was taken, so the walk covers every line the
     /// prefix matched. A lone candidate finishes with a space and ends the
-    /// list.
+    /// list — except after `@`, where the list stays until Enter takes a path:
+    /// the token keeps its `@`, so a directory lists what is in it.
     fn complete(&mut self) {
         if !self.fresh() {
             return;
@@ -1889,12 +1892,13 @@ impl Screen {
             sel.at
         };
         let lone = n == 1;
+        let forced = self.at_path();
         let mut line = sel.matches[at].clone();
         // A directory keeps the list open — the next segment is typed inside
         // it — and a file ends it with a space. What follows the token is the
         // candidate's too, so the space is only for a token that ends the line.
         let tail = self.ed.len() - token_span(&self.ed.buf, self.ed.cursor).1;
-        if lone && tail == 0 && !line.ends_with('/') {
+        if lone && tail == 0 && !forced && !line.ends_with('/') {
             line.push(' ');
         }
         // The cursor goes after what was completed, not to the end of the line:
@@ -2091,9 +2095,10 @@ impl Screen {
     /// first one when the list was never stepped through. The line is what the
     /// marker points at, even though its text may still be the prefix typed.
     ///
-    /// A path is not run, so Enter never writes one onto the line: a path
-    /// candidate is a fragment of a message, and Enter submits the message as
-    /// it was typed. Tab is what completes.
+    /// A path is not run, so Enter never writes one onto the line here: a
+    /// path candidate is a fragment of a message, and Enter submits the
+    /// message as it was typed. Tab is what completes; an `@` list is the
+    /// exception, and `take_path` handles it before this runs.
     fn take_marked(&mut self) {
         // A chooser owns the list rows while it is open; the candidates are not
         // on screen, so they are not what Enter runs.
@@ -2109,6 +2114,43 @@ impl Screen {
         }
         self.ed.buf = line.clone();
         self.ed.cursor = self.ed.len();
+    }
+
+    /// Whether the token at the cursor asks for a path with `@`: its list is
+    /// open until Enter takes a path from it.
+    fn at_path(&self) -> bool {
+        if self.command_line() {
+            return false;
+        }
+        let (start, _) = token_span(&self.ed.buf, self.ed.cursor);
+        self.ed.buf.chars().nth(start) == Some('@')
+    }
+
+    /// Enter on an `@` list: the marked path goes on the line without its `@`,
+    /// followed by a space when nothing comes after it, and the list closes.
+    /// Nothing is submitted; the next Enter sends the line. False when there
+    /// is no such list, so Enter does what it always did.
+    fn take_path(&mut self) -> bool {
+        if self.menu_active() || !self.at_path() {
+            return false;
+        }
+        let (hints, at) = self.hints();
+        let Some(line) = hints.get(at) else {
+            return false;
+        };
+        let (start, end) = token_span(&self.ed.buf, self.ed.cursor);
+        let tail = self.ed.len() - end;
+        let mut chars: Vec<char> = line.chars().collect();
+        if chars.get(start) == Some(&'@') {
+            chars.remove(start);
+        }
+        if tail == 0 {
+            chars.push(' ');
+        }
+        self.ed.cursor = chars.len() - tail;
+        self.ed.buf = chars.into_iter().collect();
+        self.selection = None;
+        true
     }
 
     /// The lines the buffer fuzzily matches: its characters in order, gaps
@@ -2189,6 +2231,7 @@ impl Screen {
             hints
                 .iter()
                 .map(|line| completed(line, &self.ed.buf, self.ed.cursor))
+                .map(|path| path.strip_prefix('@').map(str::to_string).unwrap_or(path))
                 .collect(),
             at,
         )
@@ -3329,6 +3372,83 @@ mod tests {
         press(&mut screen, KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(screen.ed.buf, "cp src/ui.rs now", "no space before `now`");
         assert_eq!(screen.ed.cursor, 12, "the cursor sits after `ui.rs`");
+    }
+
+    /// An `@` list stays open across Tab — a lone file included, and a
+    /// directory lists what is inside it — and Enter takes the marked path,
+    /// drops the `@`, closes the list and sends nothing.
+    #[test]
+    fn an_at_list_stays_open_until_enter_takes_a_path() {
+        fn tree(line: &str, _cursor: usize) -> Vec<String> {
+            let (head, word) = line.rsplit_once(' ').unwrap_or(("", line));
+            let head = if line.contains(' ') {
+                format!("{head} ")
+            } else {
+                String::new()
+            };
+            let found: &[&str] = match word {
+                "@s" => &["@src/"],
+                "@src/" => &["@src/app.rs", "@src/ui.rs"],
+                "@src/u" | "@src/ui.rs" => &["@src/ui.rs"],
+                _ => &[],
+            };
+            found.iter().map(|path| format!("{head}{path}")).collect()
+        }
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_completer(tree);
+        screen.insert_text("look @s");
+        screen.apply_key(key(KeyCode::Tab));
+        assert_eq!(screen.ed.buf, "look @src/");
+        assert_eq!(
+            screen.hint_rows().0,
+            vec!["src/app.rs", "src/ui.rs"],
+            "the directory's entries are listed, without the @"
+        );
+        screen.apply_key(key(KeyCode::Down));
+        screen.apply_key(key(KeyCode::Tab));
+        assert_eq!(
+            screen.ed.buf, "look @src/ui.rs",
+            "no space: the list is open"
+        );
+        assert!(!screen.hints().0.is_empty());
+        assert!(matches!(
+            screen.apply_key(key(KeyCode::Enter)),
+            Action::None
+        ));
+        assert_eq!(screen.ed.buf, "look src/ui.rs ");
+        assert!(screen.hints().0.is_empty(), "Enter closed the list");
+        assert!(matches!(
+            screen.apply_key(key(KeyCode::Enter)),
+            Action::Submit
+        ));
+
+        // Enter takes the marked row even when Tab never ran, and a path in
+        // the middle of the line keeps the words after it.
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_completer(|line, _| {
+            if line.starts_with("cp @src/u ") {
+                vec!["cp @src/ui.rs now".to_string()]
+            } else {
+                Vec::new()
+            }
+        });
+        screen.insert_text("cp @src/u now");
+        screen.ed.cursor = 9;
+        assert!(matches!(
+            screen.apply_key(key(KeyCode::Enter)),
+            Action::None
+        ));
+        assert_eq!(screen.ed.buf, "cp src/ui.rs now");
+        assert_eq!(screen.ed.cursor, 12, "the cursor sits after `ui.rs`");
+        // An `@` with nothing to list is text: Enter sends it.
+        let mut screen = Screen::test_screen(40, 10);
+        screen.set_completer(tree);
+        screen.insert_text("mail me @home");
+        assert!(matches!(
+            screen.apply_key(key(KeyCode::Enter)),
+            Action::Submit
+        ));
     }
 
     #[test]

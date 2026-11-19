@@ -214,7 +214,8 @@ invariants a change must not break.
   one slot, and the keys readline taught everyone. No screen, no menu, no turn.
 - `complete.rs` — path completion: the token at the cursor, listed against the
   working directory as whole lines. Directories carry a `/`, dotfiles wait to be
-  asked for, and `@` is a trigger the completion consumes. Only a line's first
+  asked for, and `@` keeps the token's list open until Enter takes a path and
+  drops the `@`. Only a line's first
   token completes without it: a path in a message is prose. `ui` reaches it
   through a function pointer, so the screen never touches the filesystem.
 - `render.rs` — transcript text: `Paint`, and what a call, a command and a
