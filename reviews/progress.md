@@ -33,7 +33,7 @@ box.
 
 ## Context and cost
 
-- [ ] [Token efficiency and context economics](token-efficiency.md)
+- [x] [Token efficiency and context economics](token-efficiency.md)
 
 ## Quality and delivery
 
