@@ -140,6 +140,11 @@ fn plain(key: KeyEvent, c: char) -> bool {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
+/// How long the input thread waits for a key before it lets go of crossterm's
+/// event-reader lock. A key ends the wait at once; this only bounds how long a
+/// cursor query can wait for the lock, and how often an idle axe wakes.
+const INPUT_POLL: Duration = Duration::from_millis(20);
+
 /// Whether the input thread has ended. The `Eof` event says so once, but a
 /// turn can consume it; the flag is what a line loop reads afterwards.
 pub(crate) type Ended = Arc<AtomicBool>;
@@ -158,17 +163,15 @@ pub(crate) fn spawn_input(tx: Sender<Event>) -> Ended {
                     return;
                 }
             }
-            // A zero timeout, not `read`: waiting for a key holds crossterm's
+            // A bounded poll, not `read`: waiting for a key holds crossterm's
             // event-reader lock, and the screen needs it to ask the terminal
-            // where the cursor is when the prompt wraps. A poll holds it for
-            // microseconds and releases it; input is picked up a few
-            // milliseconds later.
-            match poll(Duration::ZERO) {
+            // where the cursor is on a reshape. A key still wakes the poll at
+            // once; with none, the lock is released every 20 ms, inside the
+            // screen's retry budget for that question. A zero timeout and a
+            // short sleep woke an idle axe 200 times a second.
+            match poll(INPUT_POLL) {
                 Ok(true) => {}
-                Ok(false) => {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
+                Ok(false) => continue,
                 Err(_) => break,
             }
             match read() {
