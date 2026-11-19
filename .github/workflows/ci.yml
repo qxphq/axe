@@ -150,6 +150,11 @@ jobs:
           ./harness.py --no-fetch-local --wait 1 --scroll 60 'fetch:plain' '!Escape' 'show:' \
             --expect 'refused host'
           ./harness.py --wait 1 --scroll 40 'text:one' '/compact' --expect 'Mock summary of the session.'
+          # Every command and a `!cmd` while the screen is up: a debug build
+          # asserts nothing else writes the terminal then, and the panic ends
+          # the run, which fails the journey.
+          ./harness.py --wait 1 --scroll 80 '/model' '!Escape' '/sessions' '!Escape' '/skills' '/mcp' \
+            '/help' ' !echo hi' '/thinking' '!Escape' '/new' --refute 'panicked'
 
       # A project MCP file is code a repository shipped: one approval, then no
       # question at the next start.

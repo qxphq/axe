@@ -5,8 +5,15 @@
 //! control bytes (a page can carry an escape sequence), the output cap (a
 //! command can print a gigabyte) and the style (a `Style` becomes SGR in one
 //! place, so the palette is one table).
+//!
+//! It is also the one writer of stdout and stderr while no `Screen` owns the
+//! terminal: the startup lines, a piped run, the warnings. `clippy.toml`
+//! refuses `print!` and `io::stdout()` everywhere else, so a stray write while
+//! the screen is up cannot be added by accident, and a debug build asserts the
+//! screen is down when one of these runs.
 
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -63,7 +70,7 @@ pub fn terminal_safe(text: &str) -> String {
 /// Text for the terminal: stripped when there is one to strip for. Redirected
 /// output keeps its bytes, so a pipe is the same text the page held.
 pub fn terminal_text(text: &str) -> String {
-    if io::stdout().is_terminal() {
+    if stdout_is_terminal() {
         terminal_safe(text)
     } else {
         text.to_string()
@@ -172,7 +179,7 @@ pub fn head_tail(text: &str, head: usize, tail: usize) -> String {
 /// names are the terminal's (`Color::Cyan`), never an RGB value of ours, so the
 /// user's theme decides what each one is. Redirected output is plain.
 pub fn ansi(text: &str, style: Style) -> String {
-    if io::stdout().is_terminal() {
+    if stdout_is_terminal() {
         styled(text, style)
     } else {
         text.to_string()
@@ -183,7 +190,7 @@ pub fn ansi(text: &str, style: Style) -> String {
 /// whether stderr is the terminal, and a line meant for it must be stripped by
 /// what it is written to.
 pub fn ansi_err(text: &str, style: Style) -> String {
-    if io::stderr().is_terminal() {
+    if stderr_is_terminal() {
         styled(text, style)
     } else {
         text.to_string()
@@ -251,6 +258,68 @@ fn codes(style: Style) -> Vec<u8> {
         }
     }
     codes
+}
+
+// ---- output without a screen ----
+
+/// Set while a `Screen` owns the terminal: it is the only writer then.
+static SCREEN: AtomicBool = AtomicBool::new(false);
+
+/// `Screen::new` raises it and `Screen::close` lowers it.
+pub fn screen_owns_terminal(owns: bool) {
+    SCREEN.store(owns, Ordering::SeqCst);
+}
+
+/// A write while the screen is up would land between its rows: a rendering
+/// bug, caught here in a debug build and by every harness journey.
+fn no_screen() {
+    debug_assert!(
+        !SCREEN.load(Ordering::SeqCst),
+        "stdout or stderr written while the screen owns the terminal"
+    );
+}
+
+#[allow(clippy::disallowed_methods)] // the one place stdout is asked
+fn stdout_is_terminal() -> bool {
+    io::stdout().is_terminal()
+}
+
+#[allow(clippy::disallowed_methods)] // the one place stderr is asked
+fn stderr_is_terminal() -> bool {
+    io::stderr().is_terminal()
+}
+
+/// Write `text` to stdout as the caller made it — styled through `ansi`, or
+/// the model's words through `terminal_text` — and flush.
+#[allow(clippy::disallowed_methods)] // the one writer of stdout without a screen
+pub fn out(text: &str) {
+    no_screen();
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.write_all(text.as_bytes());
+    let _ = stdout.flush();
+}
+
+/// `out` for stderr: the harness's own account, never the answer.
+#[allow(clippy::disallowed_methods)] // the one writer of stderr without a screen
+pub fn err(text: &str) {
+    no_screen();
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_all(text.as_bytes());
+    let _ = stderr.flush();
+}
+
+/// One `axe:` line on stderr. The text may come from anywhere — a path, a
+/// provider's error — so it is made safe for a terminal first.
+pub fn warn(text: &str) {
+    err(&format!("axe: {}\n", terminal_safe(text)));
+}
+
+/// Why a test did not run its path: a pass for a path that never ran must say
+/// so, and stderr is where the test runner shows it.
+#[cfg(test)]
+#[allow(clippy::disallowed_macros)] // a test's own report
+pub(crate) fn skip(test: &str, why: &str) {
+    eprintln!("skip {test}: {why}");
 }
 
 #[cfg(test)]

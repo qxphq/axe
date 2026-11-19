@@ -107,7 +107,7 @@ pub fn load_default() -> Option<String> {
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         Err(e) => {
-            eprintln!("axe: cannot parse {}: {e}", file.display());
+            crate::text::warn(&format!("cannot parse {}: {e}", file.display()));
             None
         }
     }
@@ -327,14 +327,14 @@ pub fn load(cwd: &Path) -> State {
         Ok(raw) => raw,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return state,
         Err(e) => {
-            eprintln!("axe: cannot read {}: {e}", file.display());
+            crate::text::warn(&format!("cannot read {}: {e}", file.display()));
             return state;
         }
     };
     let v: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("axe: cannot parse {}: {e}", file.display());
+            crate::text::warn(&format!("cannot parse {}: {e}", file.display()));
             return state;
         }
     };
@@ -415,6 +415,7 @@ impl State {
 /// change it run one at a time under this lock, and everything they write lands
 /// inside the directory and is removed with it.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // the one place a test changes the environment
 pub(crate) mod testenv {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -431,6 +432,18 @@ pub(crate) mod testenv {
     pub fn with_env_lock<T>(f: impl FnOnce() -> T) -> T {
         let _held = lock().lock().unwrap_or_else(|e| e.into_inner());
         f()
+    }
+
+    /// Set a variable a test owns: a name no other test reads, so it needs no
+    /// lock. A variable another test reads (`HOME`, `XDG_*`) goes through
+    /// `home`, which holds the lock.
+    pub fn set_var(name: &str, value: &str) {
+        std::env::set_var(name, value);
+    }
+
+    /// The other half of `set_var`.
+    pub fn remove_var(name: &str) {
+        std::env::remove_var(name);
     }
 
     /// A directory named for the test, emptied first.
@@ -703,8 +716,8 @@ mod tests {
     #[test]
     fn without_a_home_nothing_is_kept_in_the_working_directory() {
         testenv::home("no-home", |home| {
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::set_var("HOME", "");
+            testenv::remove_var("XDG_STATE_HOME");
+            testenv::set_var("HOME", "");
             assert!(root().is_none());
             assert!(unkept().is_some());
             let cwd = home.join("work");

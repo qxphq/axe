@@ -549,10 +549,7 @@ impl Term {
             Term::Real(_) => {
                 let mut tries = 0;
                 loop {
-                    match Terminal::with_options(
-                        Tail(CrosstermBackend::new(io::stdout())),
-                        options(),
-                    ) {
+                    match Terminal::with_options(backend(), options()) {
                         Ok(term) => break Term::Real(term),
                         Err(_) if tries < 50 => {
                             tries += 1;
@@ -722,8 +719,8 @@ impl Screen {
         let rows = Frame::layout(height, Mode::Idle, Shown::default())
             .height()
             .clamp(1, height.max(1));
-        let term = match Terminal::with_options(
-            Tail(CrosstermBackend::new(io::stdout())),
+        let mut term = match Terminal::with_options(
+            backend(),
             TerminalOptions {
                 viewport: Viewport::Inline(rows),
             },
@@ -741,10 +738,11 @@ impl Screen {
         // Bracketed paste keeps a pasted block one buffer, and a terminal that
         // knows neither ignores both.
         let _ = execute!(
-            io::stdout(),
+            term.backend_mut(),
             EnableBracketedPaste,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
         );
+        crate::text::screen_owns_terminal(true);
         Ok(Screen::bare(Term::Real(term)))
     }
 
@@ -1810,6 +1808,7 @@ impl Screen {
             Term::Test(_) => {}
         }
         ratatui::restore();
+        crate::text::screen_owns_terminal(false);
     }
 
     fn insert_char(&mut self, c: char) {
@@ -2510,6 +2509,7 @@ pub(crate) fn split(text: &str) -> Vec<&str> {
 /// there is no terminal to own, so the kernel does the editing, and nothing is
 /// printed — there is no prompt to close, and a read that finds the end must
 /// not leave a row open.
+#[allow(clippy::disallowed_methods)] // the one reader of a piped run's lines
 pub fn cooked_line() -> Option<String> {
     line_from(&mut io::stdin().lock())
 }
@@ -2526,8 +2526,16 @@ fn line_from(input: &mut impl io::BufRead) -> Option<String> {
 }
 
 /// True when the screen can own the terminal.
+#[allow(clippy::disallowed_methods)] // asks, writes nothing
 pub fn is_interactive() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+/// The screen's own handle on stdout: while a `Screen` exists it is the only
+/// writer, and this is where it gets the stream.
+#[allow(clippy::disallowed_methods)] // the screen's backend
+fn backend() -> Tail<Stdout> {
+    Tail(CrosstermBackend::new(io::stdout()))
 }
 
 /// The terminal, with one rule added: a cell whose symbol is empty ends its

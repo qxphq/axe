@@ -421,7 +421,7 @@ pub fn archive_old(cwd: &Path, keep: usize) {
         return;
     }
     if !have_gzip() {
-        eprintln!("axe: gzip not found: old session bodies stay plain");
+        crate::text::warn("gzip not found: old session bodies stay plain");
         return;
     }
     for listed in old {
@@ -440,19 +440,19 @@ pub fn archive_old(cwd: &Path, keep: usize) {
             if gz.exists() {
                 meta.archived = true;
                 if let Err(e) = meta.save(&dir) {
-                    eprintln!("axe: cannot archive session {}: {e}", meta.id);
+                    crate::text::warn(&format!("cannot archive session {}: {e}", meta.id));
                 }
             }
             continue;
         }
         if let Err(e) = compress(&dir, &meta, &plain, &gz) {
-            eprintln!("axe: cannot archive session {}: {e}", meta.id);
+            crate::text::warn(&format!("cannot archive session {}: {e}", meta.id));
             let _ = fs::remove_file(dir.join(format!("{}.jsonl.gz.tmp", meta.id)));
             continue;
         }
         meta.archived = true;
         if let Err(e) = meta.save(&dir) {
-            eprintln!("axe: cannot archive session {}: {e}", meta.id);
+            crate::text::warn(&format!("cannot archive session {}: {e}", meta.id));
         }
     }
 }
@@ -501,7 +501,7 @@ fn require_gzip(what: &str) -> bool {
     if have_gzip() {
         return true;
     }
-    eprintln!("skip {what}: no gzip on this host");
+    crate::text::skip(what, "no gzip on this host");
     false
 }
 

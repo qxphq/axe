@@ -153,7 +153,7 @@ pub fn read_agents(file: &Path) -> Option<String> {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
         Err(e) => {
-            eprintln!("axe: cannot read {}: {e}", file.display());
+            crate::text::warn(&format!("cannot read {}: {e}", file.display()));
             return None;
         }
     };
@@ -161,12 +161,12 @@ pub fn read_agents(file: &Path) -> Option<String> {
         return None;
     }
     if text.len() > AGENTS_LIMIT {
-        eprintln!(
-            "axe: {} is {} bytes, truncated to {}",
+        crate::text::warn(&format!(
+            "{} is {} bytes, truncated to {}",
             file.display(),
             text.len(),
             AGENTS_LIMIT
-        );
+        ));
         // The model reads the cap too: instructions that stop mid-sentence
         // otherwise read like instructions that end there.
         let marker = "\n...[instructions truncated at 48 KiB]...\n";
@@ -710,7 +710,7 @@ mod tests {
 
     #[test]
     fn provider_level_and_key_helpers() {
-        std::env::set_var("AXE_TEST_PROVIDER_KEY", "secret");
+        crate::state::testenv::set_var("AXE_TEST_PROVIDER_KEY", "secret");
         let provider = ProviderConfig {
             name: "p".into(),
             base_url: "http://p".into(),
@@ -733,7 +733,7 @@ mod tests {
         );
         assert_eq!(provider.thinking_body(Some("off")), None);
         assert_eq!(provider.thinking_body(Some("missing")), None);
-        std::env::remove_var("AXE_TEST_PROVIDER_KEY");
+        crate::state::testenv::remove_var("AXE_TEST_PROVIDER_KEY");
         assert_eq!(provider.resolved_key(), None);
     }
 

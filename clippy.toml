@@ -1,0 +1,18 @@
+# The rules a review kept re-checking by hand, made errors: CI runs clippy with
+# `-D warnings`. Each owner allows its one use, with the reason beside it.
+
+disallowed-macros = [
+  { path = "std::print", reason = "write through text::out: one writer without a screen, none with one" },
+  { path = "std::println", reason = "write through text::out: one writer without a screen, none with one" },
+  { path = "std::eprint", reason = "write through text::err or text::warn" },
+  { path = "std::eprintln", reason = "write through text::err or text::warn" },
+  { path = "std::dbg", reason = "a debug print reaches the user's terminal" },
+]
+
+disallowed-methods = [
+  { path = "std::io::stdout", reason = "stdout belongs to text::out, or to the Screen while one exists" },
+  { path = "std::io::stderr", reason = "stderr belongs to text::err and text::warn" },
+  { path = "std::io::stdin", reason = "input is the key thread's, a piped run's cooked_line or the MCP question; a test that reads stdin hangs in an agent's shell" },
+  { path = "std::env::set_var", reason = "the environment is process-wide: a test changes it through state::testenv, under its lock" },
+  { path = "std::env::remove_var", reason = "the environment is process-wide: a test changes it through state::testenv, under its lock" },
+]

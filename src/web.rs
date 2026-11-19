@@ -1094,7 +1094,7 @@ mod tests {
 
     /// The local-host knob is debug-only; the test build is the debug build.
     fn allow_local() {
-        std::env::set_var("AXE_FETCH_ALLOW_LOCAL", "1");
+        crate::state::testenv::set_var("AXE_FETCH_ALLOW_LOCAL", "1");
     }
 
     #[test]

@@ -666,43 +666,37 @@ fn approved(cwd: &Path, file: &Path, hash: &str) -> bool {
         .is_some_and(|remembered| remembered == hash)
 }
 
-fn remember(cwd: &Path, file: &Path, hash: &str) {
+/// Record an approval. The error is the caller's to show: at startup it joins
+/// the notices, during a session the `/mcp` answer, and neither may print
+/// past the screen.
+fn remember(cwd: &Path, file: &Path, hash: &str) -> Result<(), String> {
     let mut trust = read_trust(cwd);
     trust.insert(file.display().to_string(), hash.to_string());
     let Some(file) = trust_file(cwd) else {
-        eprintln!("axe: mcp trust: no state directory, so the approval is not remembered");
-        return;
+        return Err("mcp trust: no state directory, so the approval is not remembered".into());
     };
     if let Some(Err(e)) = file.parent().map(state::private_dir) {
-        eprintln!("axe: mcp trust: {e}");
-        return;
+        return Err(format!("mcp trust: {e}"));
     }
     let value: BTreeMap<&String, &String> = trust.iter().collect();
-    let text = match serde_json::to_string_pretty(&value) {
-        Ok(text) => format!("{text}\n"),
-        Err(e) => {
-            eprintln!("axe: mcp trust: {e}");
-            return;
-        }
-    };
-    if let Err(e) = write_atomic(&file, &text, true) {
-        eprintln!("axe: mcp trust: {e}");
-    }
+    let text = serde_json::to_string_pretty(&value)
+        .map(|text| format!("{text}\n"))
+        .map_err(|e| format!("mcp trust: {e}"))?;
+    write_atomic(&file, &text, true).map_err(|e| format!("mcp trust: {e}"))
 }
 
 /// Carry a project file's approval across a write axe itself made — but only
 /// when the file was already approved. An add or a remove must never bless
 /// entries the approval question has not listed: the file is code, and the
 /// question is the only place it is shown.
-fn carry_approval(cwd: &Path, file: &Path, prior: Option<&str>) {
+fn carry_approval(cwd: &Path, file: &Path, prior: Option<&str>) -> Result<(), String> {
     match prior {
         Some(hash) if approved(cwd, file, hash) => {}
-        _ => return,
+        _ => return Ok(()),
     }
-    if let Ok(bytes) = fs::read(file) {
-        if let Some(hash) = hash_of(&bytes) {
-            remember(cwd, file, &hash);
-        }
+    match fs::read(file).ok().and_then(|bytes| hash_of(&bytes)) {
+        Some(hash) => remember(cwd, file, &hash),
+        None => Ok(()),
     }
 }
 
@@ -719,6 +713,7 @@ fn forget_trust(cwd: &Path) -> String {
 
 /// The one question: what the repository wants to run, and which of the
 /// environment it wants to see.
+#[allow(clippy::disallowed_methods)] // the approval is read before the screen exists
 fn ask(file: &Path, entries: &[Entry]) -> bool {
     let mut text = format!("mcp {} defines:\n", file.display());
     for entry in entries {
@@ -732,8 +727,8 @@ fn ask(file: &Path, entries: &[Entry]) -> bool {
         }
     }
     text.push_str("run them? [y/N] ");
-    print!("{text}");
-    io::stdout().flush().ok();
+    // The path is the repository's: it is shown, never interpreted.
+    crate::text::out(&crate::text::terminal_safe(&text));
     let mut line = String::new();
     match io::stdin().read_line(&mut line) {
         Ok(0) | Err(_) => false,
@@ -1576,7 +1571,9 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
                 Some(hash) => {
                     if interactive && ask(file, &project_entries) {
                         if let Some(dir) = cwd {
-                            remember(dir, file, hash);
+                            if let Err(e) = remember(dir, file, hash) {
+                                errors.push(e);
+                            }
                         }
                         trusted = true;
                         recorded = true;
@@ -2188,15 +2185,18 @@ fn add(rest: &str) -> String {
         Ok(()) => {
             // The user typed this entry, not the whole file: an approval the
             // file already had survives, and one it never had is not invented.
-            if path != global_path() {
-                if let Some(dir) = cwd.as_deref() {
-                    carry_approval(dir, &path, prior.as_deref());
-                }
-            }
-            format!(
+            let mut out = format!(
                 "◦ mcp: added \"{name}\" to {}\n  restart axe to load it\n",
                 path.display()
-            )
+            );
+            if path != global_path() {
+                if let Some(dir) = cwd.as_deref() {
+                    if let Err(e) = carry_approval(dir, &path, prior.as_deref()) {
+                        out.push_str(&format!("error: {e}\n"));
+                    }
+                }
+            }
+            out
         }
         Err(e) => format!("error: mcp: {e}\n"),
     }
@@ -2215,6 +2215,7 @@ fn remove(rest: &str) -> String {
         }
     }
     let mut removed = 0;
+    let mut problems = String::new();
     for file in files {
         let prior = fs::read(&file).ok().and_then(|bytes| hash_of(&bytes));
         match remove_entry(&file, name) {
@@ -2222,7 +2223,9 @@ fn remove(rest: &str) -> String {
                 removed += 1;
                 if file != global_path() {
                     if let Some(dir) = cwd.as_deref() {
-                        carry_approval(dir, &file, prior.as_deref());
+                        if let Err(e) = carry_approval(dir, &file, prior.as_deref()) {
+                            problems.push_str(&format!("error: {e}\n"));
+                        }
                     }
                 }
             }
@@ -2232,7 +2235,7 @@ fn remove(rest: &str) -> String {
     }
     match removed {
         0 => format!("error: mcp: no entry named \"{name}\" in either file\n"),
-        _ => format!("◦ mcp: removed \"{name}\"; restart axe\n"),
+        _ => format!("◦ mcp: removed \"{name}\"; restart axe\n{problems}"),
     }
 }
 
@@ -2403,7 +2406,7 @@ mod tests {
 
     #[test]
     fn references_are_found_and_resolved() {
-        std::env::set_var("AXE_TEST_MCP_VAR", "one");
+        crate::state::testenv::set_var("AXE_TEST_MCP_VAR", "one");
         assert_eq!(
             vars_in("a ${AXE_TEST_MCP_VAR} $AXE_TEST_MCP_VAR $$X"),
             vec!["AXE_TEST_MCP_VAR".to_string()]
@@ -2413,7 +2416,7 @@ mod tests {
             .unwrap_err()
             .contains("not set"));
         assert_eq!(expand("$5").unwrap(), "$5");
-        std::env::remove_var("AXE_TEST_MCP_VAR");
+        crate::state::testenv::remove_var("AXE_TEST_MCP_VAR");
     }
 
     #[test]
@@ -2576,11 +2579,14 @@ mod tests {
             let file = dir.join(".mcp.json");
             fs::write(&file, "{}").unwrap();
             let Some(hash) = hash_of(b"{}") else {
-                eprintln!("skip trust_is_by_path_and_content: no sha256sum or shasum on this host");
+                crate::text::skip(
+                    "trust_is_by_path_and_content",
+                    "no sha256sum or shasum on this host",
+                );
                 return;
             };
             assert!(!approved(&dir, &file, &hash));
-            remember(&dir, &file, &hash);
+            remember(&dir, &file, &hash).unwrap();
             assert!(approved(&dir, &file, &hash));
             let other = hash_of(b"{\"mcpServers\":{}}").expect("a digester");
             assert!(!approved(&dir, &file, &other));
@@ -2606,7 +2612,10 @@ mod tests {
             let prior = b"{\"mcpServers\":{\"a\":{\"command\":\"/bin/true\"}}}";
             fs::write(&file, prior).unwrap();
             let Some(prior_hash) = hash_of(prior) else {
-                eprintln!("skip an_axe_write_carries_only_an_approval_that_existed: no sha256sum or shasum on this host");
+                crate::text::skip(
+                    "an_axe_write_carries_only_an_approval_that_existed",
+                    "no sha256sum or shasum on this host",
+                );
                 return;
             };
 
@@ -2614,15 +2623,15 @@ mod tests {
             // still asks about everything the file now holds.
             let added = b"{\"mcpServers\":{\"a\":{\"command\":\"/bin/true\"},\"b\":{\"command\":\"/bin/false\"}}}";
             fs::write(&file, added).unwrap();
-            carry_approval(&dir, &file, Some(&prior_hash));
+            carry_approval(&dir, &file, Some(&prior_hash)).unwrap();
             let added_hash = hash_of(added).expect("a digester");
             assert!(!approved(&dir, &file, &added_hash), "nothing was blessed");
 
             // Approved before: the user's own edit keeps the approval.
             fs::write(&file, prior).unwrap();
-            remember(&dir, &file, &prior_hash);
+            remember(&dir, &file, &prior_hash).unwrap();
             fs::write(&file, added).unwrap();
-            carry_approval(&dir, &file, Some(&prior_hash));
+            carry_approval(&dir, &file, Some(&prior_hash)).unwrap();
             assert!(approved(&dir, &file, &added_hash));
         });
     }
@@ -2681,14 +2690,14 @@ mod tests {
     /// its arguments are expanded from that environment at start.
     #[test]
     fn a_command_and_its_arguments_expand_from_the_environment() {
-        std::env::set_var("AXE_TEST_MCP_ARG", "hello");
+        crate::state::testenv::set_var("AXE_TEST_MCP_ARG", "hello");
         let mut with_args = entry("t", "$AXE_TEST_MCP_COMMAND");
         with_args.args = vec![
             "--greeting".into(),
             "${AXE_TEST_MCP_ARG}".into(),
             "$$literal".into(),
         ];
-        std::env::set_var("AXE_TEST_MCP_COMMAND", "tool");
+        crate::state::testenv::set_var("AXE_TEST_MCP_COMMAND", "tool");
         let (program, args) = stdio_words(&with_args).unwrap();
         assert_eq!(program, "tool");
         assert_eq!(args, ["--greeting", "hello", "$literal"]);
@@ -2703,11 +2712,11 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.vars, vec!["AXE_TEST_MCP_ARG".to_string()]);
 
-        std::env::remove_var("AXE_TEST_MCP_ARG");
+        crate::state::testenv::remove_var("AXE_TEST_MCP_ARG");
         let err = stdio_words(&with_args).unwrap_err();
         assert!(err.contains("args[1]"), "{err}");
         assert!(err.contains("AXE_TEST_MCP_ARG is not set"), "{err}");
-        std::env::remove_var("AXE_TEST_MCP_COMMAND");
+        crate::state::testenv::remove_var("AXE_TEST_MCP_COMMAND");
     }
 
     /// A replaced file is written beside itself and renamed: a crash leaves the
@@ -2734,7 +2743,10 @@ mod tests {
     #[test]
     fn the_trust_hash_is_a_sha256_of_the_bytes() {
         let Some(hash) = hash_of(b"hello") else {
-            eprintln!("skip the_trust_hash_is_a_sha256_of_the_bytes: no sha256sum or shasum");
+            crate::text::skip(
+                "the_trust_hash_is_a_sha256_of_the_bytes",
+                "no sha256sum or shasum",
+            );
             return;
         };
         assert_eq!(

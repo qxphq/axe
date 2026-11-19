@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::{self, Write};
+
 use std::panic::catch_unwind;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -94,8 +94,7 @@ impl PlainSink {
         if std::mem::take(&mut self.flush_top) {
             trim_top(&mut done);
         }
-        print!("{done}");
-        io::stdout().flush().ok();
+        crate::text::out(&done);
     }
 
     fn flush(&mut self) {
@@ -139,7 +138,7 @@ impl Sink for PlainSink {
         // piped run keeps stdout for the model's text and puts this on stderr,
         // where it is visible when asked for and never inside the answer.
         if self.last.is_some() && ui::separated(self.last, ui::Block::Tool) {
-            eprintln!();
+            crate::text::err("\n");
         }
         self.last = Some(ui::Block::Tool);
         let mut line = String::new();
@@ -150,25 +149,23 @@ impl Sink for PlainSink {
         }
         line.push(' ');
         line.push_str(&mark.0.ansi_err(mark.1));
-        eprintln!("{line}");
+        crate::text::err(&format!("{line}\n"));
         if let Some(error) = error {
-            eprintln!("    {}", Paint::Red.ansi_err(error));
+            crate::text::err(&format!("    {}\n", Paint::Red.ansi_err(error)));
         }
-        io::stderr().flush().ok();
     }
 
     fn cut(&mut self, why: &str) {
         // The account of a round, not the answer: stderr, like a call's line.
         // `end_round` has already put the text the line is about on stdout.
-        eprintln!("axe: {why}");
-        io::stderr().flush().ok();
+        crate::text::warn(why);
     }
 
     fn end_round(&mut self) {
         self.flush();
         self.out.commit();
         if self.out.take_wrote() {
-            println!();
+            crate::text::out("\n");
         }
     }
 

@@ -134,16 +134,16 @@ fn main() {
     match asked {
         // Answered before anything else: no config, no network, no terminal.
         Cli::Version => {
-            println!("axe {}", env!("CARGO_PKG_VERSION"));
+            crate::text::out(&format!("axe {}\n", env!("CARGO_PKG_VERSION")));
             return;
         }
         Cli::Help => {
-            print!("{}", usage());
+            crate::text::out(&usage());
             return;
         }
         Cli::Unknown(arg) => {
-            eprintln!("axe: unknown argument: {}", strip_control(&arg));
-            eprint!("\n{}", usage());
+            crate::text::warn(&format!("unknown argument: {}", strip_control(&arg)));
+            crate::text::err(&format!("\n{}", usage()));
             std::process::exit(2);
         }
         Cli::Run { .. } => {}
@@ -157,7 +157,7 @@ fn main() {
     // terminal; a static's `Drop` never runs, so this is the hook.
     sandbox::cleanup();
     if let Err(e) = result {
-        eprintln!("axe: {}", strip_control(&e));
+        crate::text::warn(&e);
         std::process::exit(1);
     }
 }
@@ -735,7 +735,7 @@ impl Session {
                     // is, and the session takes its first request as its title
                     // when it is finalized.
                     if let Err(e) = self.turn(&mut sink, &cancel) {
-                        eprintln!("axe: {}", strip_control(&e));
+                        crate::text::warn(&e);
                     }
                 }
                 Cmd::Shell(command) => {
@@ -800,7 +800,7 @@ impl Session {
         };
         match screen {
             Some(screen) => screen.error(&format!("axe: {text}\n")),
-            None => eprintln!("axe: {}", strip_control(&text)),
+            None => crate::text::warn(&text),
         }
     }
 
@@ -952,7 +952,7 @@ impl Session {
             screen.set_info(self.info());
         } else {
             for warning in warnings {
-                eprintln!("axe: {}", strip_control(&warning));
+                crate::text::warn(&warning);
             }
         }
         Ok(title)
@@ -1216,7 +1216,7 @@ impl Session {
     /// replaces the list, so the numbers always refer to what was last shown.
     fn list_piped(&mut self, arg: &str) {
         if self.state.cwd.as_os_str().is_empty() {
-            eprintln!("axe: sessions need a working directory");
+            crate::text::warn("sessions need a working directory");
             return;
         }
         if let Ok(number) = arg.parse::<usize>() {
@@ -1225,35 +1225,35 @@ impl Session {
                 .and_then(|at| self.picks.get(at))
                 .cloned()
             else {
-                eprintln!("axe: no session #{number}; run /sessions first");
+                crate::text::warn(&format!("no session #{number}; run /sessions first"));
                 return;
             };
             match self.resume(&id, None) {
-                Ok(title) => println!("◦ Resumed: {}", terminal_text(&title)),
-                Err(e) => eprintln!("axe: {}", strip_control(&e)),
+                Ok(title) => crate::text::out(&format!("◦ Resumed: {}\n", terminal_text(&title))),
+                Err(e) => crate::text::warn(&e),
             }
             return;
         }
 
         let all = sessions::list(&self.state.cwd);
         if all.is_empty() {
-            print!("{NO_SESSIONS}");
+            crate::text::out(NO_SESSIONS);
             self.picks.clear();
             return;
         }
         let selected = session_rows(&self.state.cwd, &all, arg);
         if selected.is_empty() {
-            println!("no sessions match {:?}", arg.trim());
+            crate::text::out(&format!("no sessions match {:?}\n", arg.trim()));
             self.picks.clear();
             return;
         }
         self.picks = selected.iter().map(|(id, _)| id.clone()).collect();
         for (at, (_, row)) in selected.iter().enumerate() {
-            println!("{:>2}) {}", at + 1, terminal_text(row));
+            crate::text::out(&format!("{:>2}) {}\n", at + 1, terminal_text(row)));
         }
         // The numbers are useless without the line that says what to do with
         // one, and a run without a terminal cannot arrow its way out.
-        println!("resume with /sessions <n>, or search with /sessions <query>");
+        crate::text::out("resume with /sessions <n>, or search with /sessions <query>\n");
     }
 
     /// The live region's last row: what this session is pointed at, how much of
@@ -2256,9 +2256,9 @@ impl Console<'_> {
         match self {
             Console::Screen { screen, .. } => screen.output(text),
             Console::Stdout => {
-                print!("{}", terminal_text(text));
+                crate::text::out(&terminal_text(text));
                 if !text.ends_with('\n') {
-                    println!();
+                    crate::text::out("\n");
                 }
             }
         }
@@ -2275,7 +2275,7 @@ impl Console<'_> {
             }
             Console::Stdout => {
                 for line in markdown::document(text, 0) {
-                    println!("{}", markdown::ansi(&line));
+                    crate::text::out(&format!("{}\n", markdown::ansi(&line)));
                 }
             }
         }
@@ -2286,7 +2286,7 @@ impl Console<'_> {
         let text = strip_control(text);
         match self {
             Console::Screen { screen, .. } => screen.error(&format!("axe: {text}\n")),
-            Console::Stdout => eprintln!("axe: {text}"),
+            Console::Stdout => crate::text::warn(&text),
         }
     }
 

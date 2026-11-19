@@ -37,11 +37,11 @@ pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
     // hearing it now or the model reading the history it joins.
     let sandbox_note = sandbox::init();
     if let Some(note) = &sandbox_note {
-        eprintln!("axe: {}", strip_control(note));
+        crate::text::warn(note);
     }
     super::note_sandbox(sandbox_note.clone());
     if let Some(line) = state::unkept() {
-        eprintln!("axe: {line}");
+        crate::text::warn(line);
     }
     // Instructions are read once at startup, before any request: the system
     // prompt is a stable prefix and must not change mid-session.
@@ -69,11 +69,11 @@ pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
         let plan = project.join("plan");
         match state::private_dir(&plan) {
             Ok(()) => sandbox::set_plan(&plan),
-            Err(e) => eprintln!("axe: plan directory: {e}"),
+            Err(e) => crate::text::warn(&format!("plan directory: {e}")),
         }
     }
     for warning in &loaded_skills.warnings {
-        eprintln!("axe: {}", strip_control(warning));
+        crate::text::warn(warning);
     }
     let project_skills = loaded_skills
         .skills
@@ -150,25 +150,33 @@ pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
     for (ask, answer) in asks.into_iter().zip(answers) {
         let name = ask.cfg.name.clone();
         match answer {
-            Answer::Skipped(why) => eprintln!("{}: {}", strip_control(&name), strip_control(&why)),
-            Answer::Failed(e) => eprintln!("{}: {}", strip_control(&name), strip_control(&e)),
+            Answer::Skipped(why) => crate::text::err(&format!(
+                "{}: {}\n",
+                strip_control(&name),
+                strip_control(&why)
+            )),
+            Answer::Failed(e) => crate::text::err(&format!(
+                "{}: {}\n",
+                strip_control(&name),
+                strip_control(&e)
+            )),
             Answer::Models(models) if models.is_empty() => {
-                eprintln!("{}: no models", strip_control(&name))
+                crate::text::err(&format!("{}: no models\n", strip_control(&name)))
             }
             Answer::Models(models) => {
                 // One line per provider that answers, so a slow network reads
                 // as work rather than as a dead terminal. A run without a
                 // terminal says nothing here: stdout is the transcript.
                 if ui::is_interactive() {
-                    println!(
-                        " {}",
+                    crate::text::out(&format!(
+                        " {}\n",
                         Paint::Dim.ansi(&format!(
                             "{}: {} model{}",
                             strip_control(&name),
                             models.len(),
                             plural(models.len())
                         ))
-                    );
+                    ));
                 }
                 let fields = request_fields(&ask.cfg, &sid);
                 providers.push(Provider {
@@ -227,9 +235,9 @@ pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
     // one approval; the prompt here is the only question a start asks.
     for line in mcp::start(cwd.as_deref(), ui::is_interactive(), mode.explore()) {
         if ui::is_interactive() {
-            println!("{}", strip_control(&line));
+            crate::text::out(&format!("{}\n", strip_control(&line)));
         } else {
-            eprintln!("axe: {}", strip_control(&line));
+            crate::text::warn(&line);
         }
     }
     let messages = super::base_history(
@@ -310,10 +318,10 @@ pub(crate) fn set_thinking(
 pub(crate) fn validate_level(provider: &config::ProviderConfig, level: Option<&str>) {
     let Some(level) = level else { return };
     if !level_names(provider).iter().any(|name| name == level) {
-        eprintln!(
-            "axe: {}: thinking level \"{level}\" is not configured, using default",
+        crate::text::warn(&format!(
+            "{}: thinking level \"{level}\" is not configured, using default",
             provider.name
-        );
+        ));
     }
 }
 
@@ -398,7 +406,7 @@ pub(crate) fn first_run_note(mode: tools::Mode) -> &'static str {
 
 pub(crate) fn banner(notes: &[String]) {
     // One leading blank: the same margin `ui::Screen` keeps on both edges.
-    println!();
+    crate::text::out("\n");
     let width = terminal::size().map(|(width, _)| width).unwrap_or(0);
     let logo_width = LOGO
         .iter()
@@ -421,15 +429,15 @@ pub(crate) fn banner(notes: &[String]) {
             out.push_str("   ");
             out.push_str(&Paint::Dim.ansi(env!("CARGO_PKG_VERSION")));
         }
-        println!(" {}", out);
+        crate::text::out(&format!(" {}\n", out));
     }
     if !notes.is_empty() {
-        println!();
+        crate::text::out("\n");
         for note in notes {
-            println!(" {}", Paint::Dim.ansi(note));
+            crate::text::out(&format!(" {}\n", Paint::Dim.ansi(note)));
         }
     }
-    println!();
+    crate::text::out("\n");
 }
 
 pub(crate) fn session_id() -> String {
@@ -577,14 +585,14 @@ pub(crate) fn resolve(providers: &[Provider], picks: [Option<&str>; 3]) -> (usiz
         if let Some(hit) = find(providers, spec) {
             return hit;
         }
-        eprintln!("axe: model {spec:?} not available");
+        crate::text::warn(&format!("model {spec:?} not available"));
     }
     let first = (0, providers[0].models[0].id.clone());
     if any {
-        eprintln!(
-            "axe: no configured model is available, using {}",
+        crate::text::warn(&format!(
+            "no configured model is available, using {}",
             place(providers, first.0, &first.1)
-        );
+        ));
     }
     first
 }

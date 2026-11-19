@@ -122,8 +122,10 @@ invariants a change must not break.
     last. A terminal is trusted with a narrowing that also changed the height
     only after a width-only one confirmed it rewraps. No caller draws for a state change, so work that
     finishes off the UI thread cannot strand the row.
-    Startup banner and piped output run before/without a `Screen`; a stray
-    `print!` while it exists is a rendering bug. A piped run has no prompt,
+    Startup banner and piped output run before/without a `Screen`, and only
+    through `text::out`/`err`/`warn`: `clippy.toml` refuses `print!`,
+    `io::stdout()` and `io::stdin()` everywhere but their owners, and a debug
+    build asserts no `Screen` is up when one of them writes. A piped run has no prompt,
     splash or notice — stdout is the model's text (and what a line asked for),
     and the harness's own lines, tool calls included, go to stderr. Only `Screen::write` and
     `Screen::settle` write rows above the frame, and a block goes where the
@@ -214,8 +216,9 @@ invariants a change must not break.
   `/compact` summary sees, the tail kept verbatim beside it, and the naming
   request's prompt and parse. `main` decides when they run; this decides what
   they send.
-- `text.rs` — control bytes, the output cap, and the one place a `Style` becomes
-  ANSI.
+- `text.rs` — control bytes, the output cap, the one place a `Style` becomes
+  ANSI, and the one writer of stdout and stderr while no `Screen` exists
+  (`out`, `err`, `warn`).
 - `markdown.rs` — markdown: blocks, inlines, tables, entities, URL checks, and the
   renderer. `Stream` feeds it a line at a time and lays a block out when it ends.
 - `api.rs` — model listing, chat request, SSE parsing, tool-call accumulation.
@@ -357,7 +360,10 @@ cargo clippy --all-targets -- -D warnings
 
 No test reads the terminal it runs in: an agent's shell keeps stdin open, so a
 test that waited for its end would hang the gate. Read input through a reader
-the test supplies.
+the test supplies. `clippy.toml` holds these rules as lint errors: no
+`io::stdin()` outside its owners, and no `env::set_var` outside
+`state::testenv`, whose lock keeps parallel tests from moving `HOME` under
+each other.
 
 `harness.py` is the UI loop: `mock.py` + tmux pty + virtual terminal. It needs
 python3 and tmux. CI runs the journeys below, so a regression in the screen, the
