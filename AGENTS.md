@@ -33,7 +33,10 @@ invariants a change must not break.
    rule calls it data, not authority. Read once at startup; never re-read mid-session.
 6. **Stable prefix, append-only history.** System prompt and tool schemas first,
    volatile content last. Never inject timestamps, status, or cwd changes into the
-   prefix: it invalidates provider prompt caching. Sessions are append-only JSONL,
+   prefix: it invalidates provider prompt caching. `store::Messages` holds it:
+   the system prompt has no setter, and a resume, `/new` or `/compact` starts
+   over around the same one, so nothing indexes the history by position.
+   Sessions are append-only JSONL,
    replayed on resume; `/compact` appends a marked summary and the loader starts
    from the last marker, so the bytes stay and the request shrinks.
 7. **Tools are dumb.** `read`, `write`, `edit`, `bash`, `about`, `fetch`,
@@ -187,9 +190,10 @@ invariants a change must not break.
   because this is where the choice is made.
 - `prompt.rs` — the system prompt: the built-in rules, then the instructions and
   the skills catalogue, built once as the prefix every request shares.
-- `store.rs` — the session on disk and the live history that feeds it: one
-  `push` appends to both, and the bytes the info row's fill is estimated from
-  are counted there.
+- `store.rs` — the session on disk and the live history that feeds it:
+  `Messages`, the request's parts by name (the prompt, the starting notes, the
+  conversation), and `Live`, whose one `push` appends to both. The bytes the
+  info row's fill is estimated from are counted there.
 - `ui.rs` — the screen: the live frame (`Frame`, a layout from what the frame
   shows — the prompt's rows, the queued lines, the candidates — and from the
   mode

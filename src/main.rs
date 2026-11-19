@@ -50,7 +50,7 @@ use startup::{
     dir_label, find, fullness, level, level_names, models, percent, place, scaled, session_id,
     set_thinking, thinking_label, NO_SESSIONS,
 };
-use store::{history_bytes, weight, Live, Store};
+use store::{weight, Live, Messages, Store};
 use text::{strip_control, terminal_text};
 use turn::{PlainSink, Queue, Sink, TextSink};
 
@@ -286,10 +286,8 @@ struct Session {
     /// the last request is estimated on top, so the fill does not go stale
     /// between rounds.
     used_bytes: u64,
-    messages: Vec<Value>,
-    /// The history's own size in bytes, kept as it is appended to: the request
-    /// is serialized once per message rather than once per info row.
-    bytes: u64,
+    /// What a request sends: the prompt, the starting notes, the conversation.
+    messages: Messages,
     /// The session id: also the provider's `session_header` value.
     sid: String,
     /// The append-only body and its sidecar, when there is a working directory
@@ -568,21 +566,16 @@ fn help_text() -> String {
 static SANDBOX_NOTE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Keep the startup line for the histories built later: `resume`, `/new` and
-/// `/compact` all rebuild from `base_history`.
+/// `/compact` all start over with it.
 pub(crate) fn note_sandbox(text: Option<String>) {
     if let Some(text) = text {
         let _ = SANDBOX_NOTE.set(text);
     }
 }
 
-/// The messages a history starts with: the built system prompt, the current
-/// mode note, and the sandbox's own caveat when it has one.
-pub(crate) fn base_history(system: Value, mode: tools::Mode, sandbox: Option<&str>) -> Vec<Value> {
-    let mut messages = vec![system, mode_note(mode)];
-    if let Some(note) = sandbox {
-        messages.push(json!({ "role": "user", "content": note }));
-    }
-    messages
+/// The sandbox's caveat, when startup recorded one.
+fn sandbox_note() -> Option<&'static str> {
+    SANDBOX_NOTE.get().map(String::as_str)
 }
 
 /// Whether the line loop is done: nothing a finished turn handed back, and no
@@ -767,7 +760,6 @@ impl Session {
         if let Some(store) = self.store.as_mut() {
             store.record(&message);
         }
-        self.bytes += weight(&message);
         self.messages.push(message);
     }
 
@@ -878,7 +870,7 @@ impl Session {
 
     fn finalize_session(&mut self) {
         if let Some(store) = self.store.as_mut() {
-            store.finalize(&self.messages);
+            store.finalize(self.messages.conversation());
         }
     }
 
@@ -934,9 +926,7 @@ impl Session {
         // model never gave falls back to its first request.
         self.finalize_session();
 
-        self.messages = self.base_messages();
-        self.messages.extend(messages);
-        self.bytes = history_bytes(&self.messages);
+        self.messages.restart(self.mode, sandbox_note(), messages);
         self.sid = id.to_string();
         self.store = Some(store);
         self.naming = None;
@@ -962,7 +952,7 @@ impl Session {
     /// model has all of it, and a long session must not bury the prompt in
     /// scrollback. Tool calls carry their recorded outcome.
     fn replay(&self, screen: &mut ui::Screen) {
-        let history = &self.messages[2..];
+        let history = self.messages.conversation();
         let mut results: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         for message in history {
             if message["role"].as_str() != Some("tool") {
@@ -1044,8 +1034,7 @@ impl Session {
         if let Some(dir) = dir {
             self.store = Some(Store::fresh(dir, &sid));
         }
-        self.messages = self.base_messages();
-        self.bytes = history_bytes(&self.messages);
+        self.messages.restart(self.mode, sandbox_note(), Vec::new());
         self.sid = sid;
         self.naming = None;
         self.picks.clear();
@@ -1067,7 +1056,7 @@ impl Session {
         };
         meta.title.is_empty()
             && !store.naming_tried
-            && summary::naming_excerpt(&self.messages).is_some()
+            && summary::naming_excerpt(self.messages.conversation()).is_some()
     }
 
     /// Start the title request off the UI thread. The prompt stays live; the
@@ -1077,7 +1066,7 @@ impl Session {
         if !self.may_name() {
             return;
         }
-        let Some((user, assistant)) = summary::naming_excerpt(&self.messages) else {
+        let Some((user, assistant)) = summary::naming_excerpt(self.messages.conversation()) else {
             return;
         };
         if let Some(store) = self.store.as_mut() {
@@ -1086,7 +1075,7 @@ impl Session {
         let provider = self.providers[self.provider].clone();
         let model = self.model.clone();
         let level = self.thinking.clone();
-        let fallback = sessions::fallback(&self.messages);
+        let fallback = sessions::fallback(self.messages.conversation());
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let named = title_request(&provider, &model, level.as_deref(), &user, &assistant)
@@ -1296,7 +1285,7 @@ impl Session {
             }
         }
         // Live, not written: the sidecar keeps the generated title's place.
-        let (provisional, _) = sessions::fallback(&self.messages);
+        let (provisional, _) = sessions::fallback(self.messages.conversation());
         Some(provisional).filter(|title| !title.is_empty())
     }
 
@@ -1331,8 +1320,8 @@ impl Session {
     /// and no message weighs them, so the estimate adds them.
     fn used_tokens(&self) -> u64 {
         match self.used {
-            Some(measured) => measured + self.bytes.saturating_sub(self.used_bytes) / 4,
-            None => (self.bytes + tools::definitions_bytes()) / 4,
+            Some(measured) => measured + self.messages.bytes().saturating_sub(self.used_bytes) / 4,
+            None => (self.messages.bytes() + tools::definitions_bytes()) / 4,
         }
     }
 
@@ -1347,13 +1336,8 @@ impl Session {
             return false;
         };
         let reserve = config::COMPACT_RESERVE.min(window / 2);
-        let has_answer = self
-            .messages
-            .iter()
-            .skip(2)
-            .any(|message| message["role"].as_str() == Some("assistant"));
         let line = weight(&json!({ "role": "user", "content": line })) / 4;
-        has_answer && self.used_tokens() + line + reserve > window
+        self.messages.answered() && self.used_tokens() + line + reserve > window
     }
 
     fn context(&self) -> Option<u64> {
@@ -1366,9 +1350,7 @@ impl Session {
     /// before it is rewritten.
     fn set_mode(&mut self, mode: tools::Mode) {
         self.mode = mode;
-        let note = mode_note(mode);
-        self.bytes += weight(&note);
-        self.messages.push(note);
+        self.messages.push(mode_note(mode));
     }
 
     /// `/explore` and Shift+Tab share one path, so the prompt's box, the
@@ -1396,18 +1378,6 @@ impl Session {
         for line in notices {
             console.output(&format!("{line}\n"));
         }
-    }
-
-    /// The messages every history starts with: the built system prompt, the
-    /// current mode note, and the sandbox's caveat when it has one. The prefix
-    /// itself is never rewritten.
-    fn base_messages(&self) -> Vec<Value> {
-        let system = self
-            .messages
-            .first()
-            .cloned()
-            .unwrap_or_else(|| json!({ "role": "system", "content": tools::system_prompt() }));
-        base_history(system, self.mode, SANDBOX_NOTE.get().map(String::as_str))
     }
 
     /// The lines Tab completes: the slash commands, and `/skill:<name>` for
@@ -1521,12 +1491,7 @@ impl Session {
     /// A line submitted while the request runs comes back like `shell`'s: the
     /// prompt stays live, and nothing typed is lost.
     fn compact(&mut self, console: &mut Console) -> Option<String> {
-        if !self
-            .messages
-            .iter()
-            .skip(2)
-            .any(|message| message["role"].as_str() == Some("assistant"))
-        {
+        if !self.messages.answered() {
             console.output("◦ nothing to compact\n");
             return None;
         }
@@ -1543,17 +1508,17 @@ impl Session {
             .min(200_000);
         // The newest conversation stays verbatim beside the summary, so the
         // model does not have to re-read the files it was just working on.
-        let base = self.base_messages().len();
-        let cut = summary::tail_start(&self.messages, base, config::COMPACT_KEEP);
+        let conversation = self.messages.conversation();
+        let cut = summary::tail_start(conversation, config::COMPACT_KEEP);
         // A mode note is never in the body, and the new base carries the
         // current one: written after the marker, an old note would outlive the
         // flips that followed it on resume.
-        let tail: Vec<Value> = self.messages[cut..]
+        let tail: Vec<Value> = conversation[cut..]
             .iter()
             .filter(|message| !prompt::is_mode_note(message))
             .cloned()
             .collect();
-        let prompt = summary::compaction_prompt(&self.messages[..cut], budget);
+        let prompt = summary::compaction_prompt(&conversation[..cut], budget);
         let request = vec![
             json!({ "role": "system", "content": summary::COMPACT_PROMPT }),
             json!({ "role": "user", "content": prompt }),
@@ -1596,13 +1561,14 @@ impl Session {
             )),
             Ok(reply) if !reply.text.trim().is_empty() => {
                 let summary = reply.text.trim().to_string();
-                let replaced = cut.saturating_sub(base) as u64;
+                let replaced = cut as u64;
                 let kept = tail.len();
                 let content = format!("{COMPACT_NOTE}\n\n{summary}");
-                self.messages = self.base_messages();
-                self.messages
-                    .push(json!({ "role": "user", "content": content }));
-                self.bytes = history_bytes(&self.messages);
+                self.messages.restart(
+                    self.mode,
+                    sandbox_note(),
+                    vec![json!({ "role": "user", "content": content })],
+                );
                 if let Some(store) = self.store.as_mut() {
                     store.compacted(&sessions::compacted(&content, replaced));
                 }
@@ -1703,7 +1669,6 @@ impl Session {
         let mut used: Option<api::Usage> = None;
         let mut live = Live {
             messages: &mut self.messages,
-            bytes: &mut self.bytes,
             store: self.store.as_mut(),
         };
         let provider = &self.providers[self.provider];
@@ -1836,7 +1801,6 @@ impl Session {
         };
         let mut live = Live {
             messages: &mut self.messages,
-            bytes: &mut self.bytes,
             store: self.store.as_mut(),
         };
         let used = turn::run_turn(&turn, &mut live, sink)?;
@@ -1854,7 +1818,7 @@ impl Session {
         self.used = used.map(|usage| usage.prompt.saturating_add(usage.completion));
         self.cached = used.map(|usage| usage.cached).unwrap_or(0);
         self.used_bytes = match used {
-            Some(_) => self.bytes,
+            Some(_) => self.messages.bytes(),
             None => 0,
         };
     }
@@ -2505,7 +2469,7 @@ mod tests {
         }
         let mut console = Console::Stdout;
         assert!(session.compact(&mut console).is_none());
-        let kept: Vec<String> = session.messages[3..]
+        let kept: Vec<String> = session.messages.conversation()[1..]
             .iter()
             .filter_map(|message| message["content"].as_str())
             .map(str::to_string)
@@ -2516,10 +2480,10 @@ mod tests {
             kept.len()
         );
         assert!(!kept.iter().any(|text| text == "question 0"), "{kept:?}");
-        for (at, message) in session.messages[3..].iter().enumerate() {
+        for (at, message) in session.messages.conversation()[1..].iter().enumerate() {
             if message["role"].as_str() == Some("tool") {
                 assert_eq!(
-                    session.messages[2 + at]["role"].as_str(),
+                    session.messages.conversation()[at]["role"].as_str(),
                     Some("assistant"),
                     "{kept:?}"
                 );
@@ -2545,7 +2509,7 @@ mod tests {
         }
         let mut console = Console::Stdout;
         assert!(session.compact(&mut console).is_none());
-        let live = session.messages.clone();
+        let live = session.messages.all().to_vec();
         assert!(live.len() > 3, "a tail was kept: {}", live.len());
 
         let mut meta = sessions::Meta::load(&dir, "abc123").unwrap();
@@ -2601,7 +2565,9 @@ mod tests {
         session
             .messages_turn("go on", &tx, &rx, &mut screen)
             .unwrap();
-        let roles: Vec<&str> = session.messages[2..]
+        let roles: Vec<&str> = session
+            .messages
+            .conversation()
             .iter()
             .map(|message| message["role"].as_str().unwrap_or(""))
             .collect();
@@ -2609,7 +2575,7 @@ mod tests {
             roles,
             vec!["user", "assistant", "tool", "tool", "user", "assistant"]
         );
-        assert_eq!(session.messages[5]["tool_call_id"], "b");
+        assert_eq!(session.messages.conversation()[3]["tool_call_id"], "b");
         // The request itself carries the answer before the round that asked
         // for it: a provider reads the gap, not the transcript.
         let request = body_of(&server.text());
@@ -2879,8 +2845,8 @@ mod tests {
         assert_eq!(session.state.model.as_deref(), Some("p/m"));
         session.new_session(None);
         assert!(session.picks.is_empty());
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(session.messages[0]["content"].as_str(), Some("s"));
+        assert_eq!(session.messages.all().len(), 2);
+        assert_eq!(session.messages.all()[0]["content"].as_str(), Some("s"));
     }
 
     #[test]
@@ -2890,8 +2856,6 @@ mod tests {
             std::fs::create_dir_all(&cwd).unwrap();
             let mut session = Session {
                 state: state::load(&cwd),
-                messages: Vec::new(),
-                bytes: 0,
                 ..bare_session()
             };
             session.set_model(0, "m".into(), Scope::Dir);
@@ -3005,15 +2969,19 @@ mod tests {
         let listing = session.skill_listing();
         assert!(listing.contains("demo"));
         assert!(listing.contains("tools: Read"));
-        let base = session.base_messages();
-        assert_eq!(base.len(), 2);
+        let base = session.messages.all();
+        assert_eq!(base.len(), 2, "the prompt and the mode note");
         assert_eq!(base[0]["content"].as_str(), Some("s"));
     }
 
     /// A session with a system prompt and nothing else, for the fields that do
     /// not need a terminal or a directory.
     fn bare_session() -> Session {
-        let messages = vec![json!({ "role": "system", "content": "s" })];
+        let messages = Messages::new(
+            json!({ "role": "system", "content": "s" }),
+            tools::Mode::Explore,
+            None,
+        );
         Session {
             state: state::State::default(),
             providers: vec![test_provider()],
@@ -3024,7 +2992,6 @@ mod tests {
             used: None,
             cached: 0,
             used_bytes: 0,
-            bytes: history_bytes(&messages),
             messages,
             sid: "abc".into(),
             store: None,
@@ -3041,37 +3008,46 @@ mod tests {
         let mut session = bare_session();
         session.record(json!({ "role": "user", "content": "hi" }));
         session.set_mode(tools::Mode::Normal);
-        assert_eq!(session.bytes, history_bytes(&session.messages));
+        assert_eq!(
+            session.messages.bytes(),
+            store::history_bytes(session.messages.all())
+        );
         // The estimate the info row falls back to is that sum plus the tools
         // every request carries, four to a token.
-        let estimate = (session.bytes + tools::definitions_bytes()) / 4;
+        let estimate = (session.messages.bytes() + tools::definitions_bytes()) / 4;
         assert!(
             session.fill().0.starts_with(&scaled(estimate)),
             "{} of {}",
             session.fill().0,
-            session.bytes
+            session.messages.bytes()
         );
         // A replacement re-counts rather than carrying the old sum.
-        let grown = session.bytes;
-        session.messages = session.base_messages();
-        session.bytes = history_bytes(&session.messages);
-        assert!(session.bytes < grown);
-        assert_eq!(session.bytes, history_bytes(&session.messages));
+        let grown = session.messages.bytes();
+        session.messages.restart(session.mode, None, Vec::new());
+        assert!(session.messages.bytes() < grown);
+        assert_eq!(
+            session.messages.bytes(),
+            store::history_bytes(session.messages.all())
+        );
     }
 
     #[test]
     fn a_weaker_sandbox_joins_the_history() {
         let system = json!({ "role": "system", "content": "s" });
-        let held = base_history(system.clone(), tools::Mode::Explore, None);
-        assert_eq!(held.len(), 2, "the prompt and the mode note");
-        let weak = base_history(
+        let held = Messages::new(system.clone(), tools::Mode::Explore, None);
+        assert_eq!(held.all().len(), 2, "the prompt and the mode note");
+        let weak = Messages::new(
             system,
             tools::Mode::Explore,
             Some("sandbox: Landlock is unavailable"),
         );
-        assert_eq!(weak.len(), 3);
-        assert_eq!(weak[2]["role"], "user");
-        assert_eq!(weak[2]["content"], "sandbox: Landlock is unavailable");
+        assert_eq!(weak.all().len(), 3);
+        assert_eq!(weak.all()[2]["role"], "user");
+        assert_eq!(weak.all()[2]["content"], "sandbox: Landlock is unavailable");
+        assert!(
+            weak.conversation().is_empty(),
+            "the caveat is not the conversation"
+        );
     }
 
     #[test]
@@ -3082,9 +3058,9 @@ mod tests {
         assert!(session.fill().0.contains("100"));
         session.set_mode(tools::Mode::Normal);
         assert!(!session.mode.explore());
-        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages.conversation().len(), 1, "the flip's note");
         session.record(json!({ "role": "user", "content": "hi" }));
-        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages.conversation().len(), 2);
         session.warn("careful".into());
         session.flush_warnings(None);
     }
@@ -3099,8 +3075,6 @@ mod tests {
                 store.meta = Some(meta);
                 Some(store)
             },
-            messages: Vec::new(),
-            bytes: 0,
             ..bare_session()
         };
         // Untitled and empty history: the row starts with the model.
@@ -3111,11 +3085,14 @@ mod tests {
         );
         // The first request stands in until the model names the session; a
         // mode note or a shell line is not a request.
-        session.messages = vec![
-            json!({ "role": "user", "content": "explore mode: on" }),
-            json!({ "role": "user", "content": "$ !ls\nfile" }),
-            json!({ "role": "user", "content": "why is the row blank" }),
-        ];
+        session.messages.restart(
+            session.mode,
+            None,
+            vec![
+                json!({ "role": "user", "content": "$ !ls\nfile" }),
+                json!({ "role": "user", "content": "why is the row blank" }),
+            ],
+        );
         assert!(
             info_text(&session).starts_with("why is the row blank  ·  p/m"),
             "{}",
@@ -3168,8 +3145,6 @@ mod tests {
     /// messages every session starts with.
     fn session_at(server: &Server) -> Session {
         let mut session = bare_session();
-        session.messages = session.base_messages();
-        session.bytes = history_bytes(&session.messages);
         let provider = &mut session.providers[0];
         provider.ep = server.ep.clone();
         provider.models = vec![api::ModelInfo {
@@ -3209,9 +3184,9 @@ mod tests {
             .messages_turn("say hello", &tx, &rx, &mut screen)
             .unwrap();
         assert!(leftover.is_empty());
-        assert_eq!(session.messages[2]["content"], "say hello");
-        assert_eq!(session.messages[3]["role"], "assistant");
-        assert_eq!(session.messages[3]["content"], "hello\n");
+        assert_eq!(session.messages.conversation()[0]["content"], "say hello");
+        assert_eq!(session.messages.conversation()[1]["role"], "assistant");
+        assert_eq!(session.messages.conversation()[1]["content"], "hello\n");
         assert_eq!(session.used, Some(4), "the round counted its tokens");
         assert!(screen.status().is_empty(), "the status row is cleared");
         let rows = screen.transcript();
@@ -3234,8 +3209,11 @@ mod tests {
         session
             .messages_turn("look it up", &tx, &rx, &mut screen)
             .unwrap();
-        assert_eq!(session.messages[2 + 1]["tool_calls"][0]["id"], "c1");
-        assert_eq!(session.messages[2 + 2]["role"], "tool");
+        assert_eq!(
+            session.messages.conversation()[1]["tool_calls"][0]["id"],
+            "c1"
+        );
+        assert_eq!(session.messages.conversation()[2]["role"], "tool");
         let rows = screen.transcript();
         assert!(rows.iter().any(|row| row.contains("about")), "{rows:?}");
         assert!(rows.iter().any(|row| row.contains("done")), "{rows:?}");
@@ -3252,7 +3230,11 @@ mod tests {
             .messages_turn("do it", &tx, &rx, &mut screen)
             .unwrap();
         assert!(leftover.is_empty());
-        assert_eq!(session.messages.len(), 3, "only the request was recorded");
+        assert_eq!(
+            session.messages.all().len(),
+            3,
+            "only the request was recorded"
+        );
         let rows = screen.transcript();
         assert!(rows.iter().any(|row| row.contains("it broke")), "{rows:?}");
         assert!(
@@ -3301,7 +3283,7 @@ mod tests {
             "the round is not a whole answer and says so: {rows:?}"
         );
         // The text before the cut is the model's, so the session keeps it.
-        assert_eq!(session.messages.last().unwrap()["content"], "half");
+        assert_eq!(session.messages.all().last().unwrap()["content"], "half");
     }
 
     #[test]
@@ -3451,6 +3433,7 @@ mod tests {
         let notes = |session: &Session| {
             session
                 .messages
+                .all()
                 .iter()
                 .filter(|message| {
                     message["content"].as_str() == Some(&*tools::Mode::Explore.note())
@@ -3496,22 +3479,29 @@ mod tests {
         ])]);
         let mut session = session_at(&server);
         session.record(json!({ "role": "assistant", "content": "an answer" }));
-        let before = session.messages.len();
+        let before = session.messages.all().len();
         let mut console = Console::Stdout;
 
         assert!(session.compact(&mut console).is_none());
         // A history smaller than the kept tail is summarized whole: the base,
         // then the summary, and no verbatim tail.
-        assert_eq!(session.messages.len(), 3, "the base, then the summary");
-        assert!(session.messages[2]["content"]
+        assert_eq!(
+            session.messages.all().len(),
+            3,
+            "the base, then the summary"
+        );
+        assert!(session.messages.conversation()[0]["content"]
             .as_str()
             .unwrap()
             .contains("the summary"));
-        assert!(session.messages[2]["content"]
+        assert!(session.messages.conversation()[0]["content"]
             .as_str()
             .unwrap()
             .starts_with(COMPACT_NOTE));
-        assert_eq!(session.bytes, history_bytes(&session.messages));
+        assert_eq!(
+            session.messages.bytes(),
+            store::history_bytes(session.messages.all())
+        );
         assert!(session.used.is_none(), "the old count is gone");
         assert_eq!(before, 3);
     }
@@ -3527,12 +3517,12 @@ mod tests {
         ])]);
         let mut session = session_at(&server);
         session.record(json!({ "role": "assistant", "content": "an answer" }));
-        let before = session.messages.clone();
+        let before = session.messages.all().to_vec();
         let mut console = Console::Stdout;
 
         assert!(session.compact(&mut console).is_none());
-        assert_eq!(session.messages, before, "the session is unchanged");
-        assert_eq!(session.bytes, history_bytes(&before));
+        assert_eq!(session.messages.all(), before, "the session is unchanged");
+        assert_eq!(session.messages.bytes(), store::history_bytes(&before));
     }
 
     #[test]
@@ -3595,18 +3585,21 @@ mod tests {
         let mut session = bare_session();
         session.record(json!({ "role": "user", "content": "x".repeat(400) }));
         // Nothing measured: the history and the tools, four chars to a token.
-        let estimate = (session.bytes + tools::definitions_bytes()) / 4;
+        let estimate = (session.messages.bytes() + tools::definitions_bytes()) / 4;
         assert_eq!(session.used_tokens(), estimate);
         // Measured: the provider's number plus the growth since that request.
         session.used = Some(1000);
-        session.used_bytes = session.bytes;
+        session.used_bytes = session.messages.bytes();
         session.cached = 900;
         assert_eq!(session.used_tokens(), 1000);
         assert!(session.fill().0.contains("cached"), "{}", session.fill().0);
-        let grown = session.bytes;
+        let grown = session.messages.bytes();
         session.record(json!({ "role": "user", "content": "y".repeat(400) }));
         // Exactly what the request grew by, four chars to a token.
-        assert_eq!(session.used_tokens(), 1000 + (session.bytes - grown) / 4);
+        assert_eq!(
+            session.used_tokens(),
+            1000 + (session.messages.bytes() - grown) / 4
+        );
     }
 
     /// pi's trigger: within the reserve of the window there is no room for the
@@ -3627,7 +3620,7 @@ mod tests {
         // Within the reserve of the window: no room for the answer.
         session.providers[0].models[0].context = Some(8_192);
         session.used = Some(8_000);
-        session.used_bytes = session.bytes;
+        session.used_bytes = session.messages.bytes();
         assert!(session.over_threshold(""));
         // A model that does not say its window has no threshold to cross.
         session.providers[0].models[0].context = None;
@@ -3639,15 +3632,14 @@ mod tests {
     #[test]
     fn the_line_about_to_be_sent_counts_toward_the_threshold() {
         let mut session = bare_session();
-        session.messages = session.base_messages();
-        session.bytes = history_bytes(&session.messages);
+        session.messages.restart(session.mode, None, Vec::new());
         session.record(json!({ "role": "assistant", "content": "an answer" }));
         session.providers[0].models = vec![api::ModelInfo {
             id: session.model.clone(),
             context: Some(100_000),
         }];
         session.used = Some(80_000);
-        session.used_bytes = session.bytes;
+        session.used_bytes = session.messages.bytes();
         assert!(!session.over_threshold("short"));
         assert!(session.over_threshold(&"x".repeat(20_000)));
     }
@@ -3689,7 +3681,7 @@ mod tests {
         session.turn(&mut sink, &http::Cancel::new()).unwrap();
         assert_eq!(session.used, Some(32));
         assert_eq!(session.cached, 20);
-        assert_eq!(session.used_bytes, session.bytes);
+        assert_eq!(session.used_bytes, session.messages.bytes());
     }
 
     /// A mode note in the kept tail is not written after the marker: the body
@@ -3713,9 +3705,13 @@ mod tests {
         }
         let mut console = Console::Stdout;
         assert!(session.compact(&mut console).is_none());
-        assert!(session.messages.len() > 3, "a tail was kept");
+        assert!(session.messages.all().len() > 3, "a tail was kept");
         assert!(
-            !session.messages[2..].iter().any(prompt::is_mode_note),
+            !session
+                .messages
+                .conversation()
+                .iter()
+                .any(prompt::is_mode_note),
             "only the base carries the mode"
         );
 
@@ -3725,7 +3721,7 @@ mod tests {
         assert!(!replayed.iter().any(prompt::is_mode_note), "{replayed:?}");
         assert_eq!(
             replayed,
-            session.messages[2..],
+            session.messages.conversation(),
             "resume matches the live history"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3736,7 +3732,10 @@ mod tests {
         let mut session = bare_session();
         let mut console = Console::Stdout;
         assert!(session.compact(&mut console).is_none());
-        assert_eq!(session.messages.len(), 1);
+        assert!(
+            session.messages.conversation().is_empty(),
+            "nothing replaced"
+        );
     }
 
     #[test]
@@ -3798,8 +3797,6 @@ mod tests {
     fn a_resumed_history_is_replayed_into_the_transcript() {
         let mut session = bare_session();
         session.state.thoughts = true;
-        session.messages = session.base_messages();
-        session.messages[1] = json!({ "role": "user", "content": "explore mode: on" });
         // A compacted body opens with the summary. It was printed when it was
         // made; a resume starts from it, so the replay leaves it out.
         session.messages.push(json!({
@@ -3867,7 +3864,7 @@ mod tests {
         let mut session = bare_session();
         let result = session.run_shell("echo hi");
         assert!(result.contains("hi"), "{result}");
-        let last = session.messages.last().unwrap();
+        let last = session.messages.all().last().unwrap();
         assert_eq!(last["role"], "user");
         assert!(last["content"].as_str().unwrap().starts_with("$ echo hi"));
     }
@@ -3904,7 +3901,7 @@ mod tests {
 
         let leftover = session.shell("echo sous", &mut screen, &rx);
         assert!(leftover.is_none());
-        let last = session.messages.last().unwrap();
+        let last = session.messages.all().last().unwrap();
         assert_eq!(last["role"], "user");
         let content = last["content"].as_str().unwrap();
         // The header sits on its own line under the command: the same bytes
@@ -4156,6 +4153,7 @@ mod tests {
             assert_eq!(session.sid, "abc123");
             assert!(session
                 .messages
+                .all()
                 .iter()
                 .any(|m| m["content"] == "earlier words"));
             let rows = screen.transcript();
@@ -4208,7 +4206,11 @@ mod tests {
             session.list_piped("");
             session.list_piped("1");
             assert_eq!(session.sid, "abc123", "the number resumes the row");
-            assert!(session.messages.iter().any(|m| m["content"] == "a needle"));
+            assert!(session
+                .messages
+                .all()
+                .iter()
+                .any(|m| m["content"] == "a needle"));
 
             // A number that was never listed, and a directory with nothing in
             // it, are both answered rather than fatal.
@@ -4239,8 +4241,12 @@ mod tests {
 
         session.new_session(Some(&mut screen));
         assert_ne!(session.sid, "abc123");
-        assert_eq!(session.messages.len(), 2, "the base, and nothing else");
-        assert!(session.messages[0]["role"] == "system");
+        assert_eq!(
+            session.messages.all().len(),
+            2,
+            "the base, and nothing else"
+        );
+        assert!(session.messages.all()[0]["role"] == "system");
         assert_eq!(
             session.providers[0].headers[0],
             ("x-session".to_string(), session.sid.clone()),

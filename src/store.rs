@@ -4,17 +4,96 @@
 //! counted from the same append, because the info row needs it and the request
 //! is not serialized twice.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
+use crate::prompt::mode_note;
 use crate::sessions;
+use crate::tools;
 use crate::turn;
+
+/// The messages a request carries, in the order it carries them: the system
+/// prompt, the notes a history starts from (the mode, the sandbox's caveat),
+/// and the conversation. One vector, so a request borrows it whole and a long
+/// session is not copied per round; the parts are known by name, never by a
+/// position a caller has to remember.
+///
+/// The system prompt has no setter. It is built once, at startup, and every
+/// later history — a resume, `/new`, a compaction — starts over around the
+/// same one: the cached prefix cannot change inside a process.
+pub(crate) struct Messages {
+    all: Vec<Value>,
+    /// How many of `all` are the base: the prompt and the starting notes.
+    base: usize,
+    /// The whole vector's size, as the request carries it.
+    bytes: u64,
+}
+
+impl Messages {
+    /// A history around `system`, starting in `mode`.
+    pub(crate) fn new(system: Value, mode: tools::Mode, sandbox: Option<&str>) -> Messages {
+        let mut messages = Messages {
+            all: vec![system],
+            base: 1,
+            bytes: 0,
+        };
+        messages.restart(mode, sandbox, Vec::new());
+        messages
+    }
+
+    /// Start over around the same system prompt: the notes for `mode`, then
+    /// `conversation`. A resume, `/new` and a compaction all come here.
+    pub(crate) fn restart(
+        &mut self,
+        mode: tools::Mode,
+        sandbox: Option<&str>,
+        conversation: Vec<Value>,
+    ) {
+        self.all.truncate(1);
+        self.all.push(mode_note(mode));
+        if let Some(note) = sandbox {
+            self.all.push(json!({ "role": "user", "content": note }));
+        }
+        self.base = self.all.len();
+        self.all.extend(conversation);
+        self.bytes = history_bytes(&self.all);
+    }
+
+    /// Everything a request sends.
+    pub(crate) fn all(&self) -> &[Value] {
+        &self.all
+    }
+
+    /// The conversation: what came after the base, mode flips included.
+    pub(crate) fn conversation(&self) -> &[Value] {
+        &self.all[self.base..]
+    }
+
+    /// Append to the conversation. Whether it is also logged is the caller's
+    /// business: a mode note is not, a message is.
+    pub(crate) fn push(&mut self, message: Value) {
+        self.bytes += weight(&message);
+        self.all.push(message);
+    }
+
+    /// The size of what a request sends, in bytes.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Whether the model has answered anything yet: before that there is
+    /// nothing to name or to compact.
+    pub(crate) fn answered(&self) -> bool {
+        self.conversation()
+            .iter()
+            .any(|message| message["role"].as_str() == Some("assistant"))
+    }
+}
 
 /// What a turn appends to: the live history and, when this directory has one,
 /// the session's log. One `push`, so a message cannot reach the model without
 /// reaching the file, and a resumed session replays the same order.
 pub(crate) struct Live<'a> {
-    pub(crate) messages: &'a mut Vec<Value>,
-    pub(crate) bytes: &'a mut u64,
+    pub(crate) messages: &'a mut Messages,
     pub(crate) store: Option<&'a mut Store>,
 }
 
@@ -23,12 +102,11 @@ impl turn::History for Live<'_> {
         if let Some(store) = self.store.as_deref_mut() {
             store.record(&message);
         }
-        *self.bytes += weight(&message);
         self.messages.push(message);
     }
 
     fn messages(&self) -> &[Value] {
-        self.messages.as_slice()
+        self.messages.all()
     }
 }
 
@@ -259,19 +337,17 @@ mod tests {
         assert_eq!(meta.summary, "fix it", "the first request stands in");
 
         let mut resumed = Store::resumed(dir.clone(), meta).unwrap();
-        let mut messages = Vec::new();
-        let mut bytes = 0;
+        let mut messages = bare();
         {
             let mut live = Live {
                 messages: &mut messages,
-                bytes: &mut bytes,
                 store: Some(&mut resumed),
             };
             live.push(json!({ "role": "assistant", "content": "done" }));
-            assert_eq!(live.messages().len(), 1);
+            assert_eq!(live.messages().len(), 3, "the prompt, the note, the answer");
         }
-        assert_eq!(messages.len(), 1);
-        assert_eq!(bytes, weight(&messages[0]));
+        assert_eq!(messages.conversation().len(), 1);
+        assert_eq!(messages.bytes(), history_bytes(messages.all()));
         // Both messages reached the file, and the count followed.
         let meta = sessions::Meta::load(&dir, "abc123").unwrap();
         assert_eq!(meta.messages, 2);
@@ -280,19 +356,54 @@ mod tests {
 
     #[test]
     fn a_history_without_a_store_is_still_counted() {
-        let mut messages = Vec::new();
-        let mut bytes = 0;
+        let mut messages = bare();
         {
             let mut live = Live {
                 messages: &mut messages,
-                bytes: &mut bytes,
                 store: None,
             };
             live.push(json!({ "role": "user", "content": "one" }));
             live.push(json!({ "role": "user", "content": "two" }));
         }
-        assert_eq!(messages.len(), 2);
-        assert_eq!(bytes, history_bytes(&messages));
+        assert_eq!(messages.conversation().len(), 2);
+        assert_eq!(messages.bytes(), history_bytes(messages.all()));
+    }
+
+    /// A history around a one-word prompt, in explore mode.
+    fn bare() -> Messages {
+        Messages::new(
+            json!({ "role": "system", "content": "s" }),
+            tools::Mode::Explore,
+            None,
+        )
+    }
+
+    /// The parts are known by name: the prompt survives every start-over, the
+    /// notes follow the mode and the sandbox, and only the conversation is
+    /// the conversation.
+    #[test]
+    fn a_history_starts_over_around_the_same_prompt() {
+        let mut messages = bare();
+        messages.push(json!({ "role": "user", "content": "hi" }));
+        assert!(!messages.answered());
+        messages.push(json!({ "role": "assistant", "content": "hello" }));
+        assert!(messages.answered());
+        messages.restart(
+            tools::Mode::Normal,
+            Some("sandbox: weaker"),
+            vec![json!({ "role": "user", "content": "kept" })],
+        );
+        let all = messages.all();
+        assert_eq!(
+            all[0]["content"], "s",
+            "the prompt is the one it started with"
+        );
+        assert_eq!(all[1], mode_note(tools::Mode::Normal));
+        assert_eq!(all[2]["content"], "sandbox: weaker");
+        assert_eq!(messages.conversation().len(), 1);
+        assert_eq!(messages.conversation()[0]["content"], "kept");
+        assert!(!messages.answered());
+        assert_eq!(messages.bytes(), history_bytes(all));
     }
 
     #[test]

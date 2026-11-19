@@ -19,7 +19,7 @@ use crate::sandbox;
 use crate::sessions;
 use crate::skills;
 use crate::state;
-use crate::store::{history_bytes, Store};
+use crate::store::{Messages, Store};
 use crate::text::{plural, strip_control};
 use crate::tools;
 use crate::ui;
@@ -240,7 +240,7 @@ pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
             crate::text::warn(&line);
         }
     }
-    let messages = super::base_history(
+    let messages = Messages::new(
         json!({ "role": "system", "content": system }),
         mode,
         sandbox_note.as_deref(),
@@ -251,7 +251,6 @@ pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
         .and_then(sessions::dir)
         .map(|dir| Store::fresh(dir, &sid));
 
-    let bytes = history_bytes(&messages);
     let session = Session {
         state,
         providers,
@@ -263,7 +262,6 @@ pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
         cached: 0,
         used_bytes: 0,
         messages,
-        bytes,
         sid,
         store,
         startup,
