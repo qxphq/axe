@@ -436,6 +436,17 @@ impl Response {
     /// body still arriving after it is a failure, not content. `deadline`
     /// bounds the loop, not a single blocked read.
     pub fn read_capped(&mut self, limit: u64, deadline: Instant) -> io::Result<(String, bool)> {
+        let (bytes, cut) = self.read_capped_bytes(limit, deadline)?;
+        Ok((String::from_utf8_lossy(&bytes).into_owned(), cut))
+    }
+
+    /// `read_capped`, before decoding: for a caller that knows the body's
+    /// charset is not UTF-8.
+    pub fn read_capped_bytes(
+        &mut self,
+        limit: u64,
+        deadline: Instant,
+    ) -> io::Result<(Vec<u8>, bool)> {
         let mut out = Vec::new();
         let mut chunk = [0u8; 8192];
         while (out.len() as u64) < limit {
@@ -448,11 +459,11 @@ impl Response {
                 .read(&mut chunk[..room])
                 .map_err(|e| silent(e, self.read_timeout))?;
             if n == 0 {
-                return Ok((String::from_utf8_lossy(&out).into_owned(), false));
+                return Ok((out, false));
             }
             out.extend_from_slice(&chunk[..n]);
         }
-        Ok((String::from_utf8_lossy(&out).into_owned(), true))
+        Ok((out, true))
     }
 
     pub fn read_line(&mut self) -> io::Result<Option<String>> {
