@@ -162,7 +162,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: sudo apt-get update && sudo apt-get install -y tmux python3-pyte
       - run: ./harness.py --expect "mock/mock-1" --expect "ok" "text:ok"
 
       # The screen and the kernel are what unit tests cannot see, so the
@@ -193,6 +193,10 @@ jobs:
           # one blank row under the last one, not under the rewrapped rows.
           ./harness.py --size 60x30 --wait 1 --scroll 60 'text:aaa' '@resize:40x30' 'text:bbb' \
             --expect $' aaa\n\n █ text:bbb'
+          # A terminal that truncates instead leaves the measurement nothing to
+          # confirm: no row is claimed, so the reply above the frame survives.
+          ./harness.py --term pyte --size 60x30 --wait 1 --scroll 60 'text:aaa' '@resize:40x30' 'text:bbb' \
+            --expect $' █ text:aaa\n\n aaa\n' --expect $' bbb\n'
           # A terminal too short for the whole frame keeps a row above it, so
           # writing a block never scrolls the frame itself into scrollback.
           ./harness.py --size 30x7 --wait 1 --scroll 40 'text:aaa' 'text:bbb' --refute 'Responding'

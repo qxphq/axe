@@ -2,8 +2,9 @@
 """Drive axe against mock.py and print the final screen.
 
 One command replaces the manual bootstrap: a throwaway config, an in-process
-mock provider, a tmux pty of a known size, the keystrokes, and a virtual
-terminal to read back. Nothing is shared between runs.
+mock provider, a pty of a known size (tmux's, or pyte's with --term pyte),
+the keystrokes, and a virtual terminal to read back. Nothing is shared
+between runs.
 
 A positional argument is a turn: it is typed and Enter is pressed. One that
 starts with `!` is a list of tmux key names sent as-is, no Enter:
@@ -160,7 +161,11 @@ class Tmux:
             self.base + list(args), text=True, capture_output=True, check=check
         )
 
-    def start(self, size, cwd, command):
+    def start(self, size, cwd, env, binary):
+        command = "env {} {}".format(
+            " ".join(shlex.quote(f"{k}={v}") for k, v in env.items()),
+            shlex.quote(str(binary)),
+        )
         # Options come from the config file: a server with no sessions exits,
         # and the session may start (and die) before set-option could run.
         self.run(
@@ -218,6 +223,108 @@ class Tmux:
 
     def kill(self):
         self.run("kill-server")
+
+
+# tmux key names as the bytes a terminal sends; any other word is typed.
+KEYS = {
+    "Enter": "\r", "Escape": "\x1b", "Space": " ", "Tab": "\t", "BSpace": "\x7f",
+    "Up": "\x1b[A", "Down": "\x1b[B", "Right": "\x1b[C", "Left": "\x1b[D",
+    "Home": "\x1b[H", "End": "\x1b[F",
+}
+
+
+class Pyte:
+    """A pty read by pyte, a terminal that truncates on a narrowing where tmux
+    rewraps: the branch of the frame's reflow measurement tmux never takes."""
+
+    def __init__(self):
+        import pyte
+
+        self.pyte = pyte
+        self.lock = threading.Lock()
+        self.pid = None
+        self.status = None
+
+    def start(self, size, cwd, env, binary):
+        import pty
+
+        cols, rows = size
+        self.screen = self.pyte.HistoryScreen(cols, rows, history=10000)
+        self.screen.write_process_input = self.write
+        self.stream = self.pyte.ByteStream(self.screen)
+        pid, self.fd = pty.fork()
+        if pid == 0:
+            os.chdir(cwd)
+            os.execve(binary, [binary], {**os.environ, "TERM": "xterm", **env})
+        self.pid = pid
+        self.winsize(cols, rows)
+        threading.Thread(target=self.pump, daemon=True).start()
+
+    def pump(self):
+        while True:
+            try:
+                data = os.read(self.fd, 65536)
+            except OSError:
+                return
+            if not data:
+                return
+            with self.lock:
+                self.stream.feed(data)
+
+    def write(self, text):
+        # A query's answer, the cursor report above all, goes back as input.
+        os.write(self.fd, text.encode())
+
+    def winsize(self, cols, rows):
+        import fcntl
+        import struct
+        import termios
+
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def send_literal(self, text):
+        self.write(text + "\r")
+
+    def send_keys(self, keys):
+        for key in keys:
+            if key in KEYS:
+                self.write(KEYS[key])
+            elif key.startswith("C-") and len(key) == 3:
+                self.write(chr(ord(key[2].lower()) & 0x1F))
+            else:
+                self.write(key)
+
+    def resize(self, cols, rows):
+        # The screen first: the program's cursor query after SIGWINCH must
+        # already see the new geometry.
+        with self.lock:
+            self.screen.resize(rows, cols)
+        self.winsize(cols, rows)
+
+    def capture(self, scroll, ansi):
+        with self.lock:
+            history = list(self.screen.history.top)[-scroll:] if scroll else []
+            lines = [
+                "".join(row[x].data for x in sorted(row)) for row in history
+            ] + list(self.screen.display)
+        return "\n".join(lines) + "\n"
+
+    def dead(self):
+        if self.status is None:
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+            if pid:
+                self.status = os.waitstatus_to_exitcode(status)
+        return self.status is not None
+
+    def exit_code(self):
+        return str(self.status) if self.dead() else ""
+
+    def kill(self):
+        if self.pid and not self.dead():
+            os.kill(self.pid, 9)
+            os.waitpid(self.pid, 0)
+        if self.pid:
+            os.close(self.fd)
 
 
 def parse_size(raw):
@@ -292,6 +399,9 @@ def main():
     ap.add_argument("--timeout", type=float, default=30.0, metavar="SEC",
                     help="max wait for an idle screen")
     ap.add_argument("--ansi", action="store_true", help="keep colors")
+    ap.add_argument("--term", choices=("tmux", "pyte"), default="tmux",
+                    help="the terminal: tmux rewraps on a narrowing, pyte "
+                    "truncates (pip install pyte)")
     ap.add_argument("--keep", action="store_true",
                     help="keep the temp workdir")
     ap.add_argument("--work", metavar="DIR",
@@ -305,6 +415,8 @@ def main():
     args = ap.parse_args()
     if not args.turns:
         args.turns = ["text:ok"]
+    if args.ansi and args.term == "pyte":
+        ap.error("--ansi needs --term tmux: pyte's dump is text")
 
     binary = Path(args.bin).resolve()
     if not binary.exists():
@@ -333,22 +445,19 @@ def main():
     mock.FETCH_BASE = fetch_base
 
     socket = f"axe-harness-{os.getpid()}"
-    tmux = Tmux(socket, conf)
+    tmux = Tmux(socket, conf) if args.term == "tmux" else Pyte()
     ok = False
     try:
         config_home = write_config(work, port)
-        env = [
-            f"XDG_CONFIG_HOME={config_home}",
+        env = {
+            "XDG_CONFIG_HOME": str(config_home),
             # Keep per-directory state out of the real $HOME/.local/state.
-            f"XDG_STATE_HOME={Path(work) / 'state'}",
-        ]
+            "XDG_STATE_HOME": str(Path(work) / "state"),
+        }
         if not args.no_fetch_local:
             # The fixture server is on loopback, which the host guard refuses.
-            env.append("AXE_FETCH_ALLOW_LOCAL=1")
-        command = "env {} {}".format(
-            " ".join(shlex.quote(item) for item in env), shlex.quote(str(binary))
-        )
-        tmux.start(size, work, command)
+            env["AXE_FETCH_ALLOW_LOCAL"] = "1"
+        tmux.start(size, work, env, str(binary))
 
         # Wait for the info row, or for the process to die with its error.
         start = time.monotonic()

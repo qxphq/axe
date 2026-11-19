@@ -8,8 +8,11 @@ description: Wrap up a finished change in axe. Use when the user says ship, wrap
 Run from the repo root, in order. Stop at the first failure and report it;
 do not fix speculatively.
 
-1. Bump `version` in `Cargo.toml` for this change. Pre-1.0 semver: patch
-   for a fix, refactor, docs or internal change; minor for a new
+1. Bump `version` in `Cargo.toml` only if the change reaches the binary:
+   `src/`, `Cargo.toml`/`Cargo.lock`, or `README.md` (`about` compiles it
+   in). A change to the harness, `mock.py`, CI, `AGENTS.md`, reviews or
+   skills keeps the version, so its push releases nothing. Pre-1.0 semver:
+   patch for a fix, refactor, README or internal change; minor for a new
    user-facing capability; a breaking change bumps minor too, until
    `1.0.0` is declared. That file is the only place the number lives.
    The build refreshes `Cargo.lock`, so both are staged. Do not tag: a push

@@ -168,7 +168,10 @@ invariants a change must not break.
 16. **One version, in `Cargo.toml`.** `env!("CARGO_PKG_VERSION")` is the banner
     and `--version`; `flake.nix` reads the same file. The `ship` skill bumps it
     per semver (pre-1.0: patch for a fix, minor for a capability, a breaking
-    change bumps minor until `1.0.0`). No second copy and no generated file.
+    change bumps minor until `1.0.0`), and only when the binary changes: `src/`,
+    `Cargo.toml`/`Cargo.lock`, or `README.md`, which `about` compiles in. A
+    harness, CI or doc-only change keeps the version, so it releases nothing.
+    No second copy and no generated file.
     CI makes the release: a push to `main` whose version has no `v<version>`
     release yet builds the four targets and publishes one, marked latest,
     with the commits since the previous version as its notes; a push that
@@ -374,8 +377,8 @@ the test supplies. `clippy.toml` holds these rules as lint errors: no
 each other.
 
 `harness.py` is the UI loop: `mock.py` + tmux pty + virtual terminal. It needs
-python3 and tmux. CI runs the journeys below, so a regression in the screen, the
-confinement or the MCP approval fails a build rather than waiting for a person:
+python3 and tmux (pyte for `--term pyte`). CI runs the journeys below, so a
+regression in the screen, the confinement or the MCP approval fails a build rather than waiting for a person:
 the deny and the allow, the mid-turn queue, a resize, fetch paging with the host
 guard, `/compact`, and a project MCP file that asks once. `--work DIR` keeps one directory and its state; `--wait` and
 `--timeout` bound idling; `--bin` selects the binary; `--ansi`/`--scroll` control
@@ -383,7 +386,15 @@ the dump, and `--expect`/`--refute` make it an assertion. See `harness.py --help
 and `mock.py` for fixtures and replies.
 
 `@resize:COLSxROWS` resizes the pane between steps, which is what a terminal
-split does; it is how the frame's re-anchoring is checked.
+split does; it is how the frame's re-anchoring is checked. tmux rewraps on a
+narrowing, so it only ever takes the measured branch of `ui::reflowed`;
+`--term pyte` (`python3-pyte`) drives axe through a pty read by pyte, which
+truncates instead, and so checks the fallback: the reply above a narrowed frame
+must survive it.
+
+```sh
+./harness.py --term pyte --size 60x30 --wait 1 'text:aaa' '@resize:40x30' 'text:bbb' --expect $' aaa\n'
+```
 
 `fetch:PAGE` has the mock call `fetch` on a fixture page (plain, inject, big,
 image, redirect, latin1, slow); `PAGE@START+CHARS` sets paging. The harness serves
