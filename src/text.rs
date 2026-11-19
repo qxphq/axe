@@ -168,6 +168,17 @@ pub fn ansi(text: &str, style: Style) -> String {
     }
 }
 
+/// `ansi` for a stderr line: stdout redirected to a file says nothing about
+/// whether stderr is the terminal, and a line meant for it must be stripped by
+/// what it is written to.
+pub fn ansi_err(text: &str, style: Style) -> String {
+    if io::stderr().is_terminal() {
+        styled(text, style)
+    } else {
+        text.to_string()
+    }
+}
+
 /// The codes for a span, whether or not there is a terminal to read. `ansi`
 /// decides by stdout; this is what it does once that is known, so the styling
 /// itself can be checked without borrowing the process's own output.

@@ -143,14 +143,16 @@ impl Sink for PlainSink {
         }
         self.last = Some(ui::Block::Tool);
         let mut line = String::new();
+        // Styled, and stripped, by stderr: a run whose stdout is a file
+        // still writes this line to the user's terminal.
         for (paint, text) in call {
-            line.push_str(&paint.ansi(text));
+            line.push_str(&paint.ansi_err(text));
         }
         line.push(' ');
-        line.push_str(&mark.0.ansi(mark.1));
+        line.push_str(&mark.0.ansi_err(mark.1));
         eprintln!("{line}");
         if let Some(error) = error {
-            eprintln!("    {}", Paint::Red.ansi(error));
+            eprintln!("    {}", Paint::Red.ansi_err(error));
         }
         io::stderr().flush().ok();
     }

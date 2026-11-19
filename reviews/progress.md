@@ -16,7 +16,7 @@ box.
 ## Security and boundaries
 
 - [x] [Sandbox and confinement](sandbox.md)
-- [ ] [Trust boundaries and secret hygiene](trust-and-secrets.md)
+- [x] [Trust boundaries and secret hygiene](trust-and-secrets.md)
 - [ ] [Web access: fetch and search](web-tools.md)
 
 ## Terminal behavior

@@ -42,6 +42,12 @@ impl Paint {
         crate::text::ansi(text, self.style())
     }
 
+    /// The same, for a line written to stderr: styled and stripped when stderr
+    /// is a terminal, whatever stdout is.
+    pub fn ansi_err(self, text: &str) -> String {
+        crate::text::ansi_err(text, self.style())
+    }
+
     pub fn span(self, text: String) -> Span<'static> {
         Span::styled(text, self.style())
     }
@@ -143,7 +149,9 @@ pub(crate) fn call_line(call: &api::ToolCall, explore: bool) -> Vec<(Paint, Stri
         (Paint::Plain, "  ".to_string()),
         (paint, glyph.to_string()),
         (Paint::Plain, gap.to_string()),
-        (paint, call.name.clone()),
+        // The name is the model's to choose, like the arguments: an unknown
+        // one is still echoed, so it is cleaned the same way.
+        (paint, text::oneline(&call.name, 64)),
     ];
     if parts.is_empty() {
         return spans;
@@ -211,6 +219,26 @@ pub(crate) fn detail(result: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool name is the model's: one carrying a clipboard or title escape is
+    /// echoed without its control bytes, wherever the line is written.
+    #[test]
+    fn a_made_up_tool_name_carries_no_control_bytes() {
+        let call = api::ToolCall {
+            id: "c".into(),
+            name: "\x1b]52;c;aGk=\x07evil".into(),
+            arguments: "{}".into(),
+        };
+        let line: String = call_line(&call, false)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert!(line.contains("evil"), "{line:?}");
+        // A stderr line strips what it styles, decided by stderr.
+        let styled = text::styled("\x1b]0;title\x07x", Paint::Red.style());
+        assert_eq!(styled, "\x1b[31m]0;titlex\x1b[0m", "only axe's own codes");
+    }
 
     #[test]
     fn a_read_of_content_that_looks_like_an_error_succeeded() {
