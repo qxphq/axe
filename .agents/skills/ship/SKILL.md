@@ -12,7 +12,8 @@ do not fix speculatively.
    for a fix, refactor, docs or internal change; minor for a new
    user-facing capability; a breaking change bumps minor too, until
    `1.0.0` is declared. That file is the only place the number lives.
-   The build refreshes `Cargo.lock`, so both are staged. Do not tag.
+   The build refreshes `Cargo.lock`, so both are staged. Do not tag: a push
+   of a new version to `main` makes CI publish `v<version>` with its binaries.
 2. `cargo fmt`, then `cargo clippy --all-targets -- -D warnings`, then
    `cargo test --locked`. CI runs exactly these.
 3. If `flake.nix` exists and `nix` is on PATH: `nix flake lock`. It adds a

@@ -19,12 +19,12 @@ Sessions start in explore mode (shown as `read-only`), where `fetch` and
 curl -fsSL https://raw.githubusercontent.com/qxphq/axe/main/install.sh | sh
 ```
 
-That fetches a build of `main` from the rolling `latest` release, checks its
-sha256 and installs it into `~/.local/bin` (`AXE_INSTALL_DIR` overrides). Assets
-exist for x86_64 and aarch64 Linux (static, so any distribution, Alpine
-included) and for Apple Silicon and Intel macOS. The release is rebuilt on every
-push to `main`, so its version is whatever `Cargo.toml` says at that commit; the
-`latest` tag and the release notes name that commit, and no version tag marks it.
+That fetches the latest release, checks its sha256 and installs it into
+`~/.local/bin` (`AXE_INSTALL_DIR` overrides). Assets exist for x86_64 and
+aarch64 Linux (static, so any distribution, Alpine included) and for Apple
+Silicon and Intel macOS. Each version is its own release, `v<version>`, made
+when a push to `main` carries a version `Cargo.toml` has not released yet; its
+notes list the commits since the version before, and it never changes after.
 
 On NixOS it installs the flake instead — `nix profile add
 --no-write-lock-file github:qxphq/axe#default` — which builds from source and

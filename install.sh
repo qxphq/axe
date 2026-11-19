@@ -1,5 +1,6 @@
 #!/bin/sh
-# Install axe from the rolling `latest` release: a build of `main` on every push.
+# Install axe from the latest release: one per version, made by CI when a push
+# to main carries a new Cargo.toml version.
 #   curl -fsSL https://raw.githubusercontent.com/qxphq/axe/main/install.sh | sh
 # AXE_INSTALL_DIR overrides the destination; the default is ~/.local/bin.
 # NixOS installs the flake instead: nix profile add --no-write-lock-file github:qxphq/axe#default.

@@ -42,21 +42,42 @@ jobs:
       - run: nix flake check --no-build --all-systems
       - run: nix build .#default --no-link
 
-  # A rolling release of main: install.sh downloads from it, nothing is tagged.
-  release:
+  # One release per version: a push to main whose Cargo.toml version has no
+  # release yet builds the four targets and publishes `v<version>`, marked
+  # latest, which is where install.sh downloads from. A push that keeps the
+  # version publishes nothing, so a release never changes once it exists.
+  version:
     # The interactive journeys gate it too: a regression in the screen or the
-    # confinement must not replace the binaries install.sh serves.
+    # confinement must not reach the binaries install.sh serves.
     needs: [test, flake, interactive]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      new: ${{ steps.version.outputs.new }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          [ -n "$version" ] || { echo "no version in Cargo.toml" >&2; exit 1; }
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "$tag is already released; nothing to publish"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: version
+    if: needs.version.outputs.new == 'true'
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write
-    # No concurrency group: it is evaluated per matrix job, and GitHub keeps at
-    # most one pending job per group, so the four targets cancel each other.
-    # Parallel uploads are safe instead: asset names are per target and
-    # `--clobber` makes a repeat harmless.
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           # Static musl: a glibc build from these runners needs the runner's
@@ -79,7 +100,7 @@ jobs:
       - if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --target ${{ matrix.target }}
-      - run: strip target/${{ matrix.target }}/release/axe || true
+      - run: strip target/${{ matrix.target }}/release/axe
       - name: Package
         run: |
           tar=axe-${{ matrix.target }}.tar.gz
@@ -90,22 +111,51 @@ jobs:
           else
             shasum -a 256 "$tar" > "$tar.sha256"
           fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: axe-${{ matrix.target }}
+          path: axe-${{ matrix.target }}.tar.gz*
+          if-no-files-found: error
+
+  # One job creates the release with every binary in it, so a failed target
+  # leaves no release at all rather than one missing a platform.
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Two pushes of the same new version: the second waits, sees the release
+    # the first made, and publishes nothing.
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
-          # The four jobs race to create the release; a loser reads the winner's.
-          gh release view latest >/dev/null 2>&1 ||
-            gh release create latest --latest --title latest \
-              --notes "Rolling build of $GITHUB_SHA: a push to main, not a tag. The version is Cargo.toml's." ||
-            gh release view latest >/dev/null
-          gh release upload latest axe-*.tar.gz axe-*.tar.gz.sha256 --clobber
-          # The tag and the notes say which commit the assets are: both move
-          # with every push, or the page names the first build forever. The
-          # four jobs write the same commit, so the race is harmless.
-          git push -f origin "$GITHUB_SHA:refs/tags/latest"
-          gh release edit latest \
-            --notes "Rolling build of $GITHUB_SHA: a push to main, not a tag. The version is Cargo.toml's."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG was published by an earlier run"
+            exit 0
+          fi
+          [ "$(ls dist/*.tar.gz | wc -l)" -eq 4 ] || { ls dist; echo "expected four targets" >&2; exit 1; }
+          # What changed since the previous version: its commit subjects.
+          prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)
+          if [ -n "$prev" ]; then
+            { echo "Changes since $prev:"; echo; git log --no-merges --format='- %s' "$prev..$GITHUB_SHA"; } > notes.md
+          else
+            echo "The first versioned release." > notes.md
+          fi
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "axe ${TAG#v}" \
+            --notes-file notes.md --latest
 
   interactive:
     runs-on: ubuntu-latest

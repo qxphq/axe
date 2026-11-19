@@ -168,10 +168,14 @@ invariants a change must not break.
 16. **One version, in `Cargo.toml`.** `env!("CARGO_PKG_VERSION")` is the banner
     and `--version`; `flake.nix` reads the same file. The `ship` skill bumps it
     per semver (pre-1.0: patch for a fix, minor for a capability, a breaking
-    change bumps minor until `1.0.0`). No second copy, no generated file, no
-    version tag: the release is a single mutable `latest` tag whose assets are
-    clobbered on each push to `main`, and `install.sh` downloads from it
-    (on NixOS it installs the flake instead).
+    change bumps minor until `1.0.0`). No second copy and no generated file.
+    CI makes the release: a push to `main` whose version has no `v<version>`
+    release yet builds the four targets and publishes one, marked latest,
+    with the commits since the previous version as its notes; a push that
+    keeps the version publishes nothing, so a release never changes once it
+    exists. `install.sh` downloads GitHub's latest release (on NixOS it
+    installs the flake instead). Nobody tags by hand: CI's release makes the
+    tag.
 
 ## Architecture
 
