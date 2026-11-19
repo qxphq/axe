@@ -881,10 +881,17 @@ impl Session {
     }
 
     /// The provider's affinity token follows the conversation. A resumed
-    /// session must keep its own, or the provider starts a cold one.
+    /// session must keep its own, or the provider starts a cold one. The body
+    /// field a provider routes its cache by carries the same id.
     fn set_session_header(&mut self) {
         let sid = self.sid.clone();
         for provider in &mut self.providers {
+            if let (Some(field), Some(fields)) = (
+                provider.cfg.session_field.as_deref(),
+                provider.fields.as_object_mut(),
+            ) {
+                fields.insert(field.to_string(), json!(sid));
+            }
             let Some(name) = provider.cfg.session_header.clone() else {
                 continue;
             };
@@ -921,6 +928,9 @@ impl Session {
         }
         let title = session_title(&meta);
         let store = Store::resumed(dir, meta)?;
+        // The session being left is closed like `/new` closes it: a title the
+        // model never gave falls back to its first request.
+        self.finalize_session();
 
         self.messages = self.base_messages();
         self.messages.extend(messages);
@@ -4194,12 +4204,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Leaving a session for another closes it like `/new`: the title it never
+    /// got falls back to its first request.
+    #[test]
+    fn a_resume_closes_the_session_it_leaves() {
+        crate::state::testenv::home("main-resume-finalize", |home| {
+            let cwd = home.join("work");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let dir = sessions::dir(&cwd).unwrap();
+            stored_session(&dir, "abc123", "the other", "earlier words");
+            let mut session = bare_session();
+            session.state.cwd = cwd.clone();
+            session.store = Some(Store::fresh(dir.clone(), "aaa111"));
+            session.record(json!({ "role": "user", "content": "the left one" }));
+            session.resume("abc123", None).unwrap();
+            let left = sessions::Meta::load(&dir, "aaa111").unwrap();
+            assert_eq!(left.title, "the left one");
+        });
+    }
+
+    /// The body field a provider routes its cache by follows the session id,
+    /// like the header does.
+    #[test]
+    fn a_new_session_carries_its_id_in_the_body_field_too() {
+        let mut session = bare_session();
+        session.providers[0].cfg.session_field = Some("prompt_cache_key".into());
+        session.new_session(None);
+        assert_eq!(
+            session.providers[0].fields["prompt_cache_key"],
+            json!(session.sid)
+        );
+    }
+
     #[test]
     fn the_session_chooser_resumes_what_it_is_on_and_closes_on_esc() {
         crate::state::testenv::home("main-browse-sessions", |home| {
             let cwd = home.join("work");
             std::fs::create_dir_all(&cwd).unwrap();
-            let dir = sessions::dir(&cwd);
+            let dir = sessions::dir(&cwd).unwrap();
             stored_session(&dir, "abc123", "the one", "earlier words");
 
             // Esc closes the chooser and leaves its rows in the transcript.
@@ -4261,7 +4303,7 @@ mod tests {
         crate::state::testenv::home("main-list-piped", |home| {
             let cwd = home.join("work");
             std::fs::create_dir_all(&cwd).unwrap();
-            let dir = sessions::dir(&cwd);
+            let dir = sessions::dir(&cwd).unwrap();
             stored_session(&dir, "abc123", "the first", "a needle");
             let mut session = bare_session();
             session.state.cwd = cwd.clone();

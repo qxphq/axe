@@ -40,6 +40,9 @@ pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
         eprintln!("axe: {}", strip_control(note));
     }
     super::note_sandbox(sandbox_note.clone());
+    if let Some(line) = state::unkept() {
+        eprintln!("axe: {line}");
+    }
     // Instructions are read once at startup, before any request: the system
     // prompt is a stable prefix and must not change mid-session.
     // Order: config `agents`, then the project's AGENTS.md, then `system`.
@@ -62,8 +65,8 @@ pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
     let loaded_skills = skills::load(cwd.as_deref(), &cfg.skills);
     // Explore mode's second writable directory, and the only one that outlives
     // the session: scratch is removed at exit, so a plan needs its own place.
-    if let Some(dir) = &cwd {
-        let plan = state::project(dir).join("plan");
+    if let Some(project) = cwd.as_deref().and_then(state::project) {
+        let plan = project.join("plan");
         match state::private_dir(&plan) {
             Ok(()) => sandbox::set_plan(&plan),
             Err(e) => eprintln!("axe: plan directory: {e}"),
@@ -237,7 +240,8 @@ pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
 
     let store = cwd
         .as_deref()
-        .map(|dir| Store::fresh(sessions::dir(dir), &sid));
+        .and_then(sessions::dir)
+        .map(|dir| Store::fresh(dir, &sid));
 
     let bytes = history_bytes(&messages);
     let session = Session {

@@ -578,8 +578,10 @@ fn merge(global: Vec<Entry>, project: Vec<Entry>, errors: &mut Vec<String>) -> V
 
 // ---- the approval a project file needs -------------------------------------
 
-fn trust_file(cwd: &Path) -> PathBuf {
-    state::project(cwd).join("mcp-trust.json")
+/// `None` when there is no state directory: nothing is remembered, so the
+/// project file is asked about on every start.
+fn trust_file(cwd: &Path) -> Option<PathBuf> {
+    Some(state::project(cwd)?.join("mcp-trust.json"))
 }
 
 /// The digest of a file's bytes, from the host's `sha256sum` — or `shasum -a
@@ -612,7 +614,7 @@ fn digest(program: &str, args: &[&str], bytes: &[u8]) -> Option<String> {
 }
 
 fn read_trust(cwd: &Path) -> BTreeMap<String, String> {
-    let Ok(raw) = fs::read_to_string(trust_file(cwd)) else {
+    let Some(Ok(raw)) = trust_file(cwd).map(fs::read_to_string) else {
         return BTreeMap::new();
     };
     let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&raw) else {
@@ -632,8 +634,11 @@ fn approved(cwd: &Path, file: &Path, hash: &str) -> bool {
 fn remember(cwd: &Path, file: &Path, hash: &str) {
     let mut trust = read_trust(cwd);
     trust.insert(file.display().to_string(), hash.to_string());
-    let dir = state::project(cwd);
-    if let Err(e) = state::private_dir(&dir) {
+    let Some(file) = trust_file(cwd) else {
+        eprintln!("axe: mcp trust: no state directory, so the approval is not remembered");
+        return;
+    };
+    if let Some(Err(e)) = file.parent().map(state::private_dir) {
         eprintln!("axe: mcp trust: {e}");
         return;
     }
@@ -645,7 +650,7 @@ fn remember(cwd: &Path, file: &Path, hash: &str) {
             return;
         }
     };
-    if let Err(e) = write_atomic(&trust_file(cwd), &text, true) {
+    if let Err(e) = write_atomic(&file, &text, true) {
         eprintln!("axe: mcp trust: {e}");
     }
 }
@@ -667,7 +672,9 @@ fn carry_approval(cwd: &Path, file: &Path, prior: Option<&str>) {
 }
 
 fn forget_trust(cwd: &Path) -> String {
-    let file = trust_file(cwd);
+    let Some(file) = trust_file(cwd) else {
+        return "mcp: nothing remembered".into();
+    };
     match fs::remove_file(&file) {
         Ok(()) => "mcp: forgotten; the next start asks again, running servers stay".into(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => "mcp: nothing remembered".into(),
@@ -2552,7 +2559,11 @@ mod tests {
             assert!(approved(&dir, &file, &hash));
             let other = hash_of(b"{\"mcpServers\":{}}").expect("a digester");
             assert!(!approved(&dir, &file, &other));
-            let mode = fs::metadata(trust_file(&dir)).unwrap().permissions().mode() & 0o777;
+            let mode = fs::metadata(trust_file(&dir).unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o600, "the record is the user's");
             assert!(forget_trust(&dir).contains("forgotten"));
             assert!(!approved(&dir, &file, &hash));

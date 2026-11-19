@@ -27,15 +27,22 @@ pub struct State {
     pub thoughts: bool,
 }
 
-/// `$XDG_STATE_HOME` or `$HOME/.local/state`, then `axe`.
-pub(crate) fn root() -> PathBuf {
-    if let Ok(dir) = env::var("XDG_STATE_HOME") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir).join("axe");
-        }
+/// `$XDG_STATE_HOME` or `$HOME/.local/state`, then `axe`. `None` when neither
+/// is set: a relative fallback would resolve against the working directory and
+/// put plaintext sessions inside the project, so nothing is kept instead.
+pub(crate) fn root() -> Option<PathBuf> {
+    let var = |name: &str| env::var_os(name).filter(|value| !value.is_empty());
+    if let Some(dir) = var("XDG_STATE_HOME") {
+        return Some(PathBuf::from(dir).join("axe"));
     }
-    let home = env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".local/state/axe")
+    var("HOME").map(|home| PathBuf::from(home).join(".local/state/axe"))
+}
+
+/// The startup line for a run that keeps nothing, when it keeps nothing.
+pub fn unkept() -> Option<&'static str> {
+    root().is_none().then_some(
+        "neither XDG_STATE_HOME nor HOME is set: no sessions, prompt history or state are kept",
+    )
 }
 
 /// The cwd as one path component: every byte outside `[A-Za-z0-9._-]` written
@@ -74,25 +81,25 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// The directory that belongs to one working directory: its state file and
 /// its sessions. Sessions are siblings of `state.json`, under `sessions/`.
-pub fn project(cwd: &Path) -> PathBuf {
-    root().join("projects").join(key(cwd))
+pub fn project(cwd: &Path) -> Option<PathBuf> {
+    Some(root()?.join("projects").join(key(cwd)))
 }
 
 /// `<state>/axe/projects/<key>/state.json`.
-fn file(cwd: &Path) -> PathBuf {
-    project(cwd).join("state.json")
+fn file(cwd: &Path) -> Option<PathBuf> {
+    Some(project(cwd)?.join("state.json"))
 }
 
 /// `<state>/axe/default.json`: the selection a directory that pins none starts
 /// on. It lives here, not in the config, because the config is read-only input.
-fn default_file() -> PathBuf {
-    root().join("default.json")
+fn default_file() -> Option<PathBuf> {
+    Some(root()?.join("default.json"))
 }
 
 /// The global default model, `provider/id`. Best effort: a missing or broken
 /// file is no default, never a failed start.
 pub fn load_default() -> Option<String> {
-    let file = default_file();
+    let file = default_file()?;
     let raw = fs::read_to_string(&file).ok()?;
     match serde_json::from_str::<Value>(&raw) {
         Ok(v) => v["model"]
@@ -108,7 +115,8 @@ pub fn load_default() -> Option<String> {
 
 /// Write the global default whole, through a temporary like `State::save`.
 pub fn save_default(spec: &str) -> Result<(), String> {
-    let file = default_file();
+    let file = default_file()
+        .ok_or("cannot save the default model: neither XDG_STATE_HOME nor HOME is set")?;
     let Some(dir) = file.parent() else {
         return Ok(());
     };
@@ -131,8 +139,8 @@ const HISTORY_BYTES: u64 = 128 * 1024;
 
 /// `<state>/axe/projects/<key>/history.jsonl`: the prompt lines typed here, one
 /// JSON string per line so a pasted multi-line prompt survives a round trip.
-pub fn history(cwd: &Path) -> PathBuf {
-    project(cwd).join("history.jsonl")
+pub fn history(cwd: &Path) -> Option<PathBuf> {
+    Some(project(cwd)?.join("history.jsonl"))
 }
 
 /// The remembered prompt lines, oldest first. A file that cannot be read is an
@@ -141,7 +149,7 @@ pub fn read_history(cwd: &Path) -> Vec<String> {
     if cwd.as_os_str().is_empty() {
         return Vec::new();
     }
-    read_history_file(&history(cwd))
+    history(cwd).map_or_else(Vec::new, |path| read_history_file(&path))
 }
 
 /// Remember one submitted line. Best effort at the call site: a prompt that
@@ -150,7 +158,10 @@ pub fn append_history(cwd: &Path, line: &str) -> Result<(), String> {
     if cwd.as_os_str().is_empty() {
         return Ok(());
     }
-    append_history_file(&history(cwd), line)
+    match history(cwd) {
+        Some(path) => append_history_file(&path, line),
+        None => Ok(()),
+    }
 }
 
 fn read_history_file(path: &Path) -> Vec<String> {
@@ -162,6 +173,20 @@ fn read_history_file(path: &Path) -> Vec<String> {
         lines.drain(..lines.len() - HISTORY);
     }
     if text.len() as u64 > HISTORY_BYTES {
+        // Cut to the size as well as the count, newest kept: a few pasted
+        // files over the cap would otherwise be rewritten on every start and
+        // read whole on every Enter, and never shrink.
+        let mut size = 0u64;
+        let keep = lines
+            .iter()
+            .rev()
+            .take_while(|line| {
+                size += serde_json::to_string(line).map_or(0, |text| text.len()) as u64 + 1;
+                size <= HISTORY_BYTES
+            })
+            .count()
+            .max(1);
+        lines.drain(..lines.len() - keep);
         let _ = write_history_file(path, &lines);
     }
     lines
@@ -255,7 +280,9 @@ pub fn private_dir(dir: &Path) -> io::Result<()> {
         .mode(0o700)
         .create(dir)?;
     set_mode(dir, 0o700)?;
-    let root = root();
+    let Some(root) = root() else {
+        return Ok(());
+    };
     let mut at = dir.parent();
     while let Some(parent) = at.filter(|parent| parent.starts_with(&root)) {
         set_mode(parent, 0o700)?;
@@ -293,7 +320,9 @@ pub fn load(cwd: &Path) -> State {
         cwd: cwd.to_path_buf(),
         ..State::default()
     };
-    let file = file(cwd);
+    let Some(file) = file(cwd) else {
+        return state;
+    };
     let raw = match fs::read_to_string(&file) {
         Ok(raw) => raw,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return state,
@@ -333,7 +362,10 @@ impl State {
         if self.cwd.as_os_str().is_empty() {
             return Ok(());
         }
-        let file = file(&self.cwd);
+        // Nowhere to keep it is said once, at startup.
+        let Some(file) = file(&self.cwd) else {
+            return Ok(());
+        };
         let Some(dir) = file.parent() else {
             return Ok(());
         };
@@ -537,13 +569,13 @@ mod tests {
             assert_eq!(load_default().as_deref(), Some("p/m"));
             let mode =
                 |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode(&default_file()), 0o600);
+            assert_eq!(mode(&default_file().unwrap()), 0o600);
             assert_eq!(mode(&home.join("state/axe")), 0o700);
 
-            fs::write(default_file(), "{ not json").unwrap();
+            fs::write(default_file().unwrap(), "{ not json").unwrap();
             assert!(load_default().is_none());
             // An empty spec is no default either.
-            fs::write(default_file(), r#"{"model": ""}"#).unwrap();
+            fs::write(default_file().unwrap(), r#"{"model": ""}"#).unwrap();
             assert!(load_default().is_none());
         });
     }
@@ -583,8 +615,8 @@ mod tests {
 
             let mode =
                 |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode(&project(&cwd)), 0o700);
-            assert_eq!(mode(&file(&cwd)), 0o600);
+            assert_eq!(mode(&project(&cwd).unwrap()), 0o700);
+            assert_eq!(mode(&file(&cwd).unwrap()), 0o600);
         });
     }
 
@@ -595,13 +627,13 @@ mod tests {
             let fresh = load(&cwd);
             assert!(fresh.model.is_none() && fresh.thinking.is_empty() && !fresh.thoughts);
 
-            fs::create_dir_all(project(&cwd)).unwrap();
-            fs::write(file(&cwd), "{ not json").unwrap();
+            fs::create_dir_all(project(&cwd).unwrap()).unwrap();
+            fs::write(file(&cwd).unwrap(), "{ not json").unwrap();
             assert!(load(&cwd).model.is_none());
 
             // Fields that are absent keep their defaults; what is there is read.
             fs::write(
-                file(&cwd),
+                file(&cwd).unwrap(),
                 r#"{"thoughts": true, "model": "", "thinking": {"a/b": "low", "c/d": 3}}"#,
             )
             .unwrap();
@@ -631,10 +663,55 @@ mod tests {
                 read_history(&cwd),
                 vec!["first".to_string(), "second".to_string()]
             );
-            assert!(history(&cwd).is_file());
+            assert!(history(&cwd).unwrap().is_file());
             // An empty cwd remembers nothing and reads nothing.
             assert!(append_history(Path::new(""), "x").is_ok());
             assert!(read_history(Path::new("")).is_empty());
+        });
+    }
+
+    #[test]
+    fn a_history_of_large_entries_is_cut_to_the_size_cap() {
+        let dir = testenv::dir("history-size");
+        let path = dir.join("history.jsonl");
+        let mut text = String::new();
+        for i in 0..40 {
+            text.push_str(&serde_json::to_string(&format!("{i} {}", "p".repeat(10_000))).unwrap());
+            text.push('\n');
+        }
+        fs::write(&path, &text).unwrap();
+        let lines = read_history_file(&path);
+        assert!(lines.len() < 40 && !lines.is_empty(), "{}", lines.len());
+        assert!(lines.last().unwrap().starts_with("39 "), "the newest stays");
+        // The file is under the cap now, so the next read leaves it alone.
+        assert!(fs::metadata(&path).unwrap().len() <= HISTORY_BYTES);
+        // One entry larger than the cap is still kept.
+        let huge = serde_json::to_string(&"h".repeat(200_000)).unwrap();
+        fs::write(&path, format!("\"old\"\n{huge}\n")).unwrap();
+        assert_eq!(read_history_file(&path).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn without_a_home_nothing_is_kept_in_the_working_directory() {
+        testenv::home("no-home", |home| {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::set_var("HOME", "");
+            assert!(root().is_none());
+            assert!(unkept().is_some());
+            let cwd = home.join("work");
+            fs::create_dir_all(&cwd).unwrap();
+            let mut state = load(&cwd);
+            state.set_model("p/m");
+            state.save().unwrap();
+            append_history(&cwd, "a line").unwrap();
+            assert!(read_history(&cwd).is_empty());
+            assert!(save_default("p/m").is_err());
+            assert_eq!(
+                fs::read_dir(&cwd).unwrap().count(),
+                0,
+                "the project is untouched"
+            );
         });
     }
 

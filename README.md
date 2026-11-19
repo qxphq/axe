@@ -465,7 +465,9 @@ holds the global default model: what `/model -g` writes, and what a directory
 whose `state.json` names no model follows, before the config's `model`.
 
 Directories are `0700` and files `0600`: a session is plaintext, readable by
-its owner only. Use a container, a separate user, or full-disk encryption when
+its owner only. With neither `XDG_STATE_HOME` nor `HOME` set, axe says so at
+startup and keeps nothing — no sessions, prompt history, state or MCP approval —
+rather than write them under the working directory. Use a container, a separate user, or full-disk encryption when
 the local account is not the right boundary.
 
 The active body is append-only, so a crash can only leave one unfinished line:

@@ -40,9 +40,9 @@ pub struct Meta {
     pub archived: bool,
 }
 
-/// `<state>/projects/<key>/sessions`.
-pub fn dir(cwd: &Path) -> PathBuf {
-    state::project(cwd).join("sessions")
+/// `<state>/projects/<key>/sessions`; `None` when there is no state directory.
+pub fn dir(cwd: &Path) -> Option<PathBuf> {
+    Some(state::project(cwd)?.join("sessions"))
 }
 
 fn meta_path(dir: &Path, id: &str) -> PathBuf {
@@ -135,7 +135,9 @@ impl Meta {
 /// Every readable meta, newest activity first. A malformed sidecar is skipped:
 /// one broken session must not hide the others.
 pub fn list(cwd: &Path) -> Vec<Meta> {
-    let dir = dir(cwd);
+    let Some(dir) = dir(cwd) else {
+        return Vec::new();
+    };
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
@@ -411,7 +413,9 @@ fn unpack(dir: &Path, meta: &mut Meta, gz: &Path, plain: &Path) -> Result<(), St
 /// Compress the bodies older than `keep`. Best-effort: a failure is reported
 /// and the next startup tries again.
 pub fn archive_old(cwd: &Path, keep: usize) {
-    let dir = dir(cwd);
+    let Some(dir) = dir(cwd) else {
+        return;
+    };
     let old: Vec<Meta> = list(cwd).into_iter().skip(keep).collect();
     if old.is_empty() {
         return;
@@ -453,12 +457,11 @@ pub fn archive_old(cwd: &Path, keep: usize) {
     }
 }
 
+/// A gz already beside the plain body is never trusted to hold it: a crash
+/// after this rename leaves a copy, but an unpack whose removal failed leaves
+/// an old one, and that body was resumed and appended to since. The body is
+/// compressed again, and the rename replaces whichever it was.
 fn compress(dir: &Path, meta: &Meta, plain: &Path, gz: &Path) -> Result<(), String> {
-    if gz.exists() {
-        // A crash after the rename but before the plain copy was removed.
-        fs::remove_file(plain).map_err(|e| format!("remove {}: {e}", plain.display()))?;
-        return Ok(());
-    }
     let before = fingerprint(plain)?;
     let tmp = dir.join(format!("{}.jsonl.gz.tmp", meta.id));
     gzip(&[OsStr::new("-nc"), plain.as_os_str()], &tmp)?;
@@ -568,7 +571,9 @@ pub fn search(cwd: &Path, metas: &[Meta], query: &str) -> Vec<Hit> {
             .collect();
     }
 
-    let dir = dir(cwd);
+    let Some(dir) = dir(cwd) else {
+        return Vec::new();
+    };
     let mut hits = Vec::new();
     for (index, meta) in metas.iter().enumerate() {
         let mut seen = vec![false; terms.len()];
@@ -852,6 +857,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A gz left beside a body that was resumed and appended to is older than
+    /// the body: compressing again keeps every line, deleting would lose them.
+    #[test]
+    fn a_stale_archive_never_replaces_a_newer_body() {
+        if !require_gzip("a_stale_archive_never_replaces_a_newer_body") {
+            return;
+        }
+        let dir = crate::state::testenv::dir("stale-gz");
+        let mut meta = Meta::new("abc123");
+        let plain = log_path(&dir, "abc123");
+        let gz = gz_path(&dir, "abc123");
+        std::fs::write(&plain, "{\"role\":\"user\",\"content\":\"old\"}\n").unwrap();
+        compress(&dir, &meta, &plain, &gz).unwrap();
+        // The unpack whose removal of the gz failed, then a resumed append.
+        std::fs::write(
+            &plain,
+            "{\"role\":\"user\",\"content\":\"old\"}\n{\"role\":\"user\",\"content\":\"new\"}\n",
+        )
+        .unwrap();
+        compress(&dir, &meta, &plain, &gz).unwrap();
+        assert!(!plain.exists());
+        unpack(&dir, &mut meta, &gz, &plain).unwrap();
+        assert!(std::fs::read_to_string(&plain).unwrap().contains("new"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn damaged_body_is_reported() {
         let dir = std::env::temp_dir().join(format!("axe-test-damaged-{}", std::process::id()));
@@ -1072,7 +1103,7 @@ mod tests {
         testenv::home("sessions-list", |home| {
             let cwd = home.join("work");
             std::fs::create_dir_all(&cwd).unwrap();
-            let dir = dir(&cwd);
+            let dir = dir(&cwd).unwrap();
             session(&dir, "aa11", "older", &[], 10);
             session(&dir, "bb22", "newer", &[], 20);
             // A body with no sidecar, an id that is not hex, and a sidecar that
@@ -1112,7 +1143,7 @@ mod tests {
         testenv::home("sessions-search", |home| {
             let cwd = home.join("work");
             std::fs::create_dir_all(&cwd).unwrap();
-            let dir = dir(&cwd);
+            let dir = dir(&cwd).unwrap();
             let mut meta = Meta::new("aa11");
             meta.title = "Parse the sessions".into();
             meta.summary = "a parse-heavy session".into();
@@ -1160,7 +1191,7 @@ mod tests {
         testenv::home("sessions-archive", |home| {
             let cwd = home.join("work");
             std::fs::create_dir_all(&cwd).unwrap();
-            let dir = dir(&cwd);
+            let dir = dir(&cwd).unwrap();
             session(&dir, "aa11", "oldest", &["one"], 10);
             session(&dir, "bb22", "middle", &["two"], 20);
             session(&dir, "cc33", "newest", &["three"], 30);
@@ -1281,7 +1312,7 @@ mod tests {
         testenv::home("sessions-marker", |home| {
             let cwd = home.join("work");
             std::fs::create_dir_all(&cwd).unwrap();
-            let dir = dir(&cwd);
+            let dir = dir(&cwd).unwrap();
             // A body that is compressed but whose sidecar never learned it.
             let mut meta = Meta::new("abc123");
             meta.updated = 1;
