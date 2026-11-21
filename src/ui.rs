@@ -1118,7 +1118,12 @@ impl Screen {
     }
 
     fn echo(&mut self, line: &str) {
-        let mut lines = markdown::document(line, self.cols().saturating_sub(2));
+        // What the user typed is laid out as markdown, which reads a lone
+        // newline as a space: a pasted block would come back as one paragraph.
+        // Two spaces before the newline is markdown's hard break, so the rows
+        // the prompt showed stay rows, inside a paragraph or outside one.
+        let line = line.trim_end_matches('\n').replace('\n', "  \n");
+        let mut lines = markdown::document(&line, self.cols().saturating_sub(2));
         if lines.is_empty() {
             lines.push(Line::default());
         }
@@ -3507,6 +3512,30 @@ mod tests {
         assert_eq!(screen.recall.history.len(), 3, "no second `cancelled`");
         press(&mut screen, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(screen.ed.buf, "newest", "the walk was settled, not kept");
+    }
+
+    #[test]
+    fn a_pasted_block_keeps_the_rows_it_was_typed_on() {
+        let mut screen = Screen::test_screen(40, 24);
+        screen.echo_user("alpha one\nbeta two\ngamma three");
+        screen.flush();
+        let rows = screen.transcript();
+        let echo: Vec<&String> = rows.iter().filter(|row| row.contains('█')).collect();
+        assert_eq!(echo.len(), 3, "{rows:?}");
+        assert!(echo[0].contains("alpha one"), "{rows:?}");
+        assert!(echo[1].contains("beta two"), "{rows:?}");
+        assert!(echo[2].contains("gamma three"), "{rows:?}");
+        // A block that ended in a newline leaves no empty row of its own.
+        let mut screen = Screen::test_screen(40, 24);
+        screen.echo_user("only one\n");
+        screen.flush();
+        let rows = screen.transcript();
+        assert_eq!(
+            rows.iter().filter(|row| row.contains('█')).count(),
+            1,
+            "{rows:?}"
+        );
+        packed(&mut screen);
     }
 
     #[test]

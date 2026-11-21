@@ -275,7 +275,9 @@ invariants a change must not break.
   block only when the next line cannot continue it, and for a list that is an
   item at an indent already open. A row wider than the field takes the rows it
   needs — a code row keeps its indent, and the quote or item it sits in, on
-  every row it takes.
+  every row it takes. The user's own line is markdown too, but a newline it
+  carries is a hard break, so a pasted block comes back on the rows the prompt
+  showed rather than as one paragraph.
 - Style comes from `Paint` in `render.rs`, rendered as cells or ANSI: it is the
   only table of what a thing looks like, and `Info` names a variant rather than
   defining one.
