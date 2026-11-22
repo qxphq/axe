@@ -237,7 +237,7 @@ jobs:
           done
           SRV
           printf '{"mcpServers":{"t":{"command":"/bin/sh","args":["%s/srv.sh"]}}}\n' "$w" > "$w/.mcp.json"
-          ./harness.py --work "$w" --timeout 12 --scroll 120 'y' '/mcp' --expect 'mcp t: 1 tool'
+          ./harness.py --work "$w" --timeout 12 --scroll 120 'y' '/mcp' --expect 'mcp: t 1'
           ./harness.py --work "$w" --timeout 12 --scroll 120 '/mcp' --refute 'run them?'
 
       # The config's blocked paths: `read` asks and the answer is on a red
