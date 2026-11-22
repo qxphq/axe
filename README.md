@@ -481,7 +481,9 @@ LF, and an `edit` copying what it saw has to match the bytes on disk. A window
 over the cap stops after a whole line and names the offset that continues it;
 one line longer than the cap cannot be paged by line, and says so. An argument
 of the wrong type is an error, never a default, so a call that asked for line
-12 is never answered with line 1.
+12 is never answered with line 1. A `path` that starts with `~/` (or is `~`)
+expands to `$HOME`, as a shell would; any other relative path is relative to
+the working directory.
 
 `bash` starts every call in the working directory, so `cd` is pointless. Its
 output over 30 000 characters is cut, not streamed, and the result names an

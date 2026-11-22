@@ -295,7 +295,7 @@ pub fn execute(name: &str, args: &str, cancel: &Cancel, mode: Mode) -> String {
     // The turn asked the user before this call ran; a path still blocked is
     // one they did not allow, or a call nobody could ask about.
     if let Some(path) = target(name, &args, mode) {
-        if sandbox::blocked(Path::new(path)).is_some() {
+        if sandbox::blocked(Path::new(&path)).is_some() {
             return format!(
                 "error: {name} {path}: the user's config blocks this path, and the user did \
                  not allow it this session"
@@ -339,14 +339,14 @@ pub fn blocked(name: &str, args: &str, mode: Mode) -> Option<std::path::PathBuf>
         return None;
     }
     let args: Value = serde_json::from_str(args).ok()?;
-    sandbox::blocked(Path::new(target(name, &args, mode)?))
+    sandbox::blocked(Path::new(&target(name, &args, mode)?))
 }
 
 /// The file a call names, for the tools that open one in this mode.
-fn target<'a>(name: &str, args: &'a Value, mode: Mode) -> Option<&'a str> {
+fn target(name: &str, args: &Value, mode: Mode) -> Option<String> {
     match name {
-        "read" => string(args, "path").ok(),
-        "write" | "edit" if !mode.explore() => string(args, "path").ok(),
+        "read" => path(args).ok(),
+        "write" | "edit" if !mode.explore() => path(args).ok(),
         _ => None,
     }
 }
@@ -375,6 +375,27 @@ pub(crate) fn string<'a>(args: &'a Value, name: &str) -> Result<&'a str, String>
     value
         .as_str()
         .ok_or_else(|| mismatch(name, "a string", value))
+}
+
+/// The `path` a file tool opens, with a leading `~` or `~/` expanded to
+/// `$HOME`: no shell sits between the model and `std::fs`, and a literal `~`
+/// would land in a directory of that name under the working directory.
+fn path(args: &Value) -> Result<String, String> {
+    let raw = string(args, "path")?;
+    Ok(match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => tilde(raw, &home),
+        _ => raw.to_string(),
+    })
+}
+
+fn tilde(raw: &str, home: &str) -> String {
+    if raw == "~" {
+        return home.to_string();
+    }
+    match raw.strip_prefix("~/") {
+        Some(rest) => format!("{}/{rest}", home.trim_end_matches('/')),
+        None => raw.to_string(),
+    }
 }
 
 pub(crate) fn integer(args: &Value, name: &str) -> Result<Option<u64>, String> {
@@ -416,10 +437,11 @@ fn mismatch(name: &str, want: &str, value: &Value) -> String {
 // ---- local tools ----
 
 fn read(args: &Value) -> String {
-    let path = match string(args, "path") {
+    let path = match path(args) {
         Ok(path) => path,
         Err(e) => return e,
     };
+    let path = path.as_str();
     // `/proc` serves the environment the process was exec'd with; `unsetenv`
     // does not clear it. Refuse the one file that holds the provider keys,
     // whichever `/proc` route reaches it.
@@ -572,10 +594,11 @@ fn proc_environ(path: &Path) -> bool {
 }
 
 fn write(args: &Value) -> String {
-    let path = match string(args, "path") {
+    let path = match path(args) {
         Ok(path) => path,
         Err(e) => return e,
     };
+    let path = path.as_str();
     let content = match string(args, "content") {
         Ok(content) => content,
         Err(e) => return e,
@@ -594,10 +617,11 @@ fn write(args: &Value) -> String {
 }
 
 fn edit(args: &Value) -> String {
-    let path = match string(args, "path") {
+    let path = match path(args) {
         Ok(path) => path,
         Err(e) => return e,
     };
+    let path = path.as_str();
     let old = match string(args, "old") {
         Ok(old) => old,
         Err(e) => return e,
@@ -941,6 +965,17 @@ mod tests {
 
     fn temp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("axe-test-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn tilde_expands_to_home() {
+        assert_eq!(tilde("~", "/h"), "/h");
+        assert_eq!(tilde("~/a/b", "/h"), "/h/a/b");
+        assert_eq!(tilde("~/a", "/h/"), "/h/a");
+        assert_eq!(tilde("~/a", "/"), "/a");
+        assert_eq!(tilde("~user/a", "/h"), "~user/a");
+        assert_eq!(tilde("a/~/b", "/h"), "a/~/b");
+        assert_eq!(tilde("/abs", "/h"), "/abs");
     }
 
     #[test]
