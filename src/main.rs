@@ -3030,6 +3030,15 @@ mod tests {
             false,
         );
         assert_eq!(plain_text(&about), "ℹ  about");
+        let write = call_line(
+            &api::ToolCall {
+                id: "4".into(),
+                name: "write".into(),
+                arguments: r#"{"path":"a.txt"}"#.into(),
+            },
+            false,
+        );
+        assert_eq!(plain_text(&write), "✚  write(a.txt)");
         let shell = shell_line("echo hi", false);
         assert!(plain_text(&shell).contains("echo hi"));
     }
