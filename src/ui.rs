@@ -623,6 +623,9 @@ pub struct Screen {
     /// State changed since the last frame. The loops paint; the setters only
     /// mark, so a change made while nobody is drawing cannot be lost.
     dirty: bool,
+    /// A notification's bytes, sent by the next repaint once the frame under
+    /// it is drawn: the ping arrives with the answer on screen, not before.
+    notice: Option<String>,
     /// The terminal size the last frame was drawn at. A resize reflows the
     /// pane and moves the text under the frame, which is what makes the rows
     /// above it stop being known blank.
@@ -766,6 +769,7 @@ impl Screen {
             menu: None,
             restored: false,
             dirty: true,
+            notice: None,
             size: None,
             drawn: None,
             reflows: false,
@@ -1746,6 +1750,27 @@ impl Screen {
     pub fn repaint(&mut self) {
         if self.dirty {
             let _ = self.draw();
+        }
+        if let Some(bytes) = self.notice.take() {
+            self.emit(&bytes);
+        }
+    }
+
+    /// Queue a notification for the next repaint. It is an escape, not a row:
+    /// the cursor stays put, so the frame and `slack` are what they were.
+    pub fn notify(&mut self, bytes: String) {
+        self.notice = Some(bytes);
+    }
+
+    fn emit(&mut self, bytes: &str) {
+        match &mut self.term {
+            Term::Real(term) => {
+                let out = term.backend_mut();
+                let _ = out.write_all(bytes.as_bytes());
+                let _ = Write::flush(out);
+            }
+            #[cfg(test)]
+            Term::Test(_) => {}
         }
     }
 

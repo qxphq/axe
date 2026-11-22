@@ -204,6 +204,12 @@ class Tmux:
     def send_keys(self, keys):
         self.run("send-keys", "-t", self.session, *keys, check=True)
 
+    def record(self, path):
+        # What the program wrote, escapes and all: a notification is bytes
+        # the pane never draws, so only the raw stream can show it was sent.
+        self.run("pipe-pane", "-t", self.session, "-o",
+                 f"cat >> {shlex.quote(str(path))}", check=True)
+
     def capture(self, scroll, ansi):
         args = ["capture-pane", "-p"]
         if ansi:
@@ -335,10 +341,13 @@ def parse_size(raw):
         raise SystemExit(f"harness: bad --size {raw!r}, want COLSxROWS")
 
 
-def write_config(root, port, blocked=()):
+def write_config(root, port, blocked=(), notify=None):
     cfg = Path(root) / "config" / "axe"
     cfg.mkdir(parents=True, exist_ok=True)
     extra = {}
+    if notify:
+        # No wait: every turn the harness runs is a long one.
+        extra["notify"] = {"via": notify, "after": 0}
     if blocked:
         # Relative to the work directory: the config itself wants absolute.
         extra["blocked"] = [str((Path(root) / p).resolve()) for p in blocked]
@@ -416,6 +425,16 @@ def main():
                          "blocked list")
     ap.add_argument("--no-fetch-local", action="store_true",
                     help="do not allow fetch to reach the fixture server")
+    ap.add_argument("--notify", choices=("bell", "osc9", "osc777"),
+                    help="set the config's notify.via, with after 0")
+    ap.add_argument("--expect-raw", action="append", default=[],
+                    metavar="TEXT",
+                    help="fail unless the bytes axe wrote contain TEXT "
+                         "(escapes as in Python, e.g. '\\x1b]777'); "
+                         "repeatable; tmux only")
+    ap.add_argument("--refute-raw", action="append", default=[],
+                    metavar="TEXT",
+                    help="fail if the bytes axe wrote contain TEXT; repeatable")
     ap.add_argument("--expect", action="append", default=[], metavar="TEXT",
                     help="fail unless the final screen contains TEXT; repeatable")
     ap.add_argument("--refute", action="append", default=[], metavar="TEXT",
@@ -425,6 +444,9 @@ def main():
         args.turns = ["text:ok"]
     if args.ansi and args.term == "pyte":
         ap.error("--ansi needs --term tmux: pyte's dump is text")
+    raw_checks = args.expect_raw or args.refute_raw
+    if raw_checks and args.term == "pyte":
+        ap.error("--expect-raw/--refute-raw need --term tmux")
 
     binary = Path(args.bin).resolve()
     if not binary.exists():
@@ -456,7 +478,7 @@ def main():
     tmux = Tmux(socket, conf) if args.term == "tmux" else Pyte()
     ok = False
     try:
-        config_home = write_config(work, port, args.blocked)
+        config_home = write_config(work, port, args.blocked, args.notify)
         env = {
             "XDG_CONFIG_HOME": str(config_home),
             # Keep per-directory state out of the real $HOME/.local/state.
@@ -466,6 +488,9 @@ def main():
             # The fixture server is on loopback, which the host guard refuses.
             env["AXE_FETCH_ALLOW_LOCAL"] = "1"
         tmux.start(size, work, env, str(binary))
+        raw = Path(work) / "pane.raw"
+        if raw_checks:
+            tmux.record(raw)
 
         # Wait for the info row, or for the process to die with its error.
         start = time.monotonic()
@@ -501,6 +526,17 @@ def main():
             if text in screen:
                 print(f"harness: found refuted {text!r}", file=sys.stderr)
                 ok = False
+        if raw_checks:
+            written = raw.read_bytes() if raw.exists() else b""
+            unescape = lambda t: t.encode().decode("unicode_escape").encode("latin-1")
+            for text in args.expect_raw:
+                if unescape(text) not in written:
+                    print(f"harness: bytes miss expected {text!r}", file=sys.stderr)
+                    ok = False
+            for text in args.refute_raw:
+                if unescape(text) in written:
+                    print(f"harness: bytes hold refuted {text!r}", file=sys.stderr)
+                    ok = False
     finally:
         server.shutdown()
         server.server_close()

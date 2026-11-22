@@ -80,6 +80,7 @@ pick in one directory is state, not config, and so is `/model -g`'s default.
 | `agents` | extra instructions file; `~/` expands, relative to the config |
 | `skills` | extra skill directories or `SKILL.md` files |
 | `blocked` | absolute or `~/` paths the model never reaches without asking you, in either mode ([Blocked paths](#blocked-paths)) |
+| `notify` | `{"via": "bell" \| "osc9" \| "osc777", "after": seconds}`: ping the terminal when a long turn ends ([Notifications](#notifications)) |
 
 A provider entry describes the differences between servers, never code paths:
 
@@ -135,6 +136,38 @@ started the same way.
 
 MCP servers are a second input file, `mcp.json` beside this one, read the same
 way and never part of it; see [MCP servers](#mcp-servers).
+
+## Notifications
+
+```json
+"notify": { "via": "osc777", "after": 15 }
+```
+
+A turn that ran `after` seconds or longer (default `15`) ends with a terminal
+notification: `axe` and the session's title with `done`, or the error that
+stopped it. An interrupted turn, a `!cmd` line and a piped run send nothing,
+and without the key nothing is ever sent. Desktop notifications from a terminal
+have no single standard, so `via` names the escape your terminal reads:
+
+| `via` | sends | read by |
+| --- | --- | --- |
+| `bell` | BEL | every terminal: a sound, an urgency hint or a flash, no text |
+| `osc9` | `ESC ] 9 ; text BEL` | iTerm2, WezTerm, Ghostty, kitty |
+| `osc777` | `ESC ] 777 ; notify ; title ; body BEL` | Ghostty, foot, WezTerm, kitty, urxvt, patched VTE terminals |
+
+A terminal that does not know an escape ignores it. The title and body lose
+control bytes and `;`, so text from the model cannot end the sequence or add a
+field, and the body is capped at 200 characters.
+
+Inside tmux (`$TMUX` set), an OSC is wrapped as a DCS passthrough, which tmux
+forwards to the outer terminal only when allowed; `all` also lets a pane you
+are not looking at through, which is the pane a ping is for:
+
+```tmux
+set -g allow-passthrough all
+```
+
+A bell needs none of that: tmux rings the outer terminal itself.
 
 ## Instructions
 

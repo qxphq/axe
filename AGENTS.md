@@ -84,6 +84,10 @@ invariants a change must not break.
     server starts. The binary writes those files only through an explicit
     `/mcp add`/`remove`/`forget`, atomically, and such a write carries an
     approval the file already had and never creates one it did not.
+    `notify` names the one escape a long turn ends with (`bell`, `osc9`,
+    `osc777`) — there is no standard, so axe never sends two and never guesses
+    the terminal; inside tmux an OSC rides a DCS passthrough, and it goes out
+    through `Screen::repaint`, after the frame it reports on.
     Config `model` is the seed: the selection a directory starts on is its own
     `state.json`, then `<state tree>/default.json` (what `/model -g` writes),
     then the config.
@@ -401,7 +405,10 @@ each other.
 python3 and tmux (pyte for `--term pyte`). CI runs the journeys below, so a
 regression in the screen, the confinement or the MCP approval fails a build rather than waiting for a person:
 the deny and the allow, the mid-turn queue, a resize, fetch paging with the host
-guard, `/compact`, a project MCP file that asks once, and a blocked path. `--work DIR` keeps one directory and its state; `--wait` and
+guard, `/compact`, a project MCP file that asks once, a blocked path, and the
+notification a finished turn sends (`--notify VIA` sets it with no wait;
+`--expect-raw`/`--refute-raw` read the bytes the pane received, escapes
+included). `--work DIR` keeps one directory and its state; `--wait` and
 `--timeout` bound idling; `--bin` selects the binary; `--ansi`/`--scroll` control
 the dump, and `--expect`/`--refute` make it an assertion. See `harness.py --help`
 and `mock.py` for fixtures and replies.

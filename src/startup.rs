@@ -271,6 +271,7 @@ pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
         naming: None,
         warning: None,
         skills: loaded_skills.skills,
+        notify: cfg.notify,
     };
 
     if ui::is_interactive() {

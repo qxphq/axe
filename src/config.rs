@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -68,6 +69,28 @@ impl ProviderConfig {
     }
 }
 
+/// How a finished turn reaches the user when the terminal is out of sight.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Via {
+    /// BEL: every terminal has it, and tmux passes it on by itself.
+    Bell,
+    /// `OSC 9`, iTerm2's: a body and no title.
+    Osc9,
+    /// `OSC 777;notify`, rxvt's: a title and a body.
+    Osc777,
+}
+
+/// `"notify"`: the escape a turn ends with once it ran `after` or longer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Notify {
+    pub via: Via,
+    pub after: Duration,
+}
+
+/// The wait before a finished turn pings when `"after"` says nothing: long
+/// enough that an answer someone watched arrive does not.
+pub const NOTIFY_AFTER: u64 = 15;
+
 pub struct Search {
     /// Brave Search API token, resolved from `api_key_env`.
     /// `None` sends queries to DuckDuckGo.
@@ -97,6 +120,8 @@ pub struct Config {
     /// `read`, `write` and `edit` ask, and `bash` and MCP servers are refused
     /// by the kernel. Absolute, `~` expanded.
     pub blocked: Vec<PathBuf>,
+    /// The terminal notification a long turn ends with; `None` is silence.
+    pub notify: Option<Notify>,
 }
 
 pub fn path() -> PathBuf {
@@ -228,6 +253,7 @@ pub(crate) const TOP_KEYS: &[&str] = &[
     "agents",
     "skills",
     "blocked",
+    "notify",
 ];
 
 pub(crate) const PROVIDER_KEYS: &[&str] = &[
@@ -451,6 +477,28 @@ fn parse_blocked(v: &Value) -> Result<Vec<PathBuf>, String> {
     }
 }
 
+fn parse_notify(v: &Value) -> Result<Option<Notify>, String> {
+    let Some(map) = optional_section(&v["notify"], &["via", "after"], "\"notify\": ")? else {
+        return Ok(None);
+    };
+    let via = match map.get("via").and_then(Value::as_str) {
+        Some("bell") => Via::Bell,
+        Some("osc9") => Via::Osc9,
+        Some("osc777") => Via::Osc777,
+        _ => return Err("\"notify.via\" must be \"bell\", \"osc9\" or \"osc777\"".into()),
+    };
+    let after = match map.get("after") {
+        None | Some(Value::Null) => NOTIFY_AFTER,
+        Some(seconds) => seconds
+            .as_u64()
+            .ok_or_else(|| "\"notify.after\" must be whole seconds, 0 or more".to_string())?,
+    };
+    Ok(Some(Notify {
+        via,
+        after: Duration::from_secs(after),
+    }))
+}
+
 fn parse_value(v: &Value) -> Result<Config, String> {
     no_literal_key(v, "")?;
     section(v, TOP_KEYS, "")?;
@@ -528,6 +576,7 @@ fn parse_value(v: &Value) -> Result<Config, String> {
         agents: string_field(v.get("agents"), "agents", "")?.map(|raw| resolve_path(&raw)),
         skills: parse_skills(v)?,
         blocked: parse_blocked(v)?,
+        notify: parse_notify(v)?,
     })
 }
 
@@ -756,6 +805,41 @@ mod tests {
             "explore_by_default": null
         }))
         .is_ok());
+    }
+
+    #[test]
+    fn notify_takes_a_known_escape_and_whole_seconds() {
+        let parse = |notify: Value| {
+            parse_value(&serde_json::json!({"base_url": "http://p", "notify": notify}))
+        };
+        let cfg = parse(serde_json::json!({"via": "osc777"})).unwrap();
+        assert_eq!(
+            cfg.notify,
+            Some(Notify {
+                via: Via::Osc777,
+                after: Duration::from_secs(NOTIFY_AFTER)
+            })
+        );
+        let cfg = parse(serde_json::json!({"via": "bell", "after": 0})).unwrap();
+        assert_eq!(
+            cfg.notify,
+            Some(Notify {
+                via: Via::Bell,
+                after: Duration::ZERO
+            })
+        );
+        assert_eq!(parse(Value::Null).unwrap().notify, None);
+        for bad in [
+            serde_json::json!("osc9"),
+            serde_json::json!({}),
+            serde_json::json!({"via": "osc99"}),
+            serde_json::json!({"via": "osc9", "after": -1}),
+            serde_json::json!({"via": "osc9", "after": 1.5}),
+            serde_json::json!({"via": "osc9", "after": "15"}),
+            serde_json::json!({"via": "osc9", "afer": 15}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -77,6 +77,37 @@ pub fn terminal_text(text: &str) -> String {
     }
 }
 
+/// The longest notification body: a desktop banner shows a line or two.
+const NOTICE_CHARS: usize = 200;
+
+/// The bytes that ask the terminal to notify. Title and body are made safe
+/// for a field: no control byte to end the sequence early, no `;` to start a
+/// field of their own. Inside tmux an OSC goes through as a DCS passthrough,
+/// every ESC doubled, which tmux forwards only with `allow-passthrough`; BEL
+/// needs none, because tmux rings the outer terminal itself.
+pub fn notification(via: crate::config::Via, title: &str, body: &str, tmux: bool) -> String {
+    use crate::config::Via;
+    let field = |text: &str| -> String {
+        displayable(text)
+            .replace(';', ",")
+            .chars()
+            .take(NOTICE_CHARS)
+            .collect()
+    };
+    let osc = match via {
+        Via::Bell => return "\x07".to_string(),
+        // ConEmu reads `9;<digit>` as a command of its own, so the body
+        // leads with the title.
+        Via::Osc9 => format!("\x1b]9;{}: {}\x07", field(title), field(body)),
+        Via::Osc777 => format!("\x1b]777;notify;{};{}\x07", field(title), field(body)),
+    };
+    if tmux {
+        format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b"))
+    } else {
+        osc
+    }
+}
+
 /// Keep both ends of an oversized result: the error is at the end and the
 /// command is at the start, and the model can tell what was cut.
 /// Char-safe cut, marked at the end: a description or a stderr tail longer
@@ -325,6 +356,36 @@ pub(crate) fn skip(test: &str, why: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_bytes_per_escape_and_inside_tmux() {
+        use crate::config::Via;
+        assert_eq!(notification(Via::Bell, "axe", "x", false), "\x07");
+        assert_eq!(notification(Via::Bell, "axe", "x", true), "\x07");
+        assert_eq!(
+            notification(Via::Osc9, "axe", "fix: done", false),
+            "\x1b]9;axe: fix: done\x07"
+        );
+        assert_eq!(
+            notification(Via::Osc777, "axe", "fix: done", false),
+            "\x1b]777;notify;axe;fix: done\x07"
+        );
+        assert_eq!(
+            notification(Via::Osc777, "axe", "b", true),
+            "\x1bPtmux;\x1b\x1b]777;notify;axe;b\x07\x1b\\"
+        );
+    }
+
+    /// A title or an error is the model's or a server's text: it must not
+    /// end the sequence, start a field, or run on for a screen.
+    #[test]
+    fn notification_fields_cannot_escape_the_sequence() {
+        use crate::config::Via;
+        let bytes = notification(Via::Osc777, "a;b", "x\x07\x1b]52;c;aGk=\x1b\\y", false);
+        assert_eq!(bytes, "\x1b]777;notify;a,b;x]52,c,aGk=\\y\x07");
+        let long = notification(Via::Osc9, "axe", &"z".repeat(500), false);
+        assert_eq!(long.matches('z').count(), NOTICE_CHARS);
+    }
 
     /// The one cap behind `bash`, `web_search` and MCP: both ends survive, the
     /// result never grows past `max`, and a cut can never split a character.

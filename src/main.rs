@@ -303,6 +303,8 @@ struct Session {
     warning: Option<String>,
     /// The skills discovered at startup; the catalogue is in the prompt.
     skills: Vec<skills::Skill>,
+    /// The terminal notification a long turn ends with (`"notify"`).
+    notify: Option<config::Notify>,
 }
 
 fn session_title(meta: &sessions::Meta) -> String {
@@ -1631,6 +1633,7 @@ impl Session {
         rx: &Receiver<Event>,
         screen: &mut ui::Screen,
     ) -> Result<Vec<String>, String> {
+        let started = Instant::now();
         // pi's trigger: within the reserve of the window, the answer has
         // nowhere to go, so the session is summarized before the request rather
         // than after the provider refused it. The user's line is not in the
@@ -1772,6 +1775,13 @@ impl Session {
         if !result {
             screen.error("axe: turn failed\n");
         }
+        if !held.interrupted {
+            let failed = held
+                .failed
+                .as_deref()
+                .or((!result).then_some("turn failed"));
+            self.ping(started, failed, screen);
+        }
         // A request typed while the turn's last round was already in flight
         // never reached a boundary: it is the next turn, like any other line
         // that arrived too late for one, and a command line never entered the
@@ -1779,6 +1789,32 @@ impl Session {
         show_queue(screen, &[]);
         pending.extend(held.queued.into_iter().map(|entry| entry.line));
         Ok(pending)
+    }
+
+    /// A turn that ran past `"notify.after"` tells a user who looked away
+    /// that it is their move: done, or the error that stopped it. The user
+    /// stopped an interrupted one themselves, so it never gets here.
+    fn ping(&self, started: Instant, failed: Option<&str>, screen: &mut ui::Screen) {
+        let Some(notify) = self.notify else {
+            return;
+        };
+        if started.elapsed() < notify.after {
+            return;
+        }
+        let name = self.title().or_else(|| {
+            let cwd = std::env::current_dir().ok()?;
+            Some(cwd.file_name()?.to_string_lossy().into_owned())
+        });
+        let outcome = match failed {
+            Some(error) => error.lines().next().unwrap_or("failed").to_string(),
+            None => "done".to_string(),
+        };
+        let body = match name {
+            Some(name) => format!("{name}: {outcome}"),
+            None => outcome,
+        };
+        let tmux = std::env::var_os("TMUX").is_some_and(|value| !value.is_empty());
+        screen.notify(crate::text::notification(notify.via, "axe", &body, tmux));
     }
 
     fn turn(&mut self, sink: &mut dyn Sink, cancel: &http::Cancel) -> Result<(), String> {
@@ -2001,6 +2037,8 @@ struct Held {
     armed: bool,
     /// Whether the turn was actually stopped, for the line that says so.
     interrupted: bool,
+    /// The error that ended the turn, for the notification that reports it.
+    failed: Option<String>,
     /// Lines the turn took into its history. The prompt was not there to commit
     /// them — a queued line is taken, not committed — so their memory is owed
     /// when the turn is over.
@@ -2069,6 +2107,7 @@ impl Held {
             Event::Resize => screen.invalidate(),
             Event::Done(Err(e)) => {
                 screen.error(&format!("axe: {e}\n"));
+                self.failed = Some(e);
                 return true;
             }
             Event::Done(Ok(usage)) => {
@@ -3065,6 +3104,7 @@ mod tests {
             naming: None,
             warning: None,
             skills: Vec::new(),
+            notify: None,
         }
     }
 

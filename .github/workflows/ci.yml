@@ -204,6 +204,13 @@ jobs:
           ./harness.py --no-fetch-local --wait 1 --scroll 60 'fetch:plain' '!Escape' 'show:' \
             --expect 'refused host'
           ./harness.py --wait 1 --scroll 40 'text:one' '/compact' --expect 'Mock summary of the session.'
+          # A finished turn pings through tmux's passthrough; an interrupted
+          # one and a config without `notify` send nothing.
+          ./harness.py --notify osc777 --wait 1 'text:hi' \
+            --expect-raw '\x1bPtmux;\x1b\x1b]777;notify;axe;text:hi: done\x07\x1b\\'
+          ./harness.py --notify osc9 --wait 1 'tool:bash:{"command":"sleep 5"}' '!Escape' '!Escape' \
+            --refute-raw ']9;'
+          ./harness.py --wait 1 'text:hi' --refute-raw '\x07'
           # Every command and a `!cmd` while the screen is up: a debug build
           # asserts nothing else writes the terminal then, and the panic ends
           # the run, which fails the journey.
