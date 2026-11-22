@@ -289,13 +289,19 @@ invariants a change must not break.
 - Tool names and descriptions are part of the prompt. Change them deliberately.
 - `README.md` is the user-facing contract and the GitHub page. It ships through
   `about`, so keep it factual and in the same commit as the behavior it describes.
-- MCP: a server's tools are read once, at startup, because tool schemas are the
-  cached prefix — a restart is the boundary, and `/mcp` says when a file
-  changed. Names are `mcp__<server>__<tool>`, sanitized and hash-suffixed past
-  64 characters, so a server can never shadow a built-in or another server's
-  tool. A project entry may replace a global one by name, but an entry with no
-  `command`/`url` may only switch `enabled`: a repository narrows what runs,
-  never defines it. The file is code, so it needs one approval per content hash
+- MCP: a server's tools are read once, when it starts, because tool schemas are
+  the cached prefix — a restart is the boundary, and `/mcp` says when a file
+  changed. A server starts with the session unless its entry says
+  `"autoload": false`; then it starts on `/mcp load <name>`, its tools are
+  appended to the catalogue (`mcp::generation` tells `tools::definitions` to
+  rebuild), and the one prefix break is the user's choice. The catalogue only
+  grows: nothing unloads, and a mode flip restarts the loaded servers under the
+  names the model already saw. Names are `mcp__<server>__<tool>`, sanitized
+  and hash-suffixed past 64 characters, so a server can never shadow a
+  built-in or another server's tool. A project entry may replace a global one
+  by name, whole, but never edits it: whether a global server loads at start
+  is the global file's to say, and a project's own entries carry their own
+  `autoload`. The file is code, so it needs one approval per content hash
   (`mcp-trust.json` in the project's state directory), and the prompt shows the
   commands and the `$NAME` variables each entry reads — the same names the
   start expands, and `/mcp` reports that record, not whether entries are in

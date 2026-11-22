@@ -381,7 +381,7 @@ enum Command {
     Thinking(Option<String>),
     Thoughts,
     Explore,
-    /// `/mcp [add|remove|forget|name]`: the servers and their tools.
+    /// `/mcp [load|add|remove|forget|name]`: the servers and their tools.
     Mcp(String),
     /// A chooser in the interactive run, a numbered list when piped.
     Sessions(Option<String>),
@@ -525,7 +525,7 @@ const HELP: &str = "/model [id]    list the models, or switch to one for this di
                     /sessions [q]  list, search and resume sessions\n\
                     /compact       replace the history with a summary of itself\n\
                     /skills        list loaded skills (project, global, config)\n\
-                    /mcp [name]    MCP servers: list, add, remove, forget\n\
+                    /mcp [name]    MCP servers: list, load, add, remove, forget\n\
                     /skill:name [request]  load a skill's instructions and run a turn\n\
                     /new           start a new session\n\
                     /explore       toggle explore mode (read-only shell)\n\
@@ -1918,7 +1918,17 @@ impl Session {
                 Cmd::Continue
             }
             Command::Mcp(rest) => {
-                console.output(&mcp::dispatch(&rest));
+                // A load is a handshake that can take seconds: the row says so.
+                let loading = rest.split_whitespace().next() == Some("load");
+                if let (true, Some(screen)) = (loading, console.screen()) {
+                    screen.set_status("▣ Loading MCP server");
+                    screen.repaint();
+                }
+                let out = mcp::dispatch(&rest);
+                if let (true, Some(screen)) = (loading, console.screen()) {
+                    screen.set_status("");
+                }
+                console.output(&out);
                 Cmd::Continue
             }
             Command::Sessions(query) => {

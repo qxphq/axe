@@ -12,7 +12,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -183,39 +183,61 @@ impl Mode {
 
 const SPECS: &[Spec] = &[READ, WRITE, EDIT, BASH, ABOUT, FETCH, WEB_SEARCH];
 
-static DEFINITIONS: OnceLock<Value> = OnceLock::new();
-
-/// The `tools` array: the built-in schemas and whatever an MCP server
-/// contributed, read once because the catalogue is the cached prefix.
-pub fn definitions() -> &'static Value {
-    DEFINITIONS.get_or_init(|| {
-        let mut all: Vec<Value> = SPECS
-            .iter()
-            .map(|spec| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": spec.name,
-                        "description": spec.description,
-                        "parameters": serde_json::from_str::<Value>(spec.parameters)
-                            .expect("tool schema"),
-                    }
-                })
-            })
-            .collect();
-        // A server's tools join the same array. `mcp::start` runs at startup,
-        // before the first turn and therefore before this first call: the
-        // catalogue is fixed for the session and never rebuilt.
-        all.extend(crate::mcp::definitions());
-        Value::Array(all)
-    })
+/// The array as last built, and the MCP catalogue generation it was built from.
+struct Catalogue {
+    generation: u64,
+    tools: Arc<Value>,
+    bytes: u64,
 }
 
-/// The tools array's own size, once: every request carries it and no message
+static CATALOGUE: Mutex<Option<Catalogue>> = Mutex::new(None);
+
+/// The `tools` array: the built-in schemas and whatever an MCP server
+/// contributed. It is the cached prefix, so it is rebuilt only when the MCP
+/// catalogue grew — at startup, and when the user runs `/mcp load` — and a
+/// tool once in it stays.
+pub fn definitions() -> Arc<Value> {
+    catalogue(|c| c.tools.clone())
+}
+
+/// The tools array's own size: every request carries it and no message
 /// weighs it, so the fill's estimate has to add it.
 pub fn definitions_bytes() -> u64 {
-    static BYTES: OnceLock<u64> = OnceLock::new();
-    *BYTES.get_or_init(|| definitions().to_string().len() as u64)
+    catalogue(|c| c.bytes)
+}
+
+fn catalogue<T>(read: impl FnOnce(&Catalogue) -> T) -> T {
+    static BUILTIN: OnceLock<Vec<Value>> = OnceLock::new();
+    let generation = crate::mcp::generation();
+    let mut slot = CATALOGUE.lock().unwrap_or_else(PoisonError::into_inner);
+    if slot.as_ref().is_none_or(|c| c.generation != generation) {
+        let builtin = BUILTIN.get_or_init(|| {
+            SPECS
+                .iter()
+                .map(|spec| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": spec.name,
+                            "description": spec.description,
+                            "parameters": serde_json::from_str::<Value>(spec.parameters)
+                                .expect("tool schema"),
+                        }
+                    })
+                })
+                .collect()
+        });
+        let mut all = builtin.clone();
+        all.extend(crate::mcp::definitions());
+        let tools = Value::Array(all);
+        let bytes = tools.to_string().len() as u64;
+        *slot = Some(Catalogue {
+            generation,
+            tools: Arc::new(tools),
+            bytes,
+        });
+    }
+    read(slot.as_ref().expect("built above"))
 }
 
 /// Rules that hold for every user: one line each, no workflow. Rendered as a
@@ -1147,7 +1169,8 @@ mod tests {
 
     #[test]
     fn registry_and_prompt_include_every_tool() {
-        let names: Vec<&str> = definitions()
+        let tools = definitions();
+        let names: Vec<&str> = tools
             .as_array()
             .unwrap()
             .iter()

@@ -208,7 +208,7 @@ default.
     "sentry": { "url": "https://mcp.sentry.dev/mcp" },
     "grep":   { "url": "https://mcp.grep.app",
                 "headers": { "Authorization": "Bearer ${GREP_KEY}" } },
-    "docs":   { "command": "/opt/mcp-docs", "enabled": false, "timeout": 120 } } }
+    "docs":   { "command": "/opt/mcp-docs", "autoload": false, "timeout": 120 } } }
 ```
 
 | key | meaning |
@@ -218,7 +218,7 @@ default.
 | `args` | strings for a command; `~` is your home directory, and `$NAME` expands at start |
 | `env` | for a command: name → value, or an array of names as shorthand |
 | `headers` | for a url: name → value |
-| `enabled` | `false` keeps the entry and starts nothing |
+| `autoload` | `false` starts it only on `/mcp load <name>`, so its tools stay out of the context until then |
 | `timeout` | seconds per call; 60 by default |
 
 Values are strings with `$NAME` and `${NAME}` expanded from axe's own
@@ -226,9 +226,9 @@ environment at start, `$$` for a literal `$`: that is how a committed file
 names a secret without holding one. A missing variable is reported by name and
 the server does not start half-configured. `type` may name `stdio`, `http` or
 `streamable-http`, and must agree with the entry's `command` or `url`; unknown
-keys are errors, in an entry and at the top of the file. An entry with no `command`/`url`
-may only switch a global server's `enabled` — a repository can narrow what
-runs, never define it.
+keys are errors, in an entry and at the top of the file. Every entry needs a
+`command` or a `url`: a project server of the same name replaces a global one
+whole, and nothing in a repository changes a global server's `autoload`.
 
 A `url` entry is streamable HTTP: axe POSTs JSON-RPC, accepts a JSON body or an
 SSE stream, echoes `Mcp-Session-Id`, sends `MCP-Protocol-Version`, and DELETEs
@@ -237,10 +237,15 @@ entry names; axe sends nothing it was not given, reads no other auth store, and
 reports a 401 as the server's answer.
 
 Tools are named `mcp__<server>__<tool>` and carry the server's own schema and
-description. They are read once at startup, because the catalogue is part of
-the cached prompt prefix: an edit needs a restart, and `/mcp` says when a file
-changed. At most 128 tools and 256 KiB of schema per server, 4 MiB per message,
-and 30 000 characters per result with the whole text in a temporary file the
+description. They are read once, when the server starts, because the
+catalogue is part of the cached prompt prefix: an edit needs a restart, and
+`/mcp` says when a file changed. A server with `"autoload": false` is listed
+as `on demand` and gives the model nothing until `/mcp load <name>` starts it
+under the current mode; its tools are then appended to the array for the rest
+of the process, which starts the provider's prompt cache over once. Nothing
+unloads a server, and a resume or a new start goes by the file again. At most
+128 tools and 256 KiB of schema per server, 4 MiB per message, and 30 000
+characters per result with the whole text in a temporary file the
 result names. The model gets text: an image or a resource is `[image omitted]`.
 ESC stops waiting (the process keeps its server; an HTTP request is closed); a
 server that exits answers with what it printed.
@@ -254,9 +259,9 @@ mcp servers
 ```
 
 `/mcp <name>` shows one server's tools. `/mcp add [--project] [--url URL]
-[--env NAME[=VALUE]]... [--header 'K: V']... [--timeout S] <name> [command
-[args...]]`, `/mcp remove <name>` and `/mcp forget` edit the files, and the
-startup line is the proof that it worked: `mcp github: 26 tools (global)`.
+[--env NAME[=VALUE]]... [--header 'K: V']... [--timeout S] [--no-autoload]
+<name> [command [args...]]`, `/mcp remove <name>` and `/mcp forget` edit the
+files, and the startup line is the proof that it worked: `mcp github: 26 tools (global)`.
 `--env NAME` writes a reference (`${NAME}`); `--env NAME=VALUE` writes the value
 as given, so a secret belongs in the first form — a project file is committed.
 Either command keeps an approval the file already had and never creates one it
@@ -329,7 +334,7 @@ path with a space in it is not completed.
 | `/sessions [query]` | browse or search this directory's sessions |
 | `/compact` | summarize the session and continue from the summary |
 | `/skills` | list loaded skills, where they came from, and what the model sees |
-| `/mcp [name]` | the MCP servers: list them, one server's tools, `add`, `remove`, `forget` |
+| `/mcp [name]` | the MCP servers: list them, one server's tools, `load`, `add`, `remove`, `forget` |
 | `/skill:name [request]` | load a skill's instructions and run a turn |
 | `/help` | list the commands, the key bindings, the config path and its keys |
 | `/exit`, `/quit` | quit |

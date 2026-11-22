@@ -14,7 +14,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
@@ -98,14 +98,11 @@ struct Entry {
     headers: Vec<(String, String)>,
     /// Every `${NAME}`/`$NAME` the entry reads, for the approval prompt.
     vars: Vec<String>,
-    enabled: bool,
+    /// `false` keeps the server out of the catalogue until `/mcp load`.
+    autoload: bool,
     timeout: u64,
-    /// The file that defines it, for `/mcp` and for `remove`.
-    source: PathBuf,
     /// A repository supplied it, so it needed the approval.
     project: bool,
-    /// The entry carries no command: it only turns a global server on or off.
-    toggle_only: bool,
 }
 
 impl Entry {
@@ -114,13 +111,6 @@ impl Entry {
     }
 
     fn describe(&self) -> String {
-        if self.toggle_only {
-            return if self.enabled {
-                "turns the global server on".into()
-            } else {
-                "turns the global server off".into()
-            };
-        }
         if let Some(url) = &self.url {
             let mut line = url.clone();
             for (name, _) in &self.headers {
@@ -334,7 +324,7 @@ fn parse_servers(path: &Path, project: bool) -> (Vec<Entry>, Vec<String>) {
         return (entries, errors);
     };
     for (name, value) in servers {
-        match parse_entry(name, value, path, project) {
+        match parse_entry(name, value, project) {
             Ok(entry) => entries.push(entry),
             Err(e) => errors.push(format!("{}: {e}", path.display())),
         }
@@ -342,7 +332,7 @@ fn parse_servers(path: &Path, project: bool) -> (Vec<Entry>, Vec<String>) {
     (entries, errors)
 }
 
-fn parse_entry(name: &str, value: &Value, path: &Path, project: bool) -> Result<Entry, String> {
+fn parse_entry(name: &str, value: &Value, project: bool) -> Result<Entry, String> {
     if !valid_name(name) {
         return Err(format!(
             "server \"{name}\": names use letters, digits, \"_\" and \"-\" (32 at most)"
@@ -354,11 +344,11 @@ fn parse_entry(name: &str, value: &Value, path: &Path, project: bool) -> Result<
     for key in object.keys() {
         if !matches!(
             key.as_str(),
-            "command" | "args" | "env" | "url" | "headers" | "enabled" | "timeout" | "type"
+            "command" | "args" | "env" | "url" | "headers" | "autoload" | "timeout" | "type"
         ) {
             return Err(format!(
                 "server \"{name}\": unknown key \"{key}\" (axe takes command, args, env, url, \
-                 headers, enabled, timeout, type)"
+                 headers, autoload, timeout, type)"
             ));
         }
     }
@@ -378,11 +368,11 @@ fn parse_entry(name: &str, value: &Value, path: &Path, project: bool) -> Result<
             ));
         }
     }
-    let enabled = match object.get("enabled") {
+    let autoload = match object.get("autoload") {
         None => true,
         Some(value) => value
             .as_bool()
-            .ok_or_else(|| format!("server \"{name}\": \"enabled\" must be true or false"))?,
+            .ok_or_else(|| format!("server \"{name}\": \"autoload\" must be true or false"))?,
     };
     let timeout = match object.get("timeout") {
         None => CALL_TIMEOUT,
@@ -436,37 +426,7 @@ fn parse_entry(name: &str, value: &Value, path: &Path, project: bool) -> Result<
         ));
     }
     if command.is_none() && url.is_none() {
-        // A project entry with no command can only switch a global server: a
-        // repository may narrow what runs, never define it.
-        if !project {
-            return Err(format!("server \"{name}\": missing \"command\" or \"url\""));
-        }
-        if object.get("enabled").is_none() {
-            return Err(format!(
-                "server \"{name}\": needs \"command\"/\"url\", or \"enabled\" to switch a \
-                 global server"
-            ));
-        }
-        if !env.is_empty() || !headers.is_empty() || object.contains_key("args") {
-            return Err(format!(
-                "server \"{name}\": an entry without \"command\" or \"url\" may only set \
-                 \"enabled\""
-            ));
-        }
-        return Ok(Entry {
-            name: name.to_string(),
-            command: None,
-            url: None,
-            args: Vec::new(),
-            env,
-            headers,
-            vars: Vec::new(),
-            enabled,
-            timeout,
-            source: path.to_path_buf(),
-            project,
-            toggle_only: true,
-        });
+        return Err(format!("server \"{name}\": missing \"command\" or \"url\""));
     }
     let args = match object.get("args") {
         None => Vec::new(),
@@ -510,11 +470,9 @@ fn parse_entry(name: &str, value: &Value, path: &Path, project: bool) -> Result<
         env,
         headers,
         vars,
-        enabled,
+        autoload,
         timeout,
-        source: path.to_path_buf(),
         project,
-        toggle_only: false,
     })
 }
 
@@ -586,26 +544,12 @@ fn parse_headers(name: &str, value: Option<&Value>) -> Result<Vec<(String, Strin
     }
 }
 
-/// Global entries, then the project's on top. A project entry replaces the
-/// global one by name; a toggle-only entry changes its `enabled` and nothing
-/// else.
-fn merge(global: Vec<Entry>, project: Vec<Entry>, errors: &mut Vec<String>) -> Vec<Entry> {
+/// Global entries, then the project's on top: a project entry replaces the
+/// global one by name, whole. Nothing in a repository edits a global entry —
+/// whether one loads at start is the global file's to say.
+fn merge(global: Vec<Entry>, project: Vec<Entry>) -> Vec<Entry> {
     let mut by_name: BTreeMap<String, Entry> = BTreeMap::new();
-    for entry in global {
-        by_name.insert(entry.name.clone(), entry);
-    }
-    for entry in project {
-        if entry.toggle_only {
-            match by_name.get_mut(&entry.name) {
-                Some(base) => base.enabled = entry.enabled,
-                None => errors.push(format!(
-                    "{}: server \"{}\" turns on nothing: no global server has that name",
-                    entry.source.display(),
-                    entry.name
-                )),
-            }
-            continue;
-        }
+    for entry in global.into_iter().chain(project) {
         by_name.insert(entry.name.clone(), entry);
     }
     by_name.into_values().collect()
@@ -1261,7 +1205,6 @@ struct Tool {
     exposed: String,
     /// The name the server knows.
     original: String,
-    definition: Value,
 }
 
 struct Server {
@@ -1489,9 +1432,15 @@ fn stamp(path: &Path) -> Option<Stamp> {
 #[derive(Default)]
 struct Registry {
     entries: Vec<Entry>,
-    /// Indexed like `entries`: a server per enabled entry, or why it failed.
+    /// Indexed like `entries`: a server per loaded entry, or why it failed.
     running: Vec<Option<Server>>,
     failures: Vec<Option<String>>,
+    /// Indexed like `entries`: the entry is meant to run — it autoloads, or
+    /// `/mcp load` asked for it — so a mode flip restarts it.
+    loaded: Vec<bool>,
+    /// Every tool the model has been given, in the order it was given:
+    /// append-only, because it is the cached prefix.
+    catalogue: Vec<Named>,
     errors: Vec<String>,
     cwd: Option<PathBuf>,
     project: Option<PathBuf>,
@@ -1520,6 +1469,24 @@ impl Registry {
         }
         None
     }
+}
+
+/// A tool as the catalogue carries it: the server and name it came from, and
+/// the name and definition the model saw.
+struct Named {
+    server: String,
+    original: String,
+    exposed: String,
+    definition: Value,
+}
+
+/// Bumped whenever the catalogue changes, so `tools::definitions` knows to
+/// rebuild the array; process-wide so a second `start` never reuses a number.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Which catalogue `definitions` would return now.
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::SeqCst)
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -1559,9 +1526,8 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
             _ => false,
         };
         trusted = recorded;
-        // A file that only switches global servers runs nothing new: it needs
-        // no approval, and its entries are applied either way.
-        needs_approval = project_entries.iter().any(|entry| !entry.toggle_only);
+        // A file that defines nothing has nothing to approve.
+        needs_approval = !project_entries.is_empty();
         if !trusted && needs_approval {
             match &hash {
                 None => errors.push(format!(
@@ -1588,7 +1554,6 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
     let entries = merge(
         global_entries,
         if trusted { project_entries } else { Vec::new() },
-        &mut errors,
     );
     let mut notices: Vec<String> = errors.iter().map(|e| format!("mcp: {e}")).collect();
     if project.is_some() && !trusted {
@@ -1598,21 +1563,30 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
         ));
     }
 
-    let opened = open_all(&entries, explore);
+    let loaded: Vec<bool> = entries.iter().map(|e| e.autoload).collect();
+    let opened = open_all(&entries, &loaded, explore);
     let mut running = Vec::with_capacity(entries.len());
     let mut failures = Vec::with_capacity(entries.len());
+    let mut catalogue = Vec::new();
     for (entry, opened) in entries.iter().zip(opened) {
         match opened {
             None => {
+                notices.push(format!(
+                    "mcp {}: on demand — /mcp load {}{}",
+                    entry.name,
+                    entry.name,
+                    origin(entry)
+                ));
                 running.push(None);
                 failures.push(None);
             }
-            Some(Ok(server)) => {
+            Some(Ok(mut server)) => {
+                adopt(&mut catalogue, &mut server, true);
                 notices.push(format!(
                     "mcp {}: {} tool{}{}",
                     entry.name,
-                    server.listed.len(),
-                    plural(server.listed.len()),
+                    server.tools.len(),
+                    plural(server.tools.len()),
                     origin(entry)
                 ));
                 running.push(Some(server));
@@ -1625,7 +1599,6 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
             }
         }
     }
-    name_tools(&mut running);
 
     let stamps = vec![(global.clone(), stamp(&global))]
         .into_iter()
@@ -1635,6 +1608,8 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
         entries,
         running,
         failures,
+        loaded,
+        catalogue,
         errors,
         cwd: cwd.map(Path::to_path_buf),
         project,
@@ -1644,6 +1619,7 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
         stamps,
         explore,
     };
+    GENERATION.fetch_add(1, Ordering::SeqCst);
     notices
 }
 
@@ -1655,30 +1631,48 @@ fn origin(entry: &Entry) -> &'static str {
     }
 }
 
-/// Tool names, globally: `mcp__<server>__<tool>`, and a hash suffix when the
-/// name is too long or already taken, so two servers can never collide.
-fn name_tools(running: &mut [Option<Server>]) {
-    let mut taken: HashSet<String> = HashSet::new();
-    for server in running.iter_mut().flatten() {
-        let listed = std::mem::take(&mut server.listed);
-        for item in listed {
-            let exposed = tool_name(&server.name, &item.original, &taken);
-            taken.insert(exposed.clone());
-            let definition = json!({
-                "type": "function",
-                "function": {
-                    "name": exposed,
-                    "description": item.description,
-                    "parameters": item.schema,
-                }
-            });
-            server.tools.push(Tool {
-                exposed,
-                original: item.original,
-                definition,
-            });
-        }
+/// Give a freshly opened server its tools. A tool the catalogue already
+/// holds keeps the name and definition the model saw; with `grow`, a new one
+/// is named — `mcp__<server>__<tool>`, hash-suffixed when too long or taken,
+/// so two servers never collide — and appended, and without it, it is left
+/// out so the prefix cannot move. Returns whether the catalogue grew.
+fn adopt(catalogue: &mut Vec<Named>, server: &mut Server, grow: bool) -> bool {
+    let mut taken: HashSet<String> = catalogue.iter().map(|t| t.exposed.clone()).collect();
+    let mut grew = false;
+    for item in std::mem::take(&mut server.listed) {
+        let known = catalogue
+            .iter()
+            .find(|t| t.server == server.name && t.original == item.original);
+        let exposed = match known {
+            Some(t) => t.exposed.clone(),
+            None if grow => {
+                let exposed = tool_name(&server.name, &item.original, &taken);
+                taken.insert(exposed.clone());
+                let definition = json!({
+                    "type": "function",
+                    "function": {
+                        "name": exposed,
+                        "description": item.description,
+                        "parameters": item.schema,
+                    }
+                });
+                catalogue.push(Named {
+                    server: server.name.clone(),
+                    original: item.original.clone(),
+                    exposed: exposed.clone(),
+                    definition,
+                });
+                grew = true;
+                exposed
+            }
+            None => continue,
+        };
+        server.tools.push(Tool {
+            exposed,
+            original: item.original,
+        });
     }
+    grew
 }
 
 fn tool_name(server: &str, tool: &str, taken: &HashSet<String>) -> String {
@@ -1707,13 +1701,13 @@ fn tool_name(server: &str, tool: &str, taken: &HashSet<String>) -> String {
     name
 }
 
-/// Append to the tool array the request carries.
+/// Append to the tool array the request carries: every tool the model was
+/// given this session, in order, whether or not its server is up now.
 pub fn definitions() -> Vec<Value> {
     let reg = lock();
-    reg.running
+    reg.catalogue
         .iter()
-        .flatten()
-        .flat_map(|server| server.tools.iter().map(|tool| tool.definition.clone()))
+        .map(|tool| tool.definition.clone())
         .collect()
 }
 
@@ -1731,23 +1725,26 @@ pub fn call(name: &str, args: &Value, cancel: &Cancel) -> String {
     server.call(&original, args, cancel)
 }
 
-/// Whether any server is configured: a mode flip then has servers to restart.
+/// Whether any server is loaded: a mode flip then has servers to restart.
 pub fn configured() -> bool {
-    !lock().entries.is_empty()
+    lock().loaded.iter().any(|loaded| *loaded)
 }
 
-/// Open every enabled entry, `None` for a disabled one. Each server is a
+/// Open every entry `wanted` names, `None` for the rest. Each server is a
 /// process and a handshake of its own, and one that is slow must not hold the
 /// others back: the fan-out runs in parallel and the results come back in
 /// entry order, so the notices do too.
-fn open_all(entries: &[Entry], explore: bool) -> Vec<Option<Result<Server, String>>> {
+fn open_all(
+    entries: &[Entry],
+    wanted: &[bool],
+    explore: bool,
+) -> Vec<Option<Result<Server, String>>> {
     thread::scope(|scope| {
         let handles: Vec<_> = entries
             .iter()
-            .map(|entry| {
-                entry
-                    .enabled
-                    .then(|| scope.spawn(move || Server::open(entry, explore)))
+            .zip(wanted)
+            .map(|(entry, wanted)| {
+                wanted.then(|| scope.spawn(move || Server::open(entry, explore)))
             })
             .collect();
         handles
@@ -1783,41 +1780,20 @@ pub fn restart(explore: bool) -> Vec<String> {
         return Vec::new();
     }
     reg.explore = explore;
-    // The catalogue the model was given is the one that stays: a restart
-    // reuses the names and definitions it saw, so a server that lists a
-    // different set cannot move the prefix mid-session.
-    let mut kept: HashMap<(String, String), (String, Value)> = HashMap::new();
-    for (entry, server) in reg.entries.iter().zip(reg.running.iter()) {
-        let Some(server) = server else { continue };
-        for tool in &server.tools {
-            kept.insert(
-                (entry.name.clone(), tool.original.clone()),
-                (tool.exposed.clone(), tool.definition.clone()),
-            );
-        }
-    }
     stop_all(&mut reg.running);
     let mut notices = Vec::new();
     let entries = reg.entries.clone();
-    for (at, (entry, opened)) in entries.iter().zip(open_all(&entries, explore)).enumerate() {
+    let loaded = reg.loaded.clone();
+    let opened = open_all(&entries, &loaded, explore);
+    for (at, (entry, opened)) in entries.iter().zip(opened).enumerate() {
         let Some(opened) = opened else {
             continue;
         };
         match opened {
             Ok(mut server) => {
-                let listed = std::mem::take(&mut server.listed);
-                for item in listed {
-                    let Some((exposed, definition)) =
-                        kept.get(&(entry.name.clone(), item.original.clone()))
-                    else {
-                        continue;
-                    };
-                    server.tools.push(Tool {
-                        exposed: exposed.clone(),
-                        original: item.original,
-                        definition: definition.clone(),
-                    });
-                }
+                // The catalogue the model was given is the one that stays: a
+                // server that lists a different set cannot move the prefix.
+                adopt(&mut reg.catalogue, &mut server, false);
                 notices.push(format!(
                     "mcp {}: {} tool{}{}",
                     entry.name,
@@ -1836,6 +1812,55 @@ pub fn restart(explore: bool) -> Vec<String> {
         }
     }
     notices
+}
+
+/// `/mcp load <name>`: start a server that does not autoload, under the mode
+/// in force, and add its tools to the catalogue. The array changes once, here,
+/// because the user asked; the provider's cache starts over at that request.
+fn load(rest: &str) -> String {
+    let name = rest.trim();
+    if name.is_empty() || name.split_whitespace().count() != 1 {
+        return "usage: /mcp load <name>\n".into();
+    }
+    let (entry, explore) = {
+        let reg = lock();
+        let Some(at) = reg.index(name) else {
+            return format!("error: mcp: no server named \"{name}\" (see /mcp)\n");
+        };
+        let entry = reg.entries[at].clone();
+        if reg.running[at].is_some() {
+            return format!("mcp: \"{name}\" is already loaded\n");
+        }
+        (entry, reg.explore)
+    };
+    // The handshake can take seconds; the lock is not held through it.
+    let opened = Server::open(&entry, explore);
+    let mut reg = lock();
+    let Some(at) = reg.index(name) else {
+        return format!("error: mcp: no server named \"{name}\" (see /mcp)\n");
+    };
+    reg.loaded[at] = true;
+    match opened {
+        Ok(mut server) => {
+            if adopt(&mut reg.catalogue, &mut server, true) {
+                GENERATION.fetch_add(1, Ordering::SeqCst);
+            }
+            let line = format!(
+                "mcp {}: {} tool{}{}\n",
+                entry.name,
+                server.tools.len(),
+                plural(server.tools.len()),
+                origin(&entry)
+            );
+            reg.running[at] = Some(server);
+            reg.failures[at] = None;
+            line
+        }
+        Err(e) => {
+            reg.failures[at] = Some(e.clone());
+            format!("error: mcp {}: {}\n", entry.name, strip_control(&e))
+        }
+    }
 }
 
 /// At exit: no server outlives the session that started it. The registry is
@@ -1861,6 +1886,7 @@ pub fn dispatch(arg: &str) -> String {
     };
     match verb {
         "add" => add(rest),
+        "load" => load(rest),
         "remove" => remove(rest),
         "forget" => forget(),
         "list" => listing(),
@@ -1904,13 +1930,13 @@ fn listing() -> String {
     }
     let mut out = String::from("mcp servers\n");
     for (at, entry) in reg.entries.iter().enumerate() {
-        let status = match (&reg.running[at], &reg.failures[at], entry.enabled) {
-            (_, _, false) => "disabled".to_string(),
-            (Some(server), _, _) => {
+        let status = match (&reg.running[at], &reg.failures[at]) {
+            (None, None) if !reg.loaded[at] => "on demand: /mcp load".to_string(),
+            (Some(server), _) => {
                 format!("{} tool{}", server.tools.len(), plural(server.tools.len()))
             }
-            (None, Some(e), _) => format!("failed: {e}"),
-            (None, None, _) => "failed".to_string(),
+            (None, Some(e)) => format!("failed: {e}"),
+            (None, None) => "failed".to_string(),
         };
         let kind = if entry.remote() { "http" } else { "stdio" };
         out.push_str(&format!(
@@ -1923,8 +1949,8 @@ fn listing() -> String {
     }
     if let Some(file) = &reg.project {
         // The record is what this line reports, not whether entries happen to
-        // be in force: a toggle-only file was never asked about, and a file
-        // whose approval was just forgotten is not approved any more.
+        // be in force: an empty file was never asked about, and a file whose
+        // approval was just forgotten is not approved any more.
         let state = approval_state(reg.recorded, reg.needs_approval);
         out.push_str(&format!("  {}: {state}\n", file.display()));
     }
@@ -1949,9 +1975,11 @@ fn detail(name: &str) -> String {
         origin(entry),
         entry.describe()
     );
-    match (&reg.running[at], &reg.failures[at], entry.enabled) {
-        (_, _, false) => out.push_str("  disabled\n"),
-        (Some(server), _, _) => {
+    match (&reg.running[at], &reg.failures[at]) {
+        (None, None) if !reg.loaded[at] => {
+            out.push_str(&format!("  on demand: /mcp load {name}\n"))
+        }
+        (Some(server), _) => {
             for tool in &server.tools {
                 out.push_str(&format!("  {}\n", strip_control(&tool.exposed)));
             }
@@ -1961,8 +1989,8 @@ fn detail(name: &str) -> String {
                 plural(server.tools.len())
             ));
         }
-        (None, Some(e), _) => out.push_str(&format!("  failed: {}\n", strip_control(e))),
-        (None, None, _) => out.push_str("  failed\n"),
+        (None, Some(e)) => out.push_str(&format!("  failed: {}\n", strip_control(e))),
+        (None, None) => out.push_str("  failed\n"),
     }
     out
 }
@@ -1981,6 +2009,7 @@ fn empty_state() -> String {
          --env NAME      hand it a variable from your environment (repeatable);\n     \
          NAME=VALUE writes the value as given, so a secret belongs in the first\n  \
          --header 'K: V' one header, for a url (repeatable)\n  \
+         --no-autoload   keep it out of the context until /mcp load <name>\n  \
          a new server appears after a restart; /mcp then lists it.\n\n\
          a project server with the same name replaces the global one.\n\
          the global file, if you would rather edit it:\n  \
@@ -2056,11 +2085,13 @@ fn add_flags(
         Vec<(String, String)>,
         Option<String>,
         Option<u64>,
+        bool,
         Vec<String>,
     ),
     String,
 > {
     let mut project = false;
+    let mut autoload = true;
     let mut env = Vec::new();
     let mut headers = Vec::new();
     let mut url = None;
@@ -2072,6 +2103,7 @@ fn add_flags(
         let word = words[at].as_str();
         match word {
             "--project" => project = true,
+            "--no-autoload" => autoload = false,
             "--url" => match words.get(at + 1) {
                 Some(value) => {
                     url = Some(value.clone());
@@ -2127,13 +2159,13 @@ fn add_flags(
         }
         at += 1;
     }
-    Ok((project, env, headers, url, timeout, words_out))
+    Ok((project, env, headers, url, timeout, autoload, words_out))
 }
 
 fn add(rest: &str) -> String {
     let usage = "usage: /mcp add [--project] [--url URL] [--env NAME[=VALUE]]... \
-                 [--header 'K: V']... [--timeout S] <name> [command [args...]]\n";
-    let (project, env, headers, url, timeout, words) = match add_flags(rest) {
+                 [--header 'K: V']... [--timeout S] [--no-autoload] <name> [command [args...]]\n";
+    let (project, env, headers, url, timeout, autoload, words) = match add_flags(rest) {
         Ok(flags) => flags,
         Err(e) => return format!("error: mcp: {e}\n"),
     };
@@ -2174,6 +2206,9 @@ fn add(rest: &str) -> String {
     }
     if let Some(timeout) = timeout {
         entry["timeout"] = json!(timeout);
+    }
+    if !autoload {
+        entry["autoload"] = json!(false);
     }
     let path = match (project, cwd.clone()) {
         (true, Some(dir)) => project_target(&dir),
@@ -2369,11 +2404,9 @@ mod tests {
             env: Vec::new(),
             headers: Vec::new(),
             vars: Vec::new(),
-            enabled: true,
+            autoload: true,
             timeout: CALL_TIMEOUT,
-            source: PathBuf::from("/tmp/mcp.json"),
             project: false,
-            toggle_only: false,
         }
     }
 
@@ -2420,46 +2453,30 @@ mod tests {
     }
 
     #[test]
-    fn a_project_entry_replaces_or_toggles_a_global_one() {
-        let mut errors = Vec::new();
+    fn a_project_entry_replaces_a_global_one_whole() {
         let mut replacement = entry("files", "other");
         replacement.project = true;
-        let mut off = entry("git", "");
-        off.project = true;
-        off.toggle_only = true;
-        off.enabled = false;
+        let mut lazy = entry("docs", "mcp-docs");
+        lazy.project = true;
+        lazy.autoload = false;
         let merged = merge(
             vec![entry("files", "npx"), entry("git", "mcp-git")],
-            vec![replacement, off],
-            &mut errors,
+            vec![replacement, lazy],
         );
-        assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(merged.len(), 2);
-        assert_eq!(
-            merged
-                .iter()
-                .find(|e| e.name == "files")
-                .unwrap()
-                .command
-                .as_deref(),
-            Some("other")
-        );
-        assert!(!merged.iter().find(|e| e.name == "git").unwrap().enabled);
-        let mut lonely = entry("nope", "");
-        lonely.toggle_only = true;
-        let mut errors = Vec::new();
-        assert!(merge(Vec::new(), vec![lonely], &mut errors).is_empty());
-        assert!(errors[0].contains("no global server"), "{errors:?}");
+        assert_eq!(merged.len(), 3);
+        let files = merged.iter().find(|e| e.name == "files").unwrap();
+        assert_eq!(files.command.as_deref(), Some("other"));
+        assert!(files.project);
+        assert!(merged.iter().find(|e| e.name == "git").unwrap().autoload);
+        assert!(!merged.iter().find(|e| e.name == "docs").unwrap().autoload);
     }
 
     #[test]
     fn entries_are_validated_at_the_boundary() {
-        let file = Path::new("/tmp/mcp.json");
         let ok = parse_entry(
             "files",
             &json!({ "command": "npx", "args": ["-y", "s"],
                      "env": { "TOKEN": "${TOKEN}" } }),
-            file,
             false,
         )
         .unwrap();
@@ -2468,13 +2485,8 @@ mod tests {
         assert_eq!(ok.vars, vec!["TOKEN".to_string()]);
 
         // An array of names is the shorthand for a pass-through.
-        let shorthand = parse_entry(
-            "x",
-            &json!({ "command": "c", "env": ["A_TOKEN"] }),
-            file,
-            false,
-        )
-        .unwrap();
+        let shorthand =
+            parse_entry("x", &json!({ "command": "c", "env": ["A_TOKEN"] }), false).unwrap();
         assert_eq!(shorthand.env, vec![("A_TOKEN".into(), "${A_TOKEN}".into())]);
 
         // Remote servers name headers, and take no env or args.
@@ -2482,7 +2494,6 @@ mod tests {
             "sentry",
             &json!({ "url": "https://mcp.sentry.dev/mcp",
                      "headers": { "Authorization": "Bearer ${KEY}" } }),
-            file,
             false,
         )
         .unwrap();
@@ -2491,49 +2502,54 @@ mod tests {
         assert!(parse_entry(
             "x",
             &json!({ "url": "https://e/mcp", "args": ["a"] }),
-            file,
             false
         )
         .is_err());
         assert!(parse_entry(
             "x",
             &json!({ "command": "c", "headers": { "A": "B" } }),
-            file,
             false
         )
         .is_err());
         assert!(parse_entry(
             "x",
             &json!({ "command": "c", "url": "https://e/mcp" }),
-            file,
             false
         )
         .is_err());
-        assert!(parse_entry("x", &json!({ "url": "ftp://e" }), file, false).is_err());
+        assert!(parse_entry("x", &json!({ "url": "ftp://e" }), false).is_err());
 
         // A field axe would ignore must not run half a server.
-        let err =
-            parse_entry("x", &json!({ "command": "c", "cwd": "/" }), file, false).unwrap_err();
+        let err = parse_entry("x", &json!({ "command": "c", "cwd": "/" }), false).unwrap_err();
         assert!(err.contains("unknown key"), "{err}");
-        assert!(parse_entry("x", &json!({ "enabled": false }), file, false).is_err());
-        assert!(parse_entry("x", &json!({ "enabled": false }), file, true).is_ok());
-        assert!(parse_entry("x", &json!({}), file, true).is_err());
-        assert!(parse_entry("x", &json!({ "command": "c", "timeout": 0 }), file, false).is_err());
-        assert!(parse_entry(
+        let err =
+            parse_entry("x", &json!({ "command": "c", "enabled": false }), false).unwrap_err();
+        assert!(err.contains("unknown key \"enabled\""), "{err}");
+        let err = parse_entry("x", &json!({ "autoload": true }), true).unwrap_err();
+        assert!(err.contains("missing \"command\" or \"url\""), "{err}");
+        let lazy = parse_entry(
             "x",
-            &json!({ "command": "c", "enabled": "yes" }),
-            file,
-            false
-        )
-        .is_err());
-        assert!(parse_entry("x", &json!({ "command": "c", "args": "one" }), file, false).is_err());
-        assert!(parse_entry(
-            "x",
-            &json!({ "command": "c", "env": ["1BAD"] }),
-            file,
-            false
-        )
-        .is_err());
+            &json!({ "url": "https://e/mcp", "autoload": false }),
+            true,
+        );
+        assert!(
+            !lazy.unwrap().autoload,
+            "a project server may wait for a load"
+        );
+        assert!(parse_entry("x", &json!({ "autoload": false }), false).is_err());
+        let lazy = parse_entry("x", &json!({ "command": "c", "autoload": false }), false);
+        assert!(!lazy.unwrap().autoload);
+        assert!(
+            parse_entry("x", &json!({ "command": "c" }), false)
+                .unwrap()
+                .autoload
+        );
+        assert!(parse_entry("x", &json!({ "command": "c", "autoload": "no" }), false).is_err());
+        assert!(parse_entry("x", &json!({}), true).is_err());
+        assert!(parse_entry("x", &json!({ "command": "c", "timeout": 0 }), false).is_err());
+        assert!(parse_entry("x", &json!({ "command": "c", "autoload": "yes" }), false).is_err());
+        assert!(parse_entry("x", &json!({ "command": "c", "args": "one" }), false).is_err());
+        assert!(parse_entry("x", &json!({ "command": "c", "env": ["1BAD"] }), false).is_err());
     }
 
     #[test]
@@ -2650,6 +2666,8 @@ mod tests {
             "NAME=VALUE writes the value as given",
             "--header 'K: V'",
             "a url is streamable HTTP",
+            "--no-autoload",
+            "/mcp load",
         ] {
             assert!(help.contains(wanted), "{wanted:?} missing from:\n{help}");
         }
@@ -2706,7 +2724,6 @@ mod tests {
         let parsed = parse_entry(
             "t",
             &json!({ "command": "tool", "args": ["--greeting", "${AXE_TEST_MCP_ARG}"] }),
-            Path::new("/tmp/mcp.json"),
             false,
         )
         .unwrap();
@@ -2776,21 +2793,23 @@ mod tests {
 
     #[test]
     fn add_flags_carry_a_project_a_url_and_variable_names() {
-        let (project, env, headers, url, timeout, words) =
+        let (project, env, headers, url, timeout, autoload, words) =
             add_flags("--env TOKEN github npx -y s").unwrap();
         assert!(!project);
+        assert!(autoload);
         assert_eq!(env, vec![("TOKEN".to_string(), "${TOKEN}".to_string())]);
         assert!(headers.is_empty());
         assert!(url.is_none());
         assert_eq!(timeout, None);
         assert_eq!(words, vec!["github", "npx", "-y", "s"]);
 
-        let (project, env, headers, url, timeout, words) = add_flags(
+        let (project, env, headers, url, timeout, autoload, words) = add_flags(
             "--project --url https://e/mcp --header 'Authorization: Bearer ${K}' \
-             --env K --timeout 90 sentry",
+             --env K --timeout 90 --no-autoload sentry",
         )
         .unwrap();
         assert!(project);
+        assert!(!autoload);
         assert_eq!(url.as_deref(), Some("https://e/mcp"));
         assert_eq!(env, vec![("K".to_string(), "${K}".to_string())]);
         assert_eq!(
@@ -2849,8 +2868,7 @@ mod tests {
 
     #[test]
     fn a_type_must_be_a_string_that_agrees_with_the_entry() {
-        let file = Path::new("/tmp/mcp.json");
-        let check = |value: Value| parse_entry("t", &value, file, false);
+        let check = |value: Value| parse_entry("t", &value, false);
         assert!(check(json!({ "command": "c", "type": 5 })).is_err());
         assert!(check(json!({ "command": "c", "type": "http" })).is_err());
         assert!(check(json!({ "url": "https://x/mcp", "type": "stdio" })).is_err());
@@ -2887,9 +2905,9 @@ done
         let server = Server::open(&e, false).expect("a server that answers");
         assert_eq!(server.listed.len(), 1);
         assert_eq!(server.listed[0].original, "echo");
-        let mut running = vec![Some(server)];
-        name_tools(&mut running);
-        let server = running[0].as_mut().unwrap();
+        let mut server = server;
+        adopt(&mut Vec::new(), &mut server, true);
+        let server = &mut server;
         assert_eq!(server.tools[0].exposed, "mcp__t__echo");
         assert_eq!(
             server.call("echo", &json!({ "text": "hi" }), &Cancel::new()),
@@ -2922,9 +2940,9 @@ done
         let mut e = entry("t", "/bin/sh");
         e.args = vec![file.display().to_string()];
         let server = Server::open(&e, false).unwrap();
-        let mut running = vec![Some(server)];
-        name_tools(&mut running);
-        let server = running[0].as_mut().unwrap();
+        let mut server = server;
+        adopt(&mut Vec::new(), &mut server, true);
+        let server = &mut server;
         let cancel = Arc::new(Cancel::new());
         let trigger = cancel.clone();
         let flag = thread::spawn(move || {
@@ -2940,7 +2958,7 @@ done
 
     /// A restart opens its servers at once, like the start: three that each
     /// take a second to answer take about a second, not three, and come back
-    /// in entry order with a disabled one left out.
+    /// in entry order with an unloaded one left out.
     #[test]
     fn servers_open_in_parallel_and_in_order() {
         let dir = state::testenv::dir("mcp-parallel");
@@ -2954,9 +2972,10 @@ done
                 e
             })
             .collect();
-        entries[1].enabled = false;
+        entries[1].autoload = false;
         let started = Instant::now();
-        let mut opened = open_all(&entries, false);
+        let wanted: Vec<bool> = entries.iter().map(|e| e.autoload).collect();
+        let mut opened = open_all(&entries, &wanted, false);
         assert!(
             // Serial would be three seconds at least: the margin is for a slow
             // runner spawning three shells, not for the code.
@@ -2965,7 +2984,7 @@ done
             started.elapsed()
         );
         assert!(matches!(opened[0], Some(Ok(_))));
-        assert!(opened[1].is_none(), "a disabled entry is not opened");
+        assert!(opened[1].is_none(), "an entry not wanted is not opened");
         assert!(matches!(opened[2], Some(Ok(_))));
         let mut running: Vec<Option<Server>> = opened
             .drain(..)
@@ -3108,9 +3127,9 @@ done
         e.url = Some(url);
         let server = Server::open(&e, false).expect("a remote server");
         assert_eq!(server.listed.len(), 1);
-        let mut running = vec![Some(server)];
-        name_tools(&mut running);
-        let server = running[0].as_mut().unwrap();
+        let mut server = server;
+        adopt(&mut Vec::new(), &mut server, true);
+        let server = &mut server;
         assert_eq!(
             server.call("echo", &json!({}), &Cancel::new()),
             "said it back"
@@ -3195,5 +3214,63 @@ done
             shutdown();
         });
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A server that does not autoload starts nothing and gives the model
+    /// nothing until `/mcp load`, which appends its tools once; a mode flip
+    /// restarts only what is loaded.
+    #[test]
+    fn a_server_that_does_not_autoload_waits_for_a_load() {
+        state::testenv::home("mcp-load-home", |home| {
+            let dir = home.join("srv");
+            fs::create_dir_all(&dir).unwrap();
+            let args = stdio_fixture(&dir);
+            let config = global_path();
+            fs::create_dir_all(config.parent().unwrap()).unwrap();
+            let file = json!({ "mcpServers": {
+                "t": { "command": "/bin/sh", "args": args, "autoload": false },
+            } });
+            fs::write(&config, file.to_string()).unwrap();
+
+            let notices = start(Some(&dir), false, false);
+            assert!(
+                notices.iter().any(|n| n.contains("on demand")),
+                "{notices:?}"
+            );
+            assert!(definitions().is_empty());
+            assert!(dispatch("").contains("on demand"));
+            assert!(
+                restart(true).is_empty(),
+                "nothing loaded, nothing restarted"
+            );
+            assert!(restart(false).is_empty());
+            assert!(lock().running[0].is_none());
+
+            let before = generation();
+            let out = dispatch("load t");
+            assert!(out.contains("mcp t: 1 tool"), "{out}");
+            assert_eq!(generation(), before + 1);
+            let names: Vec<String> = definitions()
+                .iter()
+                .map(|d| d["function"]["name"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(names, vec!["mcp__t__echo"]);
+            assert_eq!(
+                call("mcp__t__echo", &json!({}), &Cancel::new()),
+                "said it back"
+            );
+            assert!(dispatch("load t").contains("already loaded"));
+            assert!(dispatch("load nope").contains("no server named"));
+
+            // A loaded server is restarted by a flip, and the catalogue holds.
+            let notices = restart(true);
+            assert!(
+                notices.iter().any(|n| n.contains("mcp t: 1 tool")),
+                "{notices:?}"
+            );
+            assert_eq!(generation(), before + 1);
+            assert_eq!(definitions().len(), 1);
+            shutdown();
+        });
     }
 }

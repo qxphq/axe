@@ -221,7 +221,7 @@ pub fn run_turn(
     history: &mut dyn History,
     sink: &mut dyn Sink,
 ) -> Result<Option<api::Usage>, String> {
-    let tools = tools::definitions();
+    let tools = &*tools::definitions();
     // The last round's own count. It measures the whole request, so it is the
     // fill; `None` when no round reported one.
     let mut used: Option<api::Usage> = None;
