@@ -79,6 +79,7 @@ pick in one directory is state, not config, and so is `/model -g`'s default.
 | `system` | text appended to the built-in prompt |
 | `agents` | extra instructions file; `~/` expands, relative to the config |
 | `skills` | extra skill directories or `SKILL.md` files |
+| `blocked` | absolute or `~/` paths the model never reaches without asking you, in either mode ([Blocked paths](#blocked-paths)) |
 
 A provider entry describes the differences between servers, never code paths:
 
@@ -577,6 +578,9 @@ would punch a hole in the write confinement, and the mode, owner and
 extended-attribute calls, which Landlock has no right for. Normal mode installs no filter, so
 a 32-bit binary runs there.
 
+The config's `blocked` paths are held in both modes, by the same kernel
+mechanisms; see [Blocked paths](#blocked-paths).
+
 A refusal comes from the kernel, not from axe's argument parsing, and its
 message says so: a missing binary and a denied one read differently, and a
 denied write comes back with the two directories that would have been allowed
@@ -597,6 +601,45 @@ scratch directory, and `fetch`/`web_search`, which run in axe's own process by
 design. Code loaded by an allowed program runs too, inside the same write
 confinement.
 
+## Blocked paths
+
+`"blocked": ["~/.ssh", "~/.aws", "~/.gnupg"]` keeps those paths, and
+everything under them, from the model in both modes. Each entry is absolute or
+starts with `~/`; a relative one is an error. A path is resolved before it is
+compared, so a symlink into a blocked directory is blocked too.
+
+`read`, `write` and `edit` ask first. The turn stops, and the row under the
+prompt asks in red whether that file may be opened for the rest of the session:
+`y` allows it, `n`, Enter or ESC refuse (ESC also offers the interrupt), and
+other keys are ignored so typing ahead cannot answer. A yes covers that one
+path until the session ends — `/new`, `/sessions` or a restart asks again — and
+is never written down. Either way the call stays in the transcript in red with
+the answer beside it, and a refusal reaches the model as the call's error. A
+piped run has nobody to ask, so the answer there is no.
+
+`bash` cannot be asked about in advance, so the kernel refuses it: no command
+the model runs can read, write, list or execute a blocked path, through any
+program or link, unless you allowed that path for this session through one of
+the tools above. A refused command's result tells the model so. On Linux that
+is a Landlock ruleset, which can only allow, so it allows the complement: every
+entry of every directory on the way to a blocked path except the one that leads
+there. Those directories are frozen for commands — `~/.ssh` blocked means `ls ~`
+fails and a command cannot create or remove entries directly in `~`, while
+existing files there and everything in other directories work as before. A
+blocked path inside a project freezes the project root the same way, so the
+list suits secrets that live outside working trees. On macOS the Seatbelt
+profile denies the paths directly. A stdio MCP server gets the same ruleset
+when it starts, and a yes given later does not reach a server already running.
+
+The list fails closed. On a Linux kernel without Landlock, `bash` and stdio MCP
+servers are refused while it is set, and startup says so; below Landlock ABI 3
+truncation is not mediated, and startup says that too. An empty list changes
+nothing. `!cmd` is your own shell and is not confined by it. Not covered: a
+hard link or bind mount that reaches a blocked file from elsewhere, an HTTP MCP
+server, which has no local process, and a file descriptor a command inherited.
+Patterns such as `**/.env` are not supported, because the kernel matches
+paths, not names.
+
 ## Trust and security
 
 axe runs as you. The trust boundary is the operating-system user: the model can
@@ -609,7 +652,8 @@ enforcement.
 Normal mode runs code as you, with no approval prompt in between — a deliberate
 trade-off: `bash` is a full shell, `write` and `edit` change files, and text in
 a cloned repository or a paste can talk the model into running something. Use
-it only in directories you trust. A project's `AGENTS.md` and its skills are
+it only in directories you trust. The one question a turn asks is a path on the
+config's `blocked` list. A project's `AGENTS.md` and its skills are
 read at startup and go into the prompt ungated: where you start axe is the
 whole decision. Its `.mcp.json` is the one exception — a server is code, not
 text, so the file needs one approval per content hash (the host's `sha256sum`,
@@ -621,7 +665,8 @@ nothing stands between it and the internet.
 Explore mode bounds integrity, not secrecy. The kernel denies writes outside
 the scratch directory and the project's `plan/`, and direct execution outside
 the allowlist. Reads are not confined: `read` and `bash` can read any file you
-can, and `curl`, `fetch` and `web_search` can send any of it to any host.
+can, and `curl`, `fetch` and `web_search` can send any of it to any host —
+except what the config's `blocked` list keeps out, in either mode.
 `!cmd` is your own shell and bypasses explore mode's write confinement. When
 confidentiality matters, use a container, a VM, or a dedicated user.
 

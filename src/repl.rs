@@ -47,6 +47,9 @@ pub(crate) enum Event {
     /// A line typed during the turn that the turn has just taken into its
     /// history: the transcript shows it where the model saw it.
     User(String),
+    /// A call is about to open a blocked path: the question, and where the
+    /// answer goes. The turn waits on it; a dropped sender is a no.
+    Ask(String, Sender<bool>),
     /// The terminal changed size; the live region must repaint.
     Resize,
     Done(Result<Option<crate::api::Usage>, String>),

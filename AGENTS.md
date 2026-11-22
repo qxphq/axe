@@ -61,6 +61,9 @@ invariants a change must not break.
    read anyway, so it buys nothing but friction. The one exception is a
    project's `.mcp.json`: it names a program, not text, so the start asks once
    per content hash, and the question lists every command and variable name.
+   The second is the config's `blocked` list, which the user asked for: a
+   `read`, `write` or `edit` of a blocked path stops the turn on a red y/N,
+   once per path per session, and the attempt stays red in the transcript.
 9. **Real cwd, relative paths.** `current_dir()` at startup, used for the prompt and
    every relative path. Never hardcode directories.
 10. **One config file, and it is input.** `~/.config/axe/config.json` (respects
@@ -156,7 +159,13 @@ invariants a change must not break.
     tooling set, interpreters and package managers included, and leaves out
     daemons that write through another process (`docker`, `systemctl`), setuid,
     and mode/timestamp tools (`chmod`, `touch`), which Landlock cannot see.
-    Normal mode keeps only `no_new_privs` and the scrubbed environment. The
+    Normal mode keeps only `no_new_privs` and the scrubbed environment, plus
+    the config's `blocked` paths, which hold in both modes: Landlock can only
+    allow, so the ruleset grants the complement — every entry of each
+    directory on the way to a blocked path but the one leading there — rebuilt
+    per spawn so a grant the user just gave is in it, stacked on explore's,
+    and refused outright on a kernel that cannot hold it. Seatbelt denies the
+    paths directly. `!cmd` is exempt: the list keeps paths from the model. The
     network is confined in neither mode: a child connects where the user
     connects, `!cmd` included. A leading-word check is never a substitute.
     A stdio MCP server gets the same two writable directories in explore mode
@@ -254,6 +263,9 @@ invariants a change must not break.
 - `sandbox.rs` — the only `unsafe`: seccomp, Landlock, Seatbelt, exec allowlist,
   and the two directories explore mode may write: the session's scratch and the
   project's plan. The write-only ruleset an MCP server gets is built here too.
+  So are the config's blocked paths, the session's grants, the path
+  resolution both `tools` and the ruleset compare by, and the complement
+  ruleset that holds the list against `bash` and MCP servers.
 - `mcp.rs` — MCP servers: the two config files and their merge, the project
   file's approval record, both transports (a process with its reader thread, or
   streamable HTTP with session ids and SSE), the headers a remote request
@@ -352,9 +364,9 @@ invariants a change must not break.
   trimmed form, so a command is typed with spaces around it, but the message it
   hands over is the bytes the transcript echoed. A line of nothing but spaces is
   no message at all — it leaves no block and no history step.
-- `!cmd` is the user's shell. It runs through `tools::execute`, its output joins
+- `!cmd` is the user's shell. It runs through `tools::user_shell`, its output joins
   the history as a `user` message, no turn follows, and explore-mode write
-  confinement does not apply. It leaves the line a call leaves — `render`'s
+  confinement and the blocked paths do not apply. It leaves the line a call leaves — `render`'s
   `shell_echo`, glyph and all — and its words under it, not the `exit: N` header.
 - Commit messages: imperative, one feature per commit.
 
@@ -389,7 +401,7 @@ each other.
 python3 and tmux (pyte for `--term pyte`). CI runs the journeys below, so a
 regression in the screen, the confinement or the MCP approval fails a build rather than waiting for a person:
 the deny and the allow, the mid-turn queue, a resize, fetch paging with the host
-guard, `/compact`, and a project MCP file that asks once. `--work DIR` keeps one directory and its state; `--wait` and
+guard, `/compact`, a project MCP file that asks once, and a blocked path. `--work DIR` keeps one directory and its state; `--wait` and
 `--timeout` bound idling; `--bin` selects the binary; `--ansi`/`--scroll` control
 the dump, and `--expect`/`--refute` make it an assertion. See `harness.py --help`
 and `mock.py` for fixtures and replies.
@@ -450,6 +462,19 @@ A tool you have not configured is absent from the array, not refused.
 ```sh
 mkdir -p w/.git && printf '{"mcpServers":{"t":{"command":"/bin/sh","args":["/abs/srv.sh"]}}}\n' > w/.mcp.json
 ./harness.py --work w --scroll 300 --timeout 12 'y' '/mcp'
+```
+
+Blocked paths are checked with `--blocked PATH`, relative to `--work DIR`,
+which the harness writes into the config as an absolute path. A `tool:read`
+turn on it shows the red question; `n` or `y` answers it, and since a yes lets
+the loop read on unasked faster than tmux keeps rows, it is checked by what it
+let through. `tool:bash` on the same file meets the kernel, and `' !cat'` is
+the user's shell, which the list does not reach.
+
+```sh
+mkdir -p w/secret && echo TOPSECRET > w/secret/key
+./harness.py --work w --blocked secret --wait 1 'tool:read:{"path":"secret/key"}' --expect '[y/N]'
+./harness.py --work w --blocked secret --wait 1 --scroll 400 'tool:bash:{"command":"cat secret/key"}' '!Escape' 'show:' --expect 'Permission denied'
 ```
 
 The mid-turn queue is checked by queueing a line while a slow call runs, and

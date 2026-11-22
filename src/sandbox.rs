@@ -15,10 +15,16 @@
 //! confinement; the mode, owner and xattr calls for the same reason. An
 //! explore-mode child also leaves axe's controlling terminal behind, because a
 //! child that shares it can push keys into axe's prompt with `TIOCSTI`.
+//!
+//! The config's `blocked` paths hold in both modes. Landlock can only allow,
+//! so the ruleset grants the complement: every entry of every directory on the
+//! way to a blocked path, except the one that leads there. Those directories
+//! are frozen for the child — no listing, no entries made or removed in them —
+//! and a path the user allowed this session gets its own rule back.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 /// What explore mode may execute, by name; the platform code adds the shell.
 /// This is a convenience guard, not a boundary: Landlock confines the writes,
@@ -158,6 +164,162 @@ static SCRATCH: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// project's plan. Registered by `main` before the first command runs.
 static PLAN: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+/// The config's `blocked` paths, resolved once at startup, and only the
+/// outermost: a path under another adds nothing but a hole in its ruleset.
+static BLOCKED: OnceLock<Vec<PathBuf>> = OnceLock::new();
+
+/// Paths the user allowed this session, resolved. Never written anywhere: a
+/// new session asks again.
+static GRANTED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Register the config's list. Called once, before the first command runs and
+/// before `init`, whose notice depends on it.
+pub fn set_blocked(paths: &[PathBuf]) {
+    let _ = BLOCKED.set(outermost(paths));
+}
+
+/// Resolved, deduplicated, and only the paths no other entry contains.
+fn outermost(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = paths.iter().map(|path| real(path)).collect();
+    roots.sort();
+    roots.dedup();
+    roots
+        .iter()
+        .filter(|root| {
+            !roots
+                .iter()
+                .any(|other| other != *root && root.starts_with(other))
+        })
+        .cloned()
+        .collect()
+}
+
+fn roots() -> &'static [PathBuf] {
+    BLOCKED.get().map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// Whether the config blocks anything at all: an empty list costs nothing.
+pub fn blocking() -> bool {
+    !roots().is_empty()
+}
+
+fn grants() -> Vec<PathBuf> {
+    GRANTED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// The resolved path, when it lies under a blocked one and the user has not
+/// allowed it this session. Resolved first: a symlink can be called anything.
+pub fn blocked(path: &Path) -> Option<PathBuf> {
+    if !blocking() {
+        return None;
+    }
+    let real = real(path);
+    covered(roots(), &grants(), &real).then_some(real)
+}
+
+/// Under a blocked root and under no grant. Both sides are resolved paths.
+fn covered(roots: &[PathBuf], grants: &[PathBuf], real: &Path) -> bool {
+    roots.iter().any(|root| real.starts_with(root))
+        && !grants.iter().any(|grant| real.starts_with(grant))
+}
+
+/// The user said yes: this path, and only it, for the rest of the session.
+pub fn grant(path: &Path) {
+    let real = real(path);
+    let mut granted = GRANTED.lock().unwrap_or_else(PoisonError::into_inner);
+    if !granted.contains(&real) {
+        granted.push(real);
+    }
+}
+
+/// A session boundary: what the last session allowed is asked again.
+pub fn forget_grants() {
+    GRANTED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+}
+
+/// The path a file operation reaches: absolute, its longest existing prefix
+/// canonicalised, and the rest — which does not exist yet, so it can hold no
+/// symlink — taken lexically. A dangling symlink is followed by hand, because
+/// a write through one creates its target.
+pub(crate) fn real(path: &Path) -> PathBuf {
+    real_within(path, 40)
+}
+
+fn real_within(path: &Path, links: u32) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let parts: Vec<Component> = abs.components().collect();
+    for cut in (1..=parts.len()).rev() {
+        let head: PathBuf = parts[..cut].iter().collect();
+        let base = match std::fs::canonicalize(&head) {
+            Ok(base) => base,
+            Err(_) => match std::fs::read_link(&head) {
+                Ok(target) if links > 0 => {
+                    let target = match head.parent() {
+                        Some(parent) if target.is_relative() => parent.join(target),
+                        _ => target,
+                    };
+                    real_within(&target, links - 1)
+                }
+                _ => continue,
+            },
+        };
+        let mut out = base;
+        for part in &parts[cut..] {
+            match part {
+                Component::ParentDir => {
+                    out.pop();
+                }
+                Component::Normal(name) => out.push(name),
+                _ => {}
+            }
+        }
+        return out;
+    }
+    abs
+}
+
+/// Every entry of every directory on the way to a blocked path, except the
+/// ones on the way and the blocked paths themselves, with whether it is a
+/// directory. Symlinks are left out: a rule is placed on what a path resolves
+/// to, and a link's target may be the very path being kept out; whatever it
+/// points at that is allowed gets its rule under its own name.
+#[cfg(target_os = "linux")]
+fn complement(roots: &[PathBuf]) -> Vec<(PathBuf, bool)> {
+    let frozen: std::collections::BTreeSet<&Path> = roots
+        .iter()
+        .flat_map(|root| root.ancestors().skip(1))
+        .collect();
+    let mut out = Vec::new();
+    for dir in &frozen {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if frozen.contains(path.as_path()) || roots.contains(&path) {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if !kind.is_symlink() {
+                out.push((path, kind.is_dir()));
+            }
+        }
+    }
+    out
+}
+
 /// One line for the startup banner when confinement is weaker than promised.
 pub fn init() -> Option<String> {
     #[cfg(target_os = "linux")]
@@ -203,9 +365,10 @@ fn confine_env(cmd: &mut Command, read_only: bool) -> Result<(), String> {
 }
 
 /// The command to spawn: the platform decides program and argv, so `bash()`
-/// never names a shell and never builds a profile.
-pub fn shell(command: &str, read_only: bool) -> Result<Command, String> {
-    imp::shell(command, read_only)
+/// never names a shell and never builds a profile. `user` is the user's own
+/// `!cmd`, which the blocked paths do not reach: they are kept from the model.
+pub fn shell(command: &str, read_only: bool, user: bool) -> Result<Command, String> {
+    imp::shell(command, read_only, user)
 }
 
 /// A program axe starts itself, with the confinement the mode allows: an MCP
@@ -341,7 +504,7 @@ mod imp {
     use std::process::Command;
     use std::sync::OnceLock;
 
-    use super::{confine_env, git_remotes, resolve, scratch_dir, shell_path, COMMANDS};
+    use super::{complement, confine_env, git_remotes, resolve, scratch_dir, shell_path, COMMANDS};
 
     /// The `AUDIT_ARCH_*` value the filter pins. `None` on an architecture this
     /// file has no numbers for, where explore mode's `bash` cannot be confined.
@@ -417,6 +580,10 @@ mod imp {
     const FS_MAKE_SYM: u64 = 1 << 12;
     const FS_REFER: u64 = 1 << 13;
     const FS_TRUNCATE: u64 = 1 << 14;
+    const FS_READ_FILE: u64 = 1 << 2;
+    const FS_READ_DIR: u64 = 1 << 3;
+    /// The rights a rule on a file may carry.
+    const FILE_RIGHTS: u64 = FS_EXECUTE | FS_WRITE_FILE | FS_READ_FILE | FS_TRUNCATE;
 
     /// One field: `handled_access_net` stays zero, so the ruleset says nothing
     /// about sockets and the network is not confined.
@@ -487,34 +654,53 @@ mod imp {
     struct Ruleset(OwnedFd);
 
     pub fn notice() -> Option<String> {
+        let mut lines = Vec::new();
         if TARGET.is_none() {
-            return Some(
+            lines.push(
                 "explore mode: bash is unavailable: no seccomp filter for this architecture".into(),
             );
         }
-        let Some(abi) = abi() else {
-            return Some(
-                "sandbox: Landlock is unavailable, so explore mode's bash is unconfined: any \
-                 command runs and anything is writable"
-                    .to_string(),
-            );
-        };
-        // The truncation right arrived with ABI 3: below it `truncate(2)` and
-        // `ftruncate(2)` are not mediated at all, so a file outside the two
-        // writable directories can still be emptied.
-        (abi < 3).then(|| {
-            format!(
-                "sandbox: this kernel's Landlock (ABI {abi}) cannot deny truncation, so explore \
-                 mode's bash can still empty a file outside its writable directories"
-            )
-        })
+        match abi() {
+            None => {
+                lines.push(
+                    "sandbox: Landlock is unavailable, so explore mode's bash is unconfined: any \
+                     command runs and anything is writable"
+                        .to_string(),
+                );
+                if super::blocking() {
+                    lines.push(
+                        "sandbox: Landlock is unavailable, so the config's blocked paths cannot \
+                         be held: bash and MCP servers are refused"
+                            .to_string(),
+                    );
+                }
+            }
+            // The truncation right arrived with ABI 3: below it `truncate(2)`
+            // and `ftruncate(2)` are not mediated at all, so a file outside the
+            // two writable directories can still be emptied.
+            Some(abi) if abi < 3 => {
+                lines.push(format!(
+                    "sandbox: this kernel's Landlock (ABI {abi}) cannot deny truncation, so \
+                     explore mode's bash can still empty a file outside its writable directories"
+                ));
+                if super::blocking() {
+                    lines.push(format!(
+                        "sandbox: this kernel's Landlock (ABI {abi}) cannot deny truncation, so \
+                         bash can still empty a file under a blocked path"
+                    ));
+                }
+            }
+            Some(_) => {}
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
-    pub fn shell(command: &str, read_only: bool) -> Result<Command, String> {
+    pub fn shell(command: &str, read_only: bool, user: bool) -> Result<Command, String> {
         let shell = shell_path()?;
-        // Built here, in the parent: no allocation after fork. Both the filter
-        // and the ruleset belong to explore mode: outside it there is nothing
-        // for them to protect, and the arch pin would break a 32-bit binary.
+        // Built here, in the parent: no allocation after fork. The filter and
+        // the explore ruleset belong to explore mode: outside it there is
+        // nothing for them to protect, and the arch pin would break a 32-bit
+        // binary. The blocked paths hold in both modes, but not for the user.
         let audit_arch = if read_only { TARGET } else { None };
         if read_only && audit_arch.is_none() {
             return Err("sandbox: bash is unavailable on this architecture".into());
@@ -524,10 +710,11 @@ mod imp {
         } else {
             None
         };
+        let blocks = if user { None } else { blockset("bash")? };
         let mut cmd = Command::new(&shell);
         cmd.arg("-c").arg(command);
         confine_env(&mut cmd, read_only)?;
-        confine(&mut cmd, audit_arch, rules);
+        confine(&mut cmd, audit_arch, rules, blocks);
         Ok(cmd)
     }
 
@@ -536,7 +723,16 @@ mod imp {
     /// `TIOCSTI` keys into axe's own prompt, where they run as the user's
     /// `!cmd`. Its own session is also its own process group, which is what an
     /// interrupt signals; outside explore mode the group is made directly.
-    fn confine(cmd: &mut Command, audit_arch: Option<u32>, rules: Option<RawFd>) {
+    ///
+    /// The blocked-path ruleset is moved into the closure: it is built per
+    /// spawn, and its descriptor has to outlive the fork. Landlock stacks, so
+    /// in explore mode the child holds both and gets only what both allow.
+    fn confine(
+        cmd: &mut Command,
+        audit_arch: Option<u32>,
+        rules: Option<RawFd>,
+        blocks: Option<Ruleset>,
+    ) {
         if audit_arch.is_none() {
             cmd.process_group(0);
         }
@@ -556,6 +752,9 @@ mod imp {
                 }
                 if let Some(fd) = rules {
                     restrict(fd)?;
+                }
+                if let Some(set) = &blocks {
+                    restrict(set.0.as_raw_fd())?;
                 }
                 Ok(())
             });
@@ -728,14 +927,71 @@ mod imp {
         } else {
             None
         };
+        let blocks = blockset("MCP servers")?;
         let mut cmd = Command::new(program);
         cmd.args(args);
         confine_env(&mut cmd, read_only)?;
         for (name, value) in env {
             cmd.env(name, value);
         }
-        confine(&mut cmd, audit_arch, rules);
+        confine(&mut cmd, audit_arch, rules, blocks);
         Ok(cmd)
+    }
+
+    /// The blocked-path ruleset, fresh for each spawn: the complement is a
+    /// snapshot of the directories on the way, and a grant made a moment ago
+    /// has to be in it. `None` when the config blocks nothing. A kernel that
+    /// cannot hold the list refuses the program rather than run it past it.
+    fn blockset(what: &str) -> Result<Option<Ruleset>, String> {
+        let roots = super::roots();
+        if roots.is_empty() {
+            return Ok(None);
+        }
+        let Some(abi) = abi() else {
+            return Err(format!(
+                "sandbox: the config blocks paths and this kernel has no Landlock to hold \
+                 them, so {what} are unavailable"
+            ));
+        };
+        build_blocks(abi, roots, &super::grants()).map(Some)
+    }
+
+    /// A shell under a given list, for the tests: the process-wide list is
+    /// set once, and a test must not freeze `/tmp` for its neighbours.
+    /// `None` on a kernel without Landlock.
+    #[cfg(test)]
+    pub(super) fn blocked_shell(
+        command: &str,
+        roots: &[PathBuf],
+        grants: &[PathBuf],
+    ) -> Option<Command> {
+        let set = build_blocks(abi()?, roots, grants).expect("blocked ruleset");
+        let mut cmd = Command::new(shell_path().ok()?);
+        cmd.arg("-c").arg(command);
+        confine(&mut cmd, None, None, Some(set));
+        Some(cmd)
+    }
+
+    fn build_blocks(abi: i32, roots: &[PathBuf], grants: &[PathBuf]) -> Result<Ruleset, String> {
+        let fs = rights(abi) | FS_READ_FILE | FS_READ_DIR;
+        let set = create(fs)?;
+        for (path, dir) in complement(roots) {
+            grant_entry(&set, fs, &path, dir);
+        }
+        for path in grants {
+            if let Ok(meta) = std::fs::metadata(path) {
+                grant_entry(&set, fs, path, meta.is_dir());
+            }
+        }
+        Ok(set)
+    }
+
+    /// One rule, best effort: an entry that vanished or cannot be opened stays
+    /// denied, and a missing rule only ever narrows. A rule on a non-directory
+    /// takes file rights only; the kernel refuses directory rights there.
+    fn grant_entry(set: &Ruleset, fs: u64, path: &Path, dir: bool) {
+        let access = if dir { fs } else { fs & FILE_RIGHTS };
+        let _ = allow(set, access, path);
     }
 
     fn allow(set: &Ruleset, access: u64, path: &Path) -> Result<(), String> {
@@ -886,8 +1142,11 @@ mod imp {
             .then(|| "bash is unavailable: /usr/bin/sandbox-exec is missing".to_string())
     }
 
-    pub fn shell(command: &str, read_only: bool) -> Result<Command, String> {
-        let profile = profile(read_only)?;
+    pub fn shell(command: &str, read_only: bool, user: bool) -> Result<Command, String> {
+        let mut profile = profile(read_only)?.to_string();
+        if !user {
+            profile.push_str(&blocked_rules(read_only));
+        }
         let shell = shell_path()?;
         let mut cmd = Command::new(SANDBOX_EXEC);
         cmd.arg("-p")
@@ -933,8 +1192,9 @@ mod imp {
         env: &[(String, String)],
         read_only: bool,
     ) -> Result<Command, String> {
+        let profile = format!("{}{}", writes_profile(read_only)?, blocked_rules(read_only));
         let mut cmd = Command::new(SANDBOX_EXEC);
-        cmd.arg("-p").arg(writes_profile(read_only)?).arg(program);
+        cmd.arg("-p").arg(profile).arg(program);
         cmd.args(args);
         confine_env(&mut cmd, read_only)?;
         for (name, value) in env {
@@ -1010,6 +1270,32 @@ mod imp {
         Ok(profile)
     }
 
+    /// The config's blocked paths, appended last because the last match
+    /// wins: denied whole, then each path the user allowed this session given
+    /// back what the mode allows — reading in explore mode, reading and
+    /// writing outside it.
+    fn blocked_rules(read_only: bool) -> String {
+        let mut rules = String::new();
+        for root in super::roots() {
+            rules.push_str(&format!(
+                "(deny file-read* file-write* process-exec (subpath {}))\n",
+                quote(root)
+            ));
+        }
+        if rules.is_empty() {
+            return rules;
+        }
+        let back = if read_only {
+            "file-read*"
+        } else {
+            "file-read* file-write*"
+        };
+        for grant in super::grants() {
+            rules.push_str(&format!("(allow {back} (subpath {}))\n", quote(&grant)));
+        }
+        rules
+    }
+
     fn quote(path: &Path) -> String {
         let text = path.to_string_lossy();
         format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
@@ -1039,7 +1325,7 @@ mod imp {
         Some("bash is unavailable: this platform has no sandbox".into())
     }
 
-    pub fn shell(_command: &str, _read_only: bool) -> Result<Command, String> {
+    pub fn shell(_command: &str, _read_only: bool, _user: bool) -> Result<Command, String> {
         Err("sandbox: this platform has no sandbox; bash is unavailable".into())
     }
 
@@ -1081,7 +1367,7 @@ mod tests {
                     })
             });
         let Some(name) = name else { return };
-        let Ok(mut cmd) = shell(&format!("printenv {name}"), false) else {
+        let Ok(mut cmd) = shell(&format!("printenv {name}"), false, false) else {
             return;
         };
         let out = cmd.output().unwrap();
@@ -1091,8 +1377,8 @@ mod tests {
     #[test]
     fn init_and_shell_build_without_running() {
         let _ = init();
-        assert!(shell("true", false).is_ok());
-        assert!(shell("true", true).is_ok());
+        assert!(shell("true", false, false).is_ok());
+        assert!(shell("true", true, false).is_ok());
         cleanup();
     }
 
@@ -1142,7 +1428,7 @@ mod tests {
     #[test]
     fn an_explore_child_has_a_session_of_its_own() {
         let probe = "read -r _ _ _ _ _ sid _ < /proc/self/stat; echo \"$sid $$\"";
-        let Ok(mut cmd) = shell(probe, true) else {
+        let Ok(mut cmd) = shell(probe, true, false) else {
             crate::text::skip(
                 "an_explore_child_has_a_session_of_its_own",
                 "no explore-mode shell on this platform",
@@ -1159,7 +1445,7 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         // Normal mode stays in the parent's session.
-        let out = shell(probe, false).unwrap().output().unwrap();
+        let out = shell(probe, false, false).unwrap().output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
         let mut words = text.split_whitespace();
         assert_ne!(words.next(), words.next(), "{text:?}");
@@ -1188,7 +1474,7 @@ mod tests {
             "python3 -c 'import os,sys; os.chmod(sys.argv[1], 0)' '{}'",
             file.display()
         );
-        let Ok(mut cmd) = shell(&script, true) else {
+        let Ok(mut cmd) = shell(&script, true, false) else {
             crate::text::skip(
                 "explore_mode_refuses_a_mode_change",
                 "no explore-mode shell on this platform",
@@ -1209,7 +1495,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn explore_mode_runs_an_allowed_command() {
-        let Ok(mut cmd) = shell("ls /dev/null", true) else {
+        let Ok(mut cmd) = shell("ls /dev/null", true, false) else {
             crate::text::skip(
                 "explore_mode_runs_an_allowed_command",
                 "no explore-mode shell on this platform",
@@ -1219,5 +1505,98 @@ mod tests {
         let out = cmd.output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "ls refused: {stderr}");
+    }
+
+    #[test]
+    fn a_path_resolves_through_links_and_paths_not_made_yet() {
+        let dir = std::env::temp_dir().join(format!("axe-real-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("secret")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        std::fs::write(dir.join("secret/key"), "k").unwrap();
+        std::os::unix::fs::symlink(dir.join("secret/key"), dir.join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.join("secret/new"), dir.join("dangling")).unwrap();
+        assert_eq!(real(&dir.join("link")), dir.join("secret/key"));
+        // A write through a dangling link creates its target.
+        assert_eq!(real(&dir.join("dangling")), dir.join("secret/new"));
+        // A tail that does not exist yet is taken lexically.
+        assert_eq!(real(&dir.join("nope/../secret/x")), dir.join("secret/x"));
+
+        let roots = outermost(&[dir.join("secret"), dir.join("secret/inner")]);
+        assert_eq!(
+            roots,
+            vec![dir.join("secret")],
+            "a nested entry adds nothing"
+        );
+        assert!(covered(&roots, &[], &real(&dir.join("link"))));
+        assert!(!covered(
+            &roots,
+            &[dir.join("secret/key")],
+            &real(&dir.join("link"))
+        ));
+        assert!(covered(
+            &roots,
+            &[dir.join("secret/key")],
+            &dir.join("secret/other")
+        ));
+        assert!(
+            !covered(&roots, &[], &dir.join("secretive")),
+            "a prefix is not a parent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The complement ruleset on the kernel this runs on: siblings work, the
+    /// blocked path and a link into it do not, the frozen directory can be
+    /// neither listed nor grown, and a grant opens one file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_kernel_keeps_a_blocked_path_from_bash() {
+        let dir = std::env::temp_dir().join(format!("axe-blocked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("secret")).unwrap();
+        std::fs::create_dir_all(dir.join("open")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        std::fs::write(dir.join("secret/key"), "KEY").unwrap();
+        std::fs::write(dir.join("secret/other"), "OTHER").unwrap();
+        std::fs::write(dir.join("open/file"), "OPEN").unwrap();
+        std::fs::write(dir.join("top"), "TOP").unwrap();
+        std::os::unix::fs::symlink(dir.join("secret/key"), dir.join("open/link")).unwrap();
+        let roots = vec![dir.join("secret")];
+        let run = |command: &str, grants: &[PathBuf]| {
+            let mut cmd = imp::blocked_shell(command, &roots, grants)?;
+            let out = cmd.current_dir(&dir).output().unwrap();
+            Some((
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).to_string(),
+            ))
+        };
+        let Some(open) = run("cat open/file top && echo x > open/new", &[]) else {
+            crate::text::skip("the_kernel_keeps_a_blocked_path_from_bash", "no Landlock");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        assert_eq!(open, (true, "OPENTOP".to_string()), "siblings stay usable");
+        for denied in [
+            "cat secret/key",
+            "cat open/link",
+            "ls secret",
+            "ls .",
+            "echo x > fresh",
+        ] {
+            let (ok, _) = run(denied, &[]).unwrap();
+            assert!(!ok, "{denied} should be refused");
+        }
+        assert!(!dir.join("fresh").exists());
+        let grant = [dir.join("secret/key")];
+        assert_eq!(
+            run("cat secret/key", &grant).unwrap(),
+            (true, "KEY".to_string())
+        );
+        assert!(
+            !run("cat secret/other", &grant).unwrap().0,
+            "a grant is one file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

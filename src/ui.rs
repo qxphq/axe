@@ -575,6 +575,9 @@ pub struct Screen {
     /// info row cleared: the status is metadata and can be cut, this cannot.
     /// The ESC offer is the only one.
     alert: Option<String>,
+    /// The question a blocked path asks, red: it outranks the ESC offer,
+    /// because the turn cannot go on until it is answered.
+    question: Option<String>,
     /// The lines submitted mid-turn, waiting for the boundary: one row each,
     /// above the prompt, oldest first. They grow where the user is about to
     /// type, and a queued line that scrolls away silently looks like the Enter
@@ -748,6 +751,7 @@ impl Screen {
             ed: Buffer::default(),
             status: String::new(),
             alert: None,
+            question: None,
             queued: Vec::new(),
             info: Vec::new(),
             explore: false,
@@ -847,6 +851,13 @@ impl Screen {
     /// read is not an offer.
     pub fn set_alert(&mut self, text: Option<&str>) {
         self.alert = text.map(str::to_string);
+        self.dirty = true;
+    }
+
+    /// The blocked-path question: the same row as an alert, in red, and it
+    /// wins over one while it is up.
+    pub fn set_question(&mut self, text: Option<&str>) {
+        self.question = text.map(str::to_string);
         self.dirty = true;
     }
 
@@ -1388,6 +1399,7 @@ impl Screen {
         self.menu = None;
         self.status.clear();
         self.alert = None;
+        self.question = None;
         self.queued.clear();
         match &mut self.term {
             Term::Real(term) => {
@@ -1530,7 +1542,13 @@ impl Screen {
         let status = clip(&self.status, status_cols);
         // A reverse search says what it is looking for where the ESC offer
         // would be: it is a question, like the offer.
-        let alert = self.search_label().or_else(|| self.alert.clone());
+        let alert = match &self.question {
+            Some(question) => Some((question.clone(), ERROR_STYLE)),
+            None => self
+                .search_label()
+                .or_else(|| self.alert.clone())
+                .map(|text| (text, CAUTION)),
+        };
         let frame_top = self.term.area().y;
         let mut cursor = Position::default();
 
@@ -1644,8 +1662,8 @@ impl Screen {
             // and comes back when the question is answered. A frame too
             // short for the status row gives it up, and nothing is drawn.
             match &alert {
-                Some(text) if layout.status.height > 0 => frame.render_widget(
-                    Paragraph::new(Line::styled(clip(text, cols), CAUTION)),
+                Some((text, style)) if layout.status.height > 0 => frame.render_widget(
+                    Paragraph::new(Line::styled(clip(text, cols), *style)),
                     line(layout.status.y),
                 ),
                 Some(_) => {}
@@ -3306,6 +3324,36 @@ mod tests {
         // The question is whole, so the metadata it outranks is not drawn.
         assert!(!text.contains("p/m · default"), "{text}");
         assert!(!text.contains("Thinking…"), "{text}");
+    }
+
+    #[test]
+    fn a_blocked_path_question_is_red_and_outranks_the_offer() {
+        let mut screen = Screen::test_screen(60, 10);
+        screen.set_alert(Some("press ESC again to interrupt"));
+        screen.set_question(Some("read /k is blocked. Allow? [y/N]"));
+        screen.draw().unwrap();
+        let buffer = screen.test_buffer();
+        let rows: Vec<String> = buffer
+            .content
+            .chunks(60)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let y = rows
+            .iter()
+            .position(|row| row.contains("read /k is blocked"))
+            .expect("the question is drawn");
+        assert!(!rows.join("\n").contains("press ESC again"));
+        let x = rows[y].find("read").unwrap();
+        assert_eq!(buffer.content[y * 60 + x].fg, Color::Red);
+        screen.set_question(None);
+        screen.draw().unwrap();
+        let text: String = screen
+            .test_buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("press ESC again"), "the offer comes back");
     }
 
     fn press(screen: &mut Screen, code: KeyCode, modifiers: KeyModifiers) -> Action {
