@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 
 use std::panic::catch_unwind;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ratatui::text::Line;
@@ -18,6 +19,8 @@ use serde_json::{json, Value};
 use crate::api;
 use crate::http::{self, Cancel};
 use crate::markdown;
+use crate::mcp;
+use crate::prompt;
 use crate::render::{blocked_line, call_line, detail, failed, mark, plain_text, Paint};
 use crate::sandbox;
 use crate::tools;
@@ -45,6 +48,10 @@ pub trait Sink {
     /// A line typed during the turn, which the turn has just appended to the
     /// history. Piped output has no queue, and nothing to say.
     fn user(&mut self, _line: &str) {}
+    /// The turn took the mode the prompt switched to: its note is in the
+    /// history, and the servers restarted under it with these complaints.
+    /// Piped output has no prompt to switch.
+    fn mode(&mut self, _mode: tools::Mode, _notices: &[String]) {}
     /// The call is about to open a path the config blocks: may it, for the
     /// rest of the session? Blocks until the user answers. Piped output has
     /// nobody to ask, so the answer there is no.
@@ -210,6 +217,10 @@ pub struct Turn<'a> {
     /// Request-body fields for the thinking level, when one is set.
     pub extra: Option<&'a Value>,
     pub mode: tools::Mode,
+    /// Whether the prompt shows explore mode, read at each round boundary: a
+    /// switch pressed while the turn runs reaches the next round, not the
+    /// next turn. `None` where nothing can switch it.
+    pub explore: Option<&'a AtomicBool>,
     /// A line typed while the turn runs, taken at the next round boundary.
     pub queue: Option<&'a Queue>,
     pub cancel: &'a Cancel,
@@ -219,6 +230,8 @@ pub struct Turn<'a> {
 /// log as it goes; the turn only appends, and never decides what is persisted.
 pub trait History {
     fn push(&mut self, message: Value);
+    /// State the history announces but the log never keeps: a mode note.
+    fn note(&mut self, message: Value);
     fn messages(&self) -> &[Value];
 }
 
@@ -233,11 +246,33 @@ pub fn run_turn(
     // The last round's own count. It measures the whole request, so it is the
     // fill; `None` when no round reported one.
     let mut used: Option<api::Usage> = None;
+    // The mode in force: the turn's own, until a switch reaches a boundary.
+    let mut mode = turn.mode;
 
     loop {
         // An interrupt ends the turn here too: no further round is started.
         if turn.cancel.cancelled() {
             return Ok(used);
+        }
+        // A switch pressed during the last round takes effect here, where no
+        // call is running and the next request does not exist yet: the model
+        // reads the note and carries on under the new rules.
+        if let Some(explore) = turn.explore {
+            let wanted = match explore.load(Ordering::Relaxed) {
+                true => tools::Mode::Explore,
+                false => tools::Mode::Normal,
+            };
+            if wanted != mode {
+                mode = wanted;
+                history.note(prompt::mode_note(mode));
+                // A running server cannot be narrowed or widened, so it
+                // restarts under the new mode; the row says so meanwhile.
+                if mcp::configured() {
+                    sink.status("▣ Restarting MCP servers");
+                }
+                let notices = mcp::restart(mode.explore());
+                sink.mode(mode, &notices);
+            }
         }
         // A line typed during the turn joins it here, at the only boundary
         // there is: every tool result the last reply named has been answered,
@@ -356,13 +391,13 @@ pub fn run_turn(
             if turn.cancel.cancelled() {
                 break;
             }
-            let mut echo = call_line(call, turn.mode.explore());
+            let mut echo = call_line(call, mode.explore());
             // What is running, while it runs: the finished line appears below
             // once there is a result to put on it.
             sink.status(&plain_text(&echo));
             // A blocked path is the user's to open: ask before the call runs,
             // and leave the attempt red in the transcript whatever they say.
-            if let Some(path) = tools::blocked(&call.name, &call.arguments, turn.mode) {
+            if let Some(path) = tools::blocked(&call.name, &call.arguments, mode) {
                 let allowed = sink.allow(&call.name, &path);
                 if allowed {
                     sandbox::grant(&path);
@@ -372,10 +407,11 @@ pub fn run_turn(
             // A tool that panics must still leave a result: the assistant
             // message above already named the call, and a missing result
             // outlives the turn in the log.
-            let result = catch_unwind(|| {
-                tools::execute(&call.name, &call.arguments, turn.cancel, turn.mode)
-            })
-            .unwrap_or_else(|_| format!("error: {} panicked; the call was not run", call.name));
+            let result =
+                catch_unwind(|| tools::execute(&call.name, &call.arguments, turn.cancel, mode))
+                    .unwrap_or_else(|_| {
+                        format!("error: {} panicked; the call was not run", call.name)
+                    });
             let error = failed(&call.name, &result).then(|| detail(&result));
             sink.echo(&echo, mark(&call.name, &result), error.as_deref());
             history.push(tool_message(&call.id, &result));
@@ -501,6 +537,7 @@ mod tests {
             model: "m",
             extra: None,
             mode: tools::Mode::Normal,
+            explore: None,
             queue,
             cancel,
         }
@@ -612,6 +649,9 @@ mod tests {
         fn user(&mut self, line: &str) {
             self.seen.push(format!("user:{line}"));
         }
+        fn mode(&mut self, mode: tools::Mode, _notices: &[String]) {
+            self.seen.push(format!("mode:{}", mode.explore()));
+        }
         fn end_round(&mut self) {
             self.seen.push("round".into());
         }
@@ -621,6 +661,9 @@ mod tests {
 
     impl History for Log {
         fn push(&mut self, message: Value) {
+            self.0.push(message);
+        }
+        fn note(&mut self, message: Value) {
             self.0.push(message);
         }
         fn messages(&self) -> &[Value] {
@@ -833,6 +876,50 @@ mod tests {
         assert_eq!(history.0[2]["content"], "ok");
         assert!(sink.seen.contains(&"user:and this".to_string()));
         assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_switch_the_prompt_shows_is_taken_at_the_next_round() {
+        use crate::http::support::{sse, Server};
+
+        let server = Server::new(vec![
+            sse(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"w1","function":{"name":"write","arguments":"{\"path\":\"x\",\"content\":\"y\"}"}}]}}]}"#,
+                "[DONE]",
+            ]),
+            sse(&[r#"{"choices":[{"delta":{"content":"ok"}}]}"#, "[DONE]"]),
+        ]);
+        // The turn started in normal mode; the prompt already shows explore.
+        let explore = AtomicBool::new(true);
+        let cancel = Cancel::new();
+        let turn = Turn {
+            explore: Some(&explore),
+            ..turn_at(&server.ep, &cancel, None)
+        };
+        let mut history = log();
+        let mut sink = Recorder::default();
+        run_turn(&turn, &mut history, &mut sink).unwrap();
+
+        // The note comes before the request the model reads it in, and the
+        // call runs under the mode it announces.
+        assert_eq!(history.0[1], prompt::mode_note(tools::Mode::Explore));
+        assert_eq!(history.0[2]["tool_calls"][0]["id"], "w1");
+        assert!(
+            history.0[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("write is not available"),
+            "{:?}",
+            history.0[3]
+        );
+        assert_eq!(history.0[4]["content"], "ok");
+        // Taken once: the second boundary finds nothing to change.
+        let modes: Vec<_> = sink
+            .seen
+            .iter()
+            .filter(|e| e.starts_with("mode:"))
+            .collect();
+        assert_eq!(modes, ["mode:true"]);
     }
 
     #[test]

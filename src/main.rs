@@ -28,7 +28,7 @@ mod ui;
 mod web;
 
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
@@ -43,7 +43,7 @@ use render::{
 };
 use repl::{
     choose, narrow, pump, readline, recall_lines, show_queue, spawn_input, take_back, Event, Input,
-    Pending,
+    Pending, Shown,
 };
 use sessions::COMPACT_NOTE;
 use startup::{
@@ -1251,6 +1251,12 @@ impl Session {
     /// the window it has filled, and the mode when that changes the tool set.
     /// One piece per thing, so the screen can color each on its own.
     fn info(&self) -> Vec<(ui::Info, String)> {
+        self.info_in(self.mode)
+    }
+
+    /// The row as it reads in `mode`: a switch pressed while work runs shows
+    /// at once, before the session takes it.
+    fn info_in(&self, mode: tools::Mode) -> Vec<(ui::Info, String)> {
         let mut parts = Vec::new();
         if let Some(title) = self.title() {
             parts.push((ui::Info::Title, title));
@@ -1269,10 +1275,21 @@ impl Session {
         parts.push((ui::Info::Level, level(&self.thinking)));
         let (fill, fullness) = self.fill();
         parts.push((ui::Info::Fill(fullness), fill));
-        if self.mode.explore() {
+        if mode.explore() {
             parts.push((ui::Info::Mode, "read-only".to_string()));
         }
         parts
+    }
+
+    /// The mode the prompt shows while work runs, starting from the session's.
+    fn shown(&self) -> Shown {
+        Shown::new(
+            self.mode.explore(),
+            [
+                self.info_in(tools::Mode::Normal),
+                self.info_in(tools::Mode::Explore),
+            ],
+        )
     }
 
     /// The name on the selection row: the generated title, or, until the model
@@ -1361,13 +1378,7 @@ impl Session {
         self.set_mode(self.mode.flip());
         console.explore(self.mode.explore());
         console.info(self.info());
-        console.output(if self.mode.explore() {
-            "Explore: on — the model can read, run commands and search the web, \
-             but not change your files\n"
-        } else {
-            "Explore: off — the model can change your files; web search and fetch \
-             are off\n"
-        });
+        console.output(mode_line(self.mode));
         // A running server cannot be narrowed or widened, so flipping the mode
         // restarts them under the new rules. The tool names stay what they are.
         // The row says so while it runs: a handshake can take seconds.
@@ -1451,14 +1462,13 @@ impl Session {
         screen.repaint();
         let cancel = http::Cancel::new();
         let mut queued: Option<String> = None;
-        let mut explore = false;
+        let mut shown = self.shown();
         let result = thread::scope(|scope| {
             // `!cmd` is the user's own shell: neither explore mode nor the
             // config's blocked paths confine it.
             let handle = scope.spawn(|| tools::user_shell(command, &cancel));
-            let (joined, line, switch) = pump(screen, rx, &cancel, handle);
+            let (joined, line) = pump(screen, rx, &cancel, handle, &mut shown);
             queued = line;
-            explore = switch;
             joined.unwrap_or_else(|| "error: shell thread panicked".into())
         });
         screen.set_status("");
@@ -1482,9 +1492,9 @@ impl Session {
         }));
         screen.set_info(self.info());
         screen.repaint();
-        // A Shift+Tab typed while the command ran: the mode is the session's,
-        // so it lands once the command is over.
-        if explore {
+        // A Shift+Tab typed while the command ran showed at once; the mode is
+        // the session's, so it is taken once the command is over.
+        if shown.explore != self.mode.explore() {
             self.toggle_explore(&mut Console::Screen { screen, rx });
         }
         queued
@@ -1535,7 +1545,7 @@ impl Session {
         let model = self.model.clone();
         let level = self.thinking.clone();
         let mut queued = None;
-        let mut explore = false;
+        let mut shown = self.shown();
         let result = match console {
             Console::Screen { screen, rx } => {
                 screen.set_status("▣ Compacting");
@@ -1544,9 +1554,8 @@ impl Session {
                     let handle = scope.spawn(|| {
                         compact_request(provider, &model, level.as_deref(), &request, &cancel)
                     });
-                    let (joined, line, switch) = pump(screen, rx, &cancel, handle);
+                    let (joined, line) = pump(screen, rx, &cancel, handle, &mut shown);
                     queued = line;
-                    explore = switch;
                     joined.unwrap_or_else(|| Err("compaction thread panicked".into()))
                 });
                 screen.set_status("");
@@ -1611,7 +1620,7 @@ impl Session {
             screen.repaint();
         }
         // Shift+Tab typed while the summary was being written.
-        if explore {
+        if shown.explore != self.mode.explore() {
             self.toggle_explore(console);
         }
         queued
@@ -1661,7 +1670,13 @@ impl Session {
         let turn_queue = queue.clone();
         // Everything the live prompt owns: the waiting lines, the interrupt,
         // and the unfinished line. The turn's thread owns the history.
-        let mut held = Held::default();
+        let mut held = Held {
+            shown: self.shown(),
+            ..Held::default()
+        };
+        // What the prompt shows, for the turn to read at its next boundary.
+        let explore = AtomicBool::new(self.mode.explore());
+        let turn_explore = &explore;
 
         screen.set_status("⋯ Waiting for provider");
         screen.repaint();
@@ -1697,6 +1712,7 @@ impl Session {
                     model: &model,
                     extra: Some(&extra),
                     mode,
+                    explore: Some(turn_explore),
                     queue: Some(&turn_queue),
                     cancel: turn_cancel,
                 };
@@ -1733,6 +1749,7 @@ impl Session {
                         break;
                     }
                 }
+                explore.store(held.shown.explore, Ordering::Relaxed);
                 // One paint per batch: the setters above marked the screen,
                 // and a repaint with nothing marked is a no-op.
                 screen.repaint();
@@ -1752,6 +1769,10 @@ impl Session {
             // the cost.
             screen.error("Turn interrupted — the reply is partial\n");
         }
+        // A switch the turn took is in its history already, note and all.
+        if let Some(mode) = held.applied {
+            self.mode = mode;
+        }
         self.count(used);
         screen.set_info(self.info());
 
@@ -1762,9 +1783,10 @@ impl Session {
             self.remember(line, screen);
         }
 
-        // Held from the turn: applied now, so the note sits below the answer
-        // and above whatever the user types next.
-        if held.switch {
+        // A switch no boundary reached — pressed during the last round —
+        // is taken now, so the note sits below the answer and above whatever
+        // the user types next.
+        if held.shown.explore != self.mode.explore() {
             self.toggle_explore(&mut Console::Screen {
                 screen: &mut *screen,
                 rx,
@@ -1832,6 +1854,7 @@ impl Session {
             model: &model,
             extra: Some(&extra),
             mode: self.mode,
+            explore: None,
             queue: None,
             cancel,
         };
@@ -2033,10 +2056,11 @@ struct Held {
     /// Reasoning before the answer. Its last line is unfinished until the
     /// answer starts or the round ends, so it is held until then.
     thought: String,
-    /// A mode switch pressed while the turn runs. Shift+Tab reached the live
-    /// prompt; it is applied at the boundary, because the turn's tool set and
-    /// history are fixed before it starts.
-    switch: bool,
+    /// The mode the prompt shows. Shift+Tab flips it at once; the turn takes
+    /// it at its next round boundary.
+    shown: Shown,
+    /// The mode the turn last took, its note already in the history.
+    applied: Option<tools::Mode>,
     /// ESC asks first: one press offers the interrupt, the next takes it.
     armed: bool,
     /// Whether the turn was actually stopped, for the line that says so.
@@ -2070,6 +2094,16 @@ impl Held {
             // saw it. The queue is read oldest first, which is the row the
             // frame drops.
             Event::User(line) => self.took(&line, screen),
+            // The turn took a switch at a boundary: the line says so where
+            // the model read the note.
+            Event::Mode(mode, notices) => {
+                self.applied = Some(mode);
+                screen.set_status("");
+                screen.output(mode_line(mode));
+                for line in notices {
+                    screen.output(&format!("{line}\n"));
+                }
+            }
             // Model text, already spaced by the sink.
             Event::Printed(text) => self.printed(&text, screen),
             // A tool call and its outcome, on one line.
@@ -2196,10 +2230,9 @@ impl Held {
             // Up: the waiting lines come back to the prompt, above what was
             // typed, and the frame lets go of them.
             ui::Action::Recall => self.recall(screen, queue),
-            // The turn already captured its tool set and its history prefix;
-            // the switch is applied at the boundary, after the answer it did
-            // not affect.
-            ui::Action::Explore => self.switch = true,
+            // The prompt shows it now; the round in flight keeps its mode,
+            // and the turn takes the new one at the next boundary.
+            ui::Action::Explore => self.shown.flip(screen),
             // A chooser only exists while idle.
             ui::Action::MenuStep(_) | ui::Action::MenuAccept | ui::Action::MenuCancel => {}
             ui::Action::None => {}
@@ -2359,6 +2392,17 @@ impl Console<'_> {
     }
 }
 
+/// The transcript's line for a mode the session has taken.
+fn mode_line(mode: tools::Mode) -> &'static str {
+    if mode.explore() {
+        "Explore: on — the model can read, run commands and search the web, \
+         but not change your files\n"
+    } else {
+        "Explore: off — the model can change your files; web search and fetch \
+         are off\n"
+    }
+}
+
 // ---- the sinks ----
 
 struct ChannelSink {
@@ -2451,6 +2495,12 @@ impl Sink for ChannelSink {
         // writer's, not this sink's.
         self.out.commit();
         self.send(Event::User(line.to_string()));
+    }
+
+    fn mode(&mut self, mode: tools::Mode, notices: &[String]) {
+        self.end_thought();
+        self.out.commit();
+        self.send(Event::Mode(mode, notices.to_vec()));
     }
 
     fn reasoning(&mut self, text: &str) {
@@ -4048,10 +4098,11 @@ mod tests {
         let mut screen = ui::Screen::test_screen(60, 20);
         thread::scope(|scope| {
             let handle = scope.spawn(|| 1u32);
-            let (joined, queued, explore) = pump(&mut screen, &rx, &cancel, handle);
+            let mut shown = Shown::default();
+            let (joined, queued) = pump(&mut screen, &rx, &cancel, handle, &mut shown);
             assert_eq!(joined, Some(1));
             assert!(queued.is_none());
-            assert!(!explore);
+            assert!(!shown.explore);
         });
         assert!(!cancel.cancelled(), "one press offers, it does not stop");
         drop(tx);
@@ -4065,7 +4116,7 @@ mod tests {
         let mut screen = ui::Screen::test_screen(60, 20);
         thread::scope(|scope| {
             let handle = scope.spawn(|| 1u32);
-            pump(&mut screen, &rx, &cancel, handle);
+            pump(&mut screen, &rx, &cancel, handle, &mut Shown::default());
         });
         assert!(!cancel.cancelled(), "the typing withdrew the offer");
         drop(tx);
@@ -4078,22 +4129,29 @@ mod tests {
         let mut screen = ui::Screen::test_screen(60, 20);
         thread::scope(|scope| {
             let handle = scope.spawn(|| 1u32);
-            pump(&mut screen, &rx, &cancel, handle);
+            pump(&mut screen, &rx, &cancel, handle, &mut Shown::default());
         });
         assert!(cancel.cancelled());
         drop(tx);
 
-        // Shift+Tab while the work runs is held, and comes back for the caller
-        // to apply once it is over.
+        // Shift+Tab while the work runs shows at once, and comes back for the
+        // caller to apply once it is over; a second press undoes the first.
         let cancel = http::Cancel::new();
         let (tx, rx) = events();
         tx.send(down(KeyCode::BackTab)).unwrap();
         let mut screen = ui::Screen::test_screen(60, 20);
-        let explore = thread::scope(|scope| {
+        let mut shown = Shown::default();
+        thread::scope(|scope| {
             let handle = scope.spawn(|| 1u32);
-            pump(&mut screen, &rx, &cancel, handle).2
+            pump(&mut screen, &rx, &cancel, handle, &mut shown);
         });
-        assert!(explore, "the mode switch is not dropped");
+        assert!(shown.explore, "the mode switch is not dropped");
+        tx.send(down(KeyCode::BackTab)).unwrap();
+        thread::scope(|scope| {
+            let handle = scope.spawn(|| 1u32);
+            pump(&mut screen, &rx, &cancel, handle, &mut shown);
+        });
+        assert!(!shown.explore, "two presses are no switch");
         drop(tx);
     }
 
@@ -4108,6 +4166,44 @@ mod tests {
             "a line a turn handed back still runs"
         );
         assert!(!done(&pending, false));
+    }
+
+    #[test]
+    fn a_switch_during_a_turn_shows_now_and_lands_at_the_boundary() {
+        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
+        let cancel = http::Cancel::new();
+        let mut screen = ui::Screen::test_screen(60, 20);
+        let row = vec![(ui::Info::Selection, "m".to_string())];
+        let mut read_only = row.clone();
+        read_only.push((ui::Info::Mode, "read-only".to_string()));
+        let mut held = Held {
+            shown: Shown::new(false, [row, read_only]),
+            ..Held::default()
+        };
+        let mut used = None;
+        let tab = || Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+
+        // The prompt flips at once; the turn has taken nothing yet.
+        held.event(tab(), &mut screen, &queue, &cancel, &mut used);
+        assert!(held.shown.explore);
+        assert_eq!(held.applied, None);
+        // A second press undoes it before any boundary sees it.
+        held.event(tab(), &mut screen, &queue, &cancel, &mut used);
+        assert!(!held.shown.explore);
+
+        // The turn took a switch: the line lands where the model read it.
+        held.event(tab(), &mut screen, &queue, &cancel, &mut used);
+        held.event(
+            Event::Mode(tools::Mode::Explore, vec!["mcp t: gone".into()]),
+            &mut screen,
+            &queue,
+            &cancel,
+            &mut used,
+        );
+        assert_eq!(held.applied, Some(tools::Mode::Explore));
+        let rows = screen.transcript();
+        assert!(rows.iter().any(|r| r.contains("Explore: on")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("mcp t: gone")), "{rows:?}");
     }
 
     #[test]
@@ -4210,13 +4306,14 @@ mod tests {
         tx.send(Event::Eof).unwrap();
         let mut screen = ui::Screen::test_screen(60, 20);
 
-        let (joined, queued, explore) = thread::scope(|scope| {
+        let mut shown = Shown::default();
+        let (joined, queued) = thread::scope(|scope| {
             let handle = scope.spawn(|| 7u32);
-            pump(&mut screen, &rx, &cancel, handle)
+            pump(&mut screen, &rx, &cancel, handle, &mut shown)
         });
         assert_eq!(joined, Some(7));
         assert_eq!(queued.as_deref(), Some("qpasted"), "the line is kept");
-        assert!(!explore, "no mode key was pressed");
+        assert!(!shown.explore, "no mode key was pressed");
         assert!(cancel.cancelled(), "the end of input cancels the work");
     }
 

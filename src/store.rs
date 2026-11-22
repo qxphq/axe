@@ -105,6 +105,10 @@ impl turn::History for Live<'_> {
         self.messages.push(message);
     }
 
+    fn note(&mut self, message: Value) {
+        self.messages.push(message);
+    }
+
     fn messages(&self) -> &[Value] {
         self.messages.all()
     }

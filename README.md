@@ -455,7 +455,10 @@ and `fetch` and `web_search` are refused. `--unsafe` (`-u`) starts the session t
 flag opens in the off side, whatever the config says. `/new` turns explore mode
 back on: the mode belongs to the session, and the next one starts read-only.
 Every flip is announced in the conversation as `explore mode: on` or `explore
-mode: off`, so the model knows which side it is on.
+mode: off`, so the model knows which side it is on. Shift+Tab during a turn
+flips the prompt's box and `read-only` at once; the turn takes the new mode at
+its next round, after the call running now, and the model carries on under it.
+A flip during the final answer takes effect when the turn ends.
 
 ## Tools
 

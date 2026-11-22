@@ -339,6 +339,11 @@ invariants a change must not break.
   the queue. A queued line is taken, not committed, so its memory is owed where
   it lands — the turn carries the lines it read out of the drain, the loop
   remembers the ones handed back — and every submitted line is remembered once.
+  Shift+Tab during a turn is the same boundary: the box and the info row flip
+  at once, the turn's thread reads the mode the prompt shows at each boundary,
+  and a change there pushes the mode note, restarts the MCP servers and runs
+  every later call under it. A flip no boundary reached is taken when the turn
+  ends; two flips are none. `/explore` typed mid-turn is a command and waits.
 - Sessions: `<id>.json` is the mutable sidecar; `<id>.jsonl` is append-only; bodies
   older than `sessions::KEEP` are gzipped. The sidecar stays readable, so listing
   and search work without unpacking. A compacted body carries a marked summary,

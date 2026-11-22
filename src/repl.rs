@@ -47,6 +47,9 @@ pub(crate) enum Event {
     /// A line typed during the turn that the turn has just taken into its
     /// history: the transcript shows it where the model saw it.
     User(String),
+    /// The turn took a mode switch at a round boundary, and what the servers
+    /// said as they restarted under it.
+    Mode(crate::tools::Mode, Vec<String>),
     /// A call is about to open a blocked path: the question, and where the
     /// answer goes. The turn waits on it; a dropped sender is a no.
     Ask(String, Sender<bool>),
@@ -267,8 +270,8 @@ pub(crate) fn recall_lines(screen: &mut ui::Screen, lines: &[String]) {
 pub(crate) const IDLE: Duration = Duration::from_millis(100);
 
 /// Wait for work another thread is doing while the prompt stays live: keys are
-/// folded into the line, Esc asks first and stops on the second press, and the
-/// loop ends when the work is finished. What the thread joined to comes back with the one line
+/// folded into the line, Esc asks first and stops on the second press, Shift+Tab
+/// flips the mode the prompt shows, and the loop ends when the work is finished. What the thread joined to comes back with the one line
 /// typed while it ran — a panic is `None`, and the caller names it.
 ///
 /// `!cmd` and `/compact` wait the same way, which is why this is one function:
@@ -278,12 +281,9 @@ pub(crate) fn pump<T>(
     rx: &Receiver<Event>,
     cancel: &http::Cancel,
     handle: thread::ScopedJoinHandle<'_, T>,
-) -> (Option<T>, Option<String>, bool) {
+    shown: &mut Shown,
+) -> (Option<T>, Option<String>) {
     let mut queued: Option<String> = None;
-    // Shift+Tab pressed while the work runs: applied once it is over, the way a
-    // turn holds its own switch, because the mode is the session's and the
-    // servers restart with it.
-    let mut explore = false;
     // The same offer the prompt makes during a turn: one ESC asks, any other
     // key withdraws it, the second ESC stops the work.
     let mut armed = false;
@@ -308,7 +308,7 @@ pub(crate) fn pump<T>(
                     ui::Action::Submit if !screen.is_empty() && queued.is_none() => {
                         queued = Some(screen.take());
                     }
-                    ui::Action::Explore => explore = true,
+                    ui::Action::Explore => shown.flip(screen),
                     ui::Action::Eof => {
                         cancel.cancel();
                         break;
@@ -336,7 +336,29 @@ pub(crate) fn pump<T>(
         // A setter marked the screen; one paint per event.
         screen.repaint();
     }
-    (handle.join().ok(), queued, explore)
+    (handle.join().ok(), queued)
+}
+
+/// The mode the prompt shows while work runs. Shift+Tab flips it at once — the
+/// box and the selection row — and the session takes it when the work reaches
+/// a point that can: a turn's next round, or the end of the work.
+#[derive(Default)]
+pub(crate) struct Shown {
+    pub(crate) explore: bool,
+    /// The selection row in normal mode, then in explore mode.
+    rows: [Vec<(ui::Info, String)>; 2],
+}
+
+impl Shown {
+    pub(crate) fn new(explore: bool, rows: [Vec<(ui::Info, String)>; 2]) -> Self {
+        Shown { explore, rows }
+    }
+
+    pub(crate) fn flip(&mut self, screen: &mut ui::Screen) {
+        self.explore = !self.explore;
+        screen.set_explore(self.explore);
+        screen.set_info(self.rows[usize::from(self.explore)].clone());
+    }
 }
 
 /// Collect one line from the prompt. Keys are the only input while idle;

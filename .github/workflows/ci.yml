@@ -185,6 +185,13 @@ jobs:
             'tool:bash:{"command":"python3 -c \"import time;time.sleep(6)\""}' hello '!Up' '!Escape' '!Escape' \
             --expect '│ hello'
 
+      - name: a mode switch during a turn lands at the next round
+        run: |
+          ./harness.py --wait 1 --scroll 40 \
+            'tool:bash:{"command":"python3 -c \"import time;time.sleep(4)\""}' '!BTab' \
+            '!Space' '!Space' '!Space' '!Space' '!Space' '!Space' '!Escape' '!Escape' \
+            --expect 'Explore: off' --expect 'a full bash are available'
+
       - name: a resize, fetch paging, the host guard and /compact
         run: |
           set -ex
