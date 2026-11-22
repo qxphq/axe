@@ -274,7 +274,7 @@ Tools are named `mcp__<server>__<tool>` and carry the server's own schema and
 description. They are read once, when the server starts, because the
 catalogue is part of the cached prompt prefix: an edit needs a restart, and
 `/mcp` says when a file changed. A server with `"autoload": false` is listed
-as `on demand` and gives the model nothing until `/mcp load <name>` starts it
+as `not loaded` and gives the model nothing until `/mcp load <name>` starts it
 under the current mode; its tools are then appended to the array for the rest
 of the process, which starts the provider's prompt cache over once. Nothing
 unloads a server, and a resume or a new start goes by the file again. At most
@@ -288,14 +288,19 @@ server that exits answers with what it printed.
 $ /mcp
 mcp servers
   github     global   stdio  26 tools
+  mail       global   http   not loaded
   proj       project  stdio  4 tools
+  a server that is not loaded gives the model no tools;
+  start one for this session with /mcp load <name>
   /home/anon/repo/.mcp.json: approved
 ```
 
 `/mcp <name>` shows one server's tools. `/mcp add [--project] [--url URL]
 [--env NAME[=VALUE]]... [--header 'K: V']... [--timeout S] [--no-autoload]
 <name> [command [args...]]`, `/mcp remove <name>` and `/mcp forget` edit the
-files, and the startup line is the proof that it worked: `mcp github: 26 tools (global)`.
+files. The startup row under the providers' is the proof that it worked:
+`mcp: github 26  mail  proj 4` — a loaded server with its tool count, one not
+loaded dimmed, one that failed red with its reason on the next line.
 `--env NAME` writes a reference (`${NAME}`); `--env NAME=VALUE` writes the value
 as given, so a secret belongs in the first form — a project file is committed.
 Either command keeps an approval the file already had and never creates one it
@@ -363,14 +368,14 @@ path with a space in it is not completed.
 | `/model -g [id]` | set the global default: the model a directory that pins none starts on; same chooser; the directory's own choice is dropped so it follows |
 | `/thinking [level]` | show or set the thinking level; bare, a chooser over the levels the provider configures |
 | `/thoughts` | show or hide the model's reasoning |
-| `/explore` | toggle explore mode (also Shift+Tab) |
+| `/explore` | toggle explore mode (also Shift+Tab); the line it prints says what the model may do now |
 | `/new` | start a new session, naming the one it left, clearing the screen, and turning explore mode back on |
 | `/sessions [query]` | browse or search this directory's sessions |
 | `/compact` | summarize the session and continue from the summary |
 | `/skills` | list loaded skills, where they came from, and what the model sees |
 | `/mcp [name]` | the MCP servers: list them, one server's tools, `load`, `add`, `remove`, `forget` |
 | `/skill:name [request]` | load a skill's instructions and run a turn |
-| `/help` | list the commands, the key bindings, the config path and its keys |
+| `/help` | list the commands, the key bindings, and where the config and MCP files live |
 | `/exit`, `/quit` | quit |
 
 The area under the transcript is as tall as it has to be — candidates, queued
@@ -409,7 +414,7 @@ where typing filters it and Enter on an empty line resumes the selection.
 | Tab | complete a command or a path token: put the marked candidate on the line without submitting it |
 | ↑ ↓ | move the mark over the candidates above the prompt, walk the history when there is no list, or move in a chooser; ↑ with lines waiting takes them back |
 | Shift+Tab | toggle explore mode |
-| Esc | close a chooser; twice to interrupt the running turn |
+| Esc | close a list; press twice to stop the model |
 | Ctrl+C | clear the prompt line, which stays in the ↑ history |
 | Ctrl+D | end input on an empty line; delete the character under the cursor otherwise |
 | Ctrl+A / Ctrl+E | start of line / end of line |

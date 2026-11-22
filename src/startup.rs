@@ -235,9 +235,15 @@ pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
     // tool catalogue, and the catalogue is part of the request's cached prefix.
     // A project's file is code the repository shipped, so it runs only after
     // one approval; the prompt here is the only question a start asks.
-    for line in mcp::start(cwd.as_deref(), ui::is_interactive(), mode.explore()) {
+    let notices = mcp::start(cwd.as_deref(), ui::is_interactive(), mode.explore());
+    if ui::is_interactive() {
+        if let Some(row) = mcp_row(&mcp::standing()) {
+            crate::text::out(&format!(" {row}\n"));
+        }
+    }
+    for line in notices {
         if ui::is_interactive() {
-            crate::text::out(&format!("{}\n", strip_control(&line)));
+            crate::text::out(&format!(" {}\n", strip_control(&line)));
         } else {
             crate::text::warn(&line);
         }
@@ -441,6 +447,24 @@ pub(crate) fn banner(notes: &[String]) {
     crate::text::out("\n");
 }
 
+/// The servers as one row under the providers': a loaded one with its tool
+/// count, one waiting for `/mcp load` dimmed, one that failed red (its reason
+/// is a notice of its own). `None` when nothing is configured.
+fn mcp_row(servers: &[(String, mcp::Standing)]) -> Option<String> {
+    if servers.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = servers
+        .iter()
+        .map(|(name, standing)| match standing {
+            mcp::Standing::Loaded(tools) => Paint::Plain.ansi(&format!("{name} {tools}")),
+            mcp::Standing::NotLoaded => Paint::Dim.ansi(name),
+            mcp::Standing::Failed => Paint::Red.ansi(name),
+        })
+        .collect();
+    Some(format!("{}{}", Paint::Dim.ansi("mcp: "), names.join("  ")))
+}
+
 pub(crate) fn session_id() -> String {
     let mut bytes = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -461,7 +485,12 @@ pub(crate) fn models(providers: &[Provider]) -> String {
         text.push_str(&format!("{}:\n", p.name));
         for m in &p.models {
             match m.context {
-                Some(ctx) => text.push_str(&format!("  {}/{}  ({} ctx)\n", p.name, m.id, ctx)),
+                Some(ctx) => text.push_str(&format!(
+                    "  {}/{}  ({} context)\n",
+                    p.name,
+                    m.id,
+                    scaled(ctx)
+                )),
                 None => text.push_str(&format!("  {}/{}\n", p.name, m.id)),
             }
         }
@@ -601,6 +630,20 @@ pub(crate) fn resolve(providers: &[Provider], picks: [Option<&str>; 3]) -> (usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mcp_row_names_every_server_and_counts_the_loaded() {
+        use crate::mcp::Standing;
+        assert!(mcp_row(&[]).is_none());
+        let row = mcp_row(&[
+            ("github".into(), Standing::Loaded(26)),
+            ("ha".into(), Standing::NotLoaded),
+            ("mail".into(), Standing::Failed),
+        ])
+        .unwrap();
+        // Tests run without a terminal, so the row is its text alone.
+        assert_eq!(row, "mcp: github 26  ha  mail");
+    }
 
     fn provider(name: &str, models: &[&str]) -> Provider {
         Provider {

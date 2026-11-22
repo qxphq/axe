@@ -520,43 +520,40 @@ fn safe_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-const HELP: &str = "/model [id]    list the models, or switch to one for this directory\n\
-                    /model -g [id] set the default a directory without one starts on\n\
-                    /thinking [l]  show or set the thinking level this provider configures\n\
-                    /thoughts      show or hide the model's reasoning\n\
-                    /sessions [q]  list, search and resume sessions\n\
-                    /compact       replace the history with a summary of itself\n\
-                    /skills        list loaded skills (project, global, config)\n\
-                    /mcp [name]    MCP servers: list, load, add, remove, forget\n\
-                    /skill:name [request]  load a skill's instructions and run a turn\n\
-                    /new           start a new session\n\
-                    /explore       toggle explore mode (read-only shell)\n\
-                    !cmd           run a shell command; its output joins the context\n\
-                    /help          list the commands, the keys and the config\n\
-                    /exit, /quit   quit\n\
+const HELP: &str = "/model [id]        list the models, or switch to one for this directory\n\
+                    /model -g [id]     set the model new directories start with\n\
+                    /thinking [level]  show or set the model's thinking level\n\
+                    /thoughts          show or hide the model's reasoning\n\
+                    /sessions [query]  list, search and resume sessions\n\
+                    /compact           replace the history with a summary of itself\n\
+                    /skills            list the skills and where they came from\n\
+                    /mcp [name]        list MCP servers or show one; /mcp load <name> starts one\n\
+                    /skill:name [request]  run a skill on a request\n\
+                    /new               start a new session\n\
+                    /explore           switch explore mode: the model reads but cannot change files\n\
+                    !cmd               run a shell command; its output joins the context\n\
+                    /help              the commands, the keys and where the config lives\n\
+                    /exit, /quit       quit\n\
                     \n\
-                    Tab            complete a command or a path token\n\
-                    ↑ ↓            walk the candidates, then this directory's history\n\
-                    ↑ with a queue take the waiting lines back to the prompt\n\
-                    Ctrl+R         search that history\n\
-                    Shift+Tab      toggle explore mode\n\
-                    Esc            close a chooser; twice, stop the running turn\n\
+                    Tab                complete a command or a path\n\
+                    ↑ ↓                walk the candidates, then this directory's history\n\
+                    ↑ while a turn runs  pull your queued lines back into the prompt\n\
+                    Ctrl+R             search that history\n\
+                    Shift+Tab          switch explore mode\n\
+                    Esc                close a list; press twice to stop the model\n\
                     Ctrl+J, Alt+Enter  new line\n\
-                    Ctrl+D         end input\n";
+                    Ctrl+D             end input\n";
 
-/// `/help`: the command list, then where the config is read from and the keys
-/// it takes. The path is resolved rather than written out, because
-/// `XDG_CONFIG_HOME` moves it; the keys are the parser's own lists, so the
-/// shell cannot list a key the file rejects or miss one it takes.
+/// `/help`: the command list, then where the two input files are read from.
+/// The paths are resolved rather than written out, because `XDG_CONFIG_HOME`
+/// moves them; the keys are the README's to describe, not a list here.
 fn help_text() -> String {
     format!(
-        "{HELP}\nconfig: {}\n\
-         config keys: {}\n\
-         mcp: mcp.json is global, <repo>/.mcp.json is per project (/mcp)\n\
-         provider keys: {}",
+        "{HELP}\nconfig: {}\n  \
+         every key is described in the README; the model reads it with `about`\n\
+         MCP servers: {} for every directory, <repo>/.mcp.json for one project",
         config::path().display(),
-        config::TOP_KEYS.join(", "),
-        config::PROVIDER_KEYS.join(", ")
+        mcp::global_path().display(),
     )
 }
 
@@ -1158,7 +1155,7 @@ impl Session {
                 provider.models.iter().map(move |model| {
                     let spec = format!("{}/{}", provider.name, model.id);
                     let row = match model.context {
-                        Some(ctx) => format!("{spec}  ({ctx} ctx)"),
+                        Some(ctx) => format!("{spec}  ({} context)", startup::scaled(ctx)),
                         None => spec.clone(),
                     };
                     (spec, row)
@@ -1364,10 +1361,13 @@ impl Session {
         self.set_mode(self.mode.flip());
         console.explore(self.mode.explore());
         console.info(self.info());
-        console.output(&format!(
-            "Explore: {}\n",
-            if self.mode.explore() { "on" } else { "off" }
-        ));
+        console.output(if self.mode.explore() {
+            "Explore: on — the model can read, run commands and search the web, \
+             but not change your files\n"
+        } else {
+            "Explore: off — the model can change your files; web search and fetch \
+             are off\n"
+        });
         // A running server cannot be narrowed or widened, so flipping the mode
         // restarts them under the new rules. The tool names stay what they are.
         // The row says so while it runs: a handshake can take seconds.
@@ -1402,11 +1402,15 @@ impl Session {
     fn skill_listing(&self) -> String {
         let mut out = String::new();
         for skill in &self.skills {
+            let reach = if skill.hidden {
+                format!("only /skill:{} runs it", skill.name)
+            } else {
+                "the model can use it".to_string()
+            };
             out.push_str(&format!(
-                "{}  ({}, {})\n  {}\n  {}\n",
+                "{}  ({}; {reach})\n  {}\n  {}\n",
                 skill.name,
                 skill.scope.label(),
-                if skill.hidden { "hidden" } else { "visible" },
                 skill.file.display(),
                 skill.description
             ));
@@ -2706,8 +2710,8 @@ mod tests {
             assert!(HELP.contains(name), "{name} is missing from HELP");
             assert!(readme.contains(name), "{name} is missing from README");
         }
+        assert!(help.contains("mcp.json"), "{help}");
         for key in config::TOP_KEYS.iter().chain(config::PROVIDER_KEYS) {
-            assert!(help.contains(key), "{key} is missing from /help");
             assert!(readme.contains(key), "{key} is missing from README");
         }
         // The seven are the README's tools table: `read(path, …)` and so on.

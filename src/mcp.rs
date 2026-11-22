@@ -645,12 +645,15 @@ fn carry_approval(cwd: &Path, file: &Path, prior: Option<&str>) -> Result<(), St
 }
 
 fn forget_trust(cwd: &Path) -> String {
+    let nothing = "no approval to forget for this project".to_string();
     let Some(file) = trust_file(cwd) else {
-        return "mcp: nothing remembered".into();
+        return nothing;
     };
     match fs::remove_file(&file) {
-        Ok(()) => "mcp: forgotten; the next start asks again, running servers stay".into(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => "mcp: nothing remembered".into(),
+        Ok(()) => "forgot this project's MCP approval; axe asks again at the next start \
+                   (running servers keep running)"
+            .into(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => nothing,
         Err(e) => format!("error: mcp: {}: {e}", file.display()),
     }
 }
@@ -1499,7 +1502,9 @@ fn lock() -> MutexGuard<'static, Registry> {
 }
 
 /// Load both files, ask about a project's if it is new, start the servers, and
-/// keep them. The notices go to the transcript before the first prompt.
+/// keep them. The notices are what went wrong — a file, an approval, a server
+/// that failed — and go to the transcript before the first prompt; what is
+/// running is `standing`'s to say, as one row.
 pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String> {
     let global = global_path();
     let project = cwd.and_then(project_file);
@@ -1571,24 +1576,11 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
     for (entry, opened) in entries.iter().zip(opened) {
         match opened {
             None => {
-                notices.push(format!(
-                    "mcp {}: on demand — /mcp load {}{}",
-                    entry.name,
-                    entry.name,
-                    origin(entry)
-                ));
                 running.push(None);
                 failures.push(None);
             }
             Some(Ok(mut server)) => {
                 adopt(&mut catalogue, &mut server, true);
-                notices.push(format!(
-                    "mcp {}: {} tool{}{}",
-                    entry.name,
-                    server.tools.len(),
-                    plural(server.tools.len()),
-                    origin(entry)
-                ));
                 running.push(Some(server));
                 failures.push(None);
             }
@@ -1621,6 +1613,32 @@ pub fn start(cwd: Option<&Path>, interactive: bool, explore: bool) -> Vec<String
     };
     GENERATION.fetch_add(1, Ordering::SeqCst);
     notices
+}
+
+/// Where a configured server stands, for the startup row.
+pub enum Standing {
+    /// Running, with this many tools.
+    Loaded(usize),
+    /// Waiting for `/mcp load`.
+    NotLoaded,
+    Failed,
+}
+
+/// Every configured server and where it stands, in entry order.
+pub fn standing() -> Vec<(String, Standing)> {
+    let reg = lock();
+    reg.entries
+        .iter()
+        .enumerate()
+        .map(|(at, entry)| {
+            let standing = match (&reg.running[at], reg.loaded[at]) {
+                (Some(server), _) => Standing::Loaded(server.tools.len()),
+                (None, false) => Standing::NotLoaded,
+                (None, true) => Standing::Failed,
+            };
+            (entry.name.clone(), standing)
+        })
+        .collect()
 }
 
 fn origin(entry: &Entry) -> &'static str {
@@ -1773,6 +1791,7 @@ fn stop_all(running: &mut [Option<Server>]) {
 /// A mode flip moves the confinement, and a running process cannot be narrowed
 /// or widened: every server is restarted under the new rules. The tool names
 /// stay what they were; a server that fails now only answers with errors.
+/// The notices are the failures: a restart that went well is no news.
 pub fn restart(explore: bool) -> Vec<String> {
     let mut reg = lock();
     if reg.entries.is_empty() || reg.explore == explore {
@@ -1794,13 +1813,6 @@ pub fn restart(explore: bool) -> Vec<String> {
                 // The catalogue the model was given is the one that stays: a
                 // server that lists a different set cannot move the prefix.
                 adopt(&mut reg.catalogue, &mut server, false);
-                notices.push(format!(
-                    "mcp {}: {} tool{}{}",
-                    entry.name,
-                    server.tools.len(),
-                    plural(server.tools.len()),
-                    origin(entry)
-                ));
                 reg.running[at] = Some(server);
                 reg.failures[at] = None;
             }
@@ -1931,7 +1943,7 @@ fn listing() -> String {
     let mut out = String::from("mcp servers\n");
     for (at, entry) in reg.entries.iter().enumerate() {
         let status = match (&reg.running[at], &reg.failures[at]) {
-            (None, None) if !reg.loaded[at] => "on demand: /mcp load".to_string(),
+            (None, None) if !reg.loaded[at] => "not loaded".to_string(),
             (Some(server), _) => {
                 format!("{} tool{}", server.tools.len(), plural(server.tools.len()))
             }
@@ -1946,6 +1958,12 @@ fn listing() -> String {
             kind,
             strip_control(&status),
         ));
+    }
+    if reg.loaded.iter().any(|loaded| !loaded) {
+        out.push_str(
+            "  a server that is not loaded gives the model no tools;\n  \
+             start one for this session with /mcp load <name>\n",
+        );
     }
     if let Some(file) = &reg.project {
         // The record is what this line reports, not whether entries happen to
@@ -1976,9 +1994,10 @@ fn detail(name: &str) -> String {
         entry.describe()
     );
     match (&reg.running[at], &reg.failures[at]) {
-        (None, None) if !reg.loaded[at] => {
-            out.push_str(&format!("  on demand: /mcp load {name}\n"))
-        }
+        (None, None) if !reg.loaded[at] => out.push_str(&format!(
+            "  not loaded: it gives the model no tools until you start it\n  \
+                 for this session with /mcp load {name}\n"
+        )),
         (Some(server), _) => {
             for tool in &server.tools {
                 out.push_str(&format!("  {}\n", strip_control(&tool.exposed)));
@@ -2612,7 +2631,8 @@ mod tests {
                 .mode()
                 & 0o777;
             assert_eq!(mode, 0o600, "the record is the user's");
-            assert!(forget_trust(&dir).contains("forgotten"));
+            assert!(forget_trust(&dir).contains("forgot this project's MCP approval"));
+            assert!(forget_trust(&dir).contains("no approval to forget"));
             assert!(!approved(&dir, &file, &hash));
         });
     }
@@ -3233,12 +3253,13 @@ done
             fs::write(&config, file.to_string()).unwrap();
 
             let notices = start(Some(&dir), false, false);
-            assert!(
-                notices.iter().any(|n| n.contains("on demand")),
-                "{notices:?}"
-            );
+            assert!(notices.is_empty(), "{notices:?}");
+            assert!(matches!(standing()[..], [(_, Standing::NotLoaded)]));
             assert!(definitions().is_empty());
-            assert!(dispatch("").contains("on demand"));
+            let listing = dispatch("");
+            assert!(listing.contains("not loaded"), "{listing}");
+            assert!(listing.contains("/mcp load <name>"), "{listing}");
+            assert!(dispatch("t").contains("/mcp load t"));
             assert!(
                 restart(true).is_empty(),
                 "nothing loaded, nothing restarted"
@@ -3250,6 +3271,7 @@ done
             let out = dispatch("load t");
             assert!(out.contains("mcp t: 1 tool"), "{out}");
             assert_eq!(generation(), before + 1);
+            assert!(matches!(standing()[..], [(_, Standing::Loaded(1))]));
             let names: Vec<String> = definitions()
                 .iter()
                 .map(|d| d["function"]["name"].as_str().unwrap().to_string())
@@ -3263,11 +3285,9 @@ done
             assert!(dispatch("load nope").contains("no server named"));
 
             // A loaded server is restarted by a flip, and the catalogue holds.
-            let notices = restart(true);
-            assert!(
-                notices.iter().any(|n| n.contains("mcp t: 1 tool")),
-                "{notices:?}"
-            );
+            // A restart that went well says nothing; only a failure is news.
+            assert!(restart(true).is_empty());
+            assert!(matches!(standing()[..], [(_, Standing::Loaded(1))]));
             assert_eq!(generation(), before + 1);
             assert_eq!(definitions().len(), 1);
             shutdown();
