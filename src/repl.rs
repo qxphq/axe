@@ -50,9 +50,6 @@ pub(crate) enum Event {
     /// The turn took a mode switch at a round boundary, and what the servers
     /// said as they restarted under it.
     Mode(crate::tools::Mode, Vec<String>),
-    /// A call is about to open a blocked path: the question, and where the
-    /// answer goes. The turn waits on it; a dropped sender is a no.
-    Ask(String, Sender<bool>),
     /// The terminal changed size; the live region must repaint.
     Resize,
     Done(Result<Option<crate::api::Usage>, String>),

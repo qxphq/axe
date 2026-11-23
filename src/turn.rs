@@ -9,7 +9,6 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use std::panic::catch_unwind;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -21,8 +20,7 @@ use crate::http::{self, Cancel};
 use crate::markdown;
 use crate::mcp;
 use crate::prompt;
-use crate::render::{blocked_line, call_line, detail, failed, mark, plain_text, Paint};
-use crate::sandbox;
+use crate::render::{call_line, detail, failed, mark, plain_text, Paint};
 use crate::tools;
 use crate::ui;
 
@@ -52,12 +50,6 @@ pub trait Sink {
     /// history, and the servers restarted under it with these complaints.
     /// Piped output has no prompt to switch.
     fn mode(&mut self, _mode: tools::Mode, _notices: &[String]) {}
-    /// The call is about to open a path the config blocks: may it, for the
-    /// rest of the session? Blocks until the user answers. Piped output has
-    /// nobody to ask, so the answer there is no.
-    fn allow(&mut self, _tool: &str, _path: &Path) -> bool {
-        false
-    }
     /// A round's text is over; close its last line if it wrote one.
     fn end_round(&mut self);
 }
@@ -391,19 +383,10 @@ pub fn run_turn(
             if turn.cancel.cancelled() {
                 break;
             }
-            let mut echo = call_line(call, mode.explore());
+            let echo = call_line(call, mode.explore());
             // What is running, while it runs: the finished line appears below
             // once there is a result to put on it.
             sink.status(&plain_text(&echo));
-            // A blocked path is the user's to open: ask before the call runs,
-            // and leave the attempt red in the transcript whatever they say.
-            if let Some(path) = tools::blocked(&call.name, &call.arguments, mode) {
-                let allowed = sink.allow(&call.name, &path);
-                if allowed {
-                    sandbox::grant(&path);
-                }
-                echo = blocked_line(echo, allowed);
-            }
             // A tool that panics must still leave a result: the assistant
             // message above already named the call, and a missing result
             // outlives the turn in the log.

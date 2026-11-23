@@ -164,28 +164,6 @@ pub(crate) fn call_line(call: &api::ToolCall, explore: bool) -> Vec<(Paint, Stri
     spans
 }
 
-/// A call that reached for a path the config blocks: red whatever the answer,
-/// so the attempt stands out in scrollback, with what the user said on the
-/// same line. Red is the palette's word for a failure, and an attempt on a
-/// blocked path is one even when the user lets it through.
-pub(crate) fn blocked_line(spans: Vec<(Paint, String)>, allowed: bool) -> Vec<(Paint, String)> {
-    let mut spans: Vec<(Paint, String)> = spans
-        .into_iter()
-        .map(|(paint, text)| match text.trim().is_empty() {
-            true => (paint, text),
-            false => (Paint::Red, text),
-        })
-        .collect();
-    let answer = if allowed {
-        "blocked path, allowed for this session"
-    } else {
-        "blocked path, not allowed"
-    };
-    spans.push((Paint::Plain, " ".to_string()));
-    spans.push((Paint::Red, answer.to_string()));
-    spans
-}
-
 /// A failed tool result is a result, not an error: tools report failures as
 /// text, either `error: ...` or a non-zero `exit: N`. `read` is the one tool
 /// whose success is arbitrary file content, so a file whose first line begins
@@ -284,24 +262,6 @@ mod tests {
             "error: \"offset\" must be a non-negative integer, got \"12\""
         ));
         assert_eq!(mark("read", "error: read x: gone").1, "✗");
-    }
-
-    #[test]
-    fn a_blocked_call_is_red_with_the_answer_on_its_line() {
-        let call = api::ToolCall {
-            id: "c".into(),
-            name: "read".into(),
-            arguments: r#"{"path":"/k"}"#.into(),
-        };
-        for (allowed, said) in [(true, "allowed for this session"), (false, "not allowed")] {
-            let line = blocked_line(call_line(&call, false), allowed);
-            assert!(line
-                .iter()
-                .filter(|(_, text)| !text.trim().is_empty())
-                .all(|(paint, _)| matches!(paint, Paint::Red)));
-            assert!(plain_text(&line).ends_with(said), "{}", plain_text(&line));
-            assert!(plain_text(&line).contains("(/k)"));
-        }
     }
 
     #[test]

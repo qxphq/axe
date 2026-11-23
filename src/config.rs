@@ -116,10 +116,6 @@ pub struct Config {
     /// Extra skill directories or `SKILL.md` files, scanned after the
     /// default user locations.
     pub skills: Vec<PathBuf>,
-    /// Paths no model reaches without the user's say-so, in either mode:
-    /// `read`, `write` and `edit` ask, and `bash` and MCP servers are refused
-    /// by the kernel. Absolute, `~` expanded.
-    pub blocked: Vec<PathBuf>,
     /// The terminal notification a long turn ends with; `None` is silence.
     pub notify: Option<Notify>,
 }
@@ -252,7 +248,6 @@ pub(crate) const TOP_KEYS: &[&str] = &[
     "system",
     "agents",
     "skills",
-    "blocked",
     "notify",
 ];
 
@@ -455,28 +450,6 @@ fn parse_skills(v: &Value) -> Result<Vec<PathBuf>, String> {
     }
 }
 
-/// `"blocked"`: absolute or `~` paths only. A relative one would be read
-/// against the config's directory, which is never what a list of secrets
-/// means, so it is refused rather than guessed.
-fn parse_blocked(v: &Value) -> Result<Vec<PathBuf>, String> {
-    let shape = || "\"blocked\" must be an array of absolute or ~ paths".to_string();
-    match v.get("blocked") {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(entries)) => {
-            let mut paths = Vec::new();
-            for entry in entries {
-                let raw = entry.as_str().ok_or_else(shape)?;
-                if !(raw == "~" || raw.starts_with("~/") || raw.starts_with('/')) {
-                    return Err(format!("\"blocked\": {raw:?} is not absolute or ~"));
-                }
-                paths.push(resolve_path(raw));
-            }
-            Ok(paths)
-        }
-        Some(_) => Err(shape()),
-    }
-}
-
 fn parse_notify(v: &Value) -> Result<Option<Notify>, String> {
     let Some(map) = optional_section(&v["notify"], &["via", "after"], "\"notify\": ")? else {
         return Ok(None);
@@ -575,7 +548,6 @@ fn parse_value(v: &Value) -> Result<Config, String> {
         system: string_field(v.get("system"), "system", "")?,
         agents: string_field(v.get("agents"), "agents", "")?.map(|raw| resolve_path(&raw)),
         skills: parse_skills(v)?,
-        blocked: parse_blocked(v)?,
         notify: parse_notify(v)?,
     })
 }
@@ -595,28 +567,6 @@ mod tests {
             .providers
             .iter()
             .any(|p| p.session_header.as_deref() == Some("x-opencode-session")));
-    }
-
-    #[test]
-    fn blocked_paths_are_absolute_or_home() {
-        let cfg = parse_value(&serde_json::json!({
-            "base_url": "http://x",
-            "blocked": ["~/.ssh", "/etc/shadow"]
-        }))
-        .unwrap();
-        assert_eq!(cfg.blocked.len(), 2);
-        assert!(cfg.blocked[0].ends_with(".ssh") && cfg.blocked[0].is_absolute());
-        assert_eq!(cfg.blocked[1], PathBuf::from("/etc/shadow"));
-        for bad in [
-            serde_json::json!(["relative/.env"]),
-            serde_json::json!([1]),
-            serde_json::json!("~/.ssh"),
-        ] {
-            let err = parse_value(&serde_json::json!({ "base_url": "http://x", "blocked": bad }))
-                .err()
-                .expect("refused");
-            assert!(err.contains("blocked"), "{err}");
-        }
     }
 
     #[test]

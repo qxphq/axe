@@ -341,20 +341,16 @@ def parse_size(raw):
         raise SystemExit(f"harness: bad --size {raw!r}, want COLSxROWS")
 
 
-def write_config(root, port, blocked=(), notify=None):
+def write_config(root, port, notify=None):
     cfg = Path(root) / "config" / "axe"
     cfg.mkdir(parents=True, exist_ok=True)
     extra = {}
     if notify:
         # No wait: every turn the harness runs is a long one.
         extra["notify"] = {"via": notify, "after": 0}
-    if blocked:
-        # Relative to the work directory: the config itself wants absolute.
-        extra["blocked"] = [str((Path(root) / p).resolve()) for p in blocked]
     (cfg / "config.json").write_text(
         json.dumps(
             {
-                **extra,
                 "providers": {
                     # Levels, so `/thinking` has a chooser to walk; the mock
                     # reads the body and ignores the extra field.
@@ -420,9 +416,6 @@ def main():
                     help="keep the temp workdir")
     ap.add_argument("--work", metavar="DIR",
                     help="reuse DIR as cwd and state home (implies --keep)")
-    ap.add_argument("--blocked", action="append", default=[], metavar="PATH",
-                    help="add PATH (relative to the work dir) to the config's "
-                         "blocked list")
     ap.add_argument("--no-fetch-local", action="store_true",
                     help="do not allow fetch to reach the fixture server")
     ap.add_argument("--notify", choices=("bell", "osc9", "osc777"),
@@ -478,7 +471,7 @@ def main():
     tmux = Tmux(socket, conf) if args.term == "tmux" else Pyte()
     ok = False
     try:
-        config_home = write_config(work, port, args.blocked, args.notify)
+        config_home = write_config(work, port, args.notify)
         env = {
             "XDG_CONFIG_HOME": str(config_home),
             # Keep per-directory state out of the real $HOME/.local/state.

@@ -247,28 +247,6 @@ jobs:
           ./harness.py --work "$w" --timeout 12 --scroll 120 'y' '/mcp' --expect 'mcp: t 1'
           ./harness.py --work "$w" --timeout 12 --scroll 120 '/mcp' --refute 'run them?'
 
-      # The config's blocked paths: `read` asks and the answer is on a red
-      # line, `bash` meets the kernel even in a session that allowed the
-      # read before, and the user's own `!cmd` is not confined at all.
-      - name: a blocked path asks, and bash cannot reach it
-        run: |
-          set -ex
-          w="$RUNNER_TEMP/axe-blocked"
-          rm -rf "$w"
-          mkdir -p "$w/secret"
-          echo TOPSECRET > "$w/secret/key"
-          h="./harness.py --work $w --blocked secret --wait 1"
-          $h --scroll 40 'tool:read:{"path":"secret/key"}' --expect 'Allow for this session? [y/N]'
-          $h --scroll 60 'tool:read:{"path":"secret/key"}' 'n' '!Escape' '!Escape' \
-            --expect 'blocked path, not allowed'
-          # After a yes the loop reads on unasked, faster than tmux keeps rows,
-          # so the answer is checked by what it let through.
-          $h --scroll 400 'tool:read:{"path":"secret/key"}' 'y' '!Escape' '!Escape' 'show:' \
-            --expect 'TOPSECRET' --refute 'not allowed'
-          $h --scroll 400 'tool:bash:{"command":"cat secret/key"}' '!Escape' 'show:' \
-            --expect 'Permission denied' --refute 'TOPSECRET'
-          $h --scroll 40 ' !cat secret/key' --expect 'TOPSECRET'
-
   coverage:
     runs-on: ubuntu-latest
     steps:

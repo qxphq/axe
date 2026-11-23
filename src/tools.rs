@@ -292,19 +292,9 @@ pub fn execute(name: &str, args: &str, cancel: &Cancel, mode: Mode) -> String {
         Ok(v) => v,
         Err(e) => return format!("error: invalid arguments: {e}"),
     };
-    // The turn asked the user before this call ran; a path still blocked is
-    // one they did not allow, or a call nobody could ask about.
-    if let Some(path) = target(name, &args, mode) {
-        if sandbox::blocked(Path::new(&path)).is_some() {
-            return format!(
-                "error: {name} {path}: the user's config blocks this path, and the user did \
-                 not allow it this session"
-            );
-        }
-    }
     match name {
         "read" => read(&args),
-        "bash" => bash(&args, cancel, mode, false),
+        "bash" => bash(&args, cancel, mode),
         // Documentation, no I/O: the same answer in both modes.
         "about" => README_TEXT.to_string(),
         // The catalogue is mode-independent, so a toggle leaves the cached
@@ -328,33 +318,6 @@ pub fn execute(name: &str, args: &str, cancel: &Cancel, mode: Mode) -> String {
         "axe_test_panic" => panic!("the test tool panicked"),
         other => format!("error: unknown tool: {other}"),
     }
-}
-
-/// The path a call would open that the config blocks and the user has not
-/// allowed: the question the turn asks before running it. Only the tools that
-/// take a path and would run in this mode; `bash` cannot be known in advance,
-/// and the kernel refuses it instead.
-pub fn blocked(name: &str, args: &str, mode: Mode) -> Option<std::path::PathBuf> {
-    if !sandbox::blocking() {
-        return None;
-    }
-    let args: Value = serde_json::from_str(args).ok()?;
-    sandbox::blocked(Path::new(&target(name, &args, mode)?))
-}
-
-/// The file a call names, for the tools that open one in this mode.
-fn target(name: &str, args: &Value, mode: Mode) -> Option<String> {
-    match name {
-        "read" => path(args).ok(),
-        "write" | "edit" if !mode.explore() => path(args).ok(),
-        _ => None,
-    }
-}
-
-/// The user's own `!cmd`: a full `bash`, which neither explore mode nor the
-/// blocked paths confine — both are kept from the model, not from the user.
-pub fn user_shell(command: &str, cancel: &Cancel) -> String {
-    bash(&json!({ "command": command }), cancel, Mode::Normal, true)
 }
 
 // ---- arguments ----
@@ -671,7 +634,7 @@ fn edit(args: &Value) -> String {
     }
 }
 
-fn bash(args: &Value, cancel: &Cancel, mode: Mode, user: bool) -> String {
+fn bash(args: &Value, cancel: &Cancel, mode: Mode) -> String {
     let command = match string(args, "command") {
         Ok(command) => command,
         Err(e) => return e,
@@ -691,7 +654,7 @@ fn bash(args: &Value, cancel: &Cancel, mode: Mode, user: bool) -> String {
 
     // The program and its argv come from `sandbox`: the platform decides how a
     // command is confined, and this function never names a shell.
-    let mut cmd = match sandbox::shell(command, mode.explore(), user) {
+    let mut cmd = match sandbox::shell(command, mode.explore()) {
         Ok(cmd) => cmd,
         Err(e) => return format!("error: {e}"),
     };
@@ -787,11 +750,6 @@ fn bash(args: &Value, cancel: &Cancel, mode: Mode, user: bool) -> String {
     if mode.explore() && denied(&stderr) {
         out.push_str(&mode.denial(sandbox::plan()));
     }
-    // Which path the kernel refused is not in the result, so the note names
-    // the way forward rather than the cause: `read` is the call that asks.
-    if !user && sandbox::blocking() && denied(&stderr) {
-        out.push_str(BLOCKED_NOTE);
-    }
     let cut = out.chars().count() > BASH_CHARS;
     let mut out = truncate(out, BASH_CHARS);
     if cut {
@@ -803,12 +761,6 @@ fn bash(args: &Value, cancel: &Cancel, mode: Mode, user: bool) -> String {
     }
     out
 }
-
-/// What a refused command learns when the config blocks paths. Only then: a
-/// user without the list never sees it, so their prefix and results stay as
-/// they were.
-const BLOCKED_NOTE: &str = "note: the user's config blocks some paths from every command; a \
-     file under one is reachable only through `read`, `write` or `edit`, which ask the user\n";
 
 /// `EACCES` from Landlock and `EPERM` from seccomp both arrive as one of these
 /// two strings from `sh`, which is the only signal the tool gets.
@@ -1118,12 +1070,7 @@ mod tests {
                 .contains("error: \"replace_all\" must be a boolean, got \"true\"")
         );
         assert_eq!(
-            bash(
-                &json!({ "command": 1 }),
-                &Cancel::new(),
-                Mode::Normal,
-                false
-            ),
+            bash(&json!({ "command": 1 }), &Cancel::new(), Mode::Normal),
             "error: \"command\" must be a string, got 1"
         );
         // An explicit null is an omitted key, not a type error.
@@ -1417,7 +1364,7 @@ mod tests {
     #[test]
     fn a_command_reports_its_exit_code_and_both_streams() {
         let cancel = Cancel::new();
-        assert!(bash(&json!({}), &cancel, Mode::Normal, false).contains("missing \"command\""));
+        assert!(bash(&json!({}), &cancel, Mode::Normal).contains("missing \"command\""));
         let out = execute(
             "bash",
             &json!({ "command": "echo out; echo err >&2" }).to_string(),

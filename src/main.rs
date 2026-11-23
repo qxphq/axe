@@ -924,8 +924,6 @@ impl Session {
         // The session being left is closed like `/new` closes it: a title the
         // model never gave falls back to its first request.
         self.finalize_session();
-        // What the user allowed belongs to the session that granted it.
-        sandbox::forget_grants();
 
         self.messages.restart(self.mode, sandbox_note(), messages);
         self.sid = id.to_string();
@@ -1036,7 +1034,6 @@ impl Session {
             self.store = Some(Store::fresh(dir, &sid));
         }
         self.messages.restart(self.mode, sandbox_note(), Vec::new());
-        sandbox::forget_grants();
         self.sid = sid;
         self.naming = None;
         self.picks.clear();
@@ -1461,12 +1458,14 @@ impl Session {
         screen.set_status(&plain_text(&shell_line(command, false)));
         screen.repaint();
         let cancel = http::Cancel::new();
+        let args = json!({ "command": command }).to_string();
         let mut queued: Option<String> = None;
         let mut shown = self.shown();
         let result = thread::scope(|scope| {
-            // `!cmd` is the user's own shell: neither explore mode nor the
-            // config's blocked paths confine it.
-            let handle = scope.spawn(|| tools::user_shell(command, &cancel));
+            // `!cmd` is the user's own shell: explore mode does not confine
+            // it, so the mode here is only about which tool set is offered.
+            let handle =
+                scope.spawn(|| tools::execute("bash", &args, &cancel, tools::Mode::Normal));
             let (joined, line) = pump(screen, rx, &cancel, handle, &mut shown);
             queued = line;
             joined.unwrap_or_else(|| "error: shell thread panicked".into())
@@ -1630,7 +1629,12 @@ impl Session {
     /// syntax, not the model's, so the message reads as a shell transcript.
     fn run_shell(&mut self, command: &str) -> String {
         let cancel = http::Cancel::new();
-        let result = tools::user_shell(command, &cancel);
+        let result = tools::execute(
+            "bash",
+            &json!({ "command": command }).to_string(),
+            &cancel,
+            tools::Mode::Normal,
+        );
         self.record(json!({
             "role": "user",
             "content": format!("$ {command}\n{result}"),
@@ -2071,9 +2075,6 @@ struct Held {
     /// them — a queued line is taken, not committed — so their memory is owed
     /// when the turn is over.
     read: Vec<String>,
-    /// Where the answer to a blocked-path question goes while it is up. The
-    /// turn's thread waits on it; dropping it answers no.
-    ask: Option<Sender<bool>>,
 }
 
 impl Held {
@@ -2134,13 +2135,6 @@ impl Held {
                 screen.set_status("");
                 screen.error(&format!("axe: {why}\n"));
             }
-            // A call wants a blocked path: the turn waits for the answer, and
-            // the question takes the row until it has one.
-            Event::Ask(question, reply) => {
-                screen.set_status("");
-                screen.set_question(Some(&question));
-                self.ask = Some(reply);
-            }
             // The area under us changed: paint even if no state did.
             Event::Resize => screen.invalidate(),
             Event::Done(Err(e)) => {
@@ -2179,30 +2173,6 @@ impl Held {
         queue: &Queue,
         cancel: &http::Cancel,
     ) -> bool {
-        // An open question takes y, n, Enter and ESC, and nothing else: typing
-        // ahead must not answer it. No is the default, and ESC is a no that
-        // also offers the interrupt.
-        if let Some(reply) = self.ask.take() {
-            use ratatui::crossterm::event::KeyModifiers;
-            let chord = key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-            let answer = match key.code {
-                _ if chord => None,
-                KeyCode::Char('y' | 'Y') => Some(true),
-                KeyCode::Char('n' | 'N') | KeyCode::Enter | KeyCode::Esc => Some(false),
-                _ => None,
-            };
-            let Some(answer) = answer else {
-                self.ask = Some(reply);
-                return false;
-            };
-            let _ = reply.send(answer);
-            screen.set_question(None);
-            if key.code != KeyCode::Esc {
-                return false;
-            }
-        }
         if key.code == KeyCode::Esc {
             if self.armed {
                 self.interrupted = true;
@@ -2453,19 +2423,6 @@ impl Sink for ChannelSink {
         self.send(Event::Status(text.to_string()));
     }
 
-    fn allow(&mut self, tool: &str, path: &std::path::Path) -> bool {
-        self.end_thought();
-        let (reply, answer) = mpsc::channel();
-        // The question before the path: a row too narrow for both clips the
-        // path's end, never the keys that answer it.
-        let path = crate::text::oneline(&tilde(path), 200);
-        self.send(Event::Ask(
-            format!("⚠ Allow for this session? [y/N]  {tool} {path} is blocked"),
-            reply,
-        ));
-        answer.recv().unwrap_or(false)
-    }
-
     fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str), error: Option<&str>) {
         self.end_thought();
         let mut spans = call.to_vec();
@@ -2514,18 +2471,6 @@ impl Sink for ChannelSink {
             // the clock, and `end_thought` puts the duration in its place.
             self.thought.get_or_insert_with(Instant::now);
         }
-    }
-}
-
-/// A path under the home directory as `~/...`: the question row is short.
-fn tilde(path: &std::path::Path) -> String {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    match home
-        .as_deref()
-        .and_then(|home| path.strip_prefix(home).ok())
-    {
-        Some(rest) if !rest.as_os_str().is_empty() => format!("~/{}", rest.display()),
-        _ => path.display().to_string(),
     }
 }
 
@@ -4204,65 +4149,6 @@ mod tests {
         let rows = screen.transcript();
         assert!(rows.iter().any(|r| r.contains("Explore: on")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("mcp t: gone")), "{rows:?}");
-    }
-
-    #[test]
-    fn a_blocked_path_question_takes_only_its_answers() {
-        let queue: Queue = Arc::new(Mutex::new(VecDeque::new()));
-        let cancel = http::Cancel::new();
-        let mut screen = ui::Screen::test_screen(60, 20);
-        let mut held = Held::default();
-        let mut used = None;
-        let key = |c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-
-        let (reply, answer) = mpsc::channel();
-        held.event(
-            Event::Ask("q".into(), reply),
-            &mut screen,
-            &queue,
-            &cancel,
-            &mut used,
-        );
-        // Typing ahead neither answers nor reaches the prompt.
-        held.event(key('x'), &mut screen, &queue, &cancel, &mut used);
-        let ctrl_y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL);
-        held.event(Event::Key(ctrl_y), &mut screen, &queue, &cancel, &mut used);
-        assert!(answer.try_recv().is_err(), "still waiting");
-        assert!(screen.is_empty());
-        held.event(key('y'), &mut screen, &queue, &cancel, &mut used);
-        assert_eq!(answer.try_recv(), Ok(true));
-        held.event(key('y'), &mut screen, &queue, &cancel, &mut used);
-        assert!(
-            !screen.is_empty(),
-            "with no question, a key is typing again"
-        );
-
-        // ESC is a no, and offers the interrupt without taking it.
-        let (reply, answer) = mpsc::channel();
-        held.event(
-            Event::Ask("q".into(), reply),
-            &mut screen,
-            &queue,
-            &cancel,
-            &mut used,
-        );
-        let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        held.event(esc, &mut screen, &queue, &cancel, &mut used);
-        assert_eq!(answer.try_recv(), Ok(false));
-        assert!(held.armed && !cancel.cancelled());
-
-        // Enter is the default: no.
-        let (reply, answer) = mpsc::channel();
-        held.event(
-            Event::Ask("q".into(), reply),
-            &mut screen,
-            &queue,
-            &cancel,
-            &mut used,
-        );
-        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        held.event(enter, &mut screen, &queue, &cancel, &mut used);
-        assert_eq!(answer.try_recv(), Ok(false));
     }
 
     #[test]

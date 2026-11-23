@@ -34,9 +34,7 @@ pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
     web::set_brave_key(cfg.search.brave_key.clone());
     // Confinement is announced before anything runs, once, next to the
     // provider lines: weaker than promised must never be silent — for the user
-    // hearing it now or the model reading the history it joins. The blocked
-    // paths come first: whether the kernel can hold them is part of the note.
-    sandbox::set_blocked(&cfg.blocked);
+    // hearing it now or the model reading the history it joins.
     let sandbox_note = sandbox::init();
     if let Some(note) = &sandbox_note {
         crate::text::warn(note);
