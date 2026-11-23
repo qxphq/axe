@@ -351,6 +351,7 @@ def write_config(root, port, notify=None):
     (cfg / "config.json").write_text(
         json.dumps(
             {
+                **extra,
                 "providers": {
                     # Levels, so `/thinking` has a chooser to walk; the mock
                     # reads the body and ignores the extra field.
