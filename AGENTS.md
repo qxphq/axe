@@ -8,9 +8,10 @@ invariants a change must not break.
 
 1. **Dependencies are debt.** Prefer `std`; a crate must be strictly necessary and
    widely maintained. Current: `serde_json`, `rustls`, `webpki-roots`, `ratatui`
-   (crossterm backend), `unicode-width`, and `libc` on Linux. Crypto and
-   terminal geometry are not hand-rolled; compression is the host's `gzip`,
-   never a crate.
+   (crossterm backend), `unicode-width`, `pulldown-cmark` (no default
+   features), and `libc` on Linux. Crypto, terminal geometry and markdown
+   parsing are not hand-rolled; compression is the host's `gzip`, never a
+   crate.
 2. **No speculative features.** Add a thing when its absence hurts. No alt-screen,
    panes, subagents, or permission layer until the REPL is genuinely
    insufficient. MCP servers are the one addition on that list: they are the
@@ -236,8 +237,11 @@ invariants a change must not break.
 - `text.rs` — control bytes, the output cap, the one place a `Style` becomes
   ANSI, and the one writer of stdout and stderr while no `Screen` exists
   (`out`, `err`, `warn`).
-- `markdown.rs` — markdown: blocks, inlines, tables, entities, URL checks, and the
-  renderer. `Stream` feeds it a line at a time and lays a block out when it ends.
+- `markdown.rs` — markdown: `pulldown-cmark`'s events built into blocks and
+  inlines (CommonMark, GFM tables and strikethrough; HTML tags dropped but
+  `<br>`), the nesting and table caps, URL checks, and the renderer. `Stream`
+  feeds it a line at a time and lays a block out when it ends, asking the
+  parser where a block ends.
 - `api.rs` — model listing, chat request, SSE parsing, tool-call accumulation.
 - `http.rs` — URL parsing, HTTP/1.1 over `TcpStream`/rustls with request bodies
   and response headers, body decoding (`Content-Length`, chunked, EOF), line,

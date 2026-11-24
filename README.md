@@ -7,7 +7,7 @@
 ```
 
 A minimal coding agent in Rust. One binary, one line REPL, any
-OpenAI-compatible `chat/completions` server, seven tools, **six dependencies**.
+OpenAI-compatible `chat/completions` server, seven tools, **seven dependencies**.
 It does not re-implement your shell, your tools or your system.
 
 Sessions start in explore mode (shown as `read-only`), where `fetch` and

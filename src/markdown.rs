@@ -1,17 +1,17 @@
 //! Markdown.
 //!
-//! The parser reads markdown into blocks and inlines, with the limits, the
-//! URL check and the entity table this transcript needs. The renderer turns
-//! blocks into transcript lines, wrapped at a given width, 0 meaning
-//! unbounded.
+//! `pulldown-cmark` reads CommonMark, with GFM tables and strikethrough, into
+//! events; this module builds them into blocks and inlines, with the limits
+//! and the URL check this transcript needs. The renderer turns blocks into
+//! transcript lines, wrapped at a given width, 0 meaning unbounded.
 //!
 //! `Stream` adapts the document parser to a stream of lines. Lines are held
 //! until the block they belong to ends, because laying a block out needs all
 //! of it: a table its header, a paragraph its last line.
 
+use pulldown_cmark::{Alignment, Event, Options, Parser, Tag};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use std::collections::HashMap;
 use unicode_width::UnicodeWidthChar;
 
 // --- Types ---
@@ -55,10 +55,6 @@ enum Block {
         rows: Vec<Vec<Vec<Inline>>>,
     },
     Hr,
-    Details {
-        summary: Vec<Inline>,
-        blocks: Vec<Block>,
-    },
 }
 
 const MAX_NESTING_DEPTH: usize = 10;
@@ -66,120 +62,8 @@ const MAX_TABLE_COLUMNS: usize = 50;
 const MAX_TABLE_ROWS: usize = 1000;
 const MAX_LIST_ITEMS: usize = 1000;
 
-// --- Char helpers ---
-
-fn as_chars(s: &str) -> Vec<char> {
-    s.chars().collect()
-}
-
-fn text_of(c: &[char]) -> String {
-    c.iter().collect()
-}
-
-fn at(c: &[char], i: usize) -> char {
-    c.get(i).copied().unwrap_or('\0')
-}
-
-fn starts(c: &[char], i: usize, pat: &str) -> bool {
-    pat.chars()
-        .enumerate()
-        .all(|(k, p)| c.get(i + k) == Some(&p))
-}
-
-fn find_from(c: &[char], from: usize, pat: &str) -> Option<usize> {
-    let n = pat.chars().count();
-    if n == 0 || from > c.len() {
-        return None;
-    }
-    (from..=c.len().saturating_sub(n)).find(|&i| starts(c, i, pat))
-}
-
-fn backticks(n: usize) -> String {
-    "`".repeat(n)
-}
-
-// --- Entity decoding ---
-
-fn named_entity(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "amp" => "&",
-        "lt" => "<",
-        "gt" => ">",
-        "quot" => "\"",
-        "apos" => "'",
-        "nbsp" => "\u{a0}",
-        "copy" => "\u{a9}",
-        "mdash" => "\u{2014}",
-        "ndash" => "\u{2013}",
-        "hellip" => "\u{2026}",
-        "middot" => "\u{b7}",
-        "bull" => "\u{2022}",
-        "laquo" => "\u{ab}",
-        "raquo" => "\u{bb}",
-        _ => return None,
-    })
-}
-
-/// Reject surrogates and out-of-range values, as the JS version does.
-fn codepoint(cp: u32) -> Option<char> {
-    if cp == 0 || cp > 0x10ffff || (0xd800..=0xdfff).contains(&cp) {
-        return None;
-    }
-    char::from_u32(cp)
-}
-
-pub(crate) fn decode_entities(text: &str) -> String {
-    let c = as_chars(text);
-    let mut out = String::new();
-    let mut i = 0;
-    while i < c.len() {
-        if c[i] == '&' {
-            if let Some((ch, next)) = entity_at(&c, i) {
-                out.push(ch);
-                i = next;
-                continue;
-            }
-        }
-        out.push(c[i]);
-        i += 1;
-    }
-    out
-}
-
-/// `&(?:#(\d+)|#x([0-9a-fA-F]+)|(\w+));` at `i`, decoded.
-fn entity_at(c: &[char], i: usize) -> Option<(char, usize)> {
-    let mut j = i + 1;
-    if at(c, j) == '#' {
-        let hex = matches!(at(c, j + 1), 'x' | 'X');
-        j += if hex { 2 } else { 1 };
-        let start = j;
-        while j < c.len()
-            && if hex {
-                c[j].is_ascii_hexdigit()
-            } else {
-                c[j].is_ascii_digit()
-            }
-        {
-            j += 1;
-        }
-        if j == start || at(c, j) != ';' {
-            return None;
-        }
-        let digits = text_of(&c[start..j]);
-        let cp = u32::from_str_radix(&digits, if hex { 16 } else { 10 }).ok()?;
-        return codepoint(cp).map(|ch| (ch, j + 1));
-    }
-    let start = j;
-    while j < c.len() && (c[j].is_ascii_alphanumeric() || c[j] == '_') {
-        j += 1;
-    }
-    if j == start || at(c, j) != ';' {
-        return None;
-    }
-    let name = text_of(&c[start..j]);
-    named_entity(&name)
-        .and_then(|s| s.chars().next())
-        .map(|ch| (ch, j + 1))
+fn options() -> Options {
+    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH
 }
 
 // --- URL safety ---
@@ -216,923 +100,288 @@ fn safe_url(url: &str) -> bool {
     }
 }
 
-// --- Inline parsing helpers ---
+// --- Events into blocks ---
 
-fn closing_bracket(c: &[char], open: usize) -> Option<usize> {
-    let mut depth: isize = 0;
-    let mut i = open;
-    while i < c.len() {
-        match c[i] {
-            '\\' => {
-                i += 2;
-                continue;
-            }
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth <= 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+/// What an open tag builds. `Skip` is a tag this transcript does not draw,
+/// or one nested past `MAX_NESTING_DEPTH`: its content joins its parent.
+enum Kind {
+    Root,
+    Quote,
+    Item,
+    Paragraph,
+    Heading(usize),
+    Code,
+    List(Option<u64>),
+    Table(Vec<Option<Align>>),
+    Row,
+    Cell,
+    Strong,
+    Em,
+    Del,
+    Link(String),
+    Image(String),
+    Skip,
 }
 
-fn closing_paren(c: &[char], open: usize) -> Option<usize> {
-    let mut depth: isize = 0;
-    let mut i = open;
-    while i < c.len() {
-        match c[i] {
-            '\\' => {
-                i += 2;
-                continue;
-            }
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth <= 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+/// An open tag and what it has collected so far.
+struct Node {
+    kind: Kind,
+    blocks: Vec<Block>,
+    inlines: Vec<Inline>,
+    items: Vec<Vec<Block>>,
+    cells: Vec<Vec<Inline>>,
+    rows: Vec<Vec<Vec<Inline>>>,
+    code: String,
 }
 
-/// A backtick run at `i`, and the index just past its closer. Runs of any
-/// length are honored, so a delimiter inside a multi-backtick span is inert.
-fn skip_code_span(c: &[char], i: usize) -> Option<usize> {
-    let mut n = 0;
-    while i + n < c.len() && c[i + n] == '`' {
-        n += 1;
-    }
-    find_from(c, i + n, &backticks(n)).map(|closer| closer + n)
-}
-
-fn find_delimiter(c: &[char], start: usize, delim: &str) -> Option<usize> {
-    let mut i = start;
-    while i < c.len() {
-        if c[i] == '\\' {
-            i += 2;
-            continue;
-        }
-        if c[i] == '`' {
-            if let Some(end) = skip_code_span(c, i) {
-                i = end;
-                continue;
-            }
-        }
-        if starts(c, i, delim) {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-fn find_single_delimiter(c: &[char], start: usize, ch: char) -> Option<usize> {
-    let mut i = start;
-    while i < c.len() {
-        if c[i] == '\\' {
-            i += 2;
-            continue;
-        }
-        if c[i] == '`' {
-            if let Some(end) = skip_code_span(c, i) {
-                i = end;
-                continue;
-            }
-        }
-        if c[i] == ch && (i == 0 || c[i - 1] != ch) && (i + 1 >= c.len() || c[i + 1] != ch) {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-/// A failed search from X fails from every position past X too, so one miss
-/// per delimiter is enough: without this a line of unmatched `*` is quadratic.
-fn cached(
-    c: &[char],
-    misses: &mut HashMap<&'static str, usize>,
-    key: &'static str,
-    start: usize,
-    delim: &str,
-) -> Option<usize> {
-    if misses.get(key).is_some_and(|&m| start >= m) {
-        return None;
-    }
-    let found = find_delimiter(c, start, delim);
-    if found.is_none() {
-        misses
-            .entry(key)
-            .and_modify(|m| *m = (*m).min(start))
-            .or_insert(start);
-    }
-    found
-}
-
-fn cached_single(
-    c: &[char],
-    misses: &mut HashMap<&'static str, usize>,
-    key: &'static str,
-    start: usize,
-    ch: char,
-) -> Option<usize> {
-    if misses.get(key).is_some_and(|&m| start >= m) {
-        return None;
-    }
-    let found = find_single_delimiter(c, start, ch);
-    if found.is_none() {
-        misses
-            .entry(key)
-            .and_modify(|m| *m = (*m).min(start))
-            .or_insert(start);
-    }
-    found
-}
-
-/// `<br>`, `<br/>`, `<br />`, any case.
-fn br_tag(c: &[char], i: usize) -> Option<usize> {
-    if at(c, i) != '<' {
-        return None;
-    }
-    let mut j = i + 1;
-    if !matches!(at(c, j), 'b' | 'B') || !matches!(at(c, j + 1), 'r' | 'R') {
-        return None;
-    }
-    j += 2;
-    while at(c, j).is_whitespace() {
-        j += 1;
-    }
-    if at(c, j) == '/' {
-        j += 1;
-        while at(c, j).is_whitespace() {
-            j += 1;
+impl Node {
+    fn new(kind: Kind) -> Node {
+        Node {
+            kind,
+            blocks: Vec::new(),
+            inlines: Vec::new(),
+            items: Vec::new(),
+            cells: Vec::new(),
+            rows: Vec::new(),
+            code: String::new(),
         }
     }
-    if at(c, j) == '>' {
-        Some(j + 1 - i)
-    } else {
-        None
-    }
-}
 
-/// `https?:\/\/[^\s<>\[\]]*[^\s<>\[\].,;:!?)\]}'"']`, as a length.
-fn autolink(c: &[char], i: usize) -> Option<usize> {
-    let prefix = if starts(c, i, "https://") {
-        8
-    } else if starts(c, i, "http://") {
-        7
-    } else if starts(c, i, "www.") {
-        4
-    } else {
-        return None;
-    };
-    let mut j = i + prefix;
-    while j < c.len() && !c[j].is_whitespace() && !matches!(c[j], '<' | '>' | '[' | ']') {
-        j += 1;
-    }
-    while j > i + prefix
-        && matches!(
-            c[j - 1],
-            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"'
-        )
-    {
-        j -= 1;
-    }
-    if j > i + prefix {
-        Some(j - i)
-    } else {
-        None
-    }
-}
-
-fn flush_buf(buf: &mut String, out: &mut Vec<Inline>) {
-    if !buf.is_empty() {
-        let text = std::mem::take(buf);
-        out.push(Inline::Text(if text.contains('&') {
-            decode_entities(&text)
-        } else {
-            text
-        }));
-    }
-}
-
-fn closes_underscore(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}')
-}
-
-// --- Inline parser ---
-
-fn parse_inline(text: &str) -> Vec<Inline> {
-    inline(&as_chars(text), 0)
-}
-
-fn inline(t: &[char], depth: usize) -> Vec<Inline> {
-    if t.is_empty() {
-        return Vec::new();
-    }
-    if depth > MAX_NESTING_DEPTH {
-        return vec![Inline::Text(text_of(t))];
-    }
-    let mut misses: HashMap<&'static str, usize> = HashMap::new();
-    let last_bracket = t.iter().rposition(|&c| c == ']');
-    let last_paren = t.iter().rposition(|&c| c == ')');
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    let mut i = 0;
-
-    while i < t.len() {
-        let ch = t[i];
-
-        // Escape
-        if ch == '\\' && i + 1 < t.len() && "\\`*_~[]!|".contains(t[i + 1]) {
-            buf.push(t[i + 1]);
-            i += 2;
-            continue;
+    /// Text a container holds outside any paragraph — a tight item's, an
+    /// HTML block's — is a paragraph of its own.
+    fn settle(&mut self) {
+        let inlines = std::mem::take(&mut self.inlines);
+        if visible(&inlines) {
+            self.blocks.push(Block::Paragraph(inlines));
         }
+    }
 
-        // Hard line break: two or more spaces before a newline
-        if ch == ' ' && at(t, i + 1) == ' ' {
-            let mut j = i + 2;
-            while j < t.len() && t[j] == ' ' {
-                j += 1;
-            }
-            if at(t, j) == '\n' {
-                flush_buf(&mut buf, &mut out);
-                out.push(Inline::Br);
-                i = j + 1;
-                continue;
+    fn block(&mut self, block: Block) {
+        self.settle();
+        self.blocks.push(block);
+    }
+}
+
+fn visible(inlines: &[Inline]) -> bool {
+    inlines
+        .iter()
+        .any(|i| !matches!(i, Inline::Text(t) if t.trim().is_empty()))
+}
+
+fn align(a: &Alignment) -> Option<Align> {
+    match a {
+        Alignment::None => None,
+        Alignment::Left => Some(Align::Left),
+        Alignment::Center => Some(Align::Center),
+        Alignment::Right => Some(Align::Right),
+    }
+}
+
+/// The node a tag opens under `parent`, at `depth` open tags. A paragraph,
+/// heading or code block holds only text, and an item, row or cell is as
+/// deep as the list or table around it, so only the rest is capped.
+fn kind_of(tag: Tag, parent: &Kind, depth: usize) -> Kind {
+    let capped = depth > MAX_NESTING_DEPTH;
+    match tag {
+        Tag::Paragraph | Tag::HtmlBlock => Kind::Paragraph,
+        Tag::Heading { level, .. } => Kind::Heading(level as usize),
+        Tag::CodeBlock(_) => Kind::Code,
+        Tag::Item if !matches!(parent, Kind::Skip) => Kind::Item,
+        Tag::TableHead | Tag::TableRow if !matches!(parent, Kind::Skip) => Kind::Row,
+        Tag::TableCell if !matches!(parent, Kind::Skip) => Kind::Cell,
+        _ if capped => Kind::Skip,
+        Tag::BlockQuote(_) => Kind::Quote,
+        Tag::List(start) => Kind::List(start),
+        Tag::Table(aligns) => {
+            Kind::Table(aligns.iter().take(MAX_TABLE_COLUMNS).map(align).collect())
+        }
+        Tag::Emphasis => Kind::Em,
+        Tag::Strong => Kind::Strong,
+        Tag::Strikethrough => Kind::Del,
+        Tag::Link { dest_url, .. } => Kind::Link(dest_url.into_string()),
+        Tag::Image { dest_url, .. } => Kind::Image(dest_url.into_string()),
+        _ => Kind::Skip,
+    }
+}
+
+/// A closed node, handed to the node it sits in.
+fn close(mut node: Node, parent: &mut Node) {
+    match node.kind {
+        Kind::Root => {}
+        Kind::Paragraph => {
+            if visible(&node.inlines) {
+                parent.block(Block::Paragraph(node.inlines));
             }
         }
-
-        // HTML <br>
-        if ch == '<' {
-            if let Some(len) = br_tag(t, i) {
-                flush_buf(&mut buf, &mut out);
-                out.push(Inline::Br);
-                i += len;
-                continue;
+        Kind::Heading(level) => parent.block(Block::Heading {
+            level,
+            content: node.inlines,
+        }),
+        Kind::Code => {
+            let mut content = node.code;
+            if content.ends_with('\n') {
+                content.pop();
+            }
+            parent.block(Block::Code { content });
+        }
+        Kind::Quote => {
+            node.settle();
+            parent.block(Block::Blockquote(node.blocks));
+        }
+        Kind::Item => {
+            node.settle();
+            if parent.items.len() < MAX_LIST_ITEMS {
+                parent.items.push(node.blocks);
             }
         }
-
-        // Image: ![alt](src)
-        if ch == '!' && at(t, i + 1) == '[' && last_bracket.is_some_and(|b| b > i + 1) {
-            if let Some(alt_end) = closing_bracket(t, i + 1) {
-                if at(t, alt_end + 1) == '(' && last_paren.is_some_and(|p| p > alt_end) {
-                    if let Some(src_end) = closing_paren(t, alt_end + 1) {
-                        let alt = decode_entities(&text_of(&t[i + 2..alt_end]));
-                        // Decoded before the check, so `&#106;avascript:`
-                        // cannot slip through as a relative URL.
-                        let src = decode_entities(&text_of(&t[alt_end + 2..src_end]));
-                        flush_buf(&mut buf, &mut out);
-                        if safe_url(&src) {
-                            out.push(Inline::Image { src, alt });
-                        } else {
-                            buf.push_str(&text_of(&t[i..=src_end]));
-                        }
-                        i = src_end + 1;
-                        continue;
-                    }
+        Kind::List(start) => parent.block(Block::List {
+            ordered: start.is_some(),
+            start: start.map_or(1, |n| n as usize),
+            items: node.items,
+        }),
+        Kind::Table(aligns) => {
+            let mut rows = node.rows.into_iter();
+            parent.block(Block::Table {
+                headers: rows.next().unwrap_or_default(),
+                aligns,
+                rows: rows.collect(),
+            });
+        }
+        Kind::Row => {
+            if parent.rows.len() <= MAX_TABLE_ROWS {
+                parent.rows.push(node.cells);
+            }
+        }
+        Kind::Cell => {
+            if parent.cells.len() < MAX_TABLE_COLUMNS {
+                parent.cells.push(node.inlines);
+            }
+        }
+        Kind::Strong => parent.inlines.push(Inline::Strong(node.inlines)),
+        Kind::Em => parent.inlines.push(Inline::Em(node.inlines)),
+        Kind::Del => parent.inlines.push(Inline::Del(node.inlines)),
+        Kind::Link(href) if safe_url(&href) => parent.inlines.push(Inline::Link {
+            href,
+            children: node.inlines,
+        }),
+        Kind::Image(src) if safe_url(&src) => parent.inlines.push(Inline::Image {
+            alt: plain_inlines(&node.inlines),
+            src,
+        }),
+        // An unsafe target is shown, never linked.
+        Kind::Link(url) | Kind::Image(url) => {
+            parent.inlines.append(&mut node.inlines);
+            parent.inlines.push(Inline::Text(format!(" ({url})")));
+        }
+        Kind::Skip => {
+            if node.blocks.is_empty() {
+                parent.inlines.append(&mut node.inlines);
+            } else {
+                node.settle();
+                for block in node.blocks {
+                    parent.block(block);
                 }
             }
         }
-
-        // Link: [text](url)
-        if ch == '[' && last_bracket.is_some_and(|b| b > i) {
-            if let Some(text_end) = closing_bracket(t, i) {
-                if at(t, text_end + 1) == '(' && last_paren.is_some_and(|p| p > text_end) {
-                    if let Some(url_end) = closing_paren(t, text_end + 1) {
-                        let label = text_of(&t[i + 1..text_end]);
-                        let href = decode_entities(&text_of(&t[text_end + 2..url_end]));
-                        flush_buf(&mut buf, &mut out);
-                        if safe_url(&href) {
-                            out.push(Inline::Link {
-                                href,
-                                children: inline(&as_chars(&label), depth + 1),
-                            });
-                        } else {
-                            buf.push_str(&text_of(&t[i..=url_end]));
-                        }
-                        i = url_end + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        // Autolink: bare URL
-        if (starts(t, i, "https://") || starts(t, i, "http://") || starts(t, i, "www."))
-            && (i == 0 || " \t\n(".contains(t[i - 1]))
-        {
-            if let Some(len) = autolink(t, i) {
-                flush_buf(&mut buf, &mut out);
-                let url = text_of(&t[i..i + len]);
-                let href = if url.starts_with("www.") {
-                    format!("https://{url}")
-                } else {
-                    url.clone()
-                };
-                out.push(Inline::Link {
-                    href: decode_entities(&href),
-                    children: vec![Inline::Text(url)],
-                });
-                i += len;
-                continue;
-            }
-        }
-
-        // Code span
-        if ch == '`' {
-            let mut ticks = 0;
-            let mut j = i;
-            while j < t.len() && t[j] == '`' {
-                ticks += 1;
-                j += 1;
-            }
-            if let Some(closer) = find_from(t, j, &backticks(ticks)) {
-                flush_buf(&mut buf, &mut out);
-                let mut code = text_of(&t[j..closer]);
-                if ticks > 1
-                    && code.chars().count() > 1
-                    && code.starts_with(' ')
-                    && code.ends_with(' ')
-                {
-                    code = code.chars().skip(1).collect::<String>();
-                    let n = code.chars().count();
-                    code = code.chars().take(n - 1).collect();
-                }
-                out.push(Inline::Code(code));
-                i = closer + ticks;
-                continue;
-            }
-            // No closer: the backticks are text, and the run is stepped over
-            // whole so its own first backtick is not scanned again.
-            buf.push_str(&text_of(&t[i..j]));
-            i = j;
-            continue;
-        }
-
-        // Bold + italic: ***text***
-        if starts(t, i, "***") {
-            if let Some(end) = cached(t, &mut misses, "***", i + 3, "***") {
-                flush_buf(&mut buf, &mut out);
-                out.push(Inline::Strong(vec![Inline::Em(inline(
-                    &t[i + 3..end],
-                    depth + 1,
-                ))]));
-                i = end + 3;
-                continue;
-            }
-        }
-
-        // Bold: **text**
-        if starts(t, i, "**") {
-            if let Some(end) = cached(t, &mut misses, "**", i + 2, "**") {
-                flush_buf(&mut buf, &mut out);
-                out.push(Inline::Strong(inline(&t[i + 2..end], depth + 1)));
-                i = end + 2;
-                continue;
-            }
-        }
-
-        // Strikethrough: ~~text~~
-        if starts(t, i, "~~") {
-            if let Some(end) = cached(t, &mut misses, "~~", i + 2, "~~") {
-                flush_buf(&mut buf, &mut out);
-                out.push(Inline::Del(inline(&t[i + 2..end], depth + 1)));
-                i = end + 2;
-                continue;
-            }
-        }
-
-        // Strikethrough: ~text~
-        if ch == '~' && !starts(t, i, "~~") {
-            if let Some(end) = cached_single(t, &mut misses, "~", i + 1, '~') {
-                flush_buf(&mut buf, &mut out);
-                out.push(Inline::Del(inline(&t[i + 1..end], depth + 1)));
-                i = end + 1;
-                continue;
-            }
-        }
-
-        // Italic: *text*
-        if ch == '*' && !starts(t, i, "**") {
-            if let Some(end) = cached_single(t, &mut misses, "~*", i + 1, '*') {
-                flush_buf(&mut buf, &mut out);
-                out.push(Inline::Em(inline(&t[i + 1..end], depth + 1)));
-                i = end + 1;
-                continue;
-            }
-        }
-
-        // Italic: _text_ (only at a word boundary, so `a_b_c` stays literal)
-        if ch == '_' && !starts(t, i, "__") && (i == 0 || !t[i - 1].is_ascii_alphanumeric()) {
-            if let Some(end) = cached_single(t, &mut misses, "~_", i + 1, '_') {
-                if end + 1 >= t.len() || closes_underscore(t[end + 1]) {
-                    flush_buf(&mut buf, &mut out);
-                    out.push(Inline::Em(inline(&t[i + 1..end], depth + 1)));
-                    i = end + 1;
-                    continue;
-                }
-            }
-        }
-
-        buf.push(ch);
-        i += 1;
     }
+}
 
-    flush_buf(&mut buf, &mut out);
+fn plain_inlines(inlines: &[Inline]) -> String {
+    let mut out = String::new();
+    for item in inlines {
+        match item {
+            Inline::Text(t) | Inline::Code(t) => out.push_str(t),
+            Inline::Br => out.push(' '),
+            Inline::Strong(c) | Inline::Em(c) | Inline::Del(c) => out.push_str(&plain_inlines(c)),
+            Inline::Link { children, .. } => out.push_str(&plain_inlines(children)),
+            Inline::Image { alt, .. } => out.push_str(alt),
+        }
+    }
     out
 }
 
-// --- Block helpers ---
-
-fn parse_cells(line: &str) -> Vec<String> {
-    let mut s = line;
-    if let Some(rest) = s.strip_prefix('|') {
-        s = rest;
+/// HTML is not drawn: `<br>` is a line break, any other tag is dropped and
+/// the text between tags stays.
+fn html(raw: &str) -> Option<Inline> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let br = lower
+        .strip_prefix("<br")
+        .and_then(|rest| rest.strip_suffix('>'))
+        .is_some_and(|rest| rest.trim().trim_end_matches('/').trim().is_empty());
+    if br {
+        return Some(Inline::Br);
     }
-    if let Some(rest) = s.strip_suffix('|') {
-        s = rest;
-    }
-    let c = as_chars(s);
-    let mut cells = Vec::new();
-    let mut buf = String::new();
-    let mut i = 0;
-    while i < c.len() {
-        if c[i] == '\\' && at(&c, i + 1) == '|' {
-            buf.push('|');
-            i += 2;
-        } else if c[i] == '|' {
-            cells.push(buf.trim().to_string());
-            buf.clear();
-            i += 1;
-        } else {
-            buf.push(c[i]);
-            i += 1;
+    let mut out = String::new();
+    let mut tag = false;
+    for c in raw.chars() {
+        match c {
+            '<' => tag = true,
+            '>' if tag => tag = false,
+            _ if !tag => out.push(c),
+            _ => {}
         }
     }
-    cells.push(buf.trim().to_string());
-    cells
+    (!out.is_empty()).then_some(Inline::Text(out))
 }
 
-fn parse_alignments(line: &str) -> Vec<Option<Align>> {
-    parse_cells(line)
-        .iter()
-        .map(|cell| {
-            let left = cell.starts_with(':');
-            let right = cell.ends_with(':');
-            match (left, right) {
-                (true, true) => Some(Align::Center),
-                (false, true) => Some(Align::Right),
-                (true, false) => Some(Align::Left),
-                _ => None,
+fn parse(text: &str) -> Vec<Block> {
+    let mut stack = vec![Node::new(Kind::Root)];
+    for event in Parser::new_ext(text, options()) {
+        let top = stack.len() - 1;
+        match event {
+            Event::Start(tag) => {
+                let kind = kind_of(tag, &stack[top].kind, top);
+                stack.push(Node::new(kind));
             }
-        })
-        .collect()
-}
-
-/// One cell of `|---|:--:|--:|---|`.
-fn is_delim_cell(s: &str) -> bool {
-    let c = as_chars(s);
-    if c.is_empty() {
-        return false;
-    }
-    let left = c[0] == ':';
-    let right = c.len() > 1 && c[c.len() - 1] == ':';
-    let start = usize::from(left);
-    let end = c.len() - usize::from(right);
-    if end <= start {
-        return false;
-    }
-    let dashes = &c[start..end];
-    if !dashes.iter().all(|&ch| ch == '-') {
-        return false;
-    }
-    match (left, right) {
-        (false, false) => dashes.len() >= 3,
-        (true, true) => !dashes.is_empty(),
-        _ => dashes.len() >= 2,
-    }
-}
-
-fn is_table_delim(line: &str) -> bool {
-    let mut s = line.trim();
-    if let Some(rest) = s.strip_prefix('|') {
-        s = rest;
-    }
-    if let Some(rest) = s.strip_suffix('|') {
-        s = rest;
-    }
-    s.split('|').all(|cell| is_delim_cell(cell.trim()))
-}
-
-/// The fence a line opens: its character and its length. The info string
-/// after it is not shown: the transcript has no highlighter to give it to.
-fn fence_open(line: &str) -> Option<(char, usize)> {
-    let t = line.trim();
-    let ch = t.chars().next()?;
-    if ch != '`' && ch != '~' {
-        return None;
-    }
-    let n = t.chars().take_while(|&c| c == ch).count();
-    if n < 3 {
-        return None;
-    }
-    Some((ch, n))
-}
-
-fn fence_closes(line: &str, ch: char, n: usize) -> bool {
-    let t = line.trim();
-    let count = t.chars().take_while(|&c| c == ch).count();
-    count >= n && t.chars().all(|c| c == ch)
-}
-
-fn is_hr(t: &str) -> bool {
-    let mut marks = 0;
-    for c in t.chars() {
-        if c.is_whitespace() {
-            continue;
-        }
-        if !matches!(c, '-' | '*' | '_') {
-            return false;
-        }
-        marks += 1;
-    }
-    marks >= 3
-}
-
-fn heading_start(t: &str) -> bool {
-    let level = t.chars().take_while(|&c| c == '#').count();
-    (1..=6).contains(&level) && t[level..].chars().next().is_some_and(char::is_whitespace)
-}
-
-fn heading(line: &str) -> Option<(usize, Vec<Inline>)> {
-    let t = line.trim();
-    if !heading_start(t) {
-        return None;
-    }
-    let level = t.chars().take_while(|&c| c == '#').count();
-    let rest = t[level..].trim();
-    // Closing hashes are decoration, not content: `## title ##`.
-    let mut content = rest;
-    if content.ends_with('#') {
-        let bare = content.trim_end_matches('#');
-        if bare.ends_with(char::is_whitespace) {
-            content = bare.trim_end();
-        }
-    }
-    Some((level, parse_inline(content)))
-}
-
-fn unordered_marker(t: &str) -> bool {
-    let b = t.as_bytes();
-    b.len() > 1 && matches!(b[0], b'-' | b'*' | b'+') && b[1] == b' '
-}
-
-fn ordered_marker(t: &str) -> bool {
-    let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
-    if digits == 0 {
-        return false;
-    }
-    let mut rest = t[digits..].chars();
-    matches!(rest.next(), Some('.' | ')')) && rest.next() == Some(' ')
-}
-
-fn details_start(t: &str) -> bool {
-    find_ci(t, "<details").is_some_and(|at| {
-        at == 0
-            && t["<details".len()..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_whitespace() || c == '>')
-    })
-}
-
-fn details_end(line: &str) -> bool {
-    find_ci(line, "</details")
-        .is_some_and(|at| line[at + "</details".len()..].trim_start().starts_with('>'))
-}
-
-fn find_ci(hay: &str, needle: &str) -> Option<usize> {
-    let n = needle.len();
-    let h = hay.as_bytes();
-    if n == 0 || h.len() < n {
-        return None;
-    }
-    (0..=h.len() - n).find(|&i| h[i..i + n].eq_ignore_ascii_case(needle.as_bytes()))
-}
-
-fn strip_tag(text: &str, tag: &str) -> String {
-    let open = format!("<{tag}");
-    let close = format!("</{tag}");
-    let mut s = text.to_string();
-    loop {
-        let found = match (find_ci(&s, &open), find_ci(&s, &close)) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => return s,
-        };
-        match s[found..].find('>') {
-            Some(gt) => s.replace_range(found..found + gt + 1, ""),
-            None => return s,
-        }
-    }
-}
-
-fn summary_of(raw: &str) -> String {
-    let Some(open) = find_ci(raw, "<summary") else {
-        return String::new();
-    };
-    let Some(gt) = raw[open..].find('>') else {
-        return String::new();
-    };
-    let start = open + gt + 1;
-    let Some(close) = find_ci(&raw[start..], "</summary") else {
-        return String::new();
-    };
-    raw[start..start + close].trim().to_string()
-}
-
-fn strip_details(raw: &str) -> String {
-    let s = strip_tag(raw, "details");
-    let Some(open) = find_ci(&s, "<summary") else {
-        return s.trim().to_string();
-    };
-    let Some(gt) = s[open..].find('>') else {
-        return s.trim().to_string();
-    };
-    let after = open + gt + 1;
-    let Some(close) = find_ci(&s[after..], "</summary") else {
-        return s.trim().to_string();
-    };
-    let close = after + close;
-    match s[close..].find('>') {
-        Some(gt) => format!("{}{}", &s[..open], &s[close + gt + 1..])
-            .trim()
-            .to_string(),
-        None => s.trim().to_string(),
-    }
-}
-
-/// `(indent, marker, content)` for a list item line.
-fn list_item(line: &str) -> Option<(usize, String, &str)> {
-    let indent = line.chars().take_while(|c| matches!(c, ' ' | '\t')).count();
-    let rest = &line[indent..];
-    let marker = match rest.chars().next()? {
-        c @ ('-' | '*' | '+') => c.to_string(),
-        _ => {
-            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if digits.is_empty() {
-                return None;
-            }
-            match rest[digits.len()..].chars().next()? {
-                c @ ('.' | ')') => format!("{digits}{c}"),
-                _ => return None,
-            }
-        }
-    };
-    let content = rest[marker.len()..].strip_prefix(' ')?;
-    Some((indent, marker, content))
-}
-
-fn is_block_start(line: &str, next: Option<&str>) -> bool {
-    let t = line.trim();
-    if heading_start(t)
-        || is_hr(t)
-        || t.starts_with("```")
-        || t.starts_with("~~~")
-        || t.starts_with('>')
-        || unordered_marker(t)
-        || ordered_marker(t)
-        || details_start(t)
-    {
-        return true;
-    }
-    t.starts_with('|') && next.is_some_and(|n| is_table_delim(n.trim()))
-}
-
-// --- Block parser ---
-
-fn parse_blocks(input: &str, depth: usize) -> Vec<Block> {
-    if depth > MAX_NESTING_DEPTH {
-        return if input.is_empty() {
-            Vec::new()
-        } else {
-            vec![Block::Paragraph(parse_inline(input))]
-        };
-    }
-    let lines: Vec<&str> = input.split('\n').collect();
-    let mut blocks = Vec::new();
-    let mut i = 0;
-
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim();
-
-        if trimmed.is_empty() {
-            i += 1;
-            continue;
-        }
-
-        // Fenced code block
-        if let Some((ch, n)) = fence_open(line) {
-            let mut code: Vec<&str> = Vec::new();
-            i += 1;
-            while i < lines.len() {
-                if fence_closes(lines[i], ch, n) {
-                    i += 1;
-                    break;
-                }
-                code.push(lines[i]);
-                i += 1;
-            }
-            blocks.push(Block::Code {
-                content: code.join("\n"),
-            });
-            continue;
-        }
-
-        // ATX heading
-        if let Some((level, content)) = heading(line) {
-            blocks.push(Block::Heading { level, content });
-            i += 1;
-            continue;
-        }
-
-        // Horizontal rule
-        if is_hr(trimmed) {
-            blocks.push(Block::Hr);
-            i += 1;
-            continue;
-        }
-
-        // Table
-        if trimmed.contains('|') && i + 1 < lines.len() {
-            let headers = parse_cells(line);
-            let aligns = parse_alignments(lines[i + 1]);
-            if headers.len() == aligns.len() && is_table_delim(lines[i + 1]) {
-                let headers = headers
-                    .iter()
-                    .take(MAX_TABLE_COLUMNS)
-                    .map(|c| parse_inline(c))
-                    .collect();
-                let aligns = aligns.into_iter().take(MAX_TABLE_COLUMNS).collect();
-                let mut rows: Vec<Vec<Vec<Inline>>> = Vec::new();
-                i += 2;
-                while i < lines.len()
-                    && !lines[i].trim().is_empty()
-                    && lines[i].contains('|')
-                    && rows.len() < MAX_TABLE_ROWS
-                {
-                    rows.push(
-                        parse_cells(lines[i])
-                            .iter()
-                            .take(MAX_TABLE_COLUMNS)
-                            .map(|c| parse_inline(c))
-                            .collect(),
-                    );
-                    i += 1;
-                }
-                blocks.push(Block::Table {
-                    headers,
-                    aligns,
-                    rows,
-                });
-                continue;
-            }
-        }
-
-        // Blockquote
-        if trimmed.starts_with('>') {
-            let mut quoted: Vec<String> = Vec::new();
-            while i < lines.len() {
-                let t = lines[i].trim();
-                if let Some(rest) = t.strip_prefix("> ") {
-                    quoted.push(rest.to_string());
-                } else if t == ">" {
-                    quoted.push(String::new());
-                } else if let Some(rest) = t.strip_prefix('>') {
-                    quoted.push(rest.to_string());
-                } else {
-                    break;
-                }
-                i += 1;
-            }
-            blocks.push(Block::Blockquote(parse_blocks(
-                &quoted.join("\n"),
-                depth + 1,
-            )));
-            continue;
-        }
-
-        // List
-        if let Some((base_indent, first, _)) = list_item(line) {
-            let ordered = first.chars().next().is_some_and(|c| c.is_ascii_digit());
-            let start: usize = if ordered {
-                first.trim_end_matches(['.', ')']).parse().unwrap_or(1)
-            } else {
-                1
-            };
-            let marker_len = first.chars().count() + 1;
-            let mut items: Vec<Vec<Block>> = Vec::new();
-            let mut current: Vec<String> = Vec::new();
-
-            while i < lines.len() && items.len() < MAX_LIST_ITEMS {
-                let li = lines[i];
-                match list_item(li) {
-                    Some((indent, _, content)) if indent == base_indent => {
-                        if !current.is_empty() {
-                            items.push(parse_blocks(&current.join("\n"), depth + 1));
-                        }
-                        current = vec![content.to_string()];
-                        i += 1;
-                    }
-                    // A blank line inside an item is a loose list, not its end,
-                    // as long as another item follows.
-                    _ if li.trim().is_empty() => {
-                        let next_item = lines
-                            .get(i + 1)
-                            .and_then(|l| list_item(l))
-                            .is_some_and(|(indent, _, _)| indent == base_indent);
-                        if next_item {
-                            current.push(String::new());
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    _ => {
-                        let lead = li.chars().take_while(|c| c.is_whitespace()).count();
-                        if li.chars().count() > base_indent + marker_len
-                            && lead > 0
-                            && lead >= base_indent + marker_len
-                        {
-                            current.push(li.chars().skip(base_indent + marker_len).collect());
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    }
+            Event::End(_) => {
+                if top > 0 {
+                    let node = stack.pop().unwrap_or_else(|| Node::new(Kind::Skip));
+                    close(node, &mut stack[top - 1]);
                 }
             }
-            if !current.is_empty() && items.len() < MAX_LIST_ITEMS {
-                items.push(parse_blocks(&current.join("\n"), depth + 1));
-            }
-            blocks.push(Block::List {
-                ordered,
-                start,
-                items,
-            });
-            continue;
-        }
-
-        // Details/Summary
-        if details_start(trimmed) {
-            let mut raw = vec![trimmed.to_string()];
-            i += 1;
-            while i < lines.len() {
-                raw.push(lines[i].to_string());
-                let last = details_end(lines[i]);
-                i += 1;
-                if last {
-                    break;
+            Event::Text(t) if matches!(stack[top].kind, Kind::Code) => stack[top].code.push_str(&t),
+            Event::Text(t) => stack[top].inlines.push(Inline::Text(t.into_string())),
+            Event::Code(t) => stack[top].inlines.push(Inline::Code(t.into_string())),
+            Event::Html(t) | Event::InlineHtml(t) => {
+                if let Some(inline) = html(&t) {
+                    stack[top].inlines.push(inline);
                 }
             }
-            let raw = raw.join("\n");
-            blocks.push(Block::Details {
-                summary: parse_inline(&summary_of(&raw)),
-                blocks: parse_blocks(strip_details(&raw).trim(), depth + 1),
-            });
-            continue;
-        }
-
-        // Paragraph
-        let mut para: Vec<&str> = Vec::new();
-        while i < lines.len()
-            && !lines[i].trim().is_empty()
-            && !is_block_start(lines[i], lines.get(i + 1).copied())
-        {
-            para.push(lines[i]);
-            i += 1;
-        }
-        if para.is_empty() {
-            i += 1;
-        } else {
-            blocks.push(Block::Paragraph(parse_inline(&para.join("\n"))));
+            Event::SoftBreak => stack[top].inlines.push(Inline::Text("\n".to_string())),
+            Event::HardBreak => stack[top].inlines.push(Inline::Br),
+            Event::Rule => stack[top].block(Block::Hr),
+            _ => {}
         }
     }
+    // The parser closes every tag it opens, so only the root is left.
+    let mut root = stack.swap_remove(0);
+    root.settle();
+    root.blocks
+}
 
-    blocks
+/// How many top-level blocks `text` holds, and whether the last is a list.
+fn top_level(text: &str) -> (usize, bool) {
+    let mut depth = 0usize;
+    let mut count = 0;
+    let mut list = false;
+    for event in Parser::new_ext(text, options()) {
+        match event {
+            Event::Start(tag) => {
+                if depth == 0 {
+                    count += 1;
+                    list = matches!(tag, Tag::List(_));
+                }
+                depth += 1;
+            }
+            Event::End(_) => depth = depth.saturating_sub(1),
+            Event::Rule if depth == 0 => {
+                count += 1;
+                list = false;
+            }
+            _ => {}
+        }
+    }
+    (count, list)
 }
 
 // --- Styles ---
@@ -1158,7 +407,7 @@ enum Piece {
 /// blank line: markdown's own spacing, not the caller's.
 pub fn document(text: &str, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    render(&parse_blocks(text, 0), width, &mut out);
+    render(&parse(text), width, &mut out);
     out
 }
 
@@ -1260,10 +509,6 @@ fn emit(
                 rows,
             } => {
                 table(headers, aligns, rows, base, inner, gutter, out);
-            }
-            Block::Details { summary, blocks } => {
-                push_rows(out, gutter, wrap(&pieces(summary, base.patch(BOLD)), inner));
-                emit(blocks, width, base, gutter, out);
             }
         }
     }
@@ -1603,15 +848,16 @@ fn clip(items: &[Piece], width: usize) -> Vec<Piece> {
 // --- Stream ---
 
 /// The document parser, fed a line at a time. Lines are held until the block
-/// they belong to ends: at a blank line whose next line cannot continue it, or
-/// when the caller flushes because something else goes into the transcript. A
-/// fenced block is opaque, so its blank lines are content, not boundaries.
+/// they belong to ends: at a blank line the held block cannot continue past,
+/// at a line after a gap that the parser puts in a block of its own, or when
+/// the caller flushes because something else goes into the transcript. The
+/// parser itself answers both, so a stream lays out what the same text at
+/// once would.
 #[derive(Default)]
 pub struct Stream {
     lines: Vec<String>,
-    fence: Option<(char, usize)>,
     /// Blank lines held since the last one pushed: they may separate two
-    /// blocks, or be a loose list's own gaps.
+    /// blocks, or be a list's or an open fence's own gaps.
     blank: usize,
 }
 
@@ -1621,38 +867,39 @@ impl Stream {
     }
 
     pub fn push(&mut self, line: &str, width: usize, out: &mut Vec<Line<'static>>) {
-        if let Some((ch, n)) = self.fence {
-            self.lines.push(line.to_string());
-            if fence_closes(line, ch, n) {
-                self.fence = None;
-            }
-            return;
-        }
         if line.trim().is_empty() {
             self.blank += 1;
-            // Only a list carries a gap, so only a list waits to find out
-            // whether the next line is its own: any other block has ended.
-            if !open(&self.lines) {
+            if !self.waits() {
                 self.flush(width, out);
             }
             return;
         }
         self.separate(line, width, out);
-        if let Some((ch, n)) = fence_open(line) {
-            self.fence = Some((ch, n));
-        }
         self.lines.push(line.to_string());
     }
 
-    /// Settle the blank lines held before `line`. They join the buffer when it
-    /// still belongs to the same block — the list rule of `parse_blocks`, which
-    /// keeps an item after a gap when a list is already open — and otherwise
-    /// the block ends here, before the new line.
+    /// Whether the held block may still take a line after a gap: a list, whose
+    /// next item may follow, or anything a line after a gap would join, such
+    /// as a fence not closed yet.
+    fn waits(&self) -> bool {
+        if self.lines.is_empty() {
+            return false;
+        }
+        let held = self.lines.join("\n");
+        let (count, list) = top_level(&held);
+        list || top_level(&format!("{held}\n\nx")).0 == count
+    }
+
+    /// Settle the blank lines held before `line`: they join the buffer when
+    /// the line still belongs to the block held, and otherwise the block ends
+    /// here, before the new line.
     fn separate(&mut self, line: &str, width: usize, out: &mut Vec<Line<'static>>) {
         if self.blank == 0 {
             return;
         }
-        if continues(&self.lines, line) {
+        let held = self.lines.join("\n");
+        let gap = "\n".repeat(self.blank + 1);
+        if top_level(&format!("{held}{gap}{line}")).0 == top_level(&held).0 {
             for _ in 0..std::mem::take(&mut self.blank) {
                 self.lines.push(String::new());
             }
@@ -1667,32 +914,8 @@ impl Stream {
             return;
         }
         let text = std::mem::take(&mut self.lines).join("\n");
-        self.fence = None;
-        render(&parse_blocks(&text, 0), width, out);
+        render(&parse(&text), width, out);
     }
-}
-
-/// Whether the block the buffer holds could still take a line after a blank
-/// one, so the boundary is not known yet: a list item, or content indented
-/// under one.
-fn open(lines: &[String]) -> bool {
-    let Some(last) = lines.iter().rev().find(|line| !line.trim().is_empty()) else {
-        return false;
-    };
-    list_item(last).is_some() || last.starts_with([' ', '\t'])
-}
-
-/// Whether a line after a gap still belongs to the block the buffer holds: a
-/// list item at an indent some open item already has, which is what the list
-/// loop of `parse_blocks` accepts across a blank line.
-fn continues(lines: &[String], line: &str) -> bool {
-    let Some((indent, _, _)) = list_item(line) else {
-        return false;
-    };
-    lines
-        .iter()
-        .filter_map(|held| list_item(held))
-        .any(|(open, _, _)| open == indent)
 }
 
 // --- Output for a stream that has no screen ---
@@ -1766,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn autolinks_entities_and_breaks() {
+    fn bare_urls_entities_and_breaks() {
         let out = text("see https://example.com/x &amp; more<br>next");
         assert!(out.contains("https://example.com/x"), "{out}");
         assert!(out.contains("&"), "{out}");
@@ -1780,37 +1003,6 @@ mod tests {
         assert!(out.contains("Body"), "{out}");
         assert_eq!(text("## Title ##"), "Title");
         assert!(text("---").contains("─"));
-    }
-
-    #[test]
-    fn entities_decode_only_when_they_are_ones() {
-        let at0 = |text: &str| {
-            let c: Vec<char> = text.chars().collect();
-            entity_at(&c, 0)
-        };
-        assert_eq!(at0("&amp;"), Some(('&', 5)));
-        assert_eq!(at0("&nbsp;"), Some(('\u{a0}', 6)));
-        assert_eq!(at0("&#65;"), Some(('A', 5)));
-        assert_eq!(at0("&#x42;"), Some(('B', 6)));
-        assert_eq!(at0("&#X42;"), Some(('B', 6)));
-        // Not an entity: no digits, no name, no semicolon, or no such name.
-        for bad in [
-            "&#;",
-            "&#x;",
-            "&;",
-            "&amp",
-            "&bogus;",
-            "&",
-            "&#0;",
-            "&#1114112;",
-            "&#xd800;",
-        ] {
-            assert_eq!(at0(bad), None, "{bad}");
-        }
-        assert_eq!(decode_entities("a &amp; b &#x41; &nope;"), "a & b A &nope;");
-        // An entity must be followed by something: the index past it is exact.
-        let c: Vec<char> = "x&amp;y".chars().collect();
-        assert_eq!(entity_at(&c, 1), Some(('&', 6)));
     }
 
     #[test]
@@ -1847,18 +1039,14 @@ mod tests {
     #[test]
     fn inline_marks_nest_and_unmatched_ones_stand() {
         let out = text("**bold** and *italic* and _under_ and __strong__ and ~~gone~~");
-        for kept in ["bold", "italic", "under", "strong", "gone"] {
-            assert!(out.contains(kept), "{kept}: {out}");
-        }
-        for mark in ["**", "~~", "*italic*", "_under_"] {
-            assert!(!out.contains(mark), "{mark}: {out}");
-        }
-        // A double underscore is not emphasis here: it stays as written.
-        assert!(out.contains("__strong__"), "{out}");
-        // An asterisk with a space on one side is text, not emphasis.
+        assert_eq!(out, "bold and italic and under and strong and gone");
+        // An asterisk with a space on each side is text, not emphasis.
         assert_eq!(text("a * b"), "a * b");
-        // Two asterisks with text between them are a span, spaces included.
-        assert_eq!(text("2 * 3 * 4"), "2 3 4");
+        assert_eq!(text("2 * 3 * 4"), "2 * 3 * 4");
+        // Inside a word an underscore is text.
+        assert_eq!(text("a_b_c"), "a_b_c");
+        // Entities decode.
+        assert_eq!(text("a &amp; b &#x41; &nope;"), "a & b A &nope;");
         // Emphasis inside a link stays inside it.
         let out = text("[**bold link**](https://e/x)");
         assert!(out.contains("bold link"), "{out}");
@@ -1913,10 +1101,6 @@ mod tests {
         let out = text("````\n```\ninner\n````");
         assert!(out.contains("```"), "{out}");
         assert!(out.contains("inner"), "{out}");
-        assert!(fence_open("```js").is_some());
-        assert!(fence_open("`` ``").is_none());
-        assert!(fence_closes("````", '`', 4));
-        assert!(!fence_closes("```", '`', 4));
     }
 
     #[test]
@@ -1927,16 +1111,14 @@ mod tests {
         assert!(!out.contains('#'), "{out}");
         assert!(out.lines().any(|line| line.starts_with('─')), "{out}");
         for marks in ["***", "___", "- - -"] {
-            assert!(heading(marks).is_none(), "{marks} is a rule");
-            assert!(is_hr(marks));
+            assert!(text(marks).starts_with('─'), "{marks} is a rule");
         }
-        assert!(heading("###Four").is_none(), "a heading needs a space");
-        assert!(heading("####### seven").is_none(), "seven hashes are text");
-        assert_eq!(heading("## Two ##").unwrap().0, 2);
+        assert_eq!(text("###Four"), "###Four", "a heading needs a space");
+        assert_eq!(text("####### seven"), "####### seven");
 
         let out = text("- one\n- two\n  - nested");
         assert!(out.contains("• one"), "{out}");
-        assert!(out.contains("• nested"), "{out}");
+        assert!(out.contains("  • nested"), "{out}");
 
         let out = text("1. first\n2) second");
         assert!(out.contains("1. first"), "{out}");
@@ -1953,16 +1135,6 @@ mod tests {
     }
 
     #[test]
-    fn list_items_read_markers_and_indent() {
-        assert_eq!(list_item("- x"), Some((0, "-".into(), "x")));
-        assert_eq!(list_item("   * x"), Some((3, "*".into(), "x")));
-        assert_eq!(list_item("12) x"), Some((0, "12)".into(), "x")));
-        assert_eq!(list_item("-x"), None, "a marker needs its space");
-        assert_eq!(list_item("x - y"), None);
-        assert_eq!(list_item("1.x"), None);
-    }
-
-    #[test]
     fn a_table_is_drawn_with_its_columns_and_alignment() {
         let out = text("| a | b |\n|:--|--:|\n| 1 | 2 |\n| 3 |");
         assert!(out.contains("a │ b"), "{out}");
@@ -1976,16 +1148,12 @@ mod tests {
         // A table with no body is still a table.
         let out = text("| h |\n|---|");
         assert!(out.trim().lines().count() == 2, "{out}");
-        assert_eq!(parse_cells("|a|b|"), vec!["a", "b"]);
-        assert_eq!(parse_cells("|a\\|b|c"), vec!["a|b", "c"]);
-        let aligns = parse_alignments("|:--|:-:|--:|---|");
-        assert!(matches!(aligns[0], Some(Align::Left)));
-        assert!(matches!(aligns[1], Some(Align::Center)));
-        assert!(matches!(aligns[2], Some(Align::Right)));
-        assert!(aligns[3].is_none());
-        assert!(is_table_delim("| --- | :--: |"));
-        assert!(!is_table_delim("| -- | --- |"), "two dashes are not a rule");
-        assert!(!is_table_delim("| a | b |"));
+        // Alignment pads on the side the delimiter row names.
+        let out: Vec<String> = document("| aaa | b | c |\n|:-:|--:|:--|\n| x | y | z |", 80)
+            .iter()
+            .map(plain)
+            .collect();
+        assert_eq!(out[2], "  x  │ y │ z");
     }
 
     #[test]
@@ -1993,18 +1161,7 @@ mod tests {
         let out = text("<details><summary>The summary</summary>\n\n- inside\n</details>");
         assert!(out.contains("The summary"), "{out}");
         assert!(out.contains("• inside"), "{out}");
-        assert!(!out.contains("<details>"), "{out}");
-        assert_eq!(summary_of("<summary> one </summary>"), "one");
-        assert_eq!(summary_of("<summary>unclosed"), "");
-        assert_eq!(
-            strip_details("<details><summary>s</summary>body</details>"),
-            "body"
-        );
-        assert_eq!(strip_details("<details>plain</details>"), "plain");
-        assert!(details_start("<details open>"));
-        assert!(!details_start("x <details>"));
-        assert!(details_end("  </details>"));
-        assert!(!details_end("</detail"));
+        assert!(!out.contains('<'), "{out}");
     }
 
     #[test]
@@ -2071,9 +1228,10 @@ mod tests {
         stream.flush(20, &mut out);
         let rendered: String = out.iter().map(plain).collect::<Vec<_>>().join(" ");
         assert_eq!(rendered, "tail without a blank line");
-        // Too deep to parse is a paragraph when there is text, nothing when not.
-        assert!(parse_blocks("deep", 100).len() == 1);
-        assert!(parse_blocks("", 100).is_empty());
+        // Nesting past the limit keeps the text, not the structure.
+        assert!(text(&format!("{} deep", ">".repeat(1000))).ends_with("deep"));
+        assert!(text(&format!("{}deep{}", "*".repeat(500), "*".repeat(500))).contains("deep"));
+        assert!(parse("").is_empty());
     }
 
     /// A blank line inside a list is the list's own gap, not a block boundary:
@@ -2105,26 +1263,29 @@ mod tests {
             vec!["text", "• a"]
         );
 
-        // A nested item's indent is not the outer item's: a deeper marker after
-        // a gap starts a block of its own, as it does at once.
-        // At once this is two blocks with the writer's blank row between them,
-        // not one list: the deeper marker is no item of the outer one.
-        let at_once: Vec<String> = document("- a\n\n  - b", 20)
-            .iter()
-            .map(plain)
-            .filter(|row| !row.is_empty())
-            .collect();
-        assert_eq!(at_once, vec!["• a", "• b"]);
+        // An item indented under another after a gap is nested in it, at once
+        // and streamed alike.
+        let at_once: Vec<String> = document("- a\n\n  - b", 20).iter().map(plain).collect();
+        assert_eq!(at_once, vec!["• a", "  • b"]);
         let mut stream = Stream::new();
         let mut out = Vec::new();
         for line in ["- a", "", "  - b"] {
             stream.push(line, 20, &mut out);
         }
         stream.flush(20, &mut out);
+        assert_eq!(out.iter().map(plain).collect::<Vec<_>>(), at_once);
+
+        // A gap inside an open fence is the code's own.
+        let mut stream = Stream::new();
+        let mut out = Vec::new();
+        for line in ["```", "a", "", "b"] {
+            stream.push(line, 20, &mut out);
+        }
+        assert!(out.is_empty());
+        stream.flush(20, &mut out);
         assert_eq!(
             out.iter().map(plain).collect::<Vec<_>>(),
-            vec!["• a", "• b"],
-            "a block of its own"
+            vec!["a", "", "b"]
         );
     }
 

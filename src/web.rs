@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::http::{self, Cancel};
-use crate::markdown;
 use crate::text::is_invisible;
 
 /// Caps on a fetched page: bytes off the wire, characters the model sees, and
@@ -465,10 +464,93 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
+fn named_entity(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "amp" => "&",
+        "lt" => "<",
+        "gt" => ">",
+        "quot" => "\"",
+        "apos" => "'",
+        "nbsp" => "\u{a0}",
+        "copy" => "\u{a9}",
+        "mdash" => "\u{2014}",
+        "ndash" => "\u{2013}",
+        "hellip" => "\u{2026}",
+        "middot" => "\u{b7}",
+        "bull" => "\u{2022}",
+        "laquo" => "\u{ab}",
+        "raquo" => "\u{bb}",
+        _ => return None,
+    })
+}
+
+/// Reject surrogates and out-of-range values.
+fn codepoint(cp: u32) -> Option<char> {
+    if cp == 0 || cp > 0x10ffff || (0xd800..=0xdfff).contains(&cp) {
+        return None;
+    }
+    char::from_u32(cp)
+}
+
+fn decode_entities(text: &str) -> String {
+    let c: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] == '&' {
+            if let Some((ch, next)) = entity_at(&c, i) {
+                out.push(ch);
+                i = next;
+                continue;
+            }
+        }
+        out.push(c[i]);
+        i += 1;
+    }
+    out
+}
+
+/// `&(?:#(\d+)|#x([0-9a-fA-F]+)|(\w+));` at `i`, decoded.
+fn entity_at(c: &[char], i: usize) -> Option<(char, usize)> {
+    let at = |j: usize| c.get(j).copied().unwrap_or('\0');
+    let mut j = i + 1;
+    if at(j) == '#' {
+        let hex = matches!(at(j + 1), 'x' | 'X');
+        j += if hex { 2 } else { 1 };
+        let start = j;
+        while j < c.len()
+            && if hex {
+                c[j].is_ascii_hexdigit()
+            } else {
+                c[j].is_ascii_digit()
+            }
+        {
+            j += 1;
+        }
+        if j == start || at(j) != ';' {
+            return None;
+        }
+        let digits: String = c[start..j].iter().collect();
+        let cp = u32::from_str_radix(&digits, if hex { 16 } else { 10 }).ok()?;
+        return codepoint(cp).map(|ch| (ch, j + 1));
+    }
+    let start = j;
+    while j < c.len() && (c[j].is_ascii_alphanumeric() || c[j] == '_') {
+        j += 1;
+    }
+    if j == start || at(j) != ';' {
+        return None;
+    }
+    let name: String = c[start..j].iter().collect();
+    named_entity(&name)
+        .and_then(|s| s.chars().next())
+        .map(|ch| (ch, j + 1))
+}
+
 /// The href of a DuckDuckGo result, with its `//duckduckgo.com/l/?uddg=...`
 /// redirect unwrapped. Ads and other DuckDuckGo-hosted links are not results.
 fn url_of(href: &str) -> Option<String> {
-    let href = markdown::decode_entities(href);
+    let href = decode_entities(href);
     let href = href.trim();
     let full = match href.strip_prefix("//") {
         Some(rest) => format!("https://{rest}"),
@@ -833,7 +915,7 @@ fn extract_text(html: &str) -> String {
             out.push('\n');
         }
     }
-    collapse(&markdown::decode_entities(&out))
+    collapse(&decode_entities(&out))
         .replace(INDENT, " ")
         .replace(INDENT_TAB, "\t")
 }
@@ -1512,5 +1594,36 @@ mod tests {
         assert!(is_invisible('\u{200b}') && is_invisible('\u{feff}'));
         assert!(is_invisible('\u{e0041}'));
         assert!(!is_invisible('a'));
+    }
+
+    #[test]
+    fn entities_decode_only_when_they_are_ones() {
+        let at0 = |text: &str| {
+            let c: Vec<char> = text.chars().collect();
+            entity_at(&c, 0)
+        };
+        assert_eq!(at0("&amp;"), Some(('&', 5)));
+        assert_eq!(at0("&nbsp;"), Some(('\u{a0}', 6)));
+        assert_eq!(at0("&#65;"), Some(('A', 5)));
+        assert_eq!(at0("&#x42;"), Some(('B', 6)));
+        assert_eq!(at0("&#X42;"), Some(('B', 6)));
+        // Not an entity: no digits, no name, no semicolon, or no such name.
+        for bad in [
+            "&#;",
+            "&#x;",
+            "&;",
+            "&amp",
+            "&bogus;",
+            "&",
+            "&#0;",
+            "&#1114112;",
+            "&#xd800;",
+        ] {
+            assert_eq!(at0(bad), None, "{bad}");
+        }
+        assert_eq!(decode_entities("a &amp; b &#x41; &nope;"), "a & b A &nope;");
+        // An entity must be followed by something: the index past it is exact.
+        let c: Vec<char> = "x&amp;y".chars().collect();
+        assert_eq!(entity_at(&c, 1), Some(('&', 6)));
     }
 }
