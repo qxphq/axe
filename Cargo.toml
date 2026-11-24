@@ -21,3 +21,12 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # macOS side needs nothing below std.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+# axe waits on the network and the terminal, not the CPU, so the release build
+# trades speed for size. Panics still unwind: a tool call that panics is caught
+# and becomes a result for the model.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
