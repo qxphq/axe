@@ -150,7 +150,8 @@ invariants a change must not break.
 15. **`bash` is confined by the kernel, not by strings.** Explore mode denies
     writes outside two directories — the session scratch, and the project's
     `plan/` under the state tree, which survives exit so a plan outlives the
-    session; neither is executable — and exec outside a fixed allowlist
+    session; neither is executable — and exec outside an allowlist, the
+    built-in set plus the config's `explore_commands`, taken as given
     (Landlock/Seatbelt, plus seccomp denying `io_uring_setup` and the mode,
     owner and xattr calls, which Landlock cannot mediate), in a session of its
     own so it cannot `TIOCSTI` into axe's prompt; it degrades with one startup line, which the history

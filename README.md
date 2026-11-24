@@ -74,6 +74,7 @@ pick in one directory is state, not config, and so is `/model -g`'s default.
 | `providers` | name → entry; or a top-level `base_url` for `local` |
 | `model` | `provider/id` a directory starts on when neither it nor the state root has picked one |
 | `explore_by_default` | start sessions in explore mode; default `true` |
+| `explore_commands` | program names explore mode may also run, looked up on `PATH` ([Modes](#modes)) |
 | `search.brave` | Brave token via `api_key_env`; unset → DuckDuckGo |
 | `thinking` | default level per `provider/id` for a fresh directory |
 | `system` | text appended to the built-in prompt |
@@ -447,7 +448,7 @@ says the round was not whole.
 
 Explore mode is a session setting, on by default (`explore_by_default`), and
 shown as `read-only`. When it is on, `write` and `edit` are unavailable, `bash`
-runs only a fixed allowlist of commands and writes only inside a scratch
+runs only an allowlist of commands and writes only inside a scratch
 directory and the project's `plan/`, and `fetch` and `web_search` are the way
 to read the web. When it is off, `write`, `edit` and a full `bash` are back,
 and `fetch` and `web_search` are refused. `--unsafe` (`-u`) starts the session that
@@ -585,7 +586,9 @@ the ELF interpreter each of those binaries names, read from `PT_INTERP` rather
 than assumed, since a NixOS system keeps it in `/nix/store`, plus git's network
 transports (`git-remote-https` and its siblings), which `git` execs from its
 own libexec directory rather than from `PATH`. A name that is not installed is
-skipped, so the same list works on a thin system.
+skipped, so the same list works on a thin system. `explore_commands` in the
+config adds names to it, as given: a name listed there is allowed even when it
+is one of the classes below.
 
 The list is a convenience guard, not a boundary: the kernel contains the side
 effect. `npm install` and `apt install` are allowed to start and then fail on

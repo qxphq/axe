@@ -32,7 +32,8 @@ use std::sync::OnceLock;
 /// (`sudo`, `mount`), programs whose side effect is a mode or a timestamp
 /// rather than a write (`chmod`, `touch`), and tools that exec their own
 /// `/nix/store` or `/opt/homebrew` paths (`nix`, `brew`). A name that is not
-/// installed is skipped.
+/// installed is skipped. The config's `explore_commands` adds to the list, and
+/// is taken as given: a name the user lists is the user's call.
 pub const COMMANDS: &[&str] = &[
     "apk",
     "apt",
@@ -149,6 +150,27 @@ pub const COMMANDS: &[&str] = &[
     "yarn",
     "zypper",
 ];
+
+/// Names the config adds to `COMMANDS`, registered by startup before the first
+/// command runs; the rulesets are built once, so a later set changes nothing.
+static EXTRA: OnceLock<Vec<String>> = OnceLock::new();
+
+pub fn set_commands(names: Vec<String>) {
+    let _ = EXTRA.set(names);
+}
+
+/// The built-in list and the config's, resolved on `PATH`; a name that is not
+/// installed is skipped.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn commands() -> Vec<PathBuf> {
+    let extra = EXTRA.get().map(Vec::as_slice).unwrap_or_default();
+    COMMANDS
+        .iter()
+        .copied()
+        .chain(extra.iter().map(String::as_str))
+        .filter_map(resolve)
+        .collect()
+}
 
 /// The one writable directory in explore mode: `0700`, canonicalised because
 /// both sandboxes match real paths, removed at exit.
@@ -341,7 +363,7 @@ mod imp {
     use std::process::Command;
     use std::sync::OnceLock;
 
-    use super::{confine_env, git_remotes, resolve, scratch_dir, shell_path, COMMANDS};
+    use super::{commands, confine_env, git_remotes, scratch_dir, shell_path};
 
     /// The `AUDIT_ARCH_*` value the filter pins. `None` on an architecture this
     /// file has no numbers for, where explore mode's `bash` cannot be confined.
@@ -651,7 +673,7 @@ mod imp {
         let fs = rights(abi);
         let set = create(fs)?;
 
-        let mut binaries: Vec<PathBuf> = COMMANDS.iter().filter_map(|name| resolve(name)).collect();
+        let mut binaries = commands();
         binaries.push(shell.to_path_buf());
         binaries.extend(git_remotes());
         let loaders: Vec<PathBuf> = binaries
@@ -872,7 +894,7 @@ mod imp {
     use std::process::Command;
     use std::sync::OnceLock;
 
-    use super::{confine_env, git_remotes, resolve, scratch_dir, shell_path, COMMANDS};
+    use super::{commands, confine_env, git_remotes, resolve, scratch_dir, shell_path};
 
     const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -997,7 +1019,7 @@ mod imp {
             profile.push_str(&format!("(allow file-write* (subpath {}))\n", quote(plan)));
         }
         profile.push_str("(deny process-exec)\n(allow process-exec");
-        let mut paths: Vec<PathBuf> = COMMANDS.iter().filter_map(|name| resolve(name)).collect();
+        let mut paths = commands();
         paths.extend(["sh", "bash"].iter().copied().filter_map(resolve));
         paths.extend(TRAMPOLINES.iter().copied().filter_map(xcrun));
         paths.extend(git_remotes());

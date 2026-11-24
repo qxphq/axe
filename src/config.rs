@@ -105,6 +105,8 @@ pub struct Config {
     /// Whether a session starts in explore mode (`read` and a read-only
     /// `bash`). On unless the config sets `"explore_by_default": false`.
     pub explore_by_default: bool,
+    /// Program names explore mode may execute beyond `sandbox::COMMANDS`.
+    pub explore_commands: Vec<String>,
     /// Web search: Brave when a token resolves, DuckDuckGo otherwise.
     pub search: Search,
     /// Model spec (`provider/id`) -> remembered thinking level.
@@ -158,6 +160,7 @@ const EXAMPLE: &str = r#"{
   },
   "model": "local/qwen3.8-flash-next-chat",
   "explore_by_default": true,
+  "explore_commands": [],
   "search": {
     "brave": {
       "api_key_env": "BRAVE_SEARCH_API_KEY"
@@ -243,6 +246,7 @@ pub(crate) const TOP_KEYS: &[&str] = &[
     "base_url",
     "model",
     "explore_by_default",
+    "explore_commands",
     "search",
     "thinking",
     "system",
@@ -450,6 +454,32 @@ fn parse_skills(v: &Value) -> Result<Vec<PathBuf>, String> {
     }
 }
 
+/// Names, not paths: each is looked up on `PATH` like the built-in list, so a
+/// `/` or a blank could only ever resolve to something other than it says.
+fn parse_explore_commands(v: &Value) -> Result<Vec<String>, String> {
+    let shape = "\"explore_commands\" must be an array of program names";
+    match v.get("explore_commands") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .map(|entry| {
+                let name = entry.as_str().ok_or_else(|| shape.to_string())?;
+                if name.is_empty()
+                    || name.contains('/')
+                    || name.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    return Err(format!(
+                        "\"explore_commands\": {name:?} is not a program name: it is looked \
+                         up on PATH, so it cannot be empty, contain '/', or carry whitespace"
+                    ));
+                }
+                Ok(name.to_string())
+            })
+            .collect(),
+        Some(_) => Err(shape.into()),
+    }
+}
+
 fn parse_notify(v: &Value) -> Result<Option<Notify>, String> {
     let Some(map) = optional_section(&v["notify"], &["via", "after"], "\"notify\": ")? else {
         return Ok(None);
@@ -543,6 +573,7 @@ fn parse_value(v: &Value) -> Result<Config, String> {
         model: string_field(v.get("model"), "model", "")?,
         explore_by_default: bool_field(v.get("explore_by_default"), "explore_by_default", "")?
             .unwrap_or(true),
+        explore_commands: parse_explore_commands(v)?,
         search: Search { brave_key },
         thinking,
         system: string_field(v.get("system"), "system", "")?,
@@ -591,6 +622,31 @@ mod tests {
         .is_err());
         let cfg = parse_value(&serde_json::json!({ "base_url": "http://p" })).unwrap();
         assert!(cfg.skills.is_empty());
+    }
+
+    #[test]
+    fn explore_commands_are_program_names() {
+        let cfg = parse_value(&serde_json::json!({
+            "base_url": "http://p",
+            "explore_commands": ["make", "docker"]
+        }))
+        .unwrap();
+        assert_eq!(cfg.explore_commands, ["make", "docker"]);
+        let cfg = parse_value(&serde_json::json!({ "base_url": "http://p" })).unwrap();
+        assert!(cfg.explore_commands.is_empty());
+        for bad in [
+            serde_json::json!("make"),
+            serde_json::json!([1]),
+            serde_json::json!([""]),
+            serde_json::json!(["/usr/bin/make"]),
+            serde_json::json!(["make -j"]),
+        ] {
+            assert!(parse_value(&serde_json::json!({
+                "base_url": "http://p",
+                "explore_commands": bad
+            }))
+            .is_err());
+        }
     }
 
     #[test]

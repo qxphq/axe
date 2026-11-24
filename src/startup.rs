@@ -35,6 +35,7 @@ pub(crate) fn run(start: Option<tools::Mode>) -> Result<(), String> {
     // Confinement is announced before anything runs, once, next to the
     // provider lines: weaker than promised must never be silent — for the user
     // hearing it now or the model reading the history it joins.
+    sandbox::set_commands(cfg.explore_commands.clone());
     let sandbox_note = sandbox::init();
     if let Some(note) = &sandbox_note {
         crate::text::warn(note);
