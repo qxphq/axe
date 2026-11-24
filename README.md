@@ -6,9 +6,9 @@
 ██▀██ ██ ██ ██▄▄▄
 ```
 
-A minimal coding agent in Rust. One binary, one line REPL, any
+A tiny coding agent in Rust. One binary, one line REPL, any
 OpenAI-compatible `chat/completions` server, seven tools, **seven dependencies**.
-It does not re-implement your shell, your tools or your system.
+It does not compete in features with your shell, your tools or your OS.
 
 Sessions start in explore mode (shown as `read-only`), where `fetch` and
 `web_search` are available and the writing tools are not.
