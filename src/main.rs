@@ -39,7 +39,8 @@ use serde_json::{json, Value};
 
 use prompt::mode_note;
 use render::{
-    body, call_line, detail, failed, line_of, mark, plain_text, shell_echo, shell_line, Paint,
+    body, call_rows, detail, failed, line_of, mark, marked, plain_rows, plain_text, shell_echo,
+    shell_line, Paint, Row,
 };
 use repl::{
     choose, narrow, pump, readline, recall_lines, show_queue, spawn_input, take_back, Event, Input,
@@ -736,7 +737,7 @@ impl Session {
                     // the unconfined color.
                     let mut console = Console::Stdout;
                     let result = self.run_shell(&command);
-                    console.output(&format!("{}\n", plain_text(&shell_echo(&command, &result))));
+                    console.output(&format!("{}\n", plain_rows(&shell_echo(&command, &result))));
                     console.output(body(&result));
                 }
                 Cmd::Compact => {
@@ -1008,11 +1009,16 @@ impl Session {
                                 .to_string(),
                         };
                         let result = results.get(call.id.as_str()).copied().unwrap_or("");
-                        let mut spans = call_line(&call, self.mode.explore());
-                        spans.push((Paint::Plain, " ".to_string()));
-                        let (paint, glyph) = mark(&call.name, result);
-                        spans.push((paint, glyph.to_string()));
-                        screen.insert(vec![line_of(&spans)], ui::Block::Tool);
+                        let rows = marked(
+                            // The log keeps no mode: today's would claim a
+                            // confinement the call may not have run under.
+                            call_rows(&call, None),
+                            mark(&call.name, result),
+                        );
+                        screen.insert(
+                            rows.iter().map(|row| line_of(row)).collect(),
+                            ui::Block::Tool,
+                        );
                         if failed(&call.name, result) {
                             screen.fail(&detail(result));
                         }
@@ -1472,8 +1478,9 @@ impl Session {
         });
         screen.set_status("");
         screen.set_alert(None);
+        let rows = shell_echo(command, &result);
         screen.insert(
-            vec![line_of(&shell_echo(command, &result))],
+            rows.iter().map(|row| line_of(row)).collect(),
             ui::Block::Tool,
         );
         // The command's own words: the glyph on the line has already said how
@@ -2107,8 +2114,8 @@ impl Held {
             }
             // Model text, already spaced by the sink.
             Event::Printed(text) => self.printed(&text, screen),
-            // A tool call and its outcome, on one line.
-            Event::Echo(spans, error) => {
+            // A tool call and its outcome on its first row.
+            Event::Echo(rows, error) => {
                 // A round that only reasoned and called a tool: its thought
                 // ends here, before the call it produced.
                 let tail = std::mem::take(&mut self.thought);
@@ -2116,7 +2123,10 @@ impl Held {
                 // The command that was running is in the transcript now; the
                 // status row goes back to being empty.
                 screen.set_status("");
-                screen.insert(vec![line_of(&spans)], ui::Block::Tool);
+                screen.insert(
+                    rows.iter().map(|row| line_of(row)).collect(),
+                    ui::Block::Tool,
+                );
                 if let Some(error) = &error {
                     screen.fail(error);
                 }
@@ -2423,12 +2433,10 @@ impl Sink for ChannelSink {
         self.send(Event::Status(text.to_string()));
     }
 
-    fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str), error: Option<&str>) {
+    fn echo(&mut self, call: &[Row], mark: (Paint, &'static str), error: Option<&str>) {
         self.end_thought();
-        let mut spans = call.to_vec();
-        spans.push((Paint::Plain, " ".to_string()));
-        spans.push((mark.0, mark.1.to_string()));
-        self.send(Event::Echo(spans, error.map(str::to_string)));
+        let rows = marked(call.to_vec(), mark);
+        self.send(Event::Echo(rows, error.map(str::to_string)));
     }
 
     fn cut(&mut self, why: &str) {
@@ -2477,6 +2485,7 @@ impl Sink for ChannelSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::call_line;
 
     use ratatui::crossterm::event::KeyModifiers;
 
@@ -3036,6 +3045,24 @@ mod tests {
         assert_eq!(plain_text(&write), "✚  write(a.txt)");
         let shell = shell_line("echo hi", false);
         assert!(plain_text(&shell).contains("echo hi"));
+    }
+
+    /// A script the transcript keeps reads whole: every line of the command
+    /// under the first, the mark on the first, while the status row keeps one.
+    #[test]
+    fn a_multi_line_command_echoes_every_line() {
+        let script = "cd \"$TMPDIR\"\ncat > a.py <<'EOF'\n\tprint(1)\nEOF\npython3 a.py";
+        let call = api::ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: json!({ "command": script }).to_string(),
+        };
+        let rows = marked(call_rows(&call, Some(true)), (Paint::Green, "✓"));
+        assert_eq!(
+            plain_rows(&rows),
+            "▷ cd \"$TMPDIR\" ✓\n│ cat > a.py <<'EOF'\n│     print(1)\n│ EOF\n│ python3 a.py"
+        );
+        assert_eq!(plain_text(&call_line(&call, true)), "▷ cd \"$TMPDIR\"…");
     }
 
     #[test]

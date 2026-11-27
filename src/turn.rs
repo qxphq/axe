@@ -20,7 +20,7 @@ use crate::http::{self, Cancel};
 use crate::markdown;
 use crate::mcp;
 use crate::prompt;
-use crate::render::{call_line, detail, failed, mark, plain_text, Paint};
+use crate::render::{call_line, call_rows, detail, failed, mark, plain_text, Paint, Row};
 use crate::tools;
 use crate::ui;
 
@@ -36,9 +36,9 @@ pub trait Sink {
     /// A transient label for the live region: a request waiting for the
     /// provider, a running command.
     fn status(&mut self, text: &str);
-    /// One tool call, finished: the call and its outcome on one line, and the
-    /// failure's own words beneath it.
-    fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str), error: Option<&str>);
+    /// One tool call, finished: the call's rows with its outcome on the first,
+    /// and the failure's own words beneath them.
+    fn echo(&mut self, call: &[Row], mark: (Paint, &'static str), error: Option<&str>);
     /// The round that ended is not an answer the model finished: the provider
     /// cut it at its limit, or the stream died before the protocol ended it.
     /// A line of the harness's own, under the text it is about.
@@ -139,7 +139,7 @@ impl Sink for PlainSink {
 
     fn status(&mut self, _text: &str) {}
 
-    fn echo(&mut self, call: &[(Paint, String)], mark: (Paint, &'static str), error: Option<&str>) {
+    fn echo(&mut self, call: &[Row], mark: (Paint, &'static str), error: Option<&str>) {
         self.flush();
         // A tool call is the harness's account of the turn, not the answer: a
         // piped run keeps stdout for the model's text and puts this on stderr,
@@ -148,15 +148,15 @@ impl Sink for PlainSink {
             crate::text::err("\n");
         }
         self.last = Some(ui::Block::Tool);
-        let mut line = String::new();
         // Styled, and stripped, by stderr: a run whose stdout is a file
-        // still writes this line to the user's terminal.
-        for (paint, text) in call {
-            line.push_str(&paint.ansi_err(text));
+        // still writes these rows to the user's terminal.
+        for row in crate::render::marked(call.to_vec(), mark) {
+            let line: String = row
+                .iter()
+                .map(|(paint, text)| paint.ansi_err(text))
+                .collect();
+            crate::text::err(&format!("{line}\n"));
         }
-        line.push(' ');
-        line.push_str(&mark.0.ansi_err(mark.1));
-        crate::text::err(&format!("{line}\n"));
         if let Some(error) = error {
             crate::text::err(&format!("    {}\n", Paint::Red.ansi_err(error)));
         }
@@ -383,10 +383,9 @@ pub fn run_turn(
             if turn.cancel.cancelled() {
                 break;
             }
-            let echo = call_line(call, mode.explore());
-            // What is running, while it runs: the finished line appears below
-            // once there is a result to put on it.
-            sink.status(&plain_text(&echo));
+            // What is running, while it runs: the finished rows appear below
+            // once there is a result to put on them.
+            sink.status(&plain_text(&call_line(call, mode.explore())));
             // A tool that panics must still leave a result: the assistant
             // message above already named the call, and a missing result
             // outlives the turn in the log.
@@ -396,7 +395,11 @@ pub fn run_turn(
                         format!("error: {} panicked; the call was not run", call.name)
                     });
             let error = failed(&call.name, &result).then(|| detail(&result));
-            sink.echo(&echo, mark(&call.name, &result), error.as_deref());
+            sink.echo(
+                &call_rows(call, Some(mode.explore())),
+                mark(&call.name, &result),
+                error.as_deref(),
+            );
             history.push(tool_message(&call.id, &result));
             answered += 1;
         }
@@ -616,13 +619,16 @@ mod tests {
         fn status(&mut self, text: &str) {
             self.seen.push(format!("status:{text}"));
         }
-        fn echo(
-            &mut self,
-            call: &[(Paint, String)],
-            mark: (Paint, &'static str),
-            error: Option<&str>,
-        ) {
-            let line: String = call.iter().map(|(_, text)| text.as_str()).collect();
+        fn echo(&mut self, call: &[Row], mark: (Paint, &'static str), error: Option<&str>) {
+            let line = call
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|(_, text)| text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             self.seen
                 .push(format!("echo:{line} {} {:?}", mark.1, error));
         }
@@ -1003,7 +1009,7 @@ mod tests {
         sink.end_round();
         assert!(matches!(sink.last, Some(ui::Block::Text)));
         sink.echo(
-            &[(Paint::Cyan, "read x".to_string())],
+            &[vec![(Paint::Cyan, "read x".to_string())]],
             (Paint::Green, "ok"),
             Some("boom"),
         );

@@ -343,7 +343,9 @@ A line starting with `!` is your own shell: it runs through the same tool, its
 output joins the history as a user message, and no turn follows — the model
 sees it the next time you ask something. It leaves the line a call leaves
 (`▷ cmd ✓`, or `✗` when it failed), the command's own words under it and
-the exit status carried by the glyph.
+the exit status carried by the glyph. A command of several lines, yours or
+the model's, shows its lines under the first behind a `│`, blank lines left
+out, up to 200 rows; the last row counts what did not fit.
 
 Every submitted line is remembered for the directory, across sessions: ↑ walks
 what was typed here, newest first, ↓ comes back down, and Ctrl+R searches. A

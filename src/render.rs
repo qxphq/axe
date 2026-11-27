@@ -1,5 +1,4 @@
-//! Transcript text: what a message, a tool call and a command look like on one
-//! line. The screen renders the same spans as cells, so the only difference
+//! Transcript text: what a message, a tool call and a command look like. The screen renders the same spans as cells, so the only difference
 //! between the two outputs is who does the painting.
 
 use ratatui::style::{Color, Modifier, Style};
@@ -71,22 +70,112 @@ pub(crate) fn plain_text(spans: &[(Paint, String)]) -> String {
         .to_string()
 }
 
-// A shell command, the user's (`!cmd`) or the model's, on one line: the glyph
-// says what runs, and the command follows it, since `bash` has no call syntax.
-pub(crate) fn shell_line(command: &str, explore: bool) -> Vec<(Paint, String)> {
-    // Cyan for a command that cannot change the tree: dim is the thought's
-    // color, and the two must not read alike.
-    let paint = if explore { Paint::Cyan } else { Paint::Yellow };
-    vec![
+/// The most rows a finished command takes: a script reads whole, and a file
+/// written through a heredoc does not flood the scrollback.
+const SHELL_ROWS: usize = 200;
+
+/// One row of styled spans.
+pub(crate) type Row = Vec<(Paint, String)>;
+
+// The shell glyph and its color: whether the command could change the tree.
+// Cyan for one that could not — dim is the thought's color, and the two must
+// not read alike — yellow for one that could, and plain when the mode it ran
+// under is not known: a resumed session's calls, since the log keeps no mode.
+fn shell_head(text: String, explore: Option<bool>) -> (Row, Paint) {
+    let paint = match explore {
+        Some(true) => Paint::Cyan,
+        Some(false) => Paint::Yellow,
+        None => Paint::Plain,
+    };
+    let row = vec![
         (Paint::Plain, "  ".to_string()),
         (paint, "▷".to_string()),
         (Paint::Plain, " ".to_string()),
-        (paint, text::oneline(command, 120)),
-    ]
+        (paint, text),
+    ];
+    (row, paint)
+}
+
+// A shell command, the user's (`!cmd`) or the model's, on the status row's one
+// line: the glyph says what runs, and the command follows it, since `bash` has
+// no call syntax. A leading blank line would leave the row with no command.
+pub(crate) fn shell_line(command: &str, explore: bool) -> Row {
+    shell_head(text::oneline(command.trim_start(), 120), Some(explore)).0
+}
+
+/// A finished command as rows: the glyph and its first line, then the lines
+/// after it behind a dim `│`, which sets them apart from a failure's words
+/// under them. Blank lines are left out: in a tool block a blank row reads as
+/// the end of the block. Past `SHELL_ROWS` the rest is counted, not shown.
+pub(crate) fn shell_rows(command: &str, explore: Option<bool>) -> Vec<Row> {
+    let mut lines = command
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| text::displayable(&line.replace('\t', "    ")));
+    let (head, paint) = shell_head(lines.next().unwrap_or_default(), explore);
+    let rest: Vec<String> = lines.collect();
+    let row = |paint, line| {
+        vec![
+            (Paint::Plain, "  ".to_string()),
+            (Paint::Dim, "│".to_string()),
+            (Paint::Plain, " ".to_string()),
+            (paint, line),
+        ]
+    };
+    let room = SHELL_ROWS - 1;
+    let shown = if rest.len() > room {
+        room - 1
+    } else {
+        rest.len()
+    };
+    let mut rows = vec![head];
+    rows.extend(rest[..shown].iter().map(|line| row(paint, line.clone())));
+    if shown < rest.len() {
+        rows.push(row(Paint::Dim, format!("… +{} lines", rest.len() - shown)));
+    }
+    rows
+}
+
+/// A finished call as rows: a `bash` command whole, any other call on its one
+/// line. `explore` is `None` when the mode the call ran under is not known.
+pub(crate) fn call_rows(call: &api::ToolCall, explore: Option<bool>) -> Vec<Row> {
+    if call.name == "bash" {
+        let v: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+        if let Some(command) = v["command"].as_str() {
+            return shell_rows(command, explore);
+        }
+    }
+    vec![call_line(call, explore.unwrap_or(false))]
+}
+
+/// The outcome's glyph at the end of a call's first row, where a one-line
+/// call carries it, so the marks stay in one column of the eye.
+pub(crate) fn marked(mut rows: Vec<Row>, mark: (Paint, &str)) -> Vec<Row> {
+    if let Some(first) = rows.first_mut() {
+        first.push((Paint::Plain, " ".to_string()));
+        first.push((mark.0, mark.1.to_string()));
+    }
+    rows
+}
+
+/// Rows as plain lines for a terminal with no screen: the first row's indent
+/// dropped, as `plain_text` drops it, and the rest kept relative to it.
+pub(crate) fn plain_rows(rows: &[Row]) -> String {
+    rows.iter()
+        .map(|row| {
+            let line: String = row.iter().map(|(_, text)| text.as_str()).collect();
+            line.strip_prefix("  ")
+                .unwrap_or(&line)
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // Echo tool calls compactly: show the arguments that identify the target, never
-// the raw JSON (heredoc scripts and long content are unreadable in a line).
+// the raw JSON. `bash` is the exception that proves it: its argument is the
+// call, and `call_rows` shows it whole.
 // A glyph per tool says what it does at a glance. The palette has one rule:
 // anything that can change the tree is yellow, anything that cannot is cyan
 // (dim is the thought's color, so a read-only call must not use it).
@@ -193,15 +282,11 @@ pub(crate) fn mark(name: &str, result: &str) -> (Paint, &'static str) {
     }
 }
 
-/// A finished command on one line: what ran, and one glyph for how it went.
-/// The model's calls and the user's `!cmd` share it, so a command reads the
-/// same whichever side ran it.
-pub(crate) fn shell_echo(command: &str, result: &str) -> Vec<(Paint, String)> {
-    let mut spans = shell_line(command, false);
-    spans.push((Paint::Plain, " ".to_string()));
-    let (paint, glyph) = mark("bash", result);
-    spans.push((paint, glyph.to_string()));
-    spans
+/// A finished command: what ran, and one glyph for how it went. The model's
+/// calls and the user's `!cmd` share it, so a command reads the same whichever
+/// side ran it.
+pub(crate) fn shell_echo(command: &str, result: &str) -> Vec<Row> {
+    marked(shell_rows(command, Some(false)), mark("bash", result))
 }
 
 /// A tool result's own words: the `exit: N` header is dropped, since the glyph
@@ -226,6 +311,54 @@ mod tests {
 
     /// A tool name is the model's: one carrying a clipboard or title escape is
     /// echoed without its control bytes, wherever the line is written.
+    /// Blank lines leave no row: a command that starts with one still shows
+    /// a command on its first row, and none reads as the end of the block.
+    #[test]
+    fn a_command_echoes_no_blank_rows() {
+        let rows = shell_rows("\n  \ncd src\n\nmake\n", Some(false));
+        assert_eq!(plain_rows(&rows), "▷ cd src\n│ make");
+        assert_eq!(
+            plain_text(&shell_line("\ncd src\nmake", false)),
+            "▷ cd src…"
+        );
+    }
+
+    /// A resumed call's mode is not in the log: its command is plain, not the
+    /// color of a confinement it may not have run under.
+    #[test]
+    fn a_call_of_unknown_mode_is_plain() {
+        let call = api::ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"make\nmake test"}"#.into(),
+        };
+        let rows = call_rows(&call, None);
+        assert!(rows.iter().all(|row| matches!(row[3].0, Paint::Plain)));
+        assert!(matches!(call_rows(&call, Some(true))[0][3].0, Paint::Cyan));
+        assert!(matches!(
+            call_rows(&call, Some(false))[1][3].0,
+            Paint::Yellow
+        ));
+    }
+
+    /// A heredoc that writes a big file takes `SHELL_ROWS` rows, and the last
+    /// one counts what it left out.
+    #[test]
+    fn a_long_command_is_capped_and_counted() {
+        let script: Vec<String> = (0..1000).map(|n| format!("line {n}")).collect();
+        let rows = shell_rows(&script.join("\n"), Some(false));
+        assert_eq!(rows.len(), SHELL_ROWS);
+        let last = plain_rows(&rows[SHELL_ROWS - 1..]);
+        assert_eq!(last, format!("│ … +{} lines", 1000 - (SHELL_ROWS - 1)));
+        let exact: Vec<String> = (0..SHELL_ROWS).map(|n| format!("l{n}")).collect();
+        let rows = shell_rows(&exact.join("\n"), Some(false));
+        assert_eq!(rows.len(), SHELL_ROWS);
+        assert_eq!(
+            plain_rows(&rows[SHELL_ROWS - 1..]),
+            format!("│ l{}", SHELL_ROWS - 1)
+        );
+    }
+
     #[test]
     fn a_made_up_tool_name_carries_no_control_bytes() {
         let call = api::ToolCall {

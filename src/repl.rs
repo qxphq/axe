@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::http;
-use crate::render::Paint;
+use crate::render::Row;
 use crate::turn::Queue;
 use crate::ui;
 
@@ -34,9 +34,9 @@ pub(crate) enum Event {
     Paste(String),
     /// Transcript text: finished model lines, already spaced.
     Printed(String),
-    /// One tool call and its outcome, as styled spans, and the failure's own
+    /// One tool call and its outcome, as styled rows, and the failure's own
     /// words when it failed.
-    Echo(Vec<(Paint, String)>, Option<String>),
+    Echo(Vec<Row>, Option<String>),
     /// A transient label for the status row.
     Status(String),
     /// The round is not a whole answer: a provider cut or a stream that died.

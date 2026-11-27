@@ -1258,10 +1258,13 @@ impl Screen {
         // Wrap and render inside the margin, so nothing lands on the edge.
         let margin = PAD.min(width.saturating_sub(1) as u16);
         let cols = width.saturating_sub(2 * margin as usize).max(1);
+        // A call's text starts under its glyph: a row it wraps to starts
+        // there too, so the overflow never reads as a line of its own.
+        let hang = if block == Block::Tool { TOOL_HANG } else { 0 };
         let rows: Vec<Line<'static>> = lines
             .into_iter()
             .map(expand_tabs)
-            .flat_map(|line| wrap(line, cols))
+            .flat_map(|line| wrap(line, cols, hang))
             .collect();
         let total = rows.len() as u16;
         // The rows a frame gave up are blank and already above it: the top of
@@ -2521,9 +2524,16 @@ fn row_text(cells: &[Cell]) -> String {
         .to_string()
 }
 
-/// Break a styled line into display rows of at most `width` cells. Styles are
-/// carried across the break, so a wrapped echo keeps its color.
-fn wrap(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+/// The column a tool block's text starts at: after `  ▷ `, `  │ ` and the
+/// four spaces a failure's words carry.
+const TOOL_HANG: usize = 4;
+
+/// Break a styled line into display rows of at most `width` cells, each row
+/// after the first indented by `hang`. Styles are carried across the break, so
+/// a wrapped echo keeps its color.
+fn wrap(line: Line<'static>, width: usize, hang: usize) -> Vec<Line<'static>> {
+    // A field too narrow for the indent and a cell of text wraps flush.
+    let hang = if hang < width { hang } else { 0 };
     let mut rows: Vec<Line<'static>> = Vec::new();
     let mut row: Vec<Span<'static>> = Vec::new();
     let mut col = 0usize;
@@ -2540,7 +2550,10 @@ fn wrap(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
                     row.push(Span::styled(std::mem::take(&mut text), style));
                 }
                 rows.push(Line::from(std::mem::take(&mut row)));
-                col = 0;
+                if hang > 0 {
+                    row.push(Span::raw(" ".repeat(hang)));
+                }
+                col = hang;
             }
             text.push(ch);
             col += cells;
@@ -2921,12 +2934,24 @@ mod tests {
 
     #[test]
     fn wrap_breaks_at_cells() {
-        let rows = wrap(Line::from("hello world"), 6);
+        let rows = wrap(Line::from("hello world"), 6, 0);
         let text: Vec<String> = rows
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert_eq!(text, vec!["hello ", "world"]);
+    }
+
+    /// A tool row that wraps keeps its text's column, so a long script line
+    /// does not spill to the left of the command it belongs to.
+    #[test]
+    fn wrap_hangs_a_tool_row_under_its_text() {
+        let rows = wrap(Line::from("  ▷ abcdefgh"), 8, 4);
+        let text: Vec<String> = rows
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text, vec!["  ▷ abcd", "    efgh"]);
     }
 
     #[test]
